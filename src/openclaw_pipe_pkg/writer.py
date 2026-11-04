@@ -3107,15 +3107,29 @@ async def _owui_chat_has_live_task(chat_id: str) -> bool:
 async def _session_list_active(conn: "_GatewayConnection", session_key: str,
                                *, missing: bool | None = False) -> bool | None:
     """`sessions.list` `hasActiveRun` for one session (counts a sub-agent
-    yield gap as active, unlike `sessions.describe`). `missing` when the
-    Gateway lists no such session, None when it can't be asked."""
+    yield gap as active, unlike `sessions.describe`). The read names the
+    session (`search`): an unfiltered list holds only the newest 100 rows, so
+    a long run's row, last touched when it started, is not in it, and the
+    session read as having no run. `missing` when the Gateway has no such
+    session (a chat's first message); None when it can't be asked, or when
+    more rows matched than came back and none is the session, so its absence
+    is not known."""
     try:
-        lst = await conn.send_request("sessions.list", {}, timeout=15)
+        lst = await conn.send_request(
+            "sessions.list", {"search": session_key, "limit": _SESSION_READ_LIMIT}, timeout=15)
     except Exception as ex:
         pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
         return None
-    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
-    return bool(row.get("hasActiveRun")) if row else missing
+    rows = lst.get("sessions") or []
+    row = next((r for r in rows if r.get("key") == session_key), None)
+    if row:
+        return bool(row.get("hasActiveRun"))
+    total = lst.get("totalCount")
+    if len(rows) >= _SESSION_READ_LIMIT or (total is not None and total > len(rows)):
+        pipe_log(f"  sessions.list for {session_key[-36:][:8]}...: {total or len(rows)} rows match, "
+                 "none is the session; its state is unknown")
+        return None
+    return missing
 
 
 async def _wait_for_session_idle(conn: "_GatewayConnection", session_key: str, is_active,
@@ -3403,7 +3417,7 @@ async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str)
     closed in a later second than the chat's last write is rebuilt from the
     transcript into its message (identity rule, rule E for recoveries)."""
     from open_webui.models.chats import Chats
-    lst = await conn.send_request("sessions.list", {}, timeout=15)
+    lst = await _list_all_sessions(conn)
     prefix = f"agent:{agent_id}:openwebui-"
     fixed = 0
     for row in lst.get("sessions") or []:

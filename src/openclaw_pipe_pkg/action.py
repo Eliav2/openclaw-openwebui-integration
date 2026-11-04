@@ -3099,7 +3099,7 @@ class Action:
         current_task = asyncio.ensure_future(conn.send_request(
             "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5))
         seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
-            conn.send_request("sessions.list", dict(limit=1000), timeout=30))
+            _list_all_sessions(conn))
         tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))
         jobs_task = asyncio.ensure_future(_read_automations(conn))
 
