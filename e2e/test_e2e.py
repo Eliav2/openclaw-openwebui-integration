@@ -981,6 +981,14 @@ def _gateway_up() -> bool:
 GATEWAY_PID_FILE = os.environ.get("E2E_GATEWAY_PID_FILE", "")
 
 
+def _gateway_env() -> dict:
+    """The environment a relaunched Gateway needs: e2e/start_stack.sh exports
+    E2E_FAKE_CLAUDE_DIR (its log dir, beside the pid file) for the Gateway
+    only. Without it e2e/fake_claude.py exits 1 on every claude-cli turn after
+    a relaunch (CI run 41865955203: the second-wake test after the crash tests)."""
+    return {**os.environ, "E2E_FAKE_CLAUDE_DIR": os.path.dirname(GATEWAY_PID_FILE)}
+
+
 def _alive(pid: int) -> bool:
     """Any thread of `pid` is still running. After a SIGKILL the main thread
     turns zombie first, while the others still hold the process's files: the
@@ -1109,7 +1117,7 @@ def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
     log_path = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
     log = open(log_path, "a")
     proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
-                            start_new_session=True)
+                            start_new_session=True, env=_gateway_env())
     with open(GATEWAY_PID_FILE, "w") as f:
         f.write(str(proc.pid))
 
@@ -1217,7 +1225,7 @@ def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
         turn = pool.submit(_chat_turn, token, "Respond with exactly: E2E_DURING_RESTART", chat_id=chat_id)
         def relaunch():
             proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=open(log_path, "a"),
-                                    stderr=subprocess.STDOUT, start_new_session=True)
+                                    stderr=subprocess.STDOUT, start_new_session=True, env=_gateway_env())
             with open(GATEWAY_PID_FILE, "w") as f:
                 f.write(str(proc.pid))
         try:
