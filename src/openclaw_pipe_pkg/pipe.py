@@ -2141,7 +2141,7 @@ class _PipeTurn:
         try:
             (blocks, errors), complete = await self.conn.read_until_stored(
                 self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
-                _RUN_IMAGES_MAX_WAIT_S)
+                _RUN_IMAGES_MAX_WAIT_S, empty=([], []))
         except Exception as ex:
             pipe_log(f"  run images: chat.history failed: {ex!r}")
             return

@@ -2115,37 +2115,50 @@ class _GatewayConnection:
         if ev is not None:
             ev.set()
 
-    async def read_until_stored(self, session_key: str, read, have, max_wait_s: float):
+    async def read_until_stored(self, session_key: str, read, have, max_wait_s: float, empty=None):
         """`read(fresh)` until `have(result)`: the session's stored messages
         hold what the caller waits for. The first read may be a cached one;
         each later read is fresh and follows a transcript change of
-        `session_key` (`session_message_event`, taken before that read).
-        Returns (last result, whether `have` held). `max_wait_s` bounds a
-        Gateway that never stores it, counted from the start and across every
-        read: a read that runs past it ends the wait with the result before it
-        (the first read raises `asyncio.TimeoutError`). The caller logs that."""
+        `session_key` (`session_message_event`, taken before that read, with
+        the session's message subscription taken again first: a failed
+        subscribe drops it). Returns (last result, whether `have` held).
+        `max_wait_s` bounds a Gateway that never stores it, counted from the
+        start and across every read and subscribe: one that runs past it ends
+        the wait with the result before it (`empty` before the first). A
+        read's own error, its own timeout included, is raised. The caller
+        logs both."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max_wait_s
-        got = await asyncio.wait_for(read(False), max_wait_s)
+        bound = object()
+
+        async def within(coro):
+            # Only the bound's expiry is the bound: `asyncio.wait` never raises
+            # for it, so a TimeoutError of the read itself still reaches the caller.
+            task = asyncio.ensure_future(coro)
+            left = deadline - loop.time()
+            if left > 0:
+                await asyncio.wait({task}, timeout=left)
+            if not task.done():
+                task.cancel()
+                return bound
+            return task.result()
+
+        got = await within(read(False))
+        if got is bound:
+            return empty, False
         if have(got):
             return got, True
         while True:
+            if await within(self.ensure_message_subscription(session_key)) is bound:
+                return got, False
             changed = self.session_message_event(session_key)
-            left = deadline - loop.time()
-            if left <= 0:
+            fresh = await within(read(True))
+            if fresh is bound:
                 return got, False
-            try:
-                got = await asyncio.wait_for(read(True), left)
-            except asyncio.TimeoutError:
-                return got, False
+            got = fresh
             if have(got):
                 return got, True
-            left = deadline - loop.time()
-            if left <= 0:
-                return got, False
-            try:
-                await asyncio.wait_for(changed.wait(), left)
-            except asyncio.TimeoutError:
+            if await within(changed.wait()) is bound:
                 return got, False
 
     def _on_session_message(self, payload: dict) -> None:

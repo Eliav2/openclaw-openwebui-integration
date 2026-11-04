@@ -8948,7 +8948,7 @@ class TurnWriterImageTests(_TurnWriterCase):
         file could hold the reply past the documented 30 s. The bound counts
         from the start and each read gets only what is left: a read that
         hangs ends the wait at about `max_wait_s`, with what was read before."""
-        conn = types.SimpleNamespace(session_message_event=lambda _key: asyncio.Event())
+        conn = self._bare_conn()
         reads = []
 
         async def read(fresh):
@@ -8964,6 +8964,49 @@ class TurnWriterImageTests(_TurnWriterCase):
         self.assertEqual(got, ("cached", False))
         self.assertEqual(reads, [False, True])
         self.assertLess(loop.time() - start, 0.45, "the first read's time counts against the bound")
+
+    @staticmethod
+    def _bare_conn(subscribed=None):
+        async def subscribe(key):
+            if subscribed is not None:
+                subscribed.append(key)
+        return types.SimpleNamespace(session_message_event=lambda _key: asyncio.Event(),
+                                     ensure_message_subscription=subscribe)
+
+    async def test_a_first_read_that_hangs_ends_at_the_bound_as_the_bound(self):
+        """Review on #274: a first read held past the bound (its send blocked
+        on a backlogged socket) raised the bound's TimeoutError, which the
+        callers logged as a failed read. It ends the wait like any read: the
+        caller's empty result, not complete."""
+        async def read(fresh):
+            await asyncio.sleep(3600)
+        got = await asyncio.wait_for(openclaw_pipe._GatewayConnection.read_until_stored(
+            self._bare_conn(), "k", read, lambda _got: False, 0.1, empty=([], [])), 5)
+        self.assertEqual(got, (([], []), False))
+
+    async def test_a_reads_own_timeout_is_a_failed_read_not_the_bound(self):
+        """Review on #274: `session_history`'s own 5 s timeout raises the same
+        TimeoutError as the bound; only the bound's expiry is the bound."""
+        async def read(fresh):
+            if fresh:
+                raise asyncio.TimeoutError("chat.history")
+            return "cached"
+        with self.assertRaises(asyncio.TimeoutError):
+            await openclaw_pipe._GatewayConnection.read_until_stored(
+                self._bare_conn(), "k", read, lambda _got: False, 5)
+
+    async def test_a_dropped_subscription_is_taken_again_before_the_wait(self):
+        """Review on #274: a failed `sessions.messages.subscribe` drops the
+        session's subscription, and no `session.message` would wake the wait
+        for a media message appended later. The wait takes it again first
+        (a no-op while it holds)."""
+        subscribed = []
+
+        async def read(fresh):
+            return "none yet"
+        await openclaw_pipe._GatewayConnection.read_until_stored(
+            self._bare_conn(subscribed), "k", read, lambda _got: False, 0.1)
+        self.assertEqual(subscribed[:1], ["k"])
 
     async def test_a_path_directive_is_taken_out_of_the_text(self):
         w = self.writer()
