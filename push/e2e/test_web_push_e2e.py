@@ -12,6 +12,8 @@ a saved subscription. None waits on time.
 """
 import json
 import os
+import subprocess
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -60,6 +62,7 @@ def owui():
     have = {f["id"] for f in api("/api/v1/functions/", token=token)}
     for fid, name, path in (("web_push", "Web Push", os.path.join(PUSH, "openclaw_web_push.py")),
                             ("stub", "Stub", os.path.join(HERE, "stub_pipe.py")),
+                            ("slow", "Slow", os.path.join(HERE, "slow_pipe.py")),
                             ("openclaw_gateway", "OpenClaw", os.path.join(HERE, "fake_openclaw_pipe.py"))):
         form = {"id": fid, "name": name, "content": open(path).read(), "meta": {"description": name}}
         api(f"/api/v1/functions/id/{fid}/update" if fid in have else "/api/v1/functions/create", form, token)
@@ -146,6 +149,9 @@ def browser(owui, pw):
     ctx = chrome(pw)
     ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
     ctx.add_init_script(DECISIONS)
+    # Open WebUI's sign-in sets this cookie in a browser; the service worker's
+    # actions authenticate with it (same origin, no token of their own).
+    ctx.add_cookies([{"name": "token", "value": owui, "url": BASE}])
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     yield ctx, page
     ctx.close()
@@ -200,8 +206,8 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     reply(token, "stub", a_chat, a_msg)
     (d,) = seen_for(page, a_chat)
     assert d["shown"] and d["payload"]["source"] == "api"
-    assert d["payload"] == {"v": 1, "kind": "chat.finished", "source": "api", "chat_id": a_chat,
-                            "message_id": a_msg, "title": "Chat A", "url": f"/c/{a_chat}"}
+    assert d["payload"] == {"v": 2, "kind": "chat.finished", "source": "api", "chat_id": a_chat,
+                            "message_id": a_msg, "title": "Chat A", "url": f"/c/{a_chat}", "fn": "web_push"}
     notes = page.evaluate(NOTES)   # the worker posts its decision once the notification is shown
     assert any(n["tag"] == f"chat-{a_chat}" and n["url"] == f"/c/{a_chat}" for n in notes), notes
     assert not any(s in json.dumps(notes) for s in SECRETS)
@@ -245,3 +251,156 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     reply(token, "stub", d_chat, d_msg)
     (d,) = seen_for(page, d_chat)
     assert d["shown"]
+
+
+def history(token, chat_id):
+    return api(f"/api/v1/chats/{chat_id}", token=token)["chat"]["history"]
+
+
+def act(page, action, data, reply=None):
+    """What a tap on the notification's action does: the service worker's own
+    handler (`act`), asked through a message; returns its result."""
+    return page.evaluate("""([action, data, reply]) => new Promise((ok) => {
+        navigator.serviceWorker.addEventListener('message', function f(e) {
+          if (e.data && e.data.type === 'oc-push-action') { navigator.serviceWorker.removeEventListener('message', f); ok(e.data.result); }
+        });
+        navigator.serviceWorker.controller.postMessage({type: 'oc-push-act', action, data, reply});
+      })""", [action, data, reply])
+
+
+def wait_done(token, chat_id, message_id):
+    end = time.time() + WAIT_MS / 1000
+    while time.time() < end:
+        m = history(token, chat_id)["messages"].get(message_id) or {}
+        if m.get("done") and m.get("content"):
+            return m
+        time.sleep(0.3)   # a poll of the saved state, never a wait for time
+    raise AssertionError(f"{message_id} not done")
+
+
+def owui_log(since):
+    return subprocess.run(["docker", "logs", "--since", str(int(since) - 1), os.environ.get("E2E_NAME", "owui-webpush-e2e")],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout
+
+
+def valves(token):
+    return api("/api/v1/functions/id/web_push/valves/user", token=token)
+
+
+def test_preview_reply_mute_and_the_bell(owui, browser):
+    ctx, page = browser
+    token = owui
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    other = behind(ctx, page)
+
+    # B. Preview on: the start of the reply, as plain text, is the body.
+    api("/api/v1/functions/id/web_push/valves/update",
+        {**api("/api/v1/functions/id/web_push/valves", token=token), "PREVIEW_CHARS": 600}, token)
+    try:
+        p_chat, p_msg = new_chat(token, "stub", "Chat P")
+        reply(token, "stub", p_chat, p_msg)
+        (d,) = seen_for(page, p_chat)
+        assert d["shown"] and d["payload"]["body"].startswith("STUB-SECRET-REPLY"), d
+        assert d["payload"]["fn"] == "web_push"
+        notes = page.evaluate(NOTES)
+        assert any(n["tag"] == f"chat-{p_chat}" and n["body"].startswith("STUB-SECRET-REPLY") for n in notes), notes
+        page.evaluate(CLEAR)
+    finally:
+        api("/api/v1/functions/id/web_push/valves/update",
+            {**api("/api/v1/functions/id/web_push/valves", token=token), "PREVIEW_CHARS": 0}, token)
+
+    # C. Reply from the notification: a user message in the chat under its leaf, answered.
+    data = {"chat_id": p_chat, "url": f"/c/{p_chat}", "fn": "web_push"}
+    leaf = history(token, p_chat)["currentId"]
+    assert act(page, "reply", data, "a reply from the shade") == "sent"
+    h = history(token, p_chat)
+    (u,) = [m for m in h["messages"].values() if m["role"] == "user" and m["content"] == "a reply from the shade"]
+    assert u["parentId"] == leaf
+    (a_id,) = u["childrenIds"]
+    assert wait_done(token, p_chat, a_id)["content"].startswith("STUB-SECRET-REPLY")
+
+    # C. Reply while the chat's run is going: in the chat at once, under the running reply, nothing stopped.
+    s_chat, s_msg = new_chat(token, "slow", "Chat S")
+    reply(token, "slow", s_chat, s_msg)
+    assert not history(token, s_chat)["messages"][s_msg].get("done")
+    assert act(page, "reply", {"chat_id": s_chat, "url": f"/c/{s_chat}", "fn": "web_push"}, "while it runs") == "sent"
+    h = history(token, s_chat)
+    (u,) = [m for m in h["messages"].values() if m["role"] == "user" and m["content"] == "while it runs"]
+    assert u["parentId"] == s_msg and not h["messages"][s_msg].get("done")
+    assert wait_done(token, s_chat, s_msg)["content"] == "SLOW-REPLY done"
+    assert wait_done(token, s_chat, u["childrenIds"][0])["content"] == "SLOW-REPLY done"
+
+    # C. A reply that cannot be sent (the chat's model is gone): the chat opens with the text in the box.
+    f_chat, f_msg = new_chat(token, "stub", "Chat F")
+    api(f"/api/v1/chats/{f_chat}", {"chat": {"models": ["no-such-model"]}}, token)
+    # The worker sends this page to the chat, so its answer never comes back here: wait for the chat page.
+    page.evaluate("(m) => navigator.serviceWorker.controller.postMessage(m)",
+                  {"type": "oc-push-act", "action": "reply", "reply": "keep this text",
+                   "data": {"chat_id": f_chat, "url": f"/c/{f_chat}", "fn": "web_push"}})
+    page.wait_for_url(f"**/c/{f_chat}*", timeout=WAIT_MS)
+    page.wait_for_function("() => window.ocPushReply && window.ocPushReply.text === 'keep this text'", timeout=WAIT_MS)
+    assert "/c/" + f_chat in page.url and "oc-reply" not in page.url
+    assert "keep this text" in page.locator("#chat-input").inner_text()
+    assert "not sent" in page.locator("#oc-push-notice").inner_text()
+    assert not [m for m in history(token, f_chat)["messages"].values() if m.get("content") == "keep this text"]
+
+    # D. Mute 8 h from the notification: kept server-side beside the subscriptions; nothing is sent.
+    before = valves(token)["subscriptions"]
+    assert act(page, "mute", data) == "muted"
+    v = valves(token)
+    assert v["subscriptions"] == before
+    until = json.loads(v["mutes"])[p_chat]
+    assert 8 * 3600 - 60 < until - time.time() <= 8 * 3600
+    m_msg = str(uuid.uuid4())
+    t_mute = time.time()
+    h = history(token, p_chat)
+    leaf = h["currentId"]
+    u_id = str(uuid.uuid4())
+    api("/api/chat/completions", {"model": "stub", "chat_id": p_chat, "id": m_msg, "parent_id": leaf, "stream": True,
+                                  "user_message": {"id": u_id, "parentId": leaf, "childrenIds": [], "role": "user",
+                                                   "content": "muted?", "models": ["stub"]},
+                                  "message_ids": [{"model_id": "stub", "message_id": m_msg, "modelIdx": 0}],
+                                  "session_id": "e2e"}, token)
+    wait_done(token, p_chat, m_msg)
+    end = time.time() + WAIT_MS / 1000
+    while f"chat {p_chat[:8]} is muted" not in owui_log(t_mute):
+        assert time.time() < end, "the function never skipped the muted chat"
+        time.sleep(0.3)
+    assert not [x for x in page.evaluate("() => window.ocPushSeen") if x["payload"]["chat_id"] == p_chat and x["payload"]["message_id"] == m_msg]
+
+    # D. The bell in the chat: shows the mute, changes it, survives Open WebUI redrawing its header.
+    page.bring_to_front()
+    page.goto(f"{BASE}/c/{p_chat}")
+    bell = page.locator("#oc-push-bell")
+    bell.wait_for(timeout=WAIT_MS)
+    assert bell.get_attribute("title").startswith("Muted until")
+    assert bell.evaluate("(b) => !!(b.compareDocumentPosition(document.getElementById('chat-context-menu-button')) & Node.DOCUMENT_POSITION_FOLLOWING) && b.closest('nav') !== null")
+    assert bell.evaluate("(b) => b.className === document.getElementById('chat-context-menu-button').className")
+    bell.click()
+    page.get_by_role("menuitem", name="Unmute").click()
+    page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Notifications on'", timeout=WAIT_MS)
+    assert p_chat not in json.loads(valves(token)["mutes"])
+    bell.click()
+    page.get_by_role("menuitem", name="Mute always").click()
+    page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Muted'", timeout=WAIT_MS)
+    assert json.loads(valves(token)["mutes"])[p_chat] == 0
+    if os.environ.get("E2E_SHOTS"):
+        bell.click()
+        page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-bell.png"))
+        page.keyboard.press("Escape")
+    # Open WebUI redraws the header for another chat: the bell follows, for that chat.
+    page.goto(f"{BASE}/c/{s_chat}")
+    page.wait_for_function(f"() => document.getElementById('oc-push-bell')?.dataset.chat === {json.dumps(s_chat)}", timeout=WAIT_MS)
+    assert page.locator("#oc-push-bell").get_attribute("title") == "Notifications on"
+    # Right to left: the menu opens inside the window, under the bell.
+    page.evaluate("() => document.documentElement.setAttribute('dir', 'rtl')")
+    page.locator("#oc-push-bell").click()
+    box = page.locator("#oc-push-mute-menu").bounding_box()
+    assert box["x"] >= 0 and box["x"] + box["width"] <= page.viewport_size["width"], box
+    page.keyboard.press("Escape")
+    assert page.locator("#oc-push-mute-menu").count() == 0
+    page.evaluate("() => document.documentElement.removeAttribute('dir')")
+    ocp = valves(token)
+    api("/api/v1/functions/id/web_push/valves/user/update", {**ocp, "mutes": "{}"}, token)
+    other()

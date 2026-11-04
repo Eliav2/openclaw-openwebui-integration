@@ -1,6 +1,6 @@
 # Push notifications
 
-Web Push sends a notification to your phone or computer when a reply finishes, also when Open WebUI is closed. It shows the chat's title and opens the chat on a tap. The reply itself never leaves your server.
+Web Push sends a notification to your phone or computer when a reply finishes, also when Open WebUI is closed. It shows the chat's title and opens the chat on a tap. You can answer from the notification and mute a chat. The reply itself stays on your server unless you turn on the [preview](#preview).
 
 Applies to: Web Push function, Pipe
 
@@ -9,8 +9,8 @@ Valves: the function's own (below), and the Pipe's [`PUBLISH_CHAT_FINISHED`](../
 It has three parts, all in [`push/`](https://github.com/Eliav2/openclaw-openwebui-integration/tree/main/push):
 
 - **The Web Push function** (`push/openclaw_web_push.py`): an Open WebUI event function. On each `chat.finished` it sends a push to each of the user's devices.
-- **The service worker** (`push/web/oc-sw.js`), served at `/oc-sw.js`: it receives the push and shows the notification.
-- **The page script** (`push/web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", and saves each device's subscription. Open WebUI signs in and signs up without loading a page, so the script also runs again on Open WebUI's in-app navigation whenever the signed-in token has changed.
+- **The service worker** (`push/web/oc-sw.js`), served at `/oc-sw.js`: it receives the push, shows the notification and runs its Reply and Mute buttons.
+- **The page script** (`push/web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", saves each device's subscription, and adds the [mute bell](#mute-a-chat) to a chat. Open WebUI signs in and signs up without loading a page, so the script also runs again on Open WebUI's in-app navigation whenever the signed-in token has changed.
 
 Open WebUI loads `/static/loader.js` on every page, but it rebuilds `/static` on every start, so both scripts are served by the proxy in front of Open WebUI: a [Cloudflare Worker](#serve-the-scripts-with-a-cloudflare-worker) or [nginx](#serve-the-scripts-with-nginx). Nothing else in Open WebUI changes.
 
@@ -48,6 +48,9 @@ Its valves:
 | `TTL_SECONDS` | `3600` | How long a push service keeps a notification for a device that is offline. |
 | `URGENCY` | `normal` | RFC 8030 urgency: `very-low`, `low`, `normal` or `high`. |
 | `PIPE_MODEL_PREFIXES` | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
+| `PREVIEW_CHARS` | `0` (off) | Up to this many characters of the reply, as plain text, in the notification. Read the [privacy note](#preview) first. |
+
+Its user valves are written by the page script and the service worker, not by hand: `subscriptions` (one entry per device) and `mutes` (muted chats).
 
 ## 3. Turn on the Pipe's event
 
@@ -84,7 +87,7 @@ sed -e "s/__VAPID_PUBLIC_KEY__/<public key>/g" -e "s/__FUNCTION_ID__/openclaw_we
 
 The page script replaces Open WebUI's `loader.js`, which is empty unless you put something in it. If you did, append it to `oc-push.js`.
 
-Open WebUI serves `/static/loader.js` with no `Cache-Control` header, so browsers cache it for a while: on Cloudflare for the zone's Browser Cache TTL (4 hours by default), otherwise for a heuristic time. A device that loaded the page before you started serving the page script keeps the old, empty file until that runs out, and shows no button. Both examples serve the new file with `Cache-Control: no-cache`, so this happens only once, at the switch. To skip the wait on a device, clear the browser's cached files (not its cookies or site data) and open Open WebUI again.
+Open WebUI serves `/static/loader.js` with no `Cache-Control` header, so browsers cache it for a while: on Cloudflare for the zone's Browser Cache TTL (4 hours by default), otherwise for a heuristic time. A device that loaded the page before you started serving the page script keeps the old, empty file until that runs out, and shows no button: nothing of this setup runs on it before then. Both examples serve the new file with `Cache-Control: no-cache`, so this happens only once, at the switch, and every later change of the scripts reaches a device on its next page load. To avoid the wait altogether, serve the page script first, with the function still off: a device that loads Open WebUI then has the script, and turning the function on later needs nothing on the device. Its **Enable notifications** button shows while the function is off, but Open WebUI refuses to save a device for a function that is off; a device enabled then is saved on its next page load after the function is on. On Cloudflare, a Cache Rule for `/static/loader.js` with Browser TTL "Respect origin" added a day ahead does the same. To skip the wait on one device, clear the browser's cached files (not its cookies or site data) and open Open WebUI again.
 
 ## 5. Turn it on, on each device
 
@@ -96,8 +99,10 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 
 - **One notification per chat.** A newer reply in the same chat replaces the notification that is still showing.
 - **Not while you use it.** While Open WebUI is open, visible and focused on a device, whatever chat is open, that device shows nothing, as in a messaging app; Open WebUI's own sidebar shows the new reply. In the background, closed or with the screen off, it notifies. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
-- **Title only.** The push carries the chat's title, its id and the link. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function never forwards it.
-- **Tap to open.** A tap focuses an open Open WebUI window and opens the chat, or opens a new one. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
+- **Title, and the reply only with the preview.** The push carries the chat's title, its id, the link and the function's id. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function forwards only the [preview](#preview), and only when it is on.
+- **Tap to open.** A tap on the notification focuses an open Open WebUI window and opens the chat, or opens a new one. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
+- **Reply and Mute 8 h.** Below the text, see [Buttons](#buttons).
+- **A new service worker** takes over by itself: on the next page load, and when an app left open comes back to the front. Nothing to clear or reinstall.
 - **After an Open WebUI update.** Open WebUI removes every service worker when it updates. The next time you open it on a device, it registers again with a new subscription, which replaces the old one. Replies that finish before that are not notified on that device.
 - **Another user on the same device.** When someone else signs in on a device, the page script drops the old subscription and makes a new one for them. Signing out alone does not: the device keeps getting the previous user's notifications until someone signs in again, or until notifications are turned off for the site.
 - **Gone subscriptions.** A device whose push service answers 404 or 410 is removed from the user's list.
@@ -106,13 +111,45 @@ What the function did is in Open WebUI's log:
 
 ```
 INFO     | function_openclaw_web_push_<hash>:send_all:<line> - web push: sent to fcm.googleapis.com
+INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3c4d is muted, nothing sent
 ```
+
+### Preview
+
+With `PREVIEW_CHARS` above 0 the notification shows the start of the reply instead of "New reply": plain text, tool and status blocks, images and files left out, a code block as "[code]", cut on a word. Expanded, Android shows the whole preview. A push holds about 4 KB, so a long preview is shortened to fit.
+
+Privacy: the text is on the lock screen and in the notification shade of every device you enabled, where anyone holding the phone can read it. It passes through the browser's push service (Google, Apple or Mozilla) encrypted end to end (`aes128gcm`); the push service cannot read it. Android can hide notification text on the lock screen: Settings > Notifications > "Sensitive notifications" off. That is why the preview is off by default.
+
+### Buttons
+
+Android Chrome shows two buttons under a notification (`Notification.maxActions` is 2), and adds a third of its own:
+
+- **Reply** opens a text field in the notification. What you type is sent to the chat as your message, and the agent answers as if you had typed it in the app. It is sent the way Open WebUI 0.13.0's chat page sends a message (one `/api/chat/completions` with the new message under the chat's last one), with the session cookie of your sign-in. While the chat's reply is still running, the message reaches it like one sent from another tab: the OpenClaw Pipe steers it into the run, or queues it until the run ends (see [Messages sent while the agent works](../features/reliability.md#messages-sent-while-the-agent-works)). If it cannot be sent (signed out, Access session expired, offline, an Open WebUI that answers differently), the chat opens with your text in the message box and a line saying it was not sent. It depends on Open WebUI 0.13.0's chat API; with another version, check that a reply from the notification appears in the chat.
+- **Mute 8 h**: no notifications from this chat for 8 hours, on any of your devices (see below).
+- **Unsubscribe** is Chrome's own: it turns notifications off for the whole site on that device. To turn them on again, allow notifications for the site in Chrome's site settings and open Open WebUI.
+
+Other browsers show the buttons differently or not at all; a browser without a text field opens the chat with the message box focused. iOS shows no buttons: a tap opens the chat.
+
+### Mute a chat
+
+In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯, when you have one) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. The bell shows only once a device of yours is enabled.
+
+A mute is kept on the server, in the function's `mutes` user valve, so it applies to every device of yours, iPhone included: the function checks it before it encrypts anything, and sends nothing for a muted chat. It is per user: muting a shared chat mutes it only for you.
+
+The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two devices changing them in the same instant can lose one change; change it again.
+
+### iPhone and iPad
+
+- Every push shows a notification, also with Open WebUI in front (WebKit's rule).
+- No buttons: no Reply, no Mute in the notification. Mute with the bell.
+- The preview and muted chats work as on Android.
 
 ## Turning it off
 
 Each part is separate:
 
 - Turn the function off: nothing is sent.
+- `PREVIEW_CHARS` back to `0`: notifications say "New reply" again.
 - Remove the Cloudflare Worker's routes or the nginx locations: pages load the stock `loader.js`. Service workers that are already registered stay idle until Open WebUI's next update removes them.
 - Turn the Pipe's `PUBLISH_CHAT_FINISHED` off: OpenClaw replies are no longer notified.
 
