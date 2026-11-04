@@ -1231,6 +1231,7 @@ class _PipeTurn:
                      "following that run instead of sending it again")
             found = None
             rechecks = 0
+            steers = steers_mid_run_messages(self.conn.gateway_version)
             while True:
                 changed = self.conn.session_change_event(self.session_key)
                 try:
@@ -1238,7 +1239,7 @@ class _PipeTurn:
                 except Exception as ex:
                     pipe_log(f"  chat.history for the sent run failed: {ex!r}")
                     break
-                found = _stub_turn(hist, reply_id, "")
+                found = _stub_turn(hist, reply_id, "", steers=steers)
                 if found is None or found["closed"]:
                     break
                 if not await self._session_run_active():
@@ -1247,7 +1248,7 @@ class _PipeTurn:
                     # keep the earlier one only if that read gives nothing.
                     try:
                         hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-                        found = _stub_turn(hist, reply_id, "") or found
+                        found = _stub_turn(hist, reply_id, "", steers=steers) or found
                     except Exception as ex:
                         pipe_log(f"  chat.history after the run ended failed: {ex!r}")
                     break
@@ -1375,10 +1376,14 @@ class _PipeTurn:
         only: the Gateway keeps images for a later turn. Not for a channel
         thread, whose turns wait for the thread's run (channels.py). Only
         into a run a message of this chat started, not a cron wake's or an
-        announce's (`user_turn_run_active`)."""
+        announce's (`user_turn_run_active`), and at that run's model and
+        thinking level: the run answers at its own, so a message that changes
+        either waits for a run of its own."""
         return (steers_mid_run_messages(self.conn.gateway_version)
                 and not self.turn.attachments and not self.channel_id
-                and self.conn.user_turn_run_active(self.session_key, self.chat_id))
+                and self.conn.user_turn_run_active(self.session_key, self.chat_id)
+                and self.conn.sent_settings.get(self.session_key)
+                == (self.model_override, self.requested_thinking))
 
     async def wait_and_send(self, reply_id):
         """Wait for the session's run to settle, then send this reply's
@@ -1476,6 +1481,7 @@ class _PipeTurn:
             # while the reply still streams. The run id is the idempotency
             # key.
             self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
+            self.conn.sent_settings[self.session_key] = (self.model_override, self.requested_thinking)
             try:
                 send_resp = await _run_request(
                     self.conn, RUN_SEND,
@@ -1869,14 +1875,15 @@ class _PipeTurn:
         run_text = steered.get("run_text")
         if isinstance(run_text, asyncio.Future):
             run_text = await run_text
-        run_text = run_text or {}
+        run_text = dict(run_text or {})
+        earlier = run_text.pop("earlier", None)
         # This reply's own run stays registered, steered, until its lone final
         # (`_note_run_event`), so that final never reads as a run to write.
         await _emit_status(self.__event_emitter__, "", done=True)
         # The reply that ended where this message went in, and this reply's
         # own part of the transcript: both are settled from it once the run
         # ends (`_settle_steered_replies`).
-        self.steered_earlier = steered.get("earlier")
+        self.steered_earlier = steered.get("earlier") or earlier
         self.steered_span_run = self.our_run_id
         self.our_run_id = steered["run"]
         self.turn.run_id = self.our_run_id
@@ -1885,12 +1892,20 @@ class _PipeTurn:
         self.conn.register_run_target(
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
             thinking=self.resolved_thinking, request_task_id=(self.__metadata__ or {}).get("task_id"),
-            span_run=self.steered_span_run)
+            span_run=self.steered_span_run, before=self.steered_replies_before())
         self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue, run_text)
         self.renderer.seed(run_text)
         self.assistant_stream_text = run_text.get("stream", "")
         self.fence_item_start = len(self.assistant_stream_text)
         self.event_count = 0
+
+    def steered_replies_before(self) -> list:
+        """The replies of the run this reply's message was steered into that
+        came before it, in order: each ended where a message went in."""
+        earlier = getattr(self, "steered_earlier", None)
+        if not earlier:
+            return []
+        return [*(earlier.get("before") or []), {k: v for k, v in earlier.items() if k != "before"}]
 
     async def on_owner_row(self, msg):
         """A session row while the reply waits for its interrupted run's owner."""
@@ -2389,7 +2404,7 @@ class _PipeTurn:
             # on claude-cli (its commit can trail the answer's first delta);
             # the transcript does.
             spawn_background(_settle_steered_replies(self.conn, self.session_key, [
-                self.steered_earlier,
+                *self.steered_replies_before(),
                 {"chat_id": self.owui_origin_chat_id, "message_id": self.owui_message_id,
                  "request_task_id": (self.__metadata__ or {}).get("task_id"),
                  "span_run": self.steered_span_run}]))

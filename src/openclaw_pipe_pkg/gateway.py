@@ -1882,6 +1882,10 @@ class _GatewayConnection:
             _shared["delivered_live"] if _shared is not None else {}
         )
 
+        # The model and thinking level each session's last reply was sent at
+        # (`steers_into_active_run`).
+        self.sent_settings: dict[str, tuple] = {}
+
         # Per-chat write locks for the read-modify-write paths that are not
         # turn writers (stub reconcile). Shared across connections.
         # Keyed by chat_id.
@@ -2298,7 +2302,8 @@ class _GatewayConnection:
                             thinking: str | None = None,
                             request_task_id: str | None = None,
                             span_run: str | None = None,
-                            steer_pending: bool = False) -> None:
+                            steer_pending: bool = False,
+                            before: list | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
@@ -2308,13 +2313,16 @@ class _GatewayConnection:
         when it is not `run_id`: a message steered into `run_id` shows the
         part after its own user message (`_settle_steered_replies`).
         `steer_pending`: the message went to the Gateway to be steered into
-        the session's running run, so the reply waits for that run's answer."""
+        the session's running run, so the reply waits for that run's answer.
+        `before`: the replies of `run_id` before this one, each ended where a
+        message was steered in, settled together (`_settle_steered_replies`)."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
                                   "thinking": thinking, "request_task_id": request_task_id,
-                                  "span_run": span_run, "steer_pending": steer_pending}
+                                  "span_run": span_run, "steer_pending": steer_pending,
+                                  "before": list(before or [])}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -2919,7 +2927,7 @@ class _GatewayConnection:
             run = active[0]
             earlier = self._run_targets.get(f"{sess}:{run.run_id}")
             earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
-                "span_run": earlier.get("span_run") or run.run_id}
+                "span_run": earlier.get("span_run") or run.run_id, "before": earlier.get("before") or []}
             shadow = self._run_renderers.get(f"{sess}:{run.run_id}")
             run_text = ({"received": shadow.received, "stream": shadow.received,
                          "item": shadow.last_item} if shadow is not None else None)
