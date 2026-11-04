@@ -2593,11 +2593,18 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._until_registered("run-1")
         self.active = True
         self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
-        await first
-        await r1.aclose()
-        await asyncio.sleep(0.05)
+        marked = []
+
+        async def mark(chat_id, message_id, request=None):
+            marked.append((chat_id, message_id))
+        with mock.patch.object(openclaw_pipe, "_mark_stopped", mark):
+            await first
+            await r1.aclose()
+            await asyncio.sleep(0.05)
         self.assertIn("abort", self.rpc)
         self.assertEqual(self.conn._consumers, {})
+        # Nothing adds to it after a restart (gate 280c, chat 2ddcf087).
+        self.assertEqual(marked, [("chat-1", "m1")])
 
     async def _interrupted_during_settle(self):
         """A reply cut while its run streams, and the closing of that reply
@@ -9330,6 +9337,8 @@ class TurnWriterEndTests(_TurnWriterCase):
                 self.assertEqual([h for h in history if h.get("description")][-1],
                                  {"description": "Stopped", "done": True})
                 self.assertNotIn("🧠", json.dumps(history, ensure_ascii=False))
+                # Nothing adds to it after a restart (gate 280c, chat 2ddcf087).
+                self.assertIs((self.m().get("meta") or {}).get(openclaw_pipe.STOPPED_META), True)
 
     async def test_a_handed_over_reply_resumes_with_the_users_request(self):
         """The writer kept Open WebUI's request task and the user's request

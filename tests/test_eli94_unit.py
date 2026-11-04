@@ -135,6 +135,28 @@ class _EndedWhileDownCase(unittest.IsolatedAsyncioTestCase):
 
 class EndedWhileDownTests(_EndedWhileDownCase):
 
+    async def test_a_reply_the_user_stopped_stays_as_it_was(self):
+        """Gate 280c, case stop (chat 2ddcf087): Stop landed while the model
+        chose its next call; claude-cli wrote that call to its transcript
+        before the abort's kill took it down (refused, never run). The
+        stopped reply showed its one card; the next Open WebUI start made it
+        two. What the user stopped is what the reply shows."""
+        self.msg()["statusHistory"] = [{"description": "Stopped", "done": True}]
+        self.msg()["meta"] = {openclaw_pipe.STOPPED_META: True}
+        held = copy.deepcopy(self.msg())
+        await self.startup()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.msg(), held)
+
+    async def test_a_reply_open_webuis_shutdown_cancelled_is_still_completed(self):
+        """An Open WebUI stop cancels the reply as a Stop does, "Stopped"
+        status line and all, but no page says it was the user's Stop: the
+        run went on, and its reply is completed (ELI-94)."""
+        self.msg()["statusHistory"] = [{"description": "Stopped", "done": True}]
+        await self.startup()
+        self.assertEqual([w[0] for w in self.writes], [M])
+
+
     async def test_a_run_that_ended_while_down_completes_its_partial_reply(self):
         await self.startup()
         m = self.msg()

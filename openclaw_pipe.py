@@ -9107,6 +9107,29 @@ def _final_status_history(history: list | None, lines: list, stopped: bool) -> t
     return kept + new, new
 
 
+# Message meta: the user's Stop ended this reply (the page said so). Its run
+# was aborted; a call the CLI wrote to its transcript as the abort's kill took
+# it down never ran (the Gateway refuses it), so nothing adds to the reply
+# afterwards (`_reconcile_chat_ended_runs`). An Open WebUI shutdown cancels a
+# reply the same way but no page answers for it: its run goes on (ELI-94).
+STOPPED_META = "openclaw_stopped"
+
+
+async def _mark_stopped(chat_id: str, message_id: str, request=None) -> None:
+    """Mark the reply ended by the user's Stop (STOPPED_META), after
+    `request` (Open WebUI's task for it, whose own save comes first)."""
+    if request is not None and not request.done():
+        await asyncio.wait({request})
+    try:
+        await _set_turn_meta(chat_id, message_id, {STOPPED_META: True})
+    except Exception as ex:
+        pipe_log(f"  reply {message_id[:8]}...: marking it stopped failed: {ex!r}")
+
+
+def _ended_by_stop(message: dict) -> bool:
+    return bool((message.get("meta") or {}).get(STOPPED_META))
+
+
 def _db_locked(ex: BaseException) -> bool:
     """sqlite's write lock held past busy_timeout: `database is locked`, as
     sqlite3 raises it or SQLAlchemy wraps it."""
@@ -10619,6 +10642,7 @@ class _TurnWriter:
         if not aborted and wake:
             await self._cancel_wake_run()
         await self.finalize(stopped=True)
+        await _mark_stopped(self.chat_id, self.message_id, self.request_task)
 
     async def _abort_agent_run(self) -> bool:
         """Stop a run the agent started by its id: `sessions.abort` with a run id
@@ -11989,6 +12013,8 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             current = msgs.get(mid) or {}
             if current.get("role") != "assistant" or current.get("done") is not True:
                 continue  # missing, or still generating: the ELI-90 pass owns done:false
+            if _ended_by_stop(current):
+                continue  # what the user stopped is what it shows
             held_cards = sum(1 for i in current.get("output") or [] if i.get("type") == "function_call")
             cards = sum(1 for i in output if i.get("type") == "function_call")
             held_text = _coerce_text(current.get("content")).strip()
@@ -14029,9 +14055,12 @@ async def _current_load(pipe, request):
     return current
 
 
-async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
+async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
+                                message_id=None, task_id=None):
     """Ask the page whether this cancel was Stop or Send now, and settle the
-    parked turn accordingly (see `settle_parked_turn`)."""
+    parked turn accordingly (see `settle_parked_turn`). A Stop also marks
+    the reply `message_id` stopped, once its request `task_id` ended
+    (`_mark_stopped`)."""
     intent = None
     if event_call and chat_id:
         try:
@@ -14045,6 +14074,8 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
             pipe_log(f"  cancel intent query failed: {ex!r}")
     pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
+    if intent == "stop" and chat_id and message_id:
+        spawn_background(_mark_stopped(chat_id, message_id, _owui_request_task(task_id)))
 
 
 # Open WebUI 0.12.3 creates a chat as "New Chat" (main.py, not translated).
@@ -15925,7 +15956,8 @@ class _PipeTurn:
                       "item": self.renderer.last_item},
             settle=functools.partial(
                 _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
-                self.owui_origin_chat_id, self.__event_call__),
+                self.owui_origin_chat_id, self.__event_call__, self.owui_message_id,
+                (self.__metadata__ or {}).get("task_id")),
             waiting=self.turn.waiting,
             reply=({"message_id": self.owui_message_id,
                     "renderer": copy.deepcopy(self.renderer)}

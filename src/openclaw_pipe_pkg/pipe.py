@@ -119,9 +119,12 @@ async def _current_load(pipe, request):
     return current
 
 
-async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
+async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
+                                message_id=None, task_id=None):
     """Ask the page whether this cancel was Stop or Send now, and settle the
-    parked turn accordingly (see `settle_parked_turn`)."""
+    parked turn accordingly (see `settle_parked_turn`). A Stop also marks
+    the reply `message_id` stopped, once its request `task_id` ended
+    (`_mark_stopped`)."""
     intent = None
     if event_call and chat_id:
         try:
@@ -135,6 +138,8 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
             pipe_log(f"  cancel intent query failed: {ex!r}")
     pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
+    if intent == "stop" and chat_id and message_id:
+        spawn_background(_mark_stopped(chat_id, message_id, _owui_request_task(task_id)))
 
 
 # Open WebUI 0.12.3 creates a chat as "New Chat" (main.py, not translated).
@@ -2015,7 +2020,8 @@ class _PipeTurn:
                       "item": self.renderer.last_item},
             settle=functools.partial(
                 _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
-                self.owui_origin_chat_id, self.__event_call__),
+                self.owui_origin_chat_id, self.__event_call__, self.owui_message_id,
+                (self.__metadata__ or {}).get("task_id")),
             waiting=self.turn.waiting,
             reply=({"message_id": self.owui_message_id,
                     "renderer": copy.deepcopy(self.renderer)}
