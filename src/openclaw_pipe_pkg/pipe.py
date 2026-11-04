@@ -1242,6 +1242,7 @@ class _PipeTurn:
                      f"{prior['run_id'][:20]}... (a second call from Open WebUI); "
                      "following that run instead of sending it again")
             found = None
+            steers = steers_mid_run_messages(self.conn.gateway_version)
             while True:
                 changed = self.conn.session_change_event(self.session_key)
                 try:
@@ -1249,7 +1250,7 @@ class _PipeTurn:
                 except Exception as ex:
                     pipe_log(f"  chat.history for the sent run failed: {ex!r}")
                     break
-                found = _stub_turn(hist, reply_id, "")
+                found = _stub_turn(hist, reply_id, "", steers=steers)
                 if found is None or found["closed"]:
                     break
                 if not await self._session_run_active():
@@ -1258,7 +1259,7 @@ class _PipeTurn:
                     # keep the earlier one only if that read gives nothing.
                     try:
                         hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-                        found = _stub_turn(hist, reply_id, "") or found
+                        found = _stub_turn(hist, reply_id, "", steers=steers) or found
                     except Exception as ex:
                         pipe_log(f"  chat.history after the run ended failed: {ex!r}")
                     break
@@ -1365,6 +1366,21 @@ class _PipeTurn:
         self.turn.unsent, self.turn.attachments, self.turn.waiting = [], [], []
         return True
 
+    def steers_into_active_run(self) -> bool:
+        """Whether this reply's message goes to the Gateway while a run of its
+        session works, which then steers it into that run (2026.10.10+). Text
+        only: the Gateway keeps images for a later turn. Not for a channel
+        thread, whose turns wait for the thread's run (channels.py). Only
+        into a run a message of this chat started, not a cron wake's or an
+        announce's (`user_turn_run_active`), and at that run's model and
+        thinking level: the run answers at its own, so a message that changes
+        either waits for a run of its own."""
+        return (steers_mid_run_messages(self.conn.gateway_version)
+                and not self.turn.attachments and not self.channel_id
+                and self.conn.user_turn_run_active(self.session_key, self.chat_id)
+                and self.conn.sent_settings.get(self.session_key)
+                == (self.model_override, self.requested_thinking))
+
     async def wait_and_send(self, reply_id):
         """Wait for the session's run to settle, then send this reply's
         messages as their own run (ELI-56), or hand them on (`hand_on`)."""
@@ -1378,6 +1394,19 @@ class _PipeTurn:
             # resume that starts right after a settle is caught after the
             # send instead (see `enqueued_not_started`). Stop cancels this
             # wait like any other.
+            self.to_be_steered = False
+
+            async def active():
+                # A run this message can be steered into: send it now, and
+                # the Gateway steers it in at the run's next tool boundary
+                # (`_steer` hands this reply the rest).
+                busy = await self._session_run_active()
+                if busy and self.steers_into_active_run():
+                    pipe_log("Session has an active run; sending now, to be steered into it")
+                    self.to_be_steered = True
+                    return False
+                return busy
+
             async def queued():
                 pipe_log("Session has an active run (gateway-authoritative); "
                          "queueing behind it")
@@ -1387,8 +1416,8 @@ class _PipeTurn:
                     done=False,
                 )
             ever_active = await _wait_for_session_idle(
-                self.conn, self.session_key, self._session_run_active, on_busy=queued)
-            if ever_active:
+                self.conn, self.session_key, active, on_busy=queued)
+            if ever_active and not self.to_be_steered:
                 pipe_log("  active run settled; sending queued message as its own run")
             if self in self.conn.send_waiters(self.session_key) and self.hand_on():
                 await _emit_status(self.__event_emitter__, "", done=True)
@@ -1448,6 +1477,7 @@ class _PipeTurn:
             # while the reply still streams. The run id is the idempotency
             # key.
             self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
+            self.conn.sent_settings[self.session_key] = (self.model_override, self.requested_thinking)
             try:
                 send_resp = await _run_request(
                     self.conn, RUN_SEND,
@@ -1488,6 +1518,10 @@ class _PipeTurn:
                                  "\n\n".join(t for t in self.sent_texts if t))
             self.turn.unsent = []
             self.turn.attachments = []
+            if getattr(self, "to_be_steered", False):
+                # The Gateway has it; the agent takes it in at the run's
+                # next step, and this reply shows the answer from there.
+                await _emit_status(self.__event_emitter__, STEER_PENDING_STATUS, done=False)
             if self.channel_commit is not None:
                 # The Gateway has the turn: the agent saw these messages,
                 # and it now follows the thread.
@@ -1512,6 +1546,7 @@ class _PipeTurn:
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
             thinking=self.resolved_thinking,
             request_task_id=(self.__metadata__ or {}).get("task_id"),
+            steer_pending=bool(getattr(self, "to_be_steered", False)),
         )
         # When the Gateway had admitted this reply's run (chat.send returned;
         # an adopted run already ran). An idle row read after it means the
@@ -1597,6 +1632,9 @@ class _PipeTurn:
         # Claude Code Agent calls started in the background: the run stays
         # open until their reports are in, so the reply says why (ELI-163).
         self.background_agents = 0
+        # The run this reply showed went on as a later message's answer
+        # (`_STEERED_MARKER_TYPE`): that message's run id.
+        self.steered_into = None
 
         self.adopt_new_run = True
         try:
@@ -1628,6 +1666,21 @@ class _PipeTurn:
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
                             self.on_gap()
+                            continue
+
+                        if msg.get("_steered"):
+                            # This message was steered into the session's active
+                            # run (`_steer`): its answer is the rest of it.
+                            await self.on_steered(msg["_steered"])
+                            continue
+
+                        if msg.get("type") == _STEERED_MARKER_TYPE:
+                            # A later message was steered into this run: the
+                            # rest of it is that message's answer, in its reply.
+                            self.steered_into = msg.get("into")
+                            self.done = True
+                            pipe_log(f"  a later message was steered into run "
+                                     f"{str(self.our_run_id)[:24]}...; this reply ends here")
                             continue
 
                         self.event_count += 1
@@ -1779,7 +1832,8 @@ class _PipeTurn:
                 # A parked queue now belongs to whoever claims the run; releasing
                 # it here would drop the events it is buffering.
                 if not self.turn.parked:
-                    if self.done and not self.aborted and self.our_run_id and not self.handed_over:
+                    if (self.done and not self.aborted and self.our_run_id and not self.handed_over
+                            and not self.steered_into):
                         # The run ended in this reply. Its trailing `chat` final
                         # lands after this consumer is gone and must not read as
                         # "the reply ended before its run" (a handover would
@@ -1807,6 +1861,47 @@ class _PipeTurn:
                     await _emit_status(self.__event_emitter__, line, done=True)
             else:
                 await _emit_status(self.__event_emitter__, "", done=True)
+
+    async def on_steered(self, steered: dict) -> None:
+        """Continue the run this reply's message was steered into: its events
+        come to this reply's queue from here on, and what it sent before is the
+        earlier reply's, so its closing whole-text events are not shown again.
+        From a turn writer, those baselines come once it wrote the events
+        before the steer (`_turn_pump_loop`)."""
+        run_text = steered.get("run_text")
+        if isinstance(run_text, asyncio.Future):
+            run_text = await run_text
+        run_text = dict(run_text or {})
+        earlier = run_text.pop("earlier", None)
+        # This reply's own run stays registered, steered, until its lone final
+        # (`_note_run_event`), so that final never reads as a run to write.
+        await _emit_status(self.__event_emitter__, "", done=True)
+        # The reply that ended where this message went in, and this reply's
+        # own part of the transcript: both are settled from it once the run
+        # ends (`_settle_steered_replies`).
+        self.steered_earlier = steered.get("earlier") or earlier
+        self.steered_span_run = self.our_run_id
+        self.our_run_id = steered["run"]
+        self.turn.run_id = self.our_run_id
+        # A turn writer that takes the rest over writes it into this reply's
+        # message, after what the earlier reply showed.
+        self.conn.register_run_target(
+            self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
+            thinking=self.resolved_thinking, request_task_id=(self.__metadata__ or {}).get("task_id"),
+            span_run=self.steered_span_run, before=self.steered_replies_before())
+        self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue, run_text)
+        self.renderer.seed(run_text)
+        self.assistant_stream_text = run_text.get("stream", "")
+        self.fence_item_start = len(self.assistant_stream_text)
+        self.event_count = 0
+
+    def steered_replies_before(self) -> list:
+        """The replies of the run this reply's message was steered into that
+        came before it, in order: each ended where a message went in."""
+        earlier = getattr(self, "steered_earlier", None)
+        if not earlier:
+            return []
+        return [*(earlier.get("before") or []), {k: v for k, v in earlier.items() if k != "before"}]
 
     async def on_owner_row(self, msg):
         """A session row while the reply waits for its interrupted run's owner."""
@@ -2113,7 +2208,8 @@ class _PipeTurn:
         the reply named by path (ELI-328), whatever the model. A reply that
         showed bare-name MEDIA: directives already has those images, so the
         blocks are read for it only when it also named a path."""
-        if (self.media_shown and not self.gateway_media) or self.handed_over or not self.our_run_id:
+        if ((self.media_shown and not self.gateway_media) or self.handed_over or not self.our_run_id
+                or self.steered_into):
             return
         loop = asyncio.get_running_loop()
         start = loop.time()
@@ -2192,6 +2288,12 @@ class _PipeTurn:
         recovery or thinking retry of a reply with no text."""
         pipe_log(f"DONE -- {self.event_count} events processed, "
                  f"text yielded: {self.text_yielded}")
+        if self.steered_into and not self.text_yielded and not self.aborted:
+            # A later message was steered into the run before it said anything
+            # here: the answer is in that message's reply.
+            self.record_visible_chunk(REPLY_SENT_WITH_NEXT_NOTE)
+            yield REPLY_SENT_WITH_NEXT_NOTE
+            self.text_yielded = True
         if self.adopted_run_id and not self.aborted:
             # The adopted run is over; now send the messages this reply owes
             # (its own, plus any carried over from cancelled replies), in the
@@ -2231,6 +2333,14 @@ class _PipeTurn:
             # this request's part into it, and no recovery or retry of a
             # reply that showed nothing (ELI-147).
             return
+        if (self.enqueued_not_started and not self.text_yielded and not self.aborted
+                and steers_mid_run_messages(self.conn.gateway_version)):
+            # Steered into a run no reply here shows (a wake, a reply another
+            # tab started): the agent has the message and answers it there.
+            note = "_(Sent to the reply that was already running: the agent answers it there.)_"
+            self.record_visible_chunk(note)
+            yield note
+            self.text_yielded = True
         if (self.enqueued_not_started and not self.text_yielded and not self.aborted
                 and not self.adopted_run_id and self.session_runtime == "claude-cli"
                 and self.our_run_id and self.sent_texts):
@@ -2285,6 +2395,16 @@ class _PipeTurn:
         # for a `done: false` message and with no tab open.
         if not self.aborted and self.text_yielded:
             await self.save_end_snapshot()
+
+        if getattr(self, "steered_span_run", None) and not self.aborted:
+            # The run's live events give no point where this message went in
+            # on claude-cli (its commit can trail the answer's first delta);
+            # the transcript does.
+            spawn_background(_settle_steered_replies(self.conn, self.session_key, [
+                *self.steered_replies_before(),
+                {"chat_id": self.owui_origin_chat_id, "message_id": self.owui_message_id,
+                 "request_task_id": (self.__metadata__ or {}).get("task_id"),
+                 "span_run": self.steered_span_run}]))
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not self.aborted and self.text_yielded:

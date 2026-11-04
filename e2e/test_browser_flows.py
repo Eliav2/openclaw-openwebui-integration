@@ -10,6 +10,7 @@ capture.py), so the docs images and these tests drive Open WebUI one way.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -44,6 +45,31 @@ def _openclaw_version() -> tuple:
 def _openclaw_release() -> tuple:
     """(year, month) of the Gateway the stack installed."""
     return _openclaw_version()[:2]
+
+
+@functools.lru_cache(maxsize=1)
+def _steers() -> bool:
+    """The Gateway steers a text message sent while a run works into that run
+    (2026.10.10+), so the Pipe sends it at once instead of queueing it: the
+    running reply ends at the run's next boundary and the rest of the run,
+    the answer, shows under the new message."""
+    return _openclaw_version() >= (2026, 10, 10)
+
+
+STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS
+
+
+def _steer_pending_js(index: int) -> str:
+    """Reply `index` says its message went to the Gateway, to be steered
+    into the running run."""
+    return f"() => {_message_text_js(index)}.includes({json.dumps(STEER_PENDING)})"
+
+
+def _ran_its_command(message: dict) -> bool:
+    """The held run's reply as saved at its end on a steering Gateway: its
+    command's result is in (the run's `E2E_HOLD_END` never comes, as the
+    run answers the steered message instead)."""
+    return any(i.get("type") == "function_call_output" for i in message.get("output") or [])
 
 
 @pytest.fixture(scope="module")
@@ -508,7 +534,7 @@ def _saved_replies(page, token: str) -> list:
     return [m for m in saved.values() if m.get("role") == "assistant"]
 
 
-def _saved_whole(page, token: str, run: str) -> None:
+def _saved_whole(page, token: str, run: str, whole=None) -> None:
     """Wait for the running reply (holding `run`) to be saved whole and done,
     before a reload.
 
@@ -521,10 +547,11 @@ def _saved_whole(page, token: str, run: str) -> None:
     the copies after it (the writer drops its copy once saved) gets it cut,
     and the page, with no task left on the chat, shows it cut and finished
     (ELI-274's window, for the reply's text). A mid-turn copy is never done."""
+    whole = whole or (lambda m: run in (m.get("content") or ""))
     deadline = time.time() + TURN_MS / 1000
     while True:
         replies = _saved_replies(page, token)
-        if any(m.get("done") and run in (m.get("content") or "") for m in replies):
+        if any(m.get("done") and whole(m) for m in replies):
             return
         assert time.time() < deadline, (
             f"the running reply was never saved whole: {[((m.get('content') or '')[-80:], m.get('done')) for m in replies]}")
@@ -572,16 +599,20 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
         answer = next(m for m in replies if m is not held[0])
         lines, ref = ([h.get("description") for h in m.get("statusHistory") or [] if isinstance(h, dict)]
                       for m in (held[0], answer))
-        if ("Stopped" not in lines and usage(lines) == usage(ref)) or time.time() > deadline:
+        if ("Stopped" not in lines and usage(lines) == (usage(ref) and not _steers())) \
+                or time.time() > deadline:
             break
         time.sleep(1)
     assert "Stopped" not in lines, f"a Stopped line: {lines}"
-    assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
+    # Steered, the run goes on under the new message and ends there: its
+    # usage line is the answer's alone.
+    expected = usage(ref) and not _steers()
+    assert usage(lines) == expected, f"the running reply: {lines}; the answer: {ref}"
     _reload(page)
     _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies after a reload", 60_000)
     shown = page.evaluate(f"() => {_message_text_js(0)}")
     assert "Stopped" not in shown, shown[-200:]
-    assert ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
+    assert ("\U0001f9e0" in shown) == expected, shown[-200:]
 
 
 def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page, token):
@@ -613,7 +644,12 @@ def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page, token):
     capture.send(page, "E2E_SLOW:20 BROWSER_DROP")
     _wait(page, _reply_js(0, "r.text.includes('BROWSER_DROP slow-1 slow-2')"), "the reply part way through")
     _type_and_send(page, "E2E_ECHO: BROWSER_DROP_ANSWER")
-    _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the new message queued")
+    if _steers():
+        # Sent at once, to be steered into the run: the drop comes while its
+        # reply waits for the run to take it in.
+        _wait(page, _steer_pending_js(-1), "the new message sent, to be steered into the run")
+    else:
+        _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the new message queued")
     dropped = [d for d in socket_drop.drop() if "fd" in d]
     assert dropped, "no Gateway connection of Open WebUI was dropped"
     _wait(page, _reply_js(-1, "all.length === 2 && r.done"), "the queued message's reply done")
@@ -699,7 +735,10 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
     hold_token = f"across{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py hold_file
     gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
-    run = "E2E_HOLD_END"
+    # Steered, the new message ends the running reply at the command's end
+    # (its result is in only once it is saved whole); else the run's end.
+    run, shown_whole, whole = (("function_call_output", "View Result from exec", _ran_its_command)
+                               if _steers() else ("E2E_HOLD_END", "E2E_HOLD_END", None))
     capture.new_chat(page)
     capture.send(page, f"E2E_HOLD {hold_token}")
     _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
@@ -729,7 +768,7 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         assert all(run not in response.text() for _, response in held), \
             "a held chat GET already had the whole reply"
         open(gate, "w").close()
-        _saved_whole(page, token, run)
+        _saved_whole(page, token, run, whole)
         holding[0] = False
         # A GET that came in after the gate opened may have read the saved
         # reply: it is held back until the tab shows the whole reply without it.
@@ -738,7 +777,7 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         for route, response in stale:
             route.fulfill(response=response)
         page.wait_for_selector("#chat-input", timeout=60_000)
-        _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(run)})"),
+        _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(shown_whole)})"),
               "the running reply whole and done in the tab that loaded across its save", 30_000)
         for route, response in saved:
             route.fulfill(response=response)
@@ -779,10 +818,17 @@ def test_a_reply_interrupted_while_queued_says_its_message_went_with_the_next(pa
     capture.send(page, "E2E_SLOW:15 BROWSER_TWICE")
     _wait(page, _reply_js(0, "r.text.includes('BROWSER_TWICE slow-1 slow-2')"), "the reply part way through")
     _type_and_send(page, "E2E_ECHO: BROWSER_TWICE_A")
-    _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the 2nd reply queued")
+    if _steers():
+        # Both are steered into the run at its next boundary and reach the
+        # model together; the newest one is answered.
+        _wait(page, _steer_pending_js(-1), "the 2nd message sent, to be steered into the run")
+        answer = "BROWSER_TWICE_B"
+    else:
+        _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the 2nd reply queued")
+        answer = "BROWSER_TWICE_A"
     _type_and_send(page, "E2E_ECHO: BROWSER_TWICE_B")
     _wait(page, _reply_js(-1, "all.length === 3 && all[0].done && r.done"
-                              " && r.text.includes('BROWSER_TWICE_A')"),
+                              f" && r.text.includes({json.dumps(answer)})"),
           "the 3rd reply answering the 2nd message")
     assert _replies(page)[0]["text"].count(run) == 1
     _says_where_its_message_went(page, 1, "sent together with your next one")
@@ -797,7 +843,8 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
     behind its run. Once it ends they go to the agent as one turn, in the
     order sent: three user messages in the chat, the first two replies
     saying their message went with the next, the last one answering; the
-    same after a reload."""
+    same after a reload. Where the Gateway steers them (2026.10.10+), they
+    go into the run in order, at the boundaries the Gateway picks."""
     words = [f"BROWSER_JOIN_{w}_{os.getpid()}" for w in ("A", "B", "C")]
     asked = len(_fake_llm_requests())
     hold_token = f"join{os.getpid()}_{asked}"
@@ -815,25 +862,43 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
             other.wait_for_selector("#chat-input", timeout=60_000)
             _type_and_send(other, f"E2E_ECHO: {word}")
             _wait(page, f"() => {_user_message_js(word)}", f"{word} in the chat")
-        _wait(page, f"() => {_message_text_js(-1)}.includes('Queued: waiting')", "the last message waiting")
+        _wait(page, _steer_pending_js(-1) if _steers() else f"() => {_message_text_js(-1)}.includes('Queued: waiting')",
+              "the last message waiting")
         open(gate, "w").close()
-        _wait(page, _reply_js(-1, f"all.length === 4 && all.every(a => a.done) && r.text.includes({json.dumps(words[0])})"),
+        # Joined into one turn, the first message's word is answered; steered,
+        # the three are separate messages and the newest is.
+        answer = words[2] if _steers() else words[0]
+        _wait(page, _reply_js(-1, f"all.length === 4 && all.every(a => a.done) && r.text.includes({json.dumps(answer)})"),
               "the last message's reply answering all three")
     finally:
         open(gate, "w").close()
         for other in tabs:
             other.close()
-    # The first model request that carries any of the messages carries all
-    # three, in order: sent apart, the first would carry only the first.
-    first = next((text for text in (json.dumps(r["request"]["messages"]) for r in _fake_llm_requests()[asked:])
-                  if any(w in text for w in words)), "")
-    assert all(w in first for w in words), (
-        f"the waiting messages reached the agent as separate turns: {first[-300:]}")
-    assert first.index(words[0]) < first.index(words[1]) < first.index(words[2]), first[-300:]
-    for index in (1, 2):
-        _says_where_its_message_went(page, index, "sent together with your next one")
+    requests = [json.dumps(r["request"]["messages"]) for r in _fake_llm_requests()[asked:]]
+    if _steers():
+        # Steered, each message goes in at the run's first boundary after the
+        # Gateway admits it, and admission takes the Gateway a while
+        # (chat-send stage=steer), so messages sent seconds apart can go in at
+        # different boundaries. In order either way, and each reply has its
+        # message's answer or says it went in with the next one.
+        reached = [next(n for n, text in enumerate(requests) if w in text) for w in words]
+        assert reached == sorted(reached), f"the messages reached the agent out of order: {reached}"
+        for index, word in enumerate(words, start=1):
+            _wait(page, f"() => [{json.dumps(word)}, 'sent together with your next one']"
+                        f".some(t => {_message_text_js(index)}.includes(t))",
+                  f"reply {index} answering {word} or saying where it went", 60_000)
+            assert "Queued: waiting" not in page.evaluate(f"() => {_message_text_js(index)}")
+    else:
+        # The first model request that carries any of the messages carries all
+        # three, in order: sent apart, the first would carry only the first.
+        first = next((text for text in requests if any(w in text for w in words)), "")
+        assert all(w in first for w in words), (
+            f"the waiting messages reached the agent as separate turns: {first[-300:]}")
+        assert first.index(words[0]) < first.index(words[1]) < first.index(words[2]), first[-300:]
+        for index in (1, 2):
+            _says_where_its_message_went(page, index, "sent together with your next one")
     shown = (_user_texts(page), [r["text"] for r in _replies(page)])
-    _saved_whole(page, token, "E2E_HOLD_END")
+    _saved_whole(page, token, "E2E_HOLD_END", _ran_its_command if _steers() else None)
     _reload(page)
     _wait(page, _reply_js(-1, "all.length === 4 && all.every(a => a.done)"), "the four replies after a reload", 60_000)
     assert (_user_texts(page), [r["text"] for r in _replies(page)]) == shown, "the chat changed on a reload"
@@ -844,6 +909,9 @@ def test_a_queued_reply_stopped_says_its_message_was_not_sent(page):
     """Send now, then Stop while the new message waits (ELI-188 variant):
     the Pipe drops the message, as the user stopped it, and its reply says
     so instead of "Queued" forever."""
+    if _steers():
+        pytest.skip("a text message sent mid-run is steered into the run, never held at the Pipe; "
+                    "Stop on a steered run: test_stop_after_send_now_stops_the_run")
     capture.new_chat(page)
     capture.send(page, "E2E_SLOW:15 BROWSER_SENDSTOP")
     _wait(page, _reply_js(0, "r.text.includes('BROWSER_SENDSTOP slow-1 slow-2')"), "the reply part way through")
@@ -871,8 +939,10 @@ def test_stop_after_send_now_stops_the_run(page, token):
         capture.send(page, f"E2E_HOLD {hold_token}")
         _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
         _type_and_send(page, "E2E_ECHO: BROWSER_STOP_AFTER_SEND_NOW")
-        # The new message's reply waits behind the run, at the Pipe.
-        _wait(page, _reply_js(1, "r.text.includes('Queued') && !r.done"), "the new message's reply queued behind the run")
+        # The new message's reply waits behind the run, at the Pipe; steered,
+        # it waits for the run to take it in.
+        _wait(page, _steer_pending_js(1) if _steers() else _reply_js(1, "r.text.includes('Queued') && !r.done"),
+              "the new message's reply queued behind the run")
         stop = page.locator('button[aria-label="Stop"]')
         stop.wait_for(timeout=30_000)
         stop.click()

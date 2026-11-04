@@ -23,6 +23,7 @@ import concurrent.futures
 import glob
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -603,7 +604,17 @@ def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
     _assert_clean(token, chat_id, msgs)
 
 
-def _post_turn(token: str, chat_id: str, prompt: str) -> str:
+STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS
+
+
+def _steers_mid_run_messages() -> bool:
+    """The stack's Gateway steers a message sent while a run works into that
+    run (2026.10.10+), rather than running it after (the Pipe's own gate)."""
+    m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,3})", os.environ.get("OPENCLAW_VERSION", ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
+
+
+def _post_turn(token: str, chat_id: str, prompt: str, model: str = DEFAULT_MODEL) -> str:
     """Send `prompt` in `chat_id` under its current leaf, as a client with no
     page does (the API, a script), and return its reply's id at once."""
     status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
@@ -614,20 +625,104 @@ def _post_turn(token: str, chat_id: str, prompt: str) -> str:
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     user = {"id": uid, "parentId": leaf, "childrenIds": [aid], "role": "user", "content": prompt,
-            "timestamp": now, "models": [DEFAULT_MODEL]}
+            "timestamp": now, "models": [model]}
     msgs[uid] = user
     msgs[aid] = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
-                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+                 "content": "", "model": model, "timestamp": now, "done": False}
     msgs[leaf]["childrenIds"] = [*(msgs[leaf].get("childrenIds") or []), uid]
     chat["history"]["currentId"] = aid
     status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
     assert status == 200, saved
     status, ack = _request("POST", "/api/chat/completions", {
-        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "model": model, "messages": [{"role": "user", "content": prompt}],
         "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
         "parent_id": uid, "user_message": user}, token)
     assert status == 200, ack
     return aid
+
+
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
+def test_a_message_sent_while_a_run_works_is_steered_into_it(token):
+    """Eliav 2026-11-04 (c9dc45f0): a message sent while a turn runs its tools
+    reaches the agent at the run's next tool boundary, not after the whole
+    turn, and its answer shows under it. The held run's tool here is an exec
+    that waits for the test (e2e/fake_llm.py E2E_HOLD); the message goes while
+    it runs, then the tool is let go."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_STEER_CHAT")
+    word = f"E2E_STEER_{uuid.uuid4().hex[:6]}"
+    key = _session_key(token, chat_id)
+    hold_token = f"steer{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    held = _post_turn(token, chat_id, f"E2E_HOLD {hold_token}")
+    try:
+        _until("the held run", lambda: _gw("sessions.describe", {"key": key})
+               .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=0.5)
+        since = str(int(time.time()))
+        aside = _post_turn(token, chat_id, f"E2E_ECHO: {word}")
+        # Sent to the Gateway while the run works, not held in the Pipe.
+        def sent_into_run():
+            log = subprocess.run(["docker", "logs", "--since", since, "owui"],
+                                 capture_output=True, text=True, timeout=60)
+            return "to be steered into it" in log.stdout + log.stderr
+        _until("the Pipe sending the aside into the active run", sent_into_run, timeout_s=60, every_s=0.5)
+    finally:
+        open(gate, "w").close()
+    _until("both replies done", lambda: all(
+        _chat_messages(token, chat_id)[r].get("done") for r in (held, aside)))
+    msgs = _chat_messages(token, chat_id)
+    assert msgs[aside]["content"].strip() == word, msgs[aside]["content"]
+    assert msgs[held]["content"].strip() == "E2E_HOLD_START", msgs[held]["content"]
+    statuses = json.dumps([msgs[r].get("statusHistory") for r in (held, aside)])
+    assert "Queued: waiting" not in statuses, statuses
+    # Inside the held run: the model call that carries the message also
+    # carries that run's tool result.
+    with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
+        asked = [json.dumps(json.loads(line)["request"]["messages"]) for line in f if line.strip()]
+    carrying = [a for a in asked if word in a]
+    assert carrying and "e2e-hold-released" in carrying[0], (carrying[:1] or asked[-1:])[0][-400:]
+
+
+CLI_MODEL = "openclaw_gateway.anthropic/claude-opus-5-5"  # e2e/start_stack.sh: claude-cli, e2e/fake_claude.py
+
+
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
+def test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it(token):
+    """The claude-cli runtime's own steering path (OpenClaw 2026.10.10): the
+    Gateway writes the message into the running Claude Code process, which
+    takes it in (`command_lifecycle` started) and answers it in the same turn.
+    The answer shows under the message; the running reply keeps only what
+    came before it. e2e/fake_claude.py holds its turn until a message comes."""
+    log = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    word = f"E2E_CLI_ASIDE_{uuid.uuid4().hex[:6]}"
+    hold_token = f"cli{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    held = _post_turn(token, chat_id, f"E2E_CLI_HOLD {hold_token}", model=CLI_MODEL)
+    try:
+        _until("the Claude Code turn holding", lambda: os.path.exists(log)
+               and f"holding {hold_token}" in open(log, encoding="utf-8").read(), timeout_s=60, every_s=0.2)
+        aside = _post_turn(token, chat_id, f"Stop and say {word}", model=CLI_MODEL)
+        _until("both replies done", lambda: all(
+            _chat_messages(token, chat_id)[r].get("done") for r in (held, aside)))
+        # Claude Code can stream the answer before the Gateway commits the
+        # message, so its first words may land in the running reply; the
+        # Pipe then moves the split to the transcript's (`_settle_steered_replies`).
+        _until("the held reply ending at the message", lambda: _chat_messages(token, chat_id)[held]
+               .get("content", "").strip() == "E2E_CLI_HOLD_START")
+    finally:
+        open(gate, "w").close()
+    msgs = _chat_messages(token, chat_id)
+    assert msgs[aside]["content"].strip().startswith("E2E_CLI_STEERED:") and word in msgs[aside]["content"], (
+        msgs[aside]["content"])
+    statuses = json.dumps([msgs[r].get("statusHistory") for r in (held, aside)])
+    assert "Queued: waiting" not in statuses and STEER_PENDING in statuses, statuses
+    # Taken in by the running process, not run after it as a turn of its own.
+    with open(log, encoding="utf-8") as f:
+        text = f.read()
+    turn = text[text.index(f"holding {hold_token}"):]
+    assert word in turn and "E2E_CLI_HOLD_END" not in turn, turn[-600:]
+    os.remove(gate)
 
 
 def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
@@ -653,16 +748,29 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
             _until(f"{word}'s request running", lambda n=len(replies): len(
                 (_request("GET", f"/api/tasks/chat/{chat_id}", token=token)[1] or {}).get("task_ids") or []) >= n + 1,
                 timeout_s=60, every_s=0.2)
+            if _steers_mid_run_messages():
+                # Its message is at the Gateway, to be steered in at the run's
+                # next boundary (the reply's saved status says so), so all
+                # three reach the model in one call once the run goes on.
+                _until(f"{word} sent, to be steered in", lambda r=replies[-1]: any(
+                    STEER_PENDING in str(h.get("description"))
+                    for h in _chat_messages(token, chat_id).get(r, {}).get("statusHistory") or []),
+                    timeout_s=60, every_s=0.2)
     finally:
         open(gate, "w").close()
-    msgs = _wait_for(token, chat_id, ["E2E_HOLD_END", words[0]])
+    # 2026.10.10+ steers them into the held run at its next boundary, all
+    # three in one model call; the fake model answers the newest. Older
+    # Gateways run them after it as one turn, answered by the first's echo.
+    steered = _steers_mid_run_messages()
+    answer = words[2] if steered else words[0]
+    msgs = _wait_for(token, chat_id, [answer] if steered else ["E2E_HOLD_END", answer])
     _until("every reply done", lambda: all(
         _chat_messages(token, chat_id)[r].get("done") for r in replies))
     msgs = _chat_messages(token, chat_id)
     note = "sent together with your next one"
     assert all(note in (msgs[r].get("content") or "") for r in replies[:2]), (
         [msgs[r].get("content") for r in replies])
-    assert words[0] in msgs[replies[2]]["content"] and note not in msgs[replies[2]]["content"]
+    assert answer in msgs[replies[2]]["content"] and note not in msgs[replies[2]]["content"]
     # The first model request that carries any of the messages carries all
     # three, in order: sent apart, the first would carry only the first.
     with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
@@ -1264,7 +1372,6 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
 # the browser, and the section's data is read out of that code.
 
 import asyncio  # noqa: E402
-import re  # noqa: E402
 import tempfile  # noqa: E402
 
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # e2e/fake_llm.py's task for E2E_SPAWN
@@ -1840,7 +1947,6 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
 # calls streams, and checks what the user sees: the page's live events and the
 # saved message.
 
-import re  # noqa: E402
 import threading  # noqa: E402
 from pathlib import Path  # noqa: E402
 

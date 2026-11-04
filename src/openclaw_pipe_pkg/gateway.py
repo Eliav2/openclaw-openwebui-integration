@@ -679,6 +679,21 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
 # row only when it was read after its run was admitted.
 _ROW_MARKER_TYPE = "_pipe_row"
+# Queue item `_GatewayConnection._steer` puts in a run's queues when a later
+# message of its session was steered into that run (2026.10.10+):
+# `{"type", "into"}`. The reply showing the run ends there; the rest of the run
+# is the steered message's answer and goes to that message's reply, whose
+# queues get `{"type", "_steered"}`.
+_STEERED_MARKER_TYPE = "_pipe_steered"
+
+
+def steers_mid_run_messages(version) -> bool:
+    """A 2026.10.10+ Gateway steers a message sent while a run works into
+    that run, claude-cli included (its stream-JSON process takes the input at
+    the next tool boundary; docs/concepts/queue-steering.md). 2026.10.5's
+    Claude runtime has no input injection. An unknown version is the old one."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
 
 
 # How much of the already-received text anchors a cumulative text that does not
@@ -1663,6 +1678,16 @@ class _Consumer:
     session_key: str
     run_id: str
     queues: list[asyncio.Queue] = field(default_factory=list)
+    # The run has sent an event other than a lone message-less `chat` final:
+    # it runs, rather than having been steered into another run.
+    started: bool = False
+    ended: bool = False    # its terminal event came
+    # Its message was steered into another run of the session (`_steer`):
+    # its own events (the lone final) are dropped here. It is no reply of its
+    # own, and goes with the run it was steered into (`steered_into`): a
+    # socket drop can lose its lone final.
+    steered: bool = False
+    steered_into: str = ""
 
 
 # The turn writer's entry points (writer.py's `_TurnHooks`), which the Pipe
@@ -1856,6 +1881,13 @@ class _GatewayConnection:
         self._delivered_live: dict[str, float] = (
             _shared["delivered_live"] if _shared is not None else {}
         )
+
+        # The model and thinking level each session's last reply was sent at
+        # (`steers_into_active_run`).
+        self.sent_settings: dict[str, tuple] = {}
+        # "<session>:<run>" -> how a run ended without its answer ("aborted",
+        # "error"); its end wakes the session's `session_message_event`.
+        self.runs_failed: dict[str, str] = {}
 
         # Per-chat write locks for the read-modify-write paths that are not
         # turn writers (stub reconcile). Shared across connections.
@@ -2161,9 +2193,27 @@ class _GatewayConnection:
             if await within(changed.wait()) is bound:
                 return got, False
 
+    def _note_run_failed(self, payload: dict) -> None:
+        """Record a run that ended aborted or failed, which stores no answer,
+        and wake its session's transcript waiters (a steered message's reply
+        waits for that run's answer, `_await_steered_answer`)."""
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        how = payload.get("state") if payload.get("state") in ("aborted", "error") else (
+            "error" if payload.get("stream") == "lifecycle" and data.get("phase") == "error" else None)
+        sess, run = payload.get("sessionKey"), payload.get("runId")
+        if not (how and sess and run):
+            return
+        self.runs_failed[f"{sess}:{run}"] = how
+        if len(self.runs_failed) > 2000:
+            for stale in list(self.runs_failed)[:1000]:
+                self.runs_failed.pop(stale, None)
+        self._wake_message_waiter(sess)
+
     def _on_session_message(self, payload: dict) -> None:
         key = payload.get("sessionKey") or ""
         self._wake_message_waiter(key)
+        if key and isinstance(payload.get("message"), dict):
+            self._on_user_message_committed(key, payload["message"])
         if _TURNS and key:
             _TURNS.session_message(self, key)
 
@@ -2331,17 +2381,29 @@ class _GatewayConnection:
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None,
                             thinking: str | None = None,
-                            request_task_id: str | None = None) -> None:
+                            request_task_id: str | None = None,
+                            span_run: str | None = None,
+                            steer_pending: bool = False,
+                            before: list | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
         turn's level, which a writer's resume keeps. `request_task_id`: Open
-        WebUI's task for the request, whose end a handover's write waits for."""
+        WebUI's task for the request, whose end a handover's write waits for.
+        `span_run`: the run whose part of the transcript the message shows,
+        when it is not `run_id`: a message steered into `run_id` shows the
+        part after its own user message (`_settle_steered_replies`).
+        `steer_pending`: the message went to the Gateway to be steered into
+        the session's running run, so the reply waits for that run's answer.
+        `before`: the replies of `run_id` before this one, each ended where a
+        message was steered in, settled together (`_settle_steered_replies`)."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
-                                  "thinking": thinking, "request_task_id": request_task_id}
+                                  "thinking": thinking, "request_task_id": request_task_id,
+                                  "span_run": span_run, "steer_pending": steer_pending,
+                                  "before": list(before or [])}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -2358,7 +2420,8 @@ class _GatewayConnection:
         target = self._run_targets[key]
         return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
                 "thinking": thinking or target.get("thinking"), "shown": target.get("shown", ""),
-                "request_task_id": target.get("request_task_id")}
+                "request_task_id": target.get("request_task_id"),
+                "steer_pending": bool(target.get("steer_pending"))}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"
@@ -2657,6 +2720,9 @@ class _GatewayConnection:
                 pass
         if not consumer.queues or queue is None:
             del self._consumers[key]
+            for other in [k for k, c in self._consumers.items()
+                          if c.session_key == session_key and c.steered and c.steered_into == run_id]:
+                del self._consumers[other]
             self._release_held(session_key)
             # Its run may never have started (`has_reply`): waiters re-read.
             self._wake_session_waiters(session_key)
@@ -2668,12 +2734,14 @@ class _GatewayConnection:
         Its consumer is registered before its chat.send, so this holds while
         the Gateway has no run for it yet (ELI-260); its end wakes the
         session's `session_change_event`."""
-        return any(c.session_key == session_key for c in self._consumers.values())
+        return any(c.session_key == session_key and not getattr(c, "steered", False)
+                   for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
         messages waiting here to send (ELI-172)."""
-        return bool(self._consumers or self._open_send_sections)
+        return (any(not getattr(c, "steered", False) for c in self._consumers.values())
+                or bool(self._open_send_sections))
 
     def _close_if_retired_and_idle(self) -> None:
         if self._retired and not self._serving():
@@ -2774,6 +2842,24 @@ class _GatewayConnection:
             return matches[0]
         return None
 
+    def user_turn_run_active(self, session_key: str, chat_id: str) -> bool:
+        """The session's run, as this connection sees it, is the run of a
+        user's own message in `chat_id` (a Pipe reply run, `pipe_run_id`):
+        the one kind of run a message is sent into to be steered. The Gateway
+        steers only while the run's reply operation owns the session; into
+        any other (a cron wake, an announce, a resume, one this worker does
+        not see) it falls back to its follow-up queue (agent-runner-run
+        "steering rejected; applying follow-up policy", `reply-owner-ended`),
+        where the send is aborted and, on 2026.10.10-beta.1, never runs."""
+        # Started: a message sent to be steered has a consumer too, or a turn
+        # writer once Open WebUI cancelled its reply, with no event yet.
+        runs = {c.run_id for c in self._consumers.values()
+                if c.session_key == session_key and c.started and not (c.ended or c.steered)}
+        runs |= {run for (s, run), pump in getattr(self, "_turn_pumps", {}).items()
+                 if s == session_key and pump.started and not pump.terminal.is_set()}
+        parsed = parse_pipe_run_id(next(iter(runs))) if len(runs) == 1 else None
+        return bool(parsed and parsed["kind"] == "reply" and parsed["chat"] == chat_id)
+
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """Reverse `_owui_session_key`: extract (user_id, chat_id) from a
         session key this pipe built, e.g.
@@ -2808,6 +2894,7 @@ class _GatewayConnection:
 
     async def _dispatch_run_event(self, msg: dict) -> None:
         payload = msg.get("payload", {})
+        self._note_run_failed(payload)
         spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
         if spawned:
             # The Status dialog's child index (state.py), off the loop.
@@ -2842,6 +2929,8 @@ class _GatewayConnection:
         if not consumers and _TURNS and _TURNS.route_now(self, payload):
             return
 
+        if consumers and not self._note_run_event(msg, consumers[0]):
+            return
         if consumers:
             if not payload.get("runId"):
                 pipe_log("  dispatched session-only event to sole consumer")
@@ -2864,6 +2953,89 @@ class _GatewayConnection:
         # If nothing matches at all, drop it.
         # This efficiently filters cross-session bleed.
 
+    def _note_run_event(self, msg: dict, consumer: _Consumer) -> bool:
+        """Track whether `consumer`'s run runs, has ended or was steered into
+        another run. False: drop the event (a steered run's own lone final).
+        A first event that is a `chat` final with no message means the
+        Gateway steered the run's message into the active run without its
+        commit having switched it here (`_steer`)."""
+        payload = msg.get("payload") or {}
+        terminal = (payload.get("state") in ("final", "error", "aborted")
+                    or (payload.get("stream") == "lifecycle"
+                        and (payload.get("data") or {}).get("phase") in ("end", "error")))
+        if consumer.steered:
+            if terminal:
+                self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
+            return False
+        if (not consumer.started and msg.get("event") == "chat"
+                and payload.get("state") == "final" and not payload.get("message")
+                and steers_mid_run_messages(self.gateway_version) and self._steer(consumer)):
+            self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
+            return False
+        consumer.started = True
+        consumer.ended = consumer.ended or terminal
+        return True
+
+    def _on_user_message_committed(self, session_key: str, message: dict) -> None:
+        """A user message joined the transcript. On 2026.10.10 one whose run
+        has not started while another run of the session works was steered
+        into that run: the commit comes before the answer's first event
+        (probe_steer_events.py: the steered run's own lone final can come
+        after it), so the answer goes to its reply from here."""
+        idem = str((message.get("__openclaw") or {}).get("idempotencyKey") or "")
+        if not (message.get("role") == "user" and idem.endswith(":user")
+                and steers_mid_run_messages(self.gateway_version)):
+            return
+        consumer = self._consumers.get(f"{session_key}:{idem[:-len(':user')]}")
+        if consumer is not None and not (consumer.started or consumer.steered):
+            self._steer(consumer)
+
+    def _steer(self, consumer: _Consumer) -> bool:
+        """Switch the session's active run to the reply of `consumer`'s
+        message, which the Gateway steered into it: from here, in dispatch
+        order, its events go to that reply. What it sent before belongs to the
+        reply that showed it: a live reply gets `_STEERED_MARKER_TYPE` and
+        ends, a turn writer gets `("steered", future)` behind the events it
+        still writes and ends there. The steered reply gets `_steered`: the run
+        to continue and its dedup baselines (a dict, or that future). False
+        when the session has no single active run to take."""
+        sess = consumer.session_key
+        active = [c for c in self._consumers.values()
+                  if c.session_key == sess and c is not consumer and c.started
+                  and not (c.ended or c.steered)]
+        pumps = [(run, pump) for (s, run), pump in getattr(self, "_turn_pumps", {}).items()
+                 if s == sess and pump.started and not pump.wake and not pump.terminal.is_set()]
+        if len(active) == 1:
+            run = active[0]
+            earlier = self._run_targets.get(f"{sess}:{run.run_id}")
+            earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
+                "span_run": earlier.get("span_run") or run.run_id, "before": earlier.get("before") or []}
+            shadow = self._run_renderers.get(f"{sess}:{run.run_id}")
+            run_text = ({"received": shadow.received, "stream": shadow.received,
+                         "item": shadow.last_item} if shadow is not None else None)
+            for q in run.queues:
+                q.put_control({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
+            run.queues = list(consumer.queues)
+            run_id = run.run_id
+        elif not active and len(pumps) == 1:
+            run_id, pump = pumps[0]
+            writer = pump.writer
+            earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
+                                  "request_task_id": None, "span_run": run_id}
+            run_text = asyncio.get_running_loop().create_future()
+            pump.queue.put_nowait(("steered", run_text))
+            self._consumers[f"{sess}:{run_id}"] = _Consumer(
+                session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
+        else:
+            return False
+        consumer.steered, consumer.steered_into = True, run_id
+        for q in consumer.queues:
+            q.put_control({"type": _STEERED_MARKER_TYPE, "_steered": {
+                "run": run_id, "run_text": run_text, "earlier": earlier}})
+        pipe_log(f"  run {consumer.run_id[:24]}... steered into {run_id[:24]}...; "
+                 "its reply continues that run")
+        return True
+
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
         evt_session = payload.get("sessionKey", "")
@@ -2874,7 +3046,7 @@ class _GatewayConnection:
         if evt_session and not evt_run_id:
             matches = [
                 consumer for consumer in self._consumers.values()
-                if consumer.session_key == evt_session
+                if consumer.session_key == evt_session and not consumer.steered
             ]
             return matches if len(matches) == 1 else []
         return []

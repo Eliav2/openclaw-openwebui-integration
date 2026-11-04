@@ -9588,6 +9588,260 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertTrue((await self.task_done(w)).done(), "the Open WebUI task ends with the run")
         self.assertTrue(w.closed)
 
+    async def test_a_reply_cancelled_while_its_message_waited_to_be_steered_says_where_it_went(self):
+        """2026.10.10: messages sent from other tabs while a run works are
+        steered into it, and each send cancels the previous reply, whose run
+        (its message sent, nothing run) a writer takes over. Its one event is
+        a `chat` final with no message: it says its message went with the
+        next one, not an empty reply."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="steered-run", message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": []})
+        await w.feed({"runId": "steered-run", "sessionKey": self.KEY, "state": "final"})
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "active-run"})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+
+    # A Pipe reply run, as `pipe_run_id` names it.
+    STEERED = "msg-c0ffee00-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000002-1.0"
+
+    def _steered_transcript(self, *after, committed=True):
+        """R1's message, its first answer, the message steered in as STEERED
+        (once `committed`), then `after`."""
+        return {"messages": [
+            {"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "slow-1 slow-2"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}},
+            *([{"role": "user", "content": "aside",
+                "__openclaw": {"idempotencyKey": f"{self.STEERED}:user"}}] if committed else []),
+            *after]}
+
+    async def test_a_steered_reply_waits_for_its_answer_in_the_transcript(self):
+        """CI next 3 (2026.10.10-beta.1, 7d28cc5): after a socket drop the
+        reply of a message waiting to be steered is a turn writer's. The
+        session's idle push came before the Gateway stored the run's answer to
+        it, and the reply, which streamed nothing, ended with nothing. It
+        waits for the transcript append that holds the answer."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        hist = {"now": self._steered_transcript()}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: the answer is not stored yet")
+        hist["now"] = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], "the aside")
+
+    async def test_a_steered_reply_waits_while_its_run_has_stored_nothing_yet(self):
+        """Review on #278: with the message committed and the run it went
+        into yet to store a message of its own, the transcript named no run
+        to wait for, and the reply ended without its answer. Its own lone
+        final said it was steered; it waits for that run's answer."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        w.steered_message = True
+        start = [{"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
+                 {"role": "user", "content": "aside", "__openclaw": {"idempotencyKey": f"{self.STEERED}:user"}}]
+        hist = {"now": {"messages": start}}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: the run stored nothing yet")
+        hist["now"] = {"messages": start + [
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}}]}
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertEqual(self.m()["content"], "the aside")
+
+    async def test_a_steered_reply_stops_waiting_when_its_run_is_aborted(self):
+        """Every way the run it went into ends reaches the wait as an event:
+        a run stopped or failed before its answer stores none, so its
+        aborted or error event ends the wait too."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: self._steered_transcript())
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: the answer is not stored yet")
+        await self.conn._dispatch_run_event({"type": "event", "event": "chat", "payload": {
+            "sessionKey": self.KEY, "runId": "R1", "state": "aborted"}})
+        await asyncio.wait_for(ending, 5)
+        self.assertIs(self.m()["done"], True)
+
+    async def test_a_steered_reply_stops_waiting_once_a_gateway_restart_lost_its_run(self):
+        """Review on #278: the wait for the steered answer had no end if the
+        run never stored one. A live Gateway always stores the run's closing
+        message and pushes it; one that restarted without the run (stop
+        mode, a crash) never will, so the wait ends at that restart, read
+        after the reconnect's gap, once the session has no run."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: self._steered_transcript())
+        rows = {"active": True}
+
+        async def send_request(method, params, timeout=10):
+            assert method == "sessions.list", method
+            return {"sessions": [{"key": self.KEY, "hasActiveRun": rows["active"]}]}
+        self.conn.send_request = send_request
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: the answer is not stored yet")
+        self.conn.gateway_restarts += 1
+        rows["active"] = False
+        self.conn._wake_session_waiters()           # the reconnect's gap
+        await asyncio.wait_for(ending, 5)
+        self.assertIs(self.m()["done"], True)
+
+    async def test_a_steered_reply_whose_final_came_after_the_settle_says_where_it_went(self):
+        """Two messages steered in at one boundary; the earlier one's lone
+        final reaches its writer only after the session's idle row. The
+        transcript says its message went in with the next one."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(
+            {"role": "user", "content": "second", "__openclaw": {"idempotencyKey": "R3:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "both"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}}))
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+
+    async def test_a_gateway_that_never_steers_never_says_sent_with_next(self):
+        """Review on #278: the transcript's shape alone set the steered note.
+        A Gateway before 2026.10.10 never steers, so a queued run with no
+        answer of its own is not one."""
+        self.conn.gateway_version = "2026.10.5"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(
+            {"role": "user", "content": "second", "__openclaw": {"idempotencyKey": "R3:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "both"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}}))
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
+        self.assertIs(self.m()["done"], True)
+        self.assertNotEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+
+    async def test_a_steered_reply_waits_for_its_message_to_be_committed(self):
+        """CI next 3 on fff6a65: the idle row came before the Gateway even
+        committed the steered message. The reply waits for the commit, then
+        for the answer."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        hist = {"now": self._steered_transcript(committed=False)}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: its message is not committed yet")
+        hist["now"] = self._steered_transcript()
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "committed, its answer not stored yet")
+        hist["now"] = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertEqual(self.m()["content"], "the aside")
+
+    async def test_a_steered_reply_whose_lone_final_came_before_the_commit_waits(self):
+        """CI next 3 on 986139a (a socket drop as the message went out to be
+        steered): the Gateway took the message in at the run's end; the
+        message's lone final, then the session's idle row, came before its
+        commit. The final is the steer's sign, not an abort: the reply waits
+        for the commit and the answer instead of ending with nothing."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        pump = openclaw_pipe._RunPump()
+        pump.terminal.set()
+        self.conn._turn_pumps[(self.KEY, self.STEERED)] = pump
+        hist = {"now": self._steered_transcript(committed=False)}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        await w.feed({"runId": self.STEERED, "sessionKey": self.KEY, "state": "final"})
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: its message is not committed yet")
+        reads = self.conn.session_history.await_count
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(self.conn.session_history.await_count, reads,
+                         "no read without a transcript append: the set terminal wakes nothing")
+        hist["now"] = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertEqual(self.m()["content"], "the aside")
+
+    async def test_a_reply_whose_steered_message_was_aborted_does_not_wait(self):
+        """Its own run's terminal event (an abort) came and the message never
+        reached the transcript: nothing to wait for."""
+        self.conn.gateway_version = "2026.10.10"
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        pump = openclaw_pipe._RunPump()
+        pump.terminal.set()
+        self.conn._turn_pumps[(self.KEY, self.STEERED)] = pump
+        self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(committed=False))
+        await asyncio.wait_for(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}), 5)
+        self.assertTrue(w.closed)
+
+    def test_a_reply_cancelled_before_its_run_started_is_not_steered_into(self):
+        """Its handed run never ran, so a message steered in later takes the
+        session's running run, not it."""
+        empty = {"renderer": _TurnRenderer()}
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        self.assertFalse(openclaw_pipe._handover_started(empty))
+        self.assertTrue(openclaw_pipe._handover_started({"renderer": shown}))
+
     USAGE = {"description": "🧠 34k/1.0m (3.4%)", "done": True}
     LEFT_BY_THE_CANCEL = [{"description": "Thinking...", "done": False},
                           {"description": "Stopped", "done": True},
@@ -10503,6 +10757,50 @@ class AgentTurnRoutingTests(_RoutingCase):
         await self.dispatch(run, _tool("result", tcid="toolu_2"))
         await self.spin()
         self.assertEqual(len(self.owui.upserts), writes + 1, "then none mid-turn")
+
+    async def test_a_reply_handed_over_while_its_message_waits_to_be_steered_stays_open(self):
+        """CI next 3 on 986139a: a message went to the Gateway to be steered
+        into the running run, and the socket dropped before the run took it
+        in. The reply's request ended there (Open WebUI saved it done and
+        empty) and a writer took it over, which opened only on a showable
+        item: for the 18 s until the answer the reply read finished and
+        empty. It stays open, not done, until its answer ends it."""
+        self.conn.gateway_version = "2026.10.10"
+        run = pipe_run_id(self.CHAT, self.STUB)
+        pending = {"description": openclaw_pipe.STEER_PENDING_STATUS, "done": False}
+        self.add_stub(self.STUB, statusHistory=[pending])
+        request = asyncio.get_running_loop().create_future()
+        self.owui.request_tasks["req-1"] = request
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB,
+                                      request_task_id="req-1", steer_pending=True)
+        self.assertTrue(openclaw_pipe._hand_over_run(self.conn, self.key, run))
+        await self.spin()
+        patches = lambda: [d["data"]["messages"][self.STUB]  # noqa: E731
+                           for d in self.owui.events("chat:messages") if self.STUB in d["data"]["messages"]]
+        self.assertEqual(patches(), [], "not before the request's end, whose own done would win in the tab")
+        await self.owui.end_request(self.STUB, [])
+        request.set_result(None)
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], False, "the DB says the reply goes on")
+        shown = patches()
+        self.assertTrue(shown and shown[-1]["done"] is False, "open tabs show it going on")
+        self.assertEqual(shown[-1].get("statusHistory"), [pending], "with the line it waits under")
+        # The run takes the message in at its end; the answer ends the reply.
+        self.history = {"messages": [
+            {"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "slow-1 slow-2"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}},
+            {"role": "user", "content": "aside", "__openclaw": {"idempotencyKey": f"{run}:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}}]}
+        await self.dispatch(run, {"state": "final"})
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": "R1"})
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "the aside")
 
     async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
         run = pipe_run_id(self.CHAT, self.STUB)
@@ -16090,3 +16388,571 @@ class RunMediaMessageTests(unittest.TestCase):
                 h = self._history(key, self.BLOCK, self.ERROR)
                 self.assertEqual(openclaw_pipe._history_image_blocks_for_run(h, self.RUN), [])
                 self.assertEqual(openclaw_pipe._history_media_errors_for_run(h, self.RUN), [])
+
+
+class SteeredTranscriptSpanTests(unittest.TestCase):
+    """A run a message was steered into, read back from the transcript (a
+    turn writer's end, e.g. after a socket drop cut the live hand-off): the
+    run's span ends at the steered message, whose answer is that message's
+    span. Transcripts as the 2026.10.10 stack wrote them
+    (probe_steer_events.py: claude-cli live, the built-in runtime sandbox)."""
+
+    @staticmethod
+    def _user(key, text):
+        return {"role": "user", "content": text, "__openclaw": {"idempotencyKey": f"{key}:user"}}
+
+    @staticmethod
+    def _said(text, run=None, stop="stop", key=None):
+        meta = {k: v for k, v in (("runId", run), ("idempotencyKey", key)) if v}
+        return {"role": "assistant", "content": [{"type": "text", "text": text}],
+                "stopReason": stop, "__openclaw": meta}
+
+    def _texts(self, span):
+        return [_history_renderer(span).text.strip()] if span else []
+
+    def test_built_in_runtime(self):
+        hist = {"messages": [self._user("R1", "count"), self._said("PROBE_A slow-1 slow-2", run="R1"),
+                             self._user("R2", "banana"), self._said("banana", run="R1")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["PROBE_A slow-1 slow-2"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["banana"])
+
+    def test_claude_cli(self):
+        hist = {"messages": [
+            self._user("R1", "4 rounds"), self._said("ROUND 1", stop="toolUse"),
+            {"role": "toolResult", "content": "done"},
+            self._user("R2", "Stop and say banana"), self._said("Stopped. banana", stop="end_turn"),
+            self._said("ROUND 1\n\nStopped. banana", run="R1", key="cli-assistant:R1")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["ROUND 1"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["Stopped. banana"])
+
+    def test_claude_cli_with_imported_user_copies(self):
+        """claude-cli imports Claude Code's own transcript: each user message
+        has an unkeyed copy right after the keyed one (sandbox 2026.10.10)."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        hist = {"messages": [
+            self._user("R1", "hold"), copy("hold"), self._said("E2E_CLI_HOLD_START", stop="end_turn"),
+            self._user("R2", "aside"), copy("aside"), self._said("E2E_CLI_STEERED: aside", stop="end_turn"),
+            self._said("E2E_CLI_HOLD_START\n\nE2E_CLI_STEERED: aside", run="R1", key="cli-assistant:R1")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
+
+    def test_claude_cli_closing_copy_in_place_of_the_answer(self):
+        """The closing copy carries only the last answer, so the Gateway's
+        import merges it with Claude Code's record of it (sandbox 2026.10.10)."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        hist = {"messages": [
+            self._user("R1", "hold"), copy("hold"), self._said("E2E_CLI_HOLD_START", stop="end_turn"),
+            self._user("R2", "aside"), copy("aside"),
+            self._said("E2E_CLI_STEERED: aside", run="R1", key="cli-assistant:R1")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
+
+    def test_a_cron_prompt_recorded_mid_run_is_not_steered_into_it(self):
+        """2026.10.10 claude-cli (live gate two-wakes, d51a3a0a): a wake that
+        fires while a run works is recorded in the transcript as it reaches
+        Claude Code and runs after it under its own id. The run keeps all of
+        its own messages, its closing text included."""
+        def tool(i):
+            return {"role": "assistant", "stopReason": "tool_use", "content": [
+                {"type": "toolcall", "id": f"t{i}", "name": "exec", "arguments": {"command": f"step {i}"}},
+                {"type": "tool_result", "tool_use_id": f"t{i}", "name": "exec",
+                 "content": [{"type": "text", "text": f"out {i}"}]}]}
+        hist = {"messages": [
+            self._user("R1", "do two steps"), tool(1),
+            {"role": "user", "content": "[cron:job1 wake] do W",
+             "__openclaw": {"idempotencyKey": "46f6a533-3ebe-4822-90eb-6df00aaf33c9:user"}},
+            tool(2), self._said("R-DONE", run="R1", key="cli-assistant:R1"),
+            tool(3), self._said("W-DONE", run="W1", key="cli-assistant:W1")]}
+        span = _history_span_messages(hist, "R1")
+        self.assertIn("R-DONE", _history_renderer(span).text)
+
+    PIPE_RUN = "msg-c0ffee00-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000002-1.0"
+
+    def test_a_message_the_pipe_sent_that_starts_like_a_cron_prompt_is_steered(self):
+        """Review on #278: the cron-header exclusion read a user's message
+        that starts with `[cron:<id> ...]` as a wake's prompt, so its reply
+        never waited for the answer. A Pipe-keyed send is never a wake
+        (`wake_turns` skips them the same way)."""
+        self.assertIsNotNone(openclaw_pipe.parse_pipe_run_id(self.PIPE_RUN))
+        hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1"),
+                             self._user(self.PIPE_RUN, "[cron:job1 x] what does this header mean?")]}
+        self.assertEqual(openclaw_pipe._history_steered_host(hist, self.PIPE_RUN), "R1")
+        self.assertTrue(openclaw_pipe._history_steered_answer_pending(hist, self.PIPE_RUN))
+
+    def test_a_cron_prompt_stored_mid_run_does_not_end_a_steered_answer(self):
+        """Review on #278: a wake's prompt stored while the run works (it
+        runs after it) ended the steered message's wait and span, so its
+        reply showed the sent-with-next note and no answer."""
+        cron = {"role": "user", "content": "[cron:job1 wake] do W",
+                "__openclaw": {"idempotencyKey": "46f6a533-3ebe-4822-90eb-6df00aaf33c9:user"}}
+        hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1"),
+                             self._user("R2", "banana"), cron]}
+        self.assertTrue(openclaw_pipe._history_steered_answer_pending(hist, "R2"))
+        hist["messages"].append(self._said("banana", run="R1"))
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["banana"])
+
+    def test_a_steered_replys_sent_turn_is_its_answer(self):
+        """Review on #278: a second Open WebUI call for a steered reply
+        replayed its turn from `_stub_turn`, which ran on into the host's
+        closing copy of its whole text. A steered turn is its answer
+        (`_history_steered_span`)."""
+        stub = "00000000-0000-4000-8000-000000000002"
+        r2 = f"msg-c0ffee00-0000-4000-8000-000000000001-{stub}-1.0"
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        hist = {"messages": [
+            self._user("R1", "hold"), copy("hold"), self._said("HOLD_START", stop="end_turn"),
+            self._user(r2, "aside"), copy("aside"), self._said("STEERED: aside", stop="end_turn"),
+            self._said("HOLD_START\n\nSTEERED: aside", run="R1", key="cli-assistant:R1")]}
+        turn = openclaw_pipe._stub_turn(hist, stub, "", steers=True)
+        self.assertTrue(turn["closed"])
+        self.assertEqual(self._texts(turn["messages"]), ["STEERED: aside"])
+
+    def test_two_messages_steered_at_one_boundary(self):
+        hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1"),
+                             self._user("A", "first"), self._user("B", "second"),
+                             self._said("both", run="R1")]}
+        self.assertEqual(_history_span_messages(hist, "A"), [], "its answer is the next one's")
+        self.assertEqual(self._texts(_history_span_messages(hist, "B")), ["both"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["slow-1"])
+
+    def test_a_run_still_going_has_no_steered_answer_yet(self):
+        hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1", stop="toolUse"),
+                             self._user("R2", "banana")]}
+        self.assertIsNone(_history_span_messages(hist, "R2"))
+
+    def test_a_run_after_the_last_one_ended_is_its_own(self):
+        """Queued, not steered: it starts after the earlier run closed."""
+        hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1"),
+                             self._user("R2", "next"), self._said("own answer", run="R2")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["slow-1"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["own answer"])
+
+
+class SettleSteeredRepliesTests(unittest.TestCase):
+    """`_settle_misplaced`: when the replies around a steer are rewritten from
+    the transcript. Only a moved split, never other content."""
+
+    def test_the_answer_began_in_the_earlier_reply(self):
+        self.assertTrue(openclaw_pipe._settle_misplaced(["holdSTEERED:a", "a"], ["hold", "STEERED:a"]))
+        self.assertTrue(openclaw_pipe._settle_misplaced(["holdSTEERED:a", "STEERED:a"], ["hold", "STEERED:a"]))
+
+    def test_successive_steers_each_moved_their_split(self):
+        """Review on #278: a second steer into a reply that began under an
+        earlier one left the middle reply failing the check for both pairs.
+        The replies of one run are settled together, every split at once."""
+        self.assertTrue(openclaw_pipe._settle_misplaced(
+            ["holdSTEERED:", "aSTEERED:", "b"], ["hold", "STEERED:a", "STEERED:b"]))
+        self.assertTrue(openclaw_pipe._settle_misplaced(
+            ["hold", "STEERED:aSTEERED:", "b"], ["hold", "STEERED:a", "STEERED:b"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(
+            ["holdSTEERED:", "aXSTEERED:", "b"], ["hold", "STEERED:a", "STEERED:b"]))
+
+    def test_replies_already_in_place_or_holding_more_stay(self):
+        self.assertFalse(openclaw_pipe._settle_misplaced(["hold", "STEERED:a"], ["hold", "STEERED:a"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(["holdnote", "STEERED:a"], ["hold", "STEERED:a"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(["hold", "STEERED:a(note)"], ["hold", "STEERED:a"]))
+
+
+class SettleSteeredRepliesKeepNotesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_settled_reply_keeps_the_pipes_notes(self):
+        """Review on #278: the settle rewrote a reply's output from the
+        transcript, which has none of the Pipe's own notes; they are put back
+        (`_keep_pipe_notes`), as the rebuild does."""
+        note = {"type": "message", "id": f"{openclaw_pipe._NOTE_ITEM_PREFIX}approval_1", "status": "completed",
+                "role": "assistant", "content": [{"type": "output_text", "text": "Approved."}]}
+        saved = {"m1": {"content": "holdSTEERED:a", "output": [note]}, "m2": {"content": "a", "output": []}}
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return saved[message_id]
+
+        async def emitter(*_a, **_k):
+            return mock.AsyncMock()
+        modules = owui_modules(get_event_emitter=emitter)
+        modules["open_webui.models"] = types.ModuleType("open_webui.models")
+        modules["open_webui.models.chats"] = types.ModuleType("open_webui.models.chats")
+        modules["open_webui.models.chats"].Chats = Chats
+        parts = []
+        for text in ("hold", "STEERED:a"):
+            part = openclaw_pipe._TurnRenderer()
+            part._add_text(text)
+            parts.append(part)
+        conn = openclaw_pipe._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        conn.session_history = mock.AsyncMock(return_value={"messages": []})
+        upserts = {}
+
+        async def upsert(chat_id, message_id, fields):
+            upserts[message_id] = fields
+            return True
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(openclaw_pipe, "_history_span_messages", lambda h, r: []), \
+                mock.patch.object(openclaw_pipe, "_history_renderer", mock.Mock(side_effect=parts)), \
+                mock.patch.object(openclaw_pipe, "_owui_upsert_message", upsert):
+            await openclaw_pipe._settle_steered_replies(conn, "k", [
+                {"chat_id": "c", "message_id": "m1", "span_run": "R1"},
+                {"chat_id": "c", "message_id": "m2", "span_run": "R2"}])
+        self.assertEqual(upserts["m1"]["content"], "hold")
+        self.assertIn(note["id"], [i.get("id") for i in upserts["m1"]["output"]])
+
+
+class SteerMarkerTests(unittest.TestCase):
+    def test_the_steer_markers_go_in_past_a_full_queue(self):
+        """Review on #278: the markers went in with `put_nowait`, and a run
+        queue at its bound raised QueueFull in the receive loop, which then
+        reconnected and lost events. They are control markers
+        (`_RunQueue.put_control`)."""
+        conn = openclaw_pipe._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        host = openclaw_pipe._Consumer("s", "r1", [openclaw_pipe._RunQueue(maxsize=1)], started=True)
+        steered = openclaw_pipe._Consumer("s", "r2", [openclaw_pipe._RunQueue(maxsize=1)])
+        host.queues[0].put_nowait("event")
+        steered.queues[0].put_nowait("event")
+        conn._consumers = {"s:r1": host, "s:r2": steered}
+        self.assertTrue(conn._steer(steered))
+        self.assertEqual([q.qsize() for q in host.queues], [2], "the steer marker behind the event")
+        self.assertEqual(steered.steered_into, "r1")
+
+
+class SteerChainTests(unittest.TestCase):
+    def test_a_second_steer_carries_the_replies_before_it(self):
+        """Review on #278: the replies around successive steers of one run
+        are settled together, so the steered reply knows them all."""
+        conn = openclaw_pipe._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        first = {"chat_id": "c", "message_id": "m1", "request_task_id": None, "span_run": "r1"}
+        conn.register_run_target("s", "r1", "c", "m2", span_run="r2", before=[first])
+        host = openclaw_pipe._Consumer("s", "r1", [openclaw_pipe._RunQueue()], started=True)
+        steered = openclaw_pipe._Consumer("s", "r3", [openclaw_pipe._RunQueue()])
+        conn._consumers = {"s:r1": host, "s:r3": steered}
+        self.assertTrue(conn._steer(steered))
+        earlier = steered.queues[0].get_nowait()["_steered"]["earlier"]
+        self.assertEqual(earlier, {"chat_id": "c", "message_id": "m2", "request_task_id": None,
+                                   "span_run": "r2", "before": [first]})
+
+
+class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
+    """Eliav 2026-11-04 (c9dc45f0): "Stop and say banana" sent while a
+    claude-cli turn ran its tools sat as "Queued: waiting for the current run
+    to finish…" and ran only after the whole turn. On 2026.10.10 the Gateway
+    steers such a message into the active run at its next tool boundary. Live
+    event order (probe_steer_events.py, 8be1f18c): the active run's deltas and
+    tool; the steered message's run gets only a `chat` final with no message;
+    the answer streams on the active run, whose final repeats its whole text.
+    Real reply generators; events through the connection's own dispatch."""
+
+    SK = None
+    CHAT = "c0ffee00-0000-4000-8000-000000000001"
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+
+    @classmethod
+    def _run_id(cls, n):
+        """What `pipe_run_id` gives the reply run of message n of the chat."""
+        return f"msg-{cls.CHAT}-00000000-0000-4000-8000-{n:012d}-1.0"
+
+    async def asyncSetUp(self):
+        await NoDroppedMessagesTests.asyncSetUp(self)
+        type(self).SK = self.ocp._owui_session_key(self.pipe.valves.AGENT_ID, "u1", self.CHAT)
+        self.R1, self.R2, self.R3 = (self._run_id(n) for n in (1, 2, 3))
+        send = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            got = await send(method, params, timeout)
+            if method == "chat.send":
+                return {"runId": self._run_id(int(got["runId"].rsplit("-", 1)[1]))}
+            return got
+        self.conn.send_request = send_request
+
+    def _reply(self, text, msg_id, **kw):
+        return NoDroppedMessagesTests._reply(self, text, msg_id, chat=self.CHAT, **kw)
+    _delta = NoDroppedMessagesTests._delta
+    _until_registered = NoDroppedMessagesTests._until_registered
+    _spin = staticmethod(NoDroppedMessagesTests._spin)
+    _collect = staticmethod(NoDroppedMessagesTests._collect)
+
+    def _lifecycle(self, run_id, phase):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "stream": "lifecycle", "data": {"phase": phase}}}
+
+    def _final(self, run_id, text=None):
+        payload = {"sessionKey": self.SK, "runId": run_id, "state": "final"}
+        if text is not None:
+            payload["message"] = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        return {"type": "event", "event": "chat", "payload": payload}
+
+    def _commit(self, run_id, text="aside"):
+        """The `session.message` that commits a message sent as `run_id`."""
+        return {"type": "event", "event": "session.message", "payload": {
+            "sessionKey": self.SK, "message": {"role": "user", "content": text,
+                                               "__openclaw": {"idempotencyKey": f"{run_id}:user"}}}}
+
+    async def _dispatch(self, *msgs):
+        for msg in msgs:
+            if msg.get("event") == "session.message":
+                self.conn._on_session_message(msg["payload"])
+            else:
+                await self.conn._dispatch_run_event(msg)
+        await self._spin()
+
+    async def _running_first_reply(self):
+        gen = self._reply("Do 4 rounds of sleep 12", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered(self.R1)
+        self.active = True
+        await self._dispatch(self._lifecycle(self.R1, "start"), self._delta(self.R1, "ROUND 1"))
+        return gen, first
+
+    async def test_a_mid_run_message_is_steered_and_answered_in_its_own_reply(self):
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("Stop and say banana", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        self.assertEqual(self.sent[-1], "Stop and say banana", "sent while the run works")
+        self.assertFalse(any("Queued: waiting" in str(e) for e in self.emitted))
+        self.assertTrue(any(self.ocp.STEER_PENDING_STATUS in str(e) for e in self.emitted),
+                        "the reply says its message went to the running agent")
+
+        await self._dispatch(
+            self._final(self.R2),                       # steered: no message
+            self._delta(self.R1, "\n\nStopped. banana"),
+            self._lifecycle(self.R1, "end"))
+        self.active = False
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nStopped. banana"))
+        out_a, _ = await self._collect(first_a, gen_a)
+        out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_a.strip(), "ROUND 1", "the first reply ends where the steer landed")
+        self.assertEqual(out_b.strip(), "Stopped. banana", "the answer is under the steered message")
+        self.assertEqual(self.aborts, [], "nothing taken back")
+        self.assertEqual(self.sent.count("Stop and say banana"), 1, "sent once")
+
+    async def test_the_answer_goes_to_the_steered_reply_from_its_message_commit(self):
+        """The order the built-in runtime sends (probe on the 2026.10.10 stack):
+        the steered message's commit, the answer's first event, and only then
+        the steered run's lone final. The commit is the boundary."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("Stop and say banana", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        await self._dispatch(
+            self._commit(self.R2, "Stop and say banana"),
+            self._delta(self.R1, "\n\nStopped."),
+            self._final(self.R2),
+            self._delta(self.R1, " banana"),
+            self._lifecycle(self.R1, "end"))
+        self.active = False
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nStopped. banana"))
+        out_a, _ = await self._collect(first_a, gen_a)
+        out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_a.strip(), "ROUND 1")
+        self.assertEqual(out_b.strip(), "Stopped. banana")
+        self.assertNotIn(f"{self.SK}:{self.R2}", self.conn._consumers, "its lone final retired it")
+
+    async def test_a_steered_run_whose_lone_final_never_comes_is_not_kept(self):
+        """Review on #278: the steered message's run stayed registered until
+        its own lone final, and a socket drop loses that final, so the
+        session read as running and a retired connection stayed open. It
+        is not a reply of its own (`has_reply`, `_serving`) and goes with
+        the run it was steered into."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("Stop and say banana", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        await self._dispatch(
+            self._commit(self.R2, "Stop and say banana"),
+            self._delta(self.R1, "\n\nStopped. banana"),
+            self._lifecycle(self.R1, "end"))
+        self.active = False
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nStopped. banana"))
+        out_b, _ = await self._collect(first_b, gen_b)
+        await self._collect(first_a, gen_a)
+        self.assertEqual(out_b.strip(), "Stopped. banana")
+        self.assertNotIn(f"{self.SK}:{self.R2}", self.conn._consumers)
+        self.assertFalse(self.conn.has_reply(self.SK))
+        self.assertFalse(self.conn._serving())
+
+    async def test_a_message_committed_after_the_run_ended_is_not_steered(self):
+        """Queued by the Gateway (not steered): its commit comes once the
+        active run's terminal event came, and it runs on its own."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("next", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        await self._dispatch(self._lifecycle(self.R1, "end"), self._final(self.R1, "ROUND 1"))
+        self.active = False
+        await self._dispatch(self._commit(self.R2, "next"), self._lifecycle(self.R2, "start"),
+                             self._delta(self.R2, "own answer"), self._lifecycle(self.R2, "end"),
+                             self._final(self.R2, "own answer"))
+        out_a, _ = await self._collect(first_a, gen_a)
+        out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_a.strip(), "ROUND 1")
+        self.assertEqual(out_b.strip(), "own answer")
+
+    async def test_two_messages_steered_at_one_boundary_answer_in_the_last_reply(self):
+        """Both messages arrive before the run's next boundary and reach the
+        model together (probe on the 2026.10.10 stack): the earlier one's reply
+        says its answer is in the next reply, not "no reply text"."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        replies = []
+        for i, text in enumerate(("first aside", "second aside"), start=2):
+            gen = self._reply(text, f"m{i}")
+            replies.append((gen, asyncio.ensure_future(gen.__anext__())))
+            await self._until_registered(self._run_id(i))
+        await self._dispatch(self._final(self.R2), self._final(self.R3),
+                             self._delta(self.R1, "\n\nBoth asides answered."),
+                             self._lifecycle(self.R1, "end"))
+        self.active = False
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nBoth asides answered."))
+        out_a, _ = await self._collect(first_a, gen_a)
+        (gen_b, first_b), (gen_c, first_c) = replies
+        out_b, _ = await self._collect(first_b, gen_b)
+        out_c, _ = await self._collect(first_c, gen_c)
+        self.assertEqual(out_a.strip(), "ROUND 1")
+        self.assertEqual(out_b.strip(), self.ocp.REPLY_SENT_WITH_NEXT_NOTE)
+        self.assertEqual(out_c.strip(), "Both asides answered.")
+
+    async def test_a_steer_takes_the_run_over_from_its_turn_writer(self):
+        """The browser path: Open WebUI's Send now cancelled the running reply,
+        so a turn writer shows the run in its message (ELI-158). The steer
+        ends that message with what it streamed, and the run's events from
+        then on go to the steered message's reply, which starts after it."""
+        self.conn.gateway_version = "2026.10.10"
+        conn, sk = self.conn, self.SK
+        pump = openclaw_pipe._RunPump()
+        writer = mock.Mock(message_id="w1", renderer=types.SimpleNamespace(received="ROUND 1",
+                                                                            last_item=""))
+        writer.steered_away = lambda: {"received": "ROUND 1", "stream": "ROUND 1", "item": ""}
+        writer.finalize = mock.AsyncMock()
+        writer.feed = mock.AsyncMock()
+        pump.writer, pump.started = writer, True
+        conn._turn_pumps[(sk, self.R1)] = pump
+        q2 = conn.register_consumer(sk, self.R2)
+        conn._on_session_message(self._commit(self.R2)["payload"])
+        self.assertIn(f"{sk}:{self.R1}", conn._consumers, "the active run is consumed by the steered reply now")
+        self.assertIs(conn._consumers[f"{sk}:{self.R1}"].queues[0], q2)
+        await conn._dispatch_run_event(self._delta(self.R1, "\n\nStopped. banana"))
+        await conn._dispatch_run_event(self._final(self.R2))
+        steered = q2.get_nowait()["_steered"]
+        self.assertEqual(steered["run"], self.R1)
+        self.assertEqual(q2.get_nowait()["payload"]["runId"], self.R1, "the next delta comes here")
+        self.assertTrue(q2.empty(), "the steered run's own lone final is not shown")
+        self.assertNotIn((sk, self.R2), conn._turn_pumps, "nor written as a run of its own")
+        kind, fut = pump.queue.get_nowait()
+        self.assertEqual(kind, "steered")
+        pump.queue.put_nowait((kind, fut))
+        await openclaw_pipe._turn_pump_loop(conn, sk, self.R1, ("u1", self.CHAT), pump)
+        self.assertEqual((await steered["run_text"])["stream"], "ROUND 1")
+        writer.finalize.assert_awaited_once_with(steered=True)
+        writer.feed.assert_not_awaited()
+
+    async def test_a_steer_into_a_run_whose_writer_is_not_resolved_yet_knows_the_earlier_reply(self):
+        """Review on #278: a steer that took a turn writer's run before the
+        pump had its writer passed no earlier reply, so the steered reply
+        skipped the settle around the steer. The writer's reply comes with
+        the baselines, once the pump has it."""
+        self.conn.gateway_version = "2026.10.10"
+        conn, sk = self.conn, self.SK
+        pump = openclaw_pipe._RunPump()
+        pump.started = True
+        conn._turn_pumps[(sk, self.R1)] = pump
+        q2 = conn.register_consumer(sk, self.R2)
+        conn._on_session_message(self._commit(self.R2)["payload"])
+        steered = q2.get_nowait()["_steered"]
+        writer = mock.Mock(chat_id=self.CHAT, message_id="w1")
+        writer.steered_away = lambda: {"received": "ROUND 1", "stream": "ROUND 1", "item": ""}
+        writer.finalize = mock.AsyncMock()
+        pump.writer = writer
+        await openclaw_pipe._turn_pump_loop(conn, sk, self.R1, ("u1", self.CHAT), pump)
+        self.assertEqual((await steered["run_text"])["earlier"],
+                         {"chat_id": self.CHAT, "message_id": "w1", "request_task_id": None,
+                          "span_run": self.R1})
+
+    async def test_a_message_at_another_thinking_level_waits_for_its_own_run(self):
+        """Review on #278: a message sent mid-run with another model or
+        thinking level was steered, and the Gateway answers it in the running
+        run at that run's settings. It waits for its own run, as before."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("Think harder about it", "m2", thinking="high")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._spin()
+        self.assertNotIn("Think harder about it", self.sent, "not sent into the running run")
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        first_b.cancel()
+        await self._dispatch(self._lifecycle(self.R1, "end"))
+        self.active = False
+        await self._dispatch(self._final(self.R1, "ROUND 1"))
+        await self._collect(first_a, gen_a)
+        await gen_b.aclose()
+
+    async def test_a_gateway_without_claude_steering_still_queues(self):
+        self.conn.gateway_version = "2026.10.5"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("Stop and say banana", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._spin()
+        self.assertNotIn("Stop and say banana", self.sent)
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        first_b.cancel()
+        first_a.cancel()
+        await self._spin()
+
+    async def test_a_message_with_an_image_still_queues(self):
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("what is this", "m2", image="iVBORw0KGgo=")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._spin()
+        self.assertNotIn("what is this", self.sent)
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        first_b.cancel()
+        first_a.cancel()
+        await self._spin()
+
+    def test_a_steered_message_waiting_in_a_turn_writer_is_not_a_run(self):
+        """Browser path (test_a_reply_interrupted_while_queued_...): Send now
+        cancelled the 2nd reply, whose message waits to be steered, into a turn
+        writer before the run's next boundary. The run the 3rd message goes
+        into is still the 1st message's."""
+        conn = self.conn
+        for run, started in ((self.R1, True), (self.R2, False)):
+            pump = openclaw_pipe._RunPump()
+            pump.started = started
+            conn._turn_pumps[(self.SK, run)] = pump
+        self.assertTrue(conn.user_turn_run_active(self.SK, self.CHAT))
+        conn._turn_pumps[(self.SK, self.R2)].started = True
+        self.assertFalse(conn.user_turn_run_active(self.SK, self.CHAT), "two runs: none to steer into")
+
+    async def test_a_message_sent_during_a_wake_waits_for_it(self):
+        """The active run is a cron wake's, which a turn writer shows: no run
+        of this chat's own messages. The Gateway does not steer into it, it
+        falls back to its follow-up queue and aborts the send (2026.10.10-beta.1
+        CI, `reply-owner-ended`, the follow-up never ran), so the message
+        waits for the wake and goes as its own run."""
+        self.conn.gateway_version = "2026.10.10"
+        self.runtime = "claude-cli"
+        self.active = True
+        pump = openclaw_pipe._RunPump()
+        pump.started = pump.wake = True
+        self.conn._turn_pumps[(self.SK, "6f1c2a7e-5b9d-4c3a-9e2f-0a1b2c3d4e5f")] = pump
+        gen = self._reply("Stop and say banana", "m2")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertNotIn("Stop and say banana", self.sent, "not sent into the wake")
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        first.cancel()
+        await self._spin()
+
+    async def test_a_message_sent_during_a_run_this_worker_does_not_see_waits(self):
+        """Another Open WebUI worker's run, or one started outside the Pipe:
+        nothing says it is a run of this chat's own messages."""
+        self.conn.gateway_version = "2026.10.10"
+        self.active = True
+        gen = self._reply("Stop and say banana", "m2")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertNotIn("Stop and say banana", self.sent)
+        first.cancel()
+        await self._spin()
