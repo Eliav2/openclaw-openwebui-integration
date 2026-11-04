@@ -159,7 +159,9 @@ echo "::group::OpenClaw Gateway (openclaw@$OPENCLAW_VERSION)"
 npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DIR/npm-install.log" 2>&1 \
   || { cat "$LOG_DIR/npm-install.log"; exit 1; }
 openclaw --version
-# e2e/fake_claude.py is the `claude` CLI the claude-cli runtime runs, ahead of
+# e2e/fake_claude.py is the `claude` CLI the claude-cli runtime runs (the
+# config's agents.defaults.models routes anthropic/claude-opus-5-5 to it; the
+# screenshots patch, whose models are other fakes, drops that map), ahead of
 # any real one on PATH: the stack never uses a real Claude login.
 ln -sf "$PWD/e2e/fake_claude.py" "$(npm prefix --global)/bin/claude"
 export E2E_FAKE_CLAUDE_DIR="$LOG_DIR"
