@@ -87,7 +87,7 @@ sed -e "s/__VAPID_PUBLIC_KEY__/<public key>/g" -e "s/__FUNCTION_ID__/openclaw_we
 
 The page script replaces Open WebUI's `loader.js`, which is empty unless you put something in it. If you did, append it to `oc-push.js`.
 
-Open WebUI serves `/static/loader.js` with no `Cache-Control` header, so browsers cache it for a while: on Cloudflare for the zone's Browser Cache TTL (4 hours by default), otherwise for a heuristic time. A device that loaded the page before you started serving the page script keeps the old, empty file until that runs out, and shows no button: nothing of this setup runs on it before then. Both examples serve the new file with `Cache-Control: no-cache`, so this happens only once, at the switch, and every later change of the scripts reaches a device on its next page load. To avoid the wait altogether, serve the page script first, with the function still off: a device that loads Open WebUI then has the script, and turning the function on later needs nothing on the device. On Cloudflare, a Cache Rule for `/static/loader.js` with Browser TTL "Respect origin" added a day ahead does the same. To skip the wait on one device, clear the browser's cached files (not its cookies or site data) and open Open WebUI again.
+Open WebUI serves `/static/loader.js` with no `Cache-Control` header, so browsers cache it for a while: on Cloudflare for the zone's Browser Cache TTL (4 hours by default), otherwise for a heuristic time. A device that loaded the page before you started serving the page script keeps the old, empty file until that runs out, and shows no button: nothing of this setup runs on it before then. Both examples serve the new file with `Cache-Control: no-cache`, so this happens only once, at the switch, and every later change of the scripts reaches a device on its next page load. To avoid the wait altogether, serve the page script first, with the function still off: a device that loads Open WebUI then has the script, and turning the function on later needs nothing on the device. Its **Enable notifications** button shows while the function is off, but Open WebUI refuses to save a device for a function that is off; a device enabled then is saved on its next page load after the function is on. On Cloudflare, a Cache Rule for `/static/loader.js` with Browser TTL "Respect origin" added a day ahead does the same. To skip the wait on one device, clear the browser's cached files (not its cookies or site data) and open Open WebUI again.
 
 ## 5. Turn it on, on each device
 
@@ -132,7 +132,7 @@ Other browsers show the buttons differently or not at all; a browser without a t
 
 ### Mute a chat
 
-In a chat, a bell next to Open WebUI's chat menu (⋯) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. The bell shows only once a device of yours is enabled.
+In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯, when you have one) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. The bell shows only once a device of yours is enabled.
 
 A mute is kept on the server, in the function's `mutes` user valve, so it applies to every device of yours, iPhone included: the function checks it before it encrypts anything, and sends nothing for a muted chat. It is per user: muting a shared chat mutes it only for you.
 

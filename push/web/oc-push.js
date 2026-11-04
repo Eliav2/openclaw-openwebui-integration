@@ -222,24 +222,27 @@
     document.body.appendChild(m);
   }
 
-  // Before Open WebUI's "Chat actions" button, styled like it (its classes).
+  // First in the header's right-hand controls (before the chat menu ⋯, which
+  // Open WebUI shows only to users who may share), styled like its buttons.
   // Open WebUI redraws its header freely: an observer puts the bell back.
+  const HEADER_BUTTON = "flex shrink-0 cursor-pointer items-center justify-center size-6 rounded-lg text-gray-500 transition " +
+    "hover:bg-gray-50/40 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-200";
   function placeBell() {
     const id = chatIdNow();
-    const anchor = document.getElementById("chat-context-menu-button");
+    const menuButton = document.getElementById("chat-context-menu-button");
+    const box = menuButton?.closest("nav div.flex-none") || document.querySelector("nav div.flex-none.items-center.self-center");
     const old = document.getElementById("oc-push-bell");
-    if (!id || !anchor || !hasDevices || mutes === null) { old?.remove(); return; }
-    const spot = anchor.parentElement;
-    if (old && old.dataset.chat === id && old.nextElementSibling === spot) return;
+    if (!id || !box || !hasDevices || mutes === null) { old?.remove(); return; }
+    if (old && old.dataset.chat === id && box.firstElementChild === old) return;
     old?.remove();
     const b = document.createElement("button");
     b.id = "oc-push-bell";
     b.type = "button";
     b.dataset.chat = id;
-    b.className = anchor.className;
+    b.className = menuButton?.className || HEADER_BUTTON;
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" style="width:1.125rem;height:1.125rem"></svg>';
     b.onclick = (e) => { e.stopPropagation(); menu(b); };
-    spot.before(b);
+    box.prepend(b);
     drawBell();
   }
 
