@@ -2928,7 +2928,7 @@ class _GatewayConnection:
         self.active_run_snapshot: dict[str, list[str]] = {}
         self._subscriptions_stale = False
         # One Event per session someone is waiting on, set by the next
-        # `sessions.changed` that carries run state for it (ELI-88).
+        # `sessions.changed` for it (ELI-88).
         self._session_change_waiters: dict[str, asyncio.Event] = {}
         # The same, set by the next `session.message` (a transcript append)
         # for the session (ELI-164).
@@ -3089,8 +3089,8 @@ class _GatewayConnection:
         return parent, child, task, run
 
     def session_change_event(self, session_key: str) -> asyncio.Event:
-        """An Event set by the next pushed change to `session_key`'s run state
-        (`sessions.changed` with `hasActiveRun`: run started, run settled).
+        """An Event set by the next pushed change to `session_key`
+        (`sessions.changed`: run started, run settled, a cron binding changed).
 
         Take it BEFORE reading the state, then wait on it only if the read
         said busy: a change landing between the read and the wait has already
@@ -3209,9 +3209,16 @@ class _GatewayConnection:
         the first `session.tool`)."""
         key = payload.get("sessionKey") or payload.get("key") or ""
         self.note_session_id(key, payload.get("sessionId"))
-        if key and "hasActiveRun" in payload:
+        if key:
+            # Any change of the session's row, not only one that carries
+            # `hasActiveRun`: OpenClaw 2026.10.10 ends a cron wake's run with
+            # a push that still says `hasActiveRun: true` and announces the
+            # idle in a later one with `status: done` and no `hasActiveRun`
+            # (`reason: cron-binding`). The waiter reads the row again, and
+            # the row decides.
             self._wake_session_waiters(key)
-            self.row_to_consumers(key, payload)
+            if "hasActiveRun" in payload:
+                self.row_to_consumers(key, payload)
         if key and payload.get("phase") == "message":
             # A stored message was rewritten, not appended: no `session.message`
             # follows (2026.10.5+, server-session-events historyReset branch).

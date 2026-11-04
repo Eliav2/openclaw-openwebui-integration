@@ -11,6 +11,7 @@ checked against a live Open WebUI in the PR's live test.
 import asyncio
 import os
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -317,6 +318,35 @@ class FakeRunConn:
         return [m for m, _ in self.requests if m != "sessions.list"]
 
 
+class PushConn(FakeRunConn):
+    """FakeRunConn whose wait for the thread's idle runs on the real
+    connection's wake-up by pushes (`_on_sessions_changed`), and whose
+    `sessions.list` answers the Gateway's flag (`flag`)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.real = openclaw_pipe._GatewayConnection(lambda: None)
+        self.flag = True
+
+    def session_change_event(self, key):
+        return self.real.session_change_event(key)
+
+    def push(self, **fields):
+        self.real._on_sessions_changed({"sessionKey": "k", **fields})
+
+    async def send_request(self, method, params, timeout=10):
+        if method == "sessions.list":
+            self.requests.append((method, params))
+            return {"sessions": [{"key": "k", "hasActiveRun": self.flag}]}
+        return await super().send_request(method, params, timeout)
+
+
+async def _spin():
+    """Let every ready task run until it blocks. No clock involved."""
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
 class _AsyncNull:
     async def __aenter__(self):
         return self
@@ -360,12 +390,52 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await _channel_run(conn, "k", "m", "chanfollow-x", owner=True), ("failed", None))
         self.assertNotIn("chat.send", [m for m, _ in conn.requests])
 
-    async def test_a_run_that_never_ends_gives_up_instead_of_hanging(self):
-        conn = FakeRunConn("started", [delta("Half")])
-        with mock.patch.object(openclaw_pipe, "_CHANNEL_RUN_TIMEOUT_S", 0.05):
-            got = await asyncio.wait_for(_channel_run(conn, "k", "m", "chanfollow-x", owner=True), 2)
-        self.assertEqual(got, ("failed", None))
-        self.assertEqual(conn.queues, {})
+    async def test_a_thread_that_stays_busy_for_longer_than_any_bound_still_gets_its_follow_up(self):
+        """A run can legitimately take longer than half an hour (ELI-88: the
+        queue has no ceiling for this reason). The follow-up used to be dropped
+        ("the thread stayed busy; not sent") after 1800 s. Here the clock jumps
+        a million seconds at every read; the follow-up waits for the Gateway's
+        idle and is sent."""
+        class JumpingTime:
+            def __init__(self):
+                self.now = 0.0
+
+            def monotonic(self):
+                self.now += 1_000_000.0
+                return self.now
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+        conn = PushConn("started", [final("Sure")])
+        with mock.patch.object(openclaw_pipe, "time", JumpingTime()):
+            task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
+            await _spin()
+            conn.push(reason="agent.run.started", hasActiveRun=True, status="running")
+            await _spin()
+            self.assertFalse(task.done(), "dropped while the thread was still busy")
+            conn.flag = False
+            conn.push(reason="agent.input.settled", hasActiveRun=False, status="done")
+            self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
+
+    async def test_a_follow_up_behind_a_cron_wake_is_sent_on_the_push_that_announces_the_idle(self):
+        """OpenClaw 2026.10.10: the wake's last push is `phase: end` with
+        `hasActiveRun: true` (the row reads active, `endedAt` set); the idle is
+        announced by `reason: cron-binding`, `status: done` and no top-level
+        `hasActiveRun`. Waking on that push, not on a timer, sends the
+        follow-up; nothing is sent while the Gateway's flag says active."""
+        conn = PushConn("started", [final("Sure")])
+        task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
+        await _spin()
+        conn.push(phase="end", runId="wake-1", hasActiveRun=True, status="running")
+        await _spin()
+        self.assertFalse(task.done())
+        self.assertNotIn("chat.send", conn.methods(), "sent into a flag that still says active")
+        conn.flag = False
+        conn.push(reason="cron-binding", status="done",
+                  session={"status": "done", "hasActiveRun": False, "activeRunIds": []})
+        self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
+        self.assertEqual(conn.methods(), ["chat.send"])
 
     async def test_an_unreadable_transcript_at_the_end_keeps_the_streamed_reply(self):
         settle = {"type": openclaw_pipe._ROW_MARKER_TYPE, "row": {"hasActiveRun": False, "lastRunId": "chanfollow-x"}}

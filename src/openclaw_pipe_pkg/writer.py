@@ -2700,6 +2700,38 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str,
     return bool(row.get("hasActiveRun")) if row else missing
 
 
+async def _wait_for_session_idle(conn: "_GatewayConnection", session_key: str, is_active,
+                                 on_busy=None) -> bool | None:
+    """Wait until the Gateway says `session_key` has no run, however long
+    that takes: no ceiling, no poll, no timer (ELI-88). A ceiling releases a
+    message into a run that is still going, where claude-cli drops it, or
+    drops the message.
+
+    `is_active` is a coroutine function returning the Gateway's own flag
+    (True, False, or None when it cannot say); `on_busy` is called once, the
+    first time the session reads busy. The flag decides, never the row's
+    `endedAt` or `activeRunIds`: a run admitted but not started shows the
+    previous run's end time, like a stale flag. The event is taken BEFORE
+    the read, and every push for the session (`_on_sessions_changed`) or a
+    socket gap sets it, so the idle push cannot slip between the read and
+    the wait, and a push that carries no `hasActiveRun` still wakes the read.
+    Returns whether the session was ever busy, or None when `is_active`
+    could not say."""
+    ever_busy = False
+    while True:
+        changed = conn.session_change_event(session_key)
+        active = await is_active()
+        if active is None:
+            return None
+        if not active:
+            return ever_busy
+        if not ever_busy:
+            ever_busy = True
+            if on_busy is not None:
+                await on_busy()
+        await changed.wait()
+
+
 # A long session's whole transcript (952 messages for 0abe9bde) takes the
 # Gateway well over the default 10s RPC bound to serialize.
 ORPHAN_HISTORY_TIMEOUT_S = 60
