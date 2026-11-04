@@ -2121,17 +2121,26 @@ class _GatewayConnection:
         each later read is fresh and follows a transcript change of
         `session_key` (`session_message_event`, taken before that read).
         Returns (last result, whether `have` held). `max_wait_s` bounds a
-        Gateway that never stores it; the caller logs that."""
-        got = await read(False)
+        Gateway that never stores it, counted from the start and across every
+        read: a read that runs past it ends the wait with the result before it
+        (the first read raises `asyncio.TimeoutError`). The caller logs that."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_wait_s
+        got = await asyncio.wait_for(read(False), max_wait_s)
         if have(got):
             return got, True
-        deadline = asyncio.get_running_loop().time() + max_wait_s
         while True:
             changed = self.session_message_event(session_key)
-            got = await read(True)
+            left = deadline - loop.time()
+            if left <= 0:
+                return got, False
+            try:
+                got = await asyncio.wait_for(read(True), left)
+            except asyncio.TimeoutError:
+                return got, False
             if have(got):
                 return got, True
-            left = deadline - asyncio.get_running_loop().time()
+            left = deadline - loop.time()
             if left <= 0:
                 return got, False
             try:

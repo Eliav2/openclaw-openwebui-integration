@@ -8942,6 +8942,29 @@ class TurnWriterImageTests(_TurnWriterCase):
         self.assertEqual(len(self.reads), 2, "no push, no read")
         self.assertTrue(self._final_message()["done"])
 
+    async def test_the_wait_ends_at_its_bound_counting_every_read(self):
+        """Review on #274: the bound began after the first read, and a fresh
+        read that hung was never cut off, so a Gateway that never stores the
+        file could hold the reply past the documented 30 s. The bound counts
+        from the start and each read gets only what is left: a read that
+        hangs ends the wait at about `max_wait_s`, with what was read before."""
+        conn = types.SimpleNamespace(session_message_event=lambda _key: asyncio.Event())
+        reads = []
+
+        async def read(fresh):
+            reads.append(fresh)
+            if fresh:
+                await asyncio.sleep(3600)   # a read the Gateway never answers
+            await asyncio.sleep(0.15)       # the first read takes part of the bound
+            return "cached"
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        got = await asyncio.wait_for(openclaw_pipe._GatewayConnection.read_until_stored(
+            conn, "k", read, lambda _got: False, 0.3), 5)
+        self.assertEqual(got, ("cached", False))
+        self.assertEqual(reads, [False, True])
+        self.assertLess(loop.time() - start, 0.45, "the first read's time counts against the bound")
+
     async def test_a_path_directive_is_taken_out_of_the_text(self):
         w = self.writer()
         await w.feed(_delta(f"Done.\nMEDIA:{self.PATH}\n"))
