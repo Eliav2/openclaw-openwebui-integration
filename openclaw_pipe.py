@@ -11679,6 +11679,38 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str,
     return bool(row.get("hasActiveRun")) if row else missing
 
 
+async def _wait_for_session_idle(conn: "_GatewayConnection", session_key: str, is_active,
+                                 on_busy=None) -> bool | None:
+    """Wait until the Gateway says `session_key` has no run, however long
+    that takes: no ceiling, no poll, no timer (ELI-88). A ceiling releases a
+    message into a run that is still going, where claude-cli drops it, or
+    drops the message.
+
+    `is_active` is a coroutine function returning the Gateway's own flag
+    (True, False, or None when it cannot say); `on_busy` is called once, the
+    first time the session reads busy. The flag decides, never the row's
+    `endedAt` or `activeRunIds`: a run admitted but not started shows the
+    previous run's end time, like a stale flag. The event is taken BEFORE
+    the read, and every push for the session (`_on_sessions_changed`) or a
+    socket gap sets it, so the idle push cannot slip between the read and
+    the wait, and a push that carries no `hasActiveRun` still wakes the read.
+    Returns whether the session was ever busy, or None when `is_active`
+    could not say."""
+    ever_busy = False
+    while True:
+        changed = conn.session_change_event(session_key)
+        active = await is_active()
+        if active is None:
+            return None
+        if not active:
+            return ever_busy
+        if not ever_busy:
+            ever_busy = True
+            if on_busy is not None:
+                await on_busy()
+        await changed.wait()
+
+
 # A long session's whole transcript (952 messages for 0abe9bde) takes the
 # Gateway well over the default 10s RPC bound to serialize.
 ORPHAN_HISTORY_TIMEOUT_S = 60
@@ -13341,8 +13373,6 @@ _CHANNEL_SKIP = "[skip]"
 _CHANNEL_STATE_FILE = "channel-threads.json"
 _CHANNEL_POLL_S = 2.0
 _CHANNEL_JUDGE_TIMEOUT_S = 10.0
-_CHANNEL_IDLE_WAIT_S = 1800.0   # a follow-up waits at most this long for the thread's run to end
-_CHANNEL_RUN_TIMEOUT_S = 1800.0  # and for its own run's end
 _CHANNEL_JUDGE_TAIL = 12
 _CHANNEL_JUDGE_CONTEXT_CHARS = 15000
 _CHANNEL_WATCH_ATTR = "_openclaw_channel_watcher_v1"
@@ -13648,23 +13678,11 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
     # sending, under the per-session send lock. A send into a running turn
     # (a mention in the same thread) is merged into it and never ends.
     async with conn.send_section(session_key):
-        waited = time.monotonic()
-        while True:
-            changed = conn.session_change_event(session_key)
-            active = await _session_list_active(conn, session_key, missing=False)
-            if active is None:
-                pipe_log("[channels] follow-up: the Gateway cannot say whether the thread is busy; not sent")
-                return "failed", None
-            if not active:
-                break
-            left = _CHANNEL_IDLE_WAIT_S - (time.monotonic() - waited)
-            if left <= 0:
-                pipe_log("[channels] follow-up: the thread stayed busy; not sent")
-                return "failed", None
-            try:
-                await asyncio.wait_for(changed.wait(), left)
-            except asyncio.TimeoutError:
-                pass
+        async def thread_active():
+            return await _session_list_active(conn, session_key, missing=False)
+        if await _wait_for_session_idle(conn, session_key, thread_active) is None:
+            pipe_log("[channels] follow-up: the Gateway cannot say whether the thread is busy; not sent")
+            return "failed", None
         if still_needed is not None and not still_needed():
             pipe_log("[channels] follow-up: a turn meanwhile already carried these messages")
             return "covered", None
@@ -13689,11 +13707,10 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
             run_id = resp["runId"]
             queue = conn.register_consumer(session_key, run_id)
     try:
-        return await asyncio.wait_for(_channel_run_text(conn, session_key, run_id, queue),
-                                      _CHANNEL_RUN_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        pipe_log(f"[channels] follow-up {run_id[:24]} sent no end in {_CHANNEL_RUN_TIMEOUT_S:.0f} s; not posted")
-        return "failed", None
+        # Until the run ends, however long that takes: its end arrives as the
+        # run's own final / error event, a restart marker, or the row after a
+        # reconnect (`_channel_run_text`).
+        return await _channel_run_text(conn, session_key, run_id, queue)
     finally:
         conn.unregister_consumer(session_key, run_id)
 
@@ -15273,21 +15290,16 @@ class _PipeTurn:
             # resume that starts right after a settle is caught after the
             # send instead (see `enqueued_not_started`). Stop cancels this
             # wait like any other.
-            ever_active = False
-            while True:
-                changed = self.conn.session_change_event(self.session_key)
-                if not await self._session_run_active():
-                    break
-                if not ever_active:
-                    ever_active = True
-                    pipe_log("Session has an active run (gateway-authoritative); "
-                             "queueing behind it")
-                    await _emit_status(
-                        self.__event_emitter__,
-                        "Queued: waiting for the current run to finish…",
-                        done=False,
-                    )
-                await changed.wait()
+            async def queued():
+                pipe_log("Session has an active run (gateway-authoritative); "
+                         "queueing behind it")
+                await _emit_status(
+                    self.__event_emitter__,
+                    "Queued: waiting for the current run to finish…",
+                    done=False,
+                )
+            ever_active = await _wait_for_session_idle(
+                self.conn, self.session_key, self._session_run_active, on_busy=queued)
             if ever_active:
                 pipe_log("  active run settled; sending queued message as its own run")
             if self in self.conn.send_waiters(self.session_key) and self.hand_on():

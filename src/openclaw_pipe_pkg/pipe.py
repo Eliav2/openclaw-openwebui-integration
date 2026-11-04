@@ -1356,21 +1356,16 @@ class _PipeTurn:
             # resume that starts right after a settle is caught after the
             # send instead (see `enqueued_not_started`). Stop cancels this
             # wait like any other.
-            ever_active = False
-            while True:
-                changed = self.conn.session_change_event(self.session_key)
-                if not await self._session_run_active():
-                    break
-                if not ever_active:
-                    ever_active = True
-                    pipe_log("Session has an active run (gateway-authoritative); "
-                             "queueing behind it")
-                    await _emit_status(
-                        self.__event_emitter__,
-                        "Queued: waiting for the current run to finish…",
-                        done=False,
-                    )
-                await changed.wait()
+            async def queued():
+                pipe_log("Session has an active run (gateway-authoritative); "
+                         "queueing behind it")
+                await _emit_status(
+                    self.__event_emitter__,
+                    "Queued: waiting for the current run to finish…",
+                    done=False,
+                )
+            ever_active = await _wait_for_session_idle(
+                self.conn, self.session_key, self._session_run_active, on_busy=queued)
             if ever_active:
                 pipe_log("  active run settled; sending queued message as its own run")
             if self in self.conn.send_waiters(self.session_key) and self.hand_on():
