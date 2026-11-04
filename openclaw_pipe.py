@@ -17253,7 +17253,10 @@ class _PipeTurn:
                             ladder, model_key=self.session_model_key,
                             state_dir=getattr(self.pipe.valves, "STATE_DIR", "")):
                         self._ladder_recorded = (self.session_model_key, ladder)
-            if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
+            # The row's own run facts: `hasActiveRun` (the Gateway's aggregate
+            # flag) or a non-empty `activeRunIds`, as well as the status. There
+            # is no `activeRunId`.
+            if row.get("hasActiveRun") or row.get("activeRunIds") or status in _ACTIVE_RUN_STATES:
                 return True
         except Exception as ex:
             # Describe failed: fall back to the list probe below, and if
