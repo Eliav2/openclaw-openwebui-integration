@@ -15,6 +15,11 @@ Replies:
 * `E2E_CLI_TOOL_HOLD TOKEN` -> runs tool step 1, says `E2E_CLI_HOLD_START`, waits for the
   hold file, then runs tool step 2 and ends with `E2E_CLI_HOST_DONE`. A cron wake fired
   meanwhile runs after the turn; its prompt carries the time it fired, between the steps.
+* `E2E_CLI_ABORT_TOOL TOKEN` -> calls the Gateway's MCP `exec` (the `--mcp-config` server,
+  as Claude Code does) to touch `before-TOKEN`, says `E2E_CLI_HOLD_START`, then waits for the
+  run's abort: its SIGTERM is taken and the same call is made for `after-TOKEN`, as a Claude
+  Code the abort has not killed yet can (gate 280c: a call 0.8 s after Stop). The Gateway's
+  answer goes to `abort-mcp-TOKEN.json`; the process then exits.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * anything else -> `E2E_CLI_REPLY`.
@@ -23,9 +28,13 @@ import json
 import os
 import queue
 import re
+import shlex
+import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 
@@ -39,6 +48,7 @@ if "--version" in sys.argv:
 
 HOLD = re.compile(r"E2E_CLI_HOLD\s+([A-Za-z0-9_]{3,})")
 TOOL_HOLD = re.compile(r"E2E_CLI_TOOL_HOLD\s+([A-Za-z0-9_]{3,})")
+ABORT_TOOL = re.compile(r"E2E_CLI_ABORT_TOOL\s+([A-Za-z0-9_]{3,})")
 DIR = os.environ["E2E_FAKE_CLAUDE_DIR"]  # e2e/start_stack.sh: its log dir, where the hold files are
 sid = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a in ("--session-id", "--resume")),
            str(uuid.uuid4()))
@@ -151,6 +161,57 @@ def tool_step(n, token):
     record("user", output)
 
 
+def mcp_server():
+    """The Gateway's MCP server from `--mcp-config`: a file the Gateway writes for the run
+    that starts the process and deletes after it, so it is read at startup, as Claude Code does."""
+    config = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--mcp-config"), "{}")
+    if not config.lstrip().startswith("{"):
+        with open(config) as f:
+            config = f.read()
+    servers = json.loads(config).get("mcpServers") or {}
+    return servers.get("openclaw") or next(iter(servers.values()), None)
+
+
+def mcp_call(server, name, arguments):
+    """One `tools/call` over the server's HTTP transport: (HTTP status, JSON-RPC reply or body)."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": name, "arguments": arguments}}).encode()
+    req = urllib.request.Request(server["url"], data=body, method="POST", headers={
+        **(server.get("headers") or {}), "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status, text = resp.status, resp.read().decode()
+    except urllib.error.HTTPError as ex:
+        status, text = ex.code, ex.read().decode()
+    data = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    try:
+        return status, json.loads(data[-1] if data else text)
+    except ValueError:
+        return status, text
+
+
+def abort_tool(token):
+    """A turn that calls the MCP `exec` before and after its run's abort."""
+    server = MCP
+    before = mcp_call(server, "exec", {"command": f"touch {shlex.quote(os.path.join(DIR, f'before-{token}'))}"})
+    note(f"mcp before {token}: {json.dumps(before)[:300]}")
+    aborted = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: aborted.set())
+    say("E2E_CLI_HOLD_START")
+    note(f"holding {token}")
+    while not aborted.wait(0.2):
+        if os.path.exists(os.path.join(DIR, f"hold-{token}")):
+            note(f"released {token} without an abort")
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            return
+    after = mcp_call(server, "exec", {"command": f"touch {shlex.quote(os.path.join(DIR, f'after-{token}'))}"})
+    note(f"mcp after abort {token}: {json.dumps(after)[:300]}")
+    with open(os.path.join(DIR, f"abort-mcp-{token}.json"), "w") as f:
+        json.dump({"status": after[0], "reply": after[1]}, f)
+    sys.exit(143)
+
+
 def take_in(msg):
     """Start a user input: its lifecycle, its replay, its prompt hook."""
     lifecycle("started", msg.get("uuid"))
@@ -160,15 +221,35 @@ def take_in(msg):
 
 
 note(f"start argv={sys.argv[1:]}")
-emit({"type": "system", "subtype": "init", "session_id": sid, "model": model, "tools": [], "mcp_servers": [],
-      "cwd": os.getcwd(), "permissionMode": "default", "apiKeySource": "none",
-      "capabilities": ["msg_lifecycle_v1"]})
+MCP = mcp_server()
+
+
+def init():
+    """Claude Code's init record, which it sends for every turn; the Gateway takes the
+    turn's MCP tool authority from it (2026.10.10 captureNativeTools)."""
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": model, "tools": [], "mcp_servers": [],
+          "cwd": os.getcwd(), "permissionMode": "default", "apiKeySource": "none",
+          "capabilities": ["msg_lifecycle_v1"]})
+
+
+init()
 threading.Thread(target=read_stdin, daemon=True).start()
+first = True
 while True:
     msg = inputs.get()
     if msg.get("type") == "eof":
         break
+    if not first:
+        init()
+    first = False
     take_in(msg)
+    abort_hold = ABORT_TOOL.search(text_of(msg))
+    if abort_hold:
+        abort_tool(abort_hold.group(1))
+        say("E2E_CLI_HOLD_END")
+        lifecycle("completed", msg.get("uuid"))
+        result("E2E_CLI_HOLD_END")
+        continue
     tool_hold = TOOL_HOLD.search(text_of(msg))
     if tool_hold:
         token = tool_hold.group(1)
