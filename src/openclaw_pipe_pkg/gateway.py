@@ -3214,7 +3214,11 @@ class _GatewayConnection:
             # The cancelled message keeps what it showed (the caller's forced
             # snapshot). The run's tail belongs to whoever claims it: never
             # back-filled into the stopped message, never written as a turn of
-            # its own.
+            # its own. A message still waiting to be steered keeps waiting in
+            # it (`_steer_handed_over`): the target that says so goes here.
+            target = self._run_targets.get(f"{session_key}:{run_id}") or {}
+            if reply is not None and target.get("steer_pending"):
+                reply = {**reply, "steer_pending": True}
             self.unregister_run_target(session_key, run_id)
             self.mark_delivered_live(session_key, run_id)
 

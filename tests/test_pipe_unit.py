@@ -17105,6 +17105,36 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out_b.strip(), "Stopped. banana")
         self.assertNotIn(f"{self.SK}:{self.R2}", self.conn._consumers, "its lone final retired it")
 
+    async def test_a_steered_reply_reads_as_working_until_its_answer(self):
+        """W5's live QA on 9a5bddd: once its message went in, the steered
+        reply cleared its status, so for the ~10 s until the answer's first
+        text it showed only the model name, with Stop as the only sign of
+        life. It reads like any reply whose run works."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        statuses = []
+
+        async def emitter(event):
+            if event.get("type") == "status":
+                statuses.append(event["data"])
+        gen_b = self.pipe._pipe_impl(
+            {"model": "openclaw_gateway.default",
+             "messages": [{"role": "user", "content": "add tomatoes"}]},
+            emitter, __metadata__={"chat_id": self.CHAT, "user_id": "u1", "message_id": "m2"})
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        await self._dispatch(self._commit(self.R2, "add tomatoes"))
+        self.assertEqual(statuses[-1].get("description"), "Thinking...", statuses)
+        self.assertIs(statuses[-1].get("done"), False)
+        await self._dispatch(self._delta(self.R1, "\n\nAdded."), self._final(self.R2),
+                             self._lifecycle(self.R1, "end"))
+        self.active = False
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nAdded."))
+        await self._collect(first_a, gen_a)
+        out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_b.strip(), "Added.")
+        self.assertIs(statuses[-1].get("done"), True, "and ends like one")
+
     async def test_a_steered_run_whose_lone_final_never_comes_is_not_kept(self):
         """Review on #278: the steered message's run stayed registered until
         its own lone final, and a socket drop loses that final, so the
@@ -17299,6 +17329,33 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(f"{sk}:{self.R1}", conn._consumers, f"steered into {into}: the active run is not taken")
         conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
         self.assertIn(f"{sk}:{self.R1}", conn._consumers)
+
+    async def test_a_message_whose_request_send_now_cancelled_while_it_waits_to_be_steered_still_takes_the_run(self):
+        """W5's live QA on 9a5bddd (chat bcab96b2): two follow-ups during a
+        tool run. The second one's Send now cancelled the first one's request
+        while it waited to be steered. Parking the cancelled reply dropped
+        its run target, and the handover read `steer_pending` from there, so
+        at the first follow-up's commit nothing took the run: the first reply
+        kept streaming its answer, and the follow-up's reply showed the same
+        answer again from the transcript."""
+        self.conn.gateway_version = "2026.10.10"
+        conn = self.conn
+        # A session key the turn writer routes (an Open WebUI user id).
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
+        host = openclaw_pipe._RunPump()
+        host.started = True
+        conn._turn_pumps[(sk, self.R1)] = host
+        conn.register_run_target(sk, self.R2, self.CHAT, "w2", steer_pending=True)
+        conn.park_cancelled_turn(sk, self.R2, None, [], 5, send_stop=False,
+                                 reply={"message_id": "w2", "renderer": openclaw_pipe._TurnRenderer()})
+        with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()):
+            self.assertIsNotNone(await conn.claim_cancelled_turn(sk))
+            self.assertIn((sk, self.R2), conn._turn_pumps, "its reply went to a turn writer")
+            conn._on_session_message(self._commit(self.R2, "add tomatoes", into=self.R1)["payload"])
+            self.assertIn(f"{sk}:{self.R1}", conn._consumers, "its commit takes the run")
+            await conn._dispatch_run_event(self._delta(self.R1, "the list"))
+        self.assertTrue(host.queue.empty(), "the answer after the commit is not the first reply's")
 
     async def test_a_retired_connection_closes_when_such_a_run_ends(self):
         """Review on #290: letting the run go was the connection's last

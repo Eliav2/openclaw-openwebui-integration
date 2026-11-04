@@ -7891,7 +7891,11 @@ class _GatewayConnection:
             # The cancelled message keeps what it showed (the caller's forced
             # snapshot). The run's tail belongs to whoever claims it: never
             # back-filled into the stopped message, never written as a turn of
-            # its own.
+            # its own. A message still waiting to be steered keeps waiting in
+            # it (`_steer_handed_over`): the target that says so goes here.
+            target = self._run_targets.get(f"{session_key}:{run_id}") or {}
+            if reply is not None and target.get("steer_pending"):
+                reply = {**reply, "steer_pending": True}
             self.unregister_run_target(session_key, run_id)
             self.mark_delivered_live(session_key, run_id)
 
@@ -11681,7 +11685,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
                          "thinking": thinking or (target or {}).get("thinking"), "shown": "",
                          "no_resume": bool(reply.get("no_resume")),
                          "request_task_id": (target or {}).get("request_task_id"),
-                         "steer_pending": bool((target or {}).get("steer_pending"))}
+                         "steer_pending": bool(reply.get("steer_pending")
+                                               or (target or {}).get("steer_pending"))}
         pump.started = _handover_started(pump.handover)
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
@@ -16730,7 +16735,9 @@ class _PipeTurn:
         earlier = run_text.pop("earlier", None)
         # This reply's own run stays registered, steered, until its lone final
         # (`_note_run_event`), so that final never reads as a run to write.
-        await _emit_status(self.__event_emitter__, "", done=True)
+        # The agent works on this message now: the reply reads like any whose
+        # run works, until its end replaces the line.
+        await _emit_status(self.__event_emitter__, "Thinking...", done=False)
         # The reply that ended where this message went in, and this reply's
         # own part of the transcript: both are settled from it once the run
         # ends (`_settle_steered_replies`).

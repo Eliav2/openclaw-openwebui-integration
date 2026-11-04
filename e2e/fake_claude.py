@@ -25,7 +25,8 @@ Replies:
   `E2E_LATE_PART_2` and runs tool step 2, as Claude Code goes on to its next tool boundary,
   then waits for the file `go-TOKEN`. There it takes the message in and answers it as
   `E2E_CLI_STEERED: <its text>`, then each one injected meanwhile the same way (Eliav's chat
-  c9dc45f0, test 2).
+  c9dc45f0, test 2). After each answer it takes the next message the Gateway injects (noted
+  `injected TOKEN: <count>`), until the file `done-TOKEN` says none is coming.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * anything else -> `E2E_CLI_REPLY`.
@@ -283,14 +284,22 @@ while True:
             time.sleep(0.2)
         while not inputs.empty():
             injected.append(inputs.get_nowait())
-        answer = "E2E_CLI_HOLD_END"
-        for each in injected:
-            if each.get("type") == "eof":
-                break
+        done = os.path.join(DIR, f"done-{token}")
+        answer, taken = "E2E_CLI_HOLD_END", 0
+        while taken < len(injected) and injected[taken].get("type") != "eof":
+            each = injected[taken]
+            taken += 1
             take_in(each)
             answer = f"E2E_CLI_STEERED: {text_of(each)}"
             say(answer)
             lifecycle("completed", each.get("uuid"))
+            # The Gateway hands Claude Code the next message once it took this one in.
+            while taken == len(injected) and not os.path.exists(done):
+                try:
+                    injected.append(inputs.get(timeout=0.2))
+                    note(f"injected {token}: {len(injected)}")
+                except queue.Empty:
+                    continue
         lifecycle("completed", msg.get("uuid"))
         result(answer)
         continue

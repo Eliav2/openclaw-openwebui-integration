@@ -1882,7 +1882,9 @@ class _PipeTurn:
         earlier = run_text.pop("earlier", None)
         # This reply's own run stays registered, steered, until its lone final
         # (`_note_run_event`), so that final never reads as a run to write.
-        await _emit_status(self.__event_emitter__, "", done=True)
+        # The agent works on this message now: the reply reads like any whose
+        # run works, until its end replaces the line.
+        await _emit_status(self.__event_emitter__, "Thinking...", done=False)
         # The reply that ended where this message went in, and this reply's
         # own part of the transcript: both are settled from it once the run
         # ends (`_settle_steered_replies`).

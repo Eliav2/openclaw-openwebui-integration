@@ -779,7 +779,7 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
     assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
     word = f"late{uuid.uuid4().hex[:8]}"
-    go = os.path.join(logs, f"go-{word}")
+    go, done = os.path.join(logs, f"go-{word}"), os.path.join(logs, f"done-{word}")
     page = _Page(token)
     page.join(chat_id)
     held = _post_turn(token, chat_id, f"E2E_CLI_LATE_STEER {word}", model=CLI_MODEL)
@@ -801,6 +801,7 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
         _until("the blue message sent into the turn", lambda: STEER_PENDING in json.dumps(
             _chat_messages(token, chat_id)[blue].get("statusHistory")), timeout_s=60, every_s=0.2)
         open(go, "w").close()
+        open(done, "w").close()
         _until("all three replies done", lambda: all(
             _chat_messages(token, chat_id)[r].get("done") for r in (held, tomato, blue)))
         def settled():
@@ -813,6 +814,7 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
             pass  # the asserts below say what each reply shows
     finally:
         open(go, "w").close()
+        open(done, "w").close()
         page.close()
     msgs = _chat_messages(token, chat_id)
     shown = {r: msgs[r].get("content", "") for r in (held, tomato, blue)}
@@ -826,6 +828,67 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     assert shown[blue].strip() == "E2E_CLI_REPLY" or (
         shown[blue].strip().startswith("E2E_CLI_STEERED:") and f"blue-{word}" in shown[blue]), shown
     os.remove(go)
+    os.remove(done)
+
+
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
+def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token):
+    """W5's live QA on 9a5bddd (chat bcab96b2): "add tomatoes" and then "remove
+    the milk" were sent while a claude-cli turn ran its tool. The second one's
+    Send now cancelled the first one's request while it waited to be steered,
+    so the run was not split at its commit: the first reply showed the
+    tomatoes answer, and the tomatoes reply showed it again. Each answer is
+    under its own message, once."""
+    logs = os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"])
+    log = os.path.join(logs, "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    word = f"two{uuid.uuid4().hex[:8]}"
+    go, done = os.path.join(logs, f"go-{word}"), os.path.join(logs, f"done-{word}")
+    page = _Page(token)
+    page.join(chat_id)
+    held = _post_turn(token, chat_id, f"E2E_CLI_LATE_STEER {word}", model=CLI_MODEL)
+
+    def logged(line):
+        return os.path.exists(log) and line in open(log, encoding="utf-8").read()
+    try:
+        _until("the running reply showing the run",
+               lambda: "E2E_LATE_PART_1" in _output_text(page.streamed(held)), timeout_s=60, every_s=0.2)
+        # Both sent before Claude Code reaches its next boundary, each with a Send now.
+        _request("POST", f"/api/tasks/chat/{chat_id}/stop", token=token)
+        tomato = _post_turn(token, chat_id, f"add tomatoes-{word}", model=CLI_MODEL)
+        _until("the tomatoes message sent into the turn", lambda: STEER_PENDING in json.dumps(
+            _chat_messages(token, chat_id)[tomato].get("statusHistory")), timeout_s=60, every_s=0.2)
+        _request("POST", f"/api/tasks/chat/{chat_id}/stop", token=token)
+        milk = _post_turn(token, chat_id, f"remove milk-{word}", model=CLI_MODEL)
+        _until("the milk message sent into the turn", lambda: STEER_PENDING in json.dumps(
+            _chat_messages(token, chat_id)[milk].get("statusHistory")), timeout_s=60, every_s=0.2)
+        _until("Claude Code past both sends, at its next boundary", lambda: logged(f"boundary {word}"),
+               timeout_s=60, every_s=0.2)
+        open(go, "w").close()
+        # The Gateway hands Claude Code the milk message once it took the
+        # tomatoes one in, as live: after the tomatoes answer, in the same run.
+        _until("the milk message in the turn", lambda: logged(f"injected {word}: 2"), timeout_s=60, every_s=0.2)
+        open(done, "w").close()
+        _until("all three replies done", lambda: all(
+            _chat_messages(token, chat_id)[r].get("done") for r in (held, tomato, milk)))
+        try:
+            _until("the milk answer under its message", lambda: f"milk-{word}" in
+                   _chat_messages(token, chat_id)[milk].get("content", ""), timeout_s=60)
+        except pytest.fail.Exception:
+            pass  # the asserts below say what each reply shows
+    finally:
+        open(go, "w").close()
+        open(done, "w").close()
+        page.close()
+    msgs = _chat_messages(token, chat_id)
+    shown = {r: msgs[r].get("content", "") for r in (held, tomato, milk)}
+    assert shown[held].split() == ["E2E_LATE_PART_1", "E2E_LATE_PART_2"], shown
+    for reply, own in ((tomato, f"add tomatoes-{word}"), (milk, f"remove milk-{word}")):
+        assert shown[reply].strip().startswith("E2E_CLI_STEERED:"), shown
+        assert shown[reply].count("E2E_CLI_STEERED:") == 1 and own in shown[reply], shown
+    os.remove(go)
+    os.remove(done)
 
 
 def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
