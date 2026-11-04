@@ -199,7 +199,8 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
   "agents": {
     "defaults": {
       "model": {"primary": "fake/e2e-default"},
-      "models": {"anthropic/claude-opus-5-5": {"agentRuntime": {"id": "claude-cli"}}},
+      "models": {"fake/e2e-default": {}, "fake/e2e-echo": {}, "fake/e2e-think": {},
+                 "anthropic/claude-opus-5-5": {"agentRuntime": {"id": "claude-cli"}}},
       "heartbeat": {"agentId": "main", "every": "0m"},
       "systemAgent": {"agentId": "main"}
     },
