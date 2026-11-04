@@ -730,6 +730,39 @@ def test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it(token):
     os.remove(gate)
 
 
+def test_no_tool_runs_after_the_run_is_aborted(token):
+    """What the user stopped runs nothing more (gate 280c, chat 2ddcf087):
+    a Claude Code the abort has not killed yet can still call a tool, as the
+    real one did 0.8 s after Stop. The Gateway refuses it: the run's MCP grant
+    ends with the abort (2026.10.10: `sessions.abort` aborts the run's signal
+    before it cancels the process, and every `tools/call` checks the grant).
+    e2e/fake_claude.py calls the MCP `exec` once before the abort, which
+    must run (the channel works), and once after it, which must not."""
+    log = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-claude.log")
+    logs = os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"])
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    word = f"abort{uuid.uuid4().hex[:8]}"
+    _post_turn(token, chat_id, f"E2E_CLI_ABORT_TOOL {word}", model=CLI_MODEL)
+    try:
+        _until("the Claude Code turn holding", lambda: os.path.exists(log)
+               and f"holding {word}" in open(log, encoding="utf-8").read(), timeout_s=60, every_s=0.2)
+        assert os.path.exists(os.path.join(logs, f"before-{word}")), \
+            "the MCP exec before the abort did not run: the check would prove nothing"
+        res = _gw("sessions.abort", {"key": _session_key(token, chat_id)})
+        assert res.get("status") == "aborted", res
+        answer = os.path.join(logs, f"abort-mcp-{word}.json")
+        _until("the call made after the abort to be answered", lambda: os.path.exists(answer), timeout_s=60)
+    finally:
+        open(os.path.join(logs, f"hold-{word}"), "w").close()
+    with open(answer) as f:
+        got = json.load(f)
+    assert not os.path.exists(os.path.join(logs, f"after-{word}")), f"the exec ran after the abort: {got}"
+    reply = got["reply"] if isinstance(got["reply"], dict) else {}
+    refused = got["status"] == 401 or (reply.get("result") or {}).get("isError") is True
+    assert refused, f"the call after the abort was not refused: {got}"
+
+
 def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     """Three messages sent by a client with no page while a reply runs: no
     Send now cancels them, so they wait behind the run in the Pipe. Once it

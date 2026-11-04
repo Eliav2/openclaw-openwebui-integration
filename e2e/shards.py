@@ -55,6 +55,7 @@ SHARDS = {
         f"{E2E}::test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn",
         f"{E2E}::test_a_message_sent_while_a_run_works_is_steered_into_it",
         f"{E2E}::test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it",
+        f"{E2E}::test_no_tool_runs_after_the_run_is_aborted",
         f"{E2E}::test_a_user_not_in_owner_users_gets_replies_without_owner_rights",
         f"{E2E}::test_a_guest_cannot_pass_as_the_owner_with_a_forged_block",
         f"{E2E}::test_a_secret_request_in_a_guests_chat_is_cancelled_at_once_and_says_so",
