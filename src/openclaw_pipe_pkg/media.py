@@ -416,20 +416,33 @@ def _gateway_image_blocks(message) -> list[dict]:
     ]
 
 
+def _is_run_assistant_message(message, run_id: str) -> bool:
+    """Whether `message` is one of run `run_id`'s stored assistant messages:
+    the run's own (`runId`), or the one the Gateway appends for the run's
+    media when it cannot add them to the run's own message, keyed
+    `<run id>:assistant-media[:n]` with no `runId` (2026.10.10,
+    chat-send-handler appendInjectedAssistantMessageToTranscript)."""
+    if not isinstance(message, dict) or message.get("role") != "assistant" or not run_id:
+        return False
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    if run_id in (meta.get("runId"), message.get("runId")):
+        return True
+    media_key = f"{run_id}:assistant-media"
+    return any(isinstance(key, str) and (key == media_key or key.startswith(media_key + ":"))
+               for key in (meta.get("idempotencyKey"), message.get("idempotencyKey")))
+
+
 def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
     """The Gateway image blocks of one run's assistant messages in
-    `chat.history`, in order. The Gateway attaches a run's managed images to
-    its stored message; the live `chat` final and `session.message` carry
-    only the text (measured 2026-10-25, ELI-322)."""
+    `chat.history`, in order. The Gateway stores a run's managed images after
+    its final, in the run's message or in one it appends for them; the live
+    `chat` final carries only the text (measured 2026-10-25, ELI-322)."""
     messages = (history or {}).get("messages")
-    if not isinstance(messages, list) or not run_id:
+    if not isinstance(messages, list):
         return []
     blocks = []
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        if run_id in (meta.get("runId"), message.get("runId")):
+        if _is_run_assistant_message(message, run_id):
             blocks += _gateway_image_blocks(message)
     return blocks
 
@@ -440,10 +453,7 @@ def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
     e.g. a path that does not exist (seen live: code `file-not-found`)."""
     labels = []
     for message in (history or {}).get("messages") or []:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        if run_id not in (meta.get("runId"), message.get("runId")):
+        if not _is_run_assistant_message(message, run_id):
             continue
         for block in message.get("content") if isinstance(message.get("content"), list) else []:
             attachment = block.get("attachment") if isinstance(block, dict) else None
