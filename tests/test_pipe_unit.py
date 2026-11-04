@@ -1801,6 +1801,26 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(Pipe.Valves().INTERRUPT_GRACE_SECONDS, 0)
 
 
+class MarkStoppedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_mark_is_written_at_once_and_again_after_the_request(self):
+        """Review on #282: a Stop marks the reply as soon as it is known, so
+        no `done: true` save of it comes before the mark, and again once
+        Open WebUI's request for it has ended, after the request's own save."""
+        writes = []
+
+        async def set_meta(chat_id, message_id, meta):
+            writes.append((chat_id, message_id, meta))
+            return True
+        request = asyncio.get_running_loop().create_future()
+        with mock.patch.object(openclaw_pipe, "_set_turn_meta", set_meta):
+            await asyncio.wait_for(openclaw_pipe._mark_stopped("c1", "m1", request), 1)
+            self.assertEqual(len(writes), 1, "written at once, the request still running")
+            request.set_result(None)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        self.assertEqual(writes, [("c1", "m1", {openclaw_pipe.STOPPED_META: True})] * 2)
+
+
 class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
     """Drive real reply generators through OWUI's ways of ending a response.
 
@@ -2697,11 +2717,18 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._until_registered("run-1")
         self.active = True
         self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
-        await first
-        await r1.aclose()
-        await asyncio.sleep(0.05)
+        marked = []
+
+        async def mark(chat_id, message_id, request=None):
+            marked.append((chat_id, message_id))
+        with mock.patch.object(openclaw_pipe, "_mark_stopped", mark):
+            await first
+            await r1.aclose()
+            await asyncio.sleep(0.05)
         self.assertIn("abort", self.rpc)
         self.assertEqual(self.conn._consumers, {})
+        # Nothing adds to it after a restart (gate 280c, chat 2ddcf087).
+        self.assertEqual(marked, [("chat-1", "m1")])
 
     async def _interrupted_during_settle(self):
         """A reply cut while its run streams, and the closing of that reply
@@ -10012,6 +10039,8 @@ class TurnWriterEndTests(_TurnWriterCase):
                 self.assertEqual([h for h in history if h.get("description")][-1],
                                  {"description": "Stopped", "done": True})
                 self.assertNotIn("🧠", json.dumps(history, ensure_ascii=False))
+                # Nothing adds to it after a restart (gate 280c, chat 2ddcf087).
+                self.assertIs((self.m().get("meta") or {}).get(openclaw_pipe.STOPPED_META), True)
 
     async def test_a_handed_over_reply_resumes_with_the_users_request(self):
         """The writer kept Open WebUI's request task and the user's request
@@ -10208,6 +10237,22 @@ class TurnWriterEndTests(_TurnWriterCase):
         codes = [e["data"]["code"] for e in self.owui.events("execute")]
         self.assertTrue(any(_INTENT_HOOK_JS in c and 'window.__ocAutoSend["c1"] = true' in c
                             for c in codes), codes)
+
+    async def test_a_stopped_reply_is_marked_before_its_done_save(self):
+        """Review on #282: the mark came only after M's `done: true` save, so
+        a restart between the two left a finished, unmarked reply that the
+        next start could add to. The mark is there when M is saved done."""
+        w = await self.opened_writer()
+        at_done = []
+        persist = w._persist
+
+        async def watched(**kw):
+            if kw.get("done"):
+                at_done.append((self.m().get("meta") or {}).get(openclaw_pipe.STOPPED_META))
+            return await persist(**kw)
+        w._persist = watched
+        await self.cancel_from_the_page(w, "stop")
+        self.assertEqual(at_done, [True])
 
     async def test_stop_aborts_the_run_and_finalizes_what_it_has(self):
         w = await self.opened_writer()

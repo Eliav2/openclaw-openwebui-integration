@@ -91,7 +91,7 @@ These replies follow the same rules as yours, see [Reliability](./reliability.md
 
 - **Gateway restart mid-run:** the reply is continued in the same message, by the Gateway's recovery or by a resume from the Pipe, never by both. See [Gateway restarts](./reliability.md#gateway-restarts).
 - **Open WebUI restart mid-run:** when Open WebUI is back, the reply is picked up and finished.
-- **Run ended while Open WebUI was down:** its reply is written from the transcript when Open WebUI starts.
+- **Run ended while Open WebUI was down:** its reply is written from the transcript when Open WebUI starts. A reply you stopped stays as it was.
 - **Lost connection:** the Pipe reconnects and finishes the message from the transcript once the run is over.
 
 ## Messages from older versions

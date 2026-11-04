@@ -78,7 +78,7 @@ Valve: [`STATE_DIR`](../configuration.md#state_dir), default `/data/openclaw-bri
 Restarting or shutting down Open WebUI does not stop your agent. The run keeps going on the Gateway, and nothing is aborted. When Open WebUI is back, the Pipe finds the replies that were left unfinished:
 
 - **Run still going:** the reply is picked up and streamed to the end in the same message.
-- **Run ended while Open WebUI was down:** the reply is written from the run's transcript.
+- **Run ended while Open WebUI was down:** the reply is written from the run's transcript. A reply you stopped stays as it was: what you stopped is what it shows.
 - **A message sent while Open WebUI was starting:** its reply is left to that message's own request, which answers it. Only a reply whose request was lost is finished by the Pipe.
 
 ## Gateway restarts
