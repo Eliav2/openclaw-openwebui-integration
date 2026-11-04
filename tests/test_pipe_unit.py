@@ -9507,6 +9507,59 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], True)
         self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
 
+    def _steered_transcript(self, *after):
+        """R1's message, its first answer, the message steered in as R2, then `after`."""
+        return {"messages": [
+            {"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "slow-1 slow-2"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}},
+            {"role": "user", "content": "aside", "__openclaw": {"idempotencyKey": "R2:user"}},
+            *after]}
+
+    async def test_a_steered_reply_waits_for_its_answer_in_the_transcript(self):
+        """CI next 3 (2026.10.10-beta.1, 7d28cc5): after a socket drop the
+        reply of a message waiting to be steered is a turn writer's. The
+        session's idle push came before the Gateway stored the run's answer to
+        it, and the reply, which streamed nothing, ended with nothing. It
+        waits for the transcript append that holds the answer."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="R2", message_id="m1", takeover=True, renderer=_TurnRenderer())
+        hist = {"now": self._steered_transcript()}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: the answer is not stored yet")
+        hist["now"] = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], "the aside")
+
+    async def test_a_steered_reply_whose_final_came_after_the_settle_says_where_it_went(self):
+        """Two messages steered in at one boundary; the earlier one's lone
+        final reaches its writer only after the session's idle row. The
+        transcript says its message went in with the next one."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="R2", message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(
+            {"role": "user", "content": "second", "__openclaw": {"idempotencyKey": "R3:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "both"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}}))
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+
     def test_a_reply_cancelled_before_its_run_started_is_not_steered_into(self):
         """Its handed run never ran, so a message steered in later takes the
         session's running run, not it."""

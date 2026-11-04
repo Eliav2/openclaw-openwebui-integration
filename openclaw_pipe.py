@@ -10454,7 +10454,30 @@ class _TurnWriter:
                 note = f"**Error:** {row['lastRunError']}"
         if note is None and await self._ask_question():
             return
+        if not self.opened and not self._showable():
+            await self._await_steered_answer()
         await self.finalize(note)
+
+    async def _await_steered_answer(self) -> None:
+        """M's message was steered into another run, which answers it: wait
+        for the transcript to hold that answer (`_history_steered_span`), or
+        for the next turn, before M ends from it. The session's idle push can
+        come before the Gateway stores the run's last message (2026.10.10-beta.1
+        CI, a socket drop while the message waited to be steered), and M,
+        which streamed nothing, would end with nothing. Each read follows a
+        transcript append (`session_message_event`, taken before the read)."""
+        while True:
+            appended = self.conn.session_message_event(self.session_key)
+            try:
+                hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.history failed waiting for a steered answer: {ex!r}")
+                return
+            if not _history_steered_answer_pending(hist, self.run_id):
+                return
+            pipe_log(f"  turn writer: {self.message_id[:8]}... waits for the answer to its "
+                     f"steered message in the transcript")
+            await appended.wait()
 
     async def _run_is_inter_session(self) -> bool:
         """True when this run answers another session's `sessions_send` (provenance
@@ -10638,6 +10661,9 @@ class _TurnWriter:
                 if rebuilt is not None:
                     self.renderer = rebuilt
                 self.renderer.flush()
+                if hist and _history_steered_host(hist, self.run_id) is not None:
+                    # Also when its lone final came after the settle.
+                    self.steered_message = True
                 if self.steered_message and not self._showable():
                     # Its message went into another run together with a later
                     # one, whose reply has the answer (`_history_steered_span`).
@@ -11880,6 +11906,28 @@ def _history_steered_into(history: dict, index: int) -> str | None:
         if isinstance(m, dict) and m.get("role") == "user" and not _history_imported_copy(messages, k):
             return None
     return None
+
+
+def _history_steered_host(history: dict, run_id: str) -> str | None:
+    """The run `run_id`'s message was steered into, or None."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id or _history_ran(history, run_id):
+        return None
+    start = next((n for n, m in enumerate(messages) if _history_user_run_id(m) == run_id), None)
+    return _history_steered_into(history, start) if start is not None else None
+
+
+def _history_steered_answer_pending(history: dict, run_id: str) -> bool:
+    """`run_id`'s message was steered into a run whose answer to it is not in
+    the transcript yet, and no later turn began (a message steered in after
+    it, or a run of its own, ends what this one waits for)."""
+    if _history_steered_host(history, run_id) is None:
+        return False
+    messages = history["messages"]
+    start = next(n for n, m in enumerate(messages) if _history_user_run_id(m) == run_id)
+    if any(_history_user_run_id(m) for m in messages[start + 1:]):
+        return False
+    return _history_steered_span(history, run_id) is None
 
 
 def _history_steered_span(history: dict, run_id: str) -> list | None:
