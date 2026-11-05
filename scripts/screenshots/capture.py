@@ -445,6 +445,7 @@ REBUILD_DONE = "The cache is rebuilt"
 STEER_RELEASE = (2026, 10, 10)
 STEER_PENDING = "it reads it at its next step"
 QUEUED_NOTE = "Queued"
+TOOL_OUTPUT_ITEM = "function_call_output"   # the saved result of a tool call in a reply's output
 
 
 def opened_card_clip(message_js: str) -> str:
@@ -1268,7 +1269,7 @@ class Scenes:
             last = [(m.get("done"), (m.get("content") or "")[-60:]) for m in replies]
             if (len(replies) >= TWO_REPLIES and all(m.get("done") is True for m in replies)
                     and self._rebuild_ends_with() in (replies[0].get("content") or "")
-                    and (not self.steers or any(i.get("type") == "function_call_output"
+                    and (not self.steers or any(i.get("type") == TOOL_OUTPUT_ITEM
                                                 for i in replies[0].get("output") or []))
                     and "It's on main" in (replies[-1].get("content") or "")
                     and REBUILD_DONE not in (replies[-1].get("content") or "")):
