@@ -10,8 +10,18 @@ _FIT_JPEG_QUALITY = 85
 # JPEG size grows with the pixel count, so each try scales both sides by the
 # square root of (cap / size), a little under it so one try usually lands.
 _FIT_SCALE_MARGIN = 0.95
+# libjpeg refuses an image with a side above this (`JPEG_MAX_DIMENSION` in
+# jpeglib.h), so a longer side is cut down before the first encode.
+_JPEG_MAX_DIMENSION = 65500
+# Characters base64 decoding skips: they are not part of the payload's size.
+_BASE64_WHITESPACE = " \t\r\n"
 # `chat.send` attachment type of an image (the same value gateway.py sends).
 _IMAGE_ATTACHMENT_TYPE = "image"
+
+
+# One fit at a time: each holds the whole photo decoded plus a converted and a
+# resized copy, so the memory spent is one photo's, however many are sent.
+_image_fit_lock = asyncio.Lock()
 
 
 class ImageTooLargeError(Exception):
@@ -22,7 +32,8 @@ class ImageTooLargeError(Exception):
 def _base64_decoded_size(data: str) -> int:
     """Decoded byte count of a base64 string, without decoding it."""
     data = data.strip()
-    return len(data) * 3 // 4 - (len(data) - len(data.rstrip("=")))
+    chars = len(data) - sum(data.count(c) for c in _BASE64_WHITESPACE)
+    return chars * 3 // 4 - (len(data) - len(data.rstrip("=")))
 
 
 def _images_over_cap(attachments: list, max_bytes: int) -> bool:
@@ -43,6 +54,11 @@ def _shrink_to_jpeg(raw: bytes, max_bytes: int, PIL) -> bytes | None:
         img.paste(rgba, mask=rgba.getchannel("A"))
     elif img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
+    longest = max(img.size)
+    if longest > _JPEG_MAX_DIMENSION:
+        scale = _JPEG_MAX_DIMENSION / longest
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                         Image.LANCZOS)
     out = io.BytesIO()
     img.save(out, "JPEG", quality=_FIT_JPEG_QUALITY, optimize=True)
     while out.tell() > max_bytes:

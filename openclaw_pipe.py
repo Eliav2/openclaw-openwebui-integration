@@ -1548,8 +1548,18 @@ _FIT_JPEG_QUALITY = 85
 # JPEG size grows with the pixel count, so each try scales both sides by the
 # square root of (cap / size), a little under it so one try usually lands.
 _FIT_SCALE_MARGIN = 0.95
+# libjpeg refuses an image with a side above this (`JPEG_MAX_DIMENSION` in
+# jpeglib.h), so a longer side is cut down before the first encode.
+_JPEG_MAX_DIMENSION = 65500
+# Characters base64 decoding skips: they are not part of the payload's size.
+_BASE64_WHITESPACE = " \t\r\n"
 # `chat.send` attachment type of an image (the same value gateway.py sends).
 _IMAGE_ATTACHMENT_TYPE = "image"
+
+
+# One fit at a time: each holds the whole photo decoded plus a converted and a
+# resized copy, so the memory spent is one photo's, however many are sent.
+_image_fit_lock = asyncio.Lock()
 
 
 class ImageTooLargeError(Exception):
@@ -1560,7 +1570,8 @@ class ImageTooLargeError(Exception):
 def _base64_decoded_size(data: str) -> int:
     """Decoded byte count of a base64 string, without decoding it."""
     data = data.strip()
-    return len(data) * 3 // 4 - (len(data) - len(data.rstrip("=")))
+    chars = len(data) - sum(data.count(c) for c in _BASE64_WHITESPACE)
+    return chars * 3 // 4 - (len(data) - len(data.rstrip("=")))
 
 
 def _images_over_cap(attachments: list, max_bytes: int) -> bool:
@@ -1581,6 +1592,11 @@ def _shrink_to_jpeg(raw: bytes, max_bytes: int, PIL) -> bytes | None:
         img.paste(rgba, mask=rgba.getchannel("A"))
     elif img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
+    longest = max(img.size)
+    if longest > _JPEG_MAX_DIMENSION:
+        scale = _JPEG_MAX_DIMENSION / longest
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                         Image.LANCZOS)
     out = io.BytesIO()
     img.save(out, "JPEG", quality=_FIT_JPEG_QUALITY, optimize=True)
     while out.tell() > max_bytes:
@@ -4958,8 +4974,13 @@ GATEWAY_IMAGE_BYTES_FALLBACK = 6 * 1024 * 1024
 
 def _hello_max_image_bytes(hello_ok: dict) -> int:
     """The image cap hello-ok advertises, else the Gateway's built-in one."""
-    cap = ((hello_ok.get("policy") or {}).get("attachments") or {}).get("maxImageBytes")
-    return cap if isinstance(cap, int) and cap > 0 else GATEWAY_IMAGE_BYTES_FALLBACK
+    policy = hello_ok.get("policy")
+    attachments = policy.get("attachments") if isinstance(policy, dict) else None
+    cap = attachments.get("maxImageBytes") if isinstance(attachments, dict) else None
+    # `True` is an int in Python: it is not a byte count.
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        return cap
+    return GATEWAY_IMAGE_BYTES_FALLBACK
 
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]*)(?:;[^,]*)?,(.*)$", re.DOTALL)
@@ -14242,23 +14263,6 @@ class _PipeTurn:
             self.ended = True
             return
 
-        # An image over the Gateway's cap would be refused whole: shrink it
-        # here, once, so every later send of this message carries the copy
-        # that fits. A retry (`_send_texts`) already has its fitted images.
-        # Only an image over it leaves the event loop: a message with small
-        # images must not wait a thread hop behind the ones before it.
-        if not self._send_texts and _images_over_cap(
-                self.image_attachments, self.conn.gateway_max_image_bytes):
-            try:
-                self.image_attachments = await asyncio.to_thread(
-                    _fit_image_attachments, self.image_attachments,
-                    self.conn.gateway_max_image_bytes)
-            except ImageTooLargeError as e:
-                await _emit_status(self.__event_emitter__, "", done=True)
-                yield str(e)
-                self.ended = True
-                return
-
         # --- Derive stable session key ---
         if self.__metadata__:
             self.chat_id = (
@@ -14372,6 +14376,32 @@ class _PipeTurn:
                     f"{self.adopted_run_id[:20]}... alive and continuing it in this "
                     "reply before sending the message"
                 )
+
+        # An image over the Gateway's cap would be refused whole: shrink it
+        # here, once, so every later send of this message carries the copy
+        # that fits. After the claim, which must not wait behind the fit (the
+        # parked turn's timer does not); a retry (`_send_texts`) already has its
+        # fitted images. Only an image over the cap leaves the event loop: a
+        # message with small images must not wait a thread hop behind the ones
+        # before it. One fit at a time: each holds the whole photo decoded.
+        if not self._send_texts and _images_over_cap(
+                self.image_attachments, self.conn.gateway_max_image_bytes):
+            try:
+                async with _image_fit_lock:
+                    fitted = await asyncio.to_thread(
+                        _fit_image_attachments, self.image_attachments,
+                        self.conn.gateway_max_image_bytes)
+            except ImageTooLargeError as e:
+                await _emit_status(self.__event_emitter__, "", done=True)
+                yield str(e)
+                self.ended = True
+                return
+            # The turn, the retry copy and a claimed run's carried list hold
+            # the original objects: swap each for its fitted copy.
+            fitted_for = {id(a): f for a, f in zip(self.image_attachments, fitted)}
+            self.turn.attachments = [fitted_for.get(id(a), a) for a in self.turn.attachments]
+            self.sent_attachments = [fitted_for.get(id(a), a) for a in self.sent_attachments]
+            self.image_attachments = fitted
 
         # Apply the model. ELI-59: a burst's patches are all redundant -- same
         # session, same model -- so (a) a per-session lock collapses them to one

@@ -500,8 +500,13 @@ GATEWAY_IMAGE_BYTES_FALLBACK = 6 * 1024 * 1024
 
 def _hello_max_image_bytes(hello_ok: dict) -> int:
     """The image cap hello-ok advertises, else the Gateway's built-in one."""
-    cap = ((hello_ok.get("policy") or {}).get("attachments") or {}).get("maxImageBytes")
-    return cap if isinstance(cap, int) and cap > 0 else GATEWAY_IMAGE_BYTES_FALLBACK
+    policy = hello_ok.get("policy")
+    attachments = policy.get("attachments") if isinstance(policy, dict) else None
+    cap = attachments.get("maxImageBytes") if isinstance(attachments, dict) else None
+    # `True` is an int in Python: it is not a byte count.
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        return cap
+    return GATEWAY_IMAGE_BYTES_FALLBACK
 
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]*)(?:;[^,]*)?,(.*)$", re.DOTALL)

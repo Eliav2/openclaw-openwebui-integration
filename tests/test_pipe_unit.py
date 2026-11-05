@@ -2970,6 +2970,53 @@ class NoDroppedMessagesTests(_TurnCase):
         self.assertLessEqual(len(base64.b64decode(content)), 300_000)
         await self._answer(r, first)
 
+    async def test_the_parked_turn_is_claimed_before_a_photo_is_shrunk(self):
+        """The parked turn's timer does not wait for a claim: a slow fit ahead of it could outlast
+        the grace window and the follow-up would find no run to adopt."""
+        self.conn.gateway_max_image_bytes = 300_000
+        order = []
+        claim, fit = self.conn.claim_cancelled_turn, self.ocp._fit_image_attachments
+
+        async def claiming(session_key):
+            order.append("claim")
+            return await claim(session_key)
+
+        def fitting(*args):
+            order.append("fit")
+            return fit(*args)
+
+        self.conn.claim_cancelled_turn = claiming
+        with mock.patch.object(self.ocp, "_fit_image_attachments", fitting):
+            r = self._reply("what does the sign say?", "m2", image=self._noise_png((1600, 1200)))
+            first = await self._sent_or_answer(r)
+        self.assertEqual(order, ["claim", "fit"])
+        await self._answer(r, first)
+
+    async def test_photos_of_different_chats_are_shrunk_one_at_a_time(self):
+        """Each fit holds a whole photo decoded: two at once would hold two."""
+        self.conn.gateway_max_image_bytes = 300_000
+        running, most = [0], [0]
+
+        def fitting(attachments, max_bytes):
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+            time.sleep(0.15)
+            running[0] -= 1
+            return attachments
+
+        image = self._noise_png((1600, 1200))
+        with mock.patch.object(self.ocp, "_fit_image_attachments", fitting):
+            gens = [self._reply("hi", f"m{n}", image=image, chat=f"chat-{n}") for n in (2, 3)]
+            tasks = [asyncio.ensure_future(g.__anext__()) for g in gens]
+            for _ in range(500):
+                if len(self.sent) >= 2 or all(t.done() for t in tasks):
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(most[0], 1)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_a_photo_under_the_gateway_cap_is_sent_byte_for_byte(self):
         image = self._noise_png((200, 150))
         r = self._reply("hi", "m2", image=image)

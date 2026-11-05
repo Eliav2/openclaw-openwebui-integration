@@ -1,6 +1,7 @@
 """Photos over the Gateway's image cap are shrunk before chat.send (S8)."""
 import base64
 import io
+import textwrap
 import unittest
 from unittest import mock
 
@@ -15,6 +16,7 @@ import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (  # noqa: E402
     GATEWAY_IMAGE_BYTES_FALLBACK,
     ImageTooLargeError,
+    _base64_decoded_size,
     _fit_image_attachments,
     _hello_max_image_bytes,
 )
@@ -95,10 +97,29 @@ class FitImageAttachmentsTests(unittest.TestCase):
             _fit_image_attachments([attachment(raw)], 1)
         self.assertIn("couldn't be made small enough", str(caught.exception))
 
+    def test_a_side_over_the_jpeg_limit_is_cut_down_before_the_first_encode(self):
+        """libjpeg refuses a side above 65500 px: the copy that fits must still be made."""
+        img = Image.effect_noise((70_000, 8), 60)
+        out = io.BytesIO()
+        img.save(out, "PNG")
+        self.assertGreater(out.tell(), self.CAP)
+        [fit] = _fit_image_attachments([attachment(out.getvalue())], self.CAP)
+        small = base64.b64decode(fit["content"])
+        self.assertLessEqual(len(small), self.CAP)
+        self.assertLessEqual(max(Image.open(io.BytesIO(small)).size), 65_500)
+
     def test_bytes_pillow_cannot_read_are_refused_plainly(self):
         junk = attachment(b"\x00" * (self.CAP + 1))
         with self.assertRaises(ImageTooLargeError):
             _fit_image_attachments([junk], self.CAP)
+
+
+class Base64SizeTests(unittest.TestCase):
+    def test_line_breaks_inside_the_payload_are_not_counted(self):
+        raw = bytes(range(256)) * 40
+        wrapped = "\r\n".join(textwrap.wrap(base64.b64encode(raw).decode("ascii"), 76))
+        self.assertEqual(_base64_decoded_size(wrapped), len(raw))
+        self.assertEqual(_base64_decoded_size(base64.b64encode(raw).decode("ascii")), len(raw))
 
 
 class HelloImageCapTests(unittest.TestCase):
@@ -107,7 +128,10 @@ class HelloImageCapTests(unittest.TestCase):
         self.assertEqual(_hello_max_image_bytes(hello), 1234567)
 
     def test_a_gateway_that_does_not_advertise_it_gets_the_built_in_cap(self):
-        for hello in ({}, {"policy": {}}, {"policy": {"attachments": {"maxImageBytes": 0}}}):
+        for hello in ({}, {"policy": {}}, {"policy": {"attachments": {"maxImageBytes": 0}}},
+                      {"policy": {"attachments": {"maxImageBytes": True}}},  # a bool is no byte count
+                      {"policy": {"attachments": []}}, {"policy": {"attachments": "x"}},
+                      {"policy": []}):
             self.assertEqual(_hello_max_image_bytes(hello), GATEWAY_IMAGE_BYTES_FALLBACK)
         self.assertEqual(GATEWAY_IMAGE_BYTES_FALLBACK, 6291456)
 
