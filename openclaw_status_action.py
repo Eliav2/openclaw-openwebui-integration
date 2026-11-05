@@ -5824,35 +5824,14 @@ async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=
 # --- action ----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Milestone 1: prove a second OWUI Function can reach the OpenClaw gateway
-# and read live session data, without disturbing the existing Pipe or its
-# status-line code (emit.py / pipe.py are untouched by this fragment).
-#
-# Connection strategy, in order:
-#   1. Reuse the Pipe's already-connected `_GatewayConnection` singleton.
-#      The Pipe stashes it on `open_webui.socket.main` (a stable OWUI
-#      module both Functions can import) purely so ITS OWN future redeploys
-#      can find and clean up an orphaned previous connection -- see
-#      `_STALE_CONN_ATTR` / `_remember_gateway_connection` in gateway.py.
-#      This fragment only ever READS that attribute, never writes it: if we
-#      also wrote there, whichever of {Pipe, Action} connected most
-#      recently would silently "win" the slot, and the Pipe's own
-#      `_reap_stale_gateway_connection()` could tear down a connection it
-#      doesn't actually own on its next redeploy. Read-only avoids that
-#      collision entirely.
-#   2. If the Pipe hasn't connected yet in this process (e.g. right after a
-#      container restart, before any chat turn happened -- in practice
-#      unlikely, since this Action's button only appears above an existing
-#      assistant message, which means the Pipe already ran at least once),
-#      open our own connection. It still reuses the same STATE_DIR-persisted
-#      device identity/token the Pipe already has, so this never triggers a
-#      second `openclaw devices approve`. This fallback connection is owned
-#      entirely by this module (its own singleton, never stashed on the
-#      shared attribute) so it can never collide with the Pipe's bookkeeping
-#      either.
-#
-# This fragment reuses gateway.py verbatim (see build.py's ACTION artifact),
-# without the turn writer: its fallback connection only makes requests.
+# Gateway connection for the Status Action.
+#   1. Reuse the Pipe's `_GatewayConnection`, stashed on `open_webui.socket.main`
+#      (see `_STALE_CONN_ATTR` in gateway.py). Only ever READ that slot: writing
+#      it would let the Pipe's `_reap_stale_gateway_connection()` tear down a
+#      connection it does not own.
+#   2. Else open our own, owned by this module only. It reuses the Pipe's
+#      persisted device identity, so no second `openclaw devices approve`.
+# gateway.py is reused verbatim, without the turn writer.
 
 _action_fallback_connection: "_GatewayConnection | None" = None
 _action_fallback_lock = asyncio.Lock()
@@ -5863,8 +5842,7 @@ async def _get_action_connection(valves_getter):
     try:
         import open_webui.socket.main as _owui_socket_main
         pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
-        # A Pipe connection opened for an earlier GATEWAY_URL is not reused: the
-        # Pipe replaces it on its next message.
+        # A connection opened for an earlier GATEWAY_URL is not reused.
         if pipe_conn is not None and not pipe_conn.endpoint_moved():
             await pipe_conn.ensure_connected()
             return pipe_conn, "pipe"
@@ -5890,38 +5868,14 @@ async def _get_action_connection(valves_getter):
 
 
 # ---------------------------------------------------------------------------
-# Milestone 2 (+ later, per-section independent loading): a real dialog
-# instead of a toast, rendered via the "execute" event (runs unsandboxed in
-# the actual OWUI page, not a sandboxed Rich UI iframe) so it can use
-# OWUI's own live Tailwind classes and CSS custom properties directly --
-# exact design-system match for free, no hand-tuned color palette, no
-# guessing which of OWUI's several themes is active. The trade-off
-# (unsandboxed JS) is acceptable here because the code is 100%
-# admin-authored, not influenced by any untrusted input; the only dynamic
-# values are our own gateway's numbers, passed in as a single JSON blob per
-# section (never string-interpolated) so nothing can break out of the data
-# payload.
+# The dialog runs via the "execute" event in the real OWUI page (not a
+# sandboxed iframe) to use OWUI's own Tailwind classes and theme. Safe because
+# the code is admin-authored and data goes in only as one JSON blob per section.
 #
-# Each of Context, Rate Limits, and Subagents loads and fills independently:
-# three separate skeleton placeholders open
-# immediately, and each is replaced by its own `execute` fill event as soon
-# as ITS OWN gateway call resolves, rather than one combined
-# fetch-everything-then-render-once step where a slow call holds up
-# everything else. Subagents is fully independent (sessions.list only, no
-# dependency on the other two). Rate Limits genuinely needs the active
-# provider's name, which only comes from sessions.describe -- rather than
-# faking independence there, its fill waits on Context's own resolution of
-# that RPC (shared Task, not a second request) before adding usage.status
-# on top; it still has its own skeleton and fills in on its own schedule,
-# separate from Context's.
-#
-# Shared JS helpers (bar rendering, color thresholds, section headers, the
-# Compact button's click handler) are defined once in _MODAL_OPEN_JS_TEMPLATE and
-# stashed on `window.__openclawStatus` rather than duplicated in each
-# section's fill template -- each fill is its own separate `execute` call
-# (a fresh top-level script, no shared scope with the others), so without
-# this every section would need its own copy of ~30 lines of identical
-# helper code.
+# Each section has its own skeleton and its own `execute` fill, so a slow call
+# holds up only its section. Rate Limits waits on Context's sessions.describe
+# (shared Task) for the provider. Shared helpers live on `window.__openclawStatus`
+# since each fill is a separate script with no shared scope.
 # ---------------------------------------------------------------------------
 
 _MODAL_OPEN_JS_TEMPLATE = r"""
@@ -6967,13 +6921,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 })();
 """
 
-# Fired only on a post-compact refresh (_run_status(show_loading=False)),
-# never on the initial open. _MODAL_COMPACTING_JS (below) replaces
-# #openclaw-status-sections' entire contents with its spinner, which
-# destroys the three individual section ids each fill function targets --
-# this recreates fresh skeletons in their place before the refreshed RPCs
-# are fired, without touching the overlay/header/window.__openclawStatus
-# (already correctly set up from the original open).
+# Post-compact refresh only: _MODAL_COMPACTING_JS replaced the sections, so
+# recreate their skeletons before the refreshed reads.
 _RESET_SECTIONS_JS = r"""
 (function() {
   const wrap = document.getElementById('openclaw-status-sections');
@@ -6986,13 +6935,8 @@ _RESET_SECTIONS_JS = r"""
 })();
 """
 
-# Static (no data), fired the moment a compact is triggered -- see
-# Action._run_compact. Deliberately a distinct, prominent "Compacting..."
-# state rather than reusing the generic loading skeleton: compaction is an
-# LLM call that can take a while, so the dialog should look like it's
-# doing something specific and ongoing, not like a normal fetch that's
-# about to finish in a second. Replaces the whole sections wrapper (not a
-# specific section) since this is a dialog-wide state, not a per-query one.
+# Fired the moment a compact starts: a distinct "Compacting..." state, since
+# compaction is an LLM call that can take a while.
 _MODAL_COMPACTING_JS = r"""
 (function() {
   const wrap = document.getElementById('openclaw-status-sections');
@@ -7024,9 +6968,7 @@ _MODAL_COMPACTING_JS = r"""
 })();
 """
 
-# Dialog-wide error (connection failures, "busy" guard, compact timeout) --
-# also replaces the whole sections wrapper rather than one section, same
-# reasoning as _MODAL_COMPACTING_JS.
+# Dialog-wide error (connection failure, "busy" guard, compact timeout).
 _SECTIONS_ERROR_JS_TEMPLATE = r"""
 (function() {
   const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
@@ -7127,14 +7069,8 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# Always gets its own section when we have a real provider to report on --
-# not gated on windows.length > 0. The gateway's usage.status can
-# transiently report zero windows for the active provider while a run is
-# in flight (its rate-limit cache is most likely refreshed from that run's
-# own API response headers, so there's a real gap while one is active) --
-# silently omitting the section in that case looked exactly like a missing
-# feature rather than a temporary data gap. Showing an explicit note instead turns that into an
-# understood, expected state.
+# Always shown for a real provider: usage.status can report zero windows while
+# a run is in flight, and a missing section looked like a missing feature.
 _LIMITS_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -7224,12 +7160,8 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# The Subagents section (ELI-152/155/163): a fold titled with its count, open
-# at its first fill when a child runs. A fold opened for the first time with
-# its rows still `pending` (the open read no transcripts for a section
-# nobody had opened) asks the Action for them (mode "subagent-rows"). Each
-# row opens the per-subagent drawer (S.openSubagentDrawer) with the fields it
-# already knows, so the drawer paints its header before any RPC resolves.
+# The Subagents section (ELI-152/155/163): a fold opened for the first time
+# with rows still `pending` asks the Action for them (mode "subagent-rows").
 _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -7285,10 +7217,8 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# Claude Code's in-process Agent calls (ELI-152): not Gateway sessions, so
-# no duration, only what the chat's tool cards tell; a tap shows its task and
-# result (ELI-155). Read from Open WebUI's copy of the chat alone, so this
-# section fills even when the Gateway does not answer.
+# Claude Code's in-process Agent calls (ELI-152, ELI-155): not Gateway
+# sessions, read from Open WebUI's copy of the chat alone.
 _AGENTS_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -7328,10 +7258,8 @@ _AGENTS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# The Background section (ELI-163): this chat's background commands, media
-# jobs, automation runs and background agents, and the automations bound to
-# it. A fold like Subagents. A source this Gateway
-# lacks says so in a note; one that failed says so too, and the rest shows.
+# The Background section (ELI-163): this chat's background work and bound
+# automations. A missing or failed source says so in a note.
 _BACKGROUND_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -7445,8 +7373,7 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# One section's error in its place (S.sectionError): a failed source
-# leaves every other section as it is.
+# One section's error in its place (S.sectionError).
 _SECTION_ERROR_JS_TEMPLATE = r"""
 (function() {
   const S = window.__openclawStatus;
@@ -7455,9 +7382,7 @@ _SECTION_ERROR_JS_TEMPLATE = r"""
 """
 
 
-# The drawer opened from here rather than by a row tap: an old sub-agent
-# message's toolbar click. `S.openDrawer` (_MODAL_OPEN_JS_TEMPLATE) builds it;
-# `server` because this request fills it next.
+# The drawer opened from here (an old sub-agent message's toolbar click).
 _DRAWER_OPEN_JS_TEMPLATE = r"""
 (function() {
   const S = window.__openclawStatus;
@@ -7465,8 +7390,7 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
 })();
 """
 
-# Whole-drawer error (task not found, connect failure): the run's place
-# says what went wrong. `KEY`: only the drawer showing that sub-agent.
+# Whole-drawer error. `KEY`: only the drawer showing that sub-agent.
 _DRAWER_ERROR_JS_TEMPLATE = r"""
 (function() {
   const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
@@ -7480,8 +7404,7 @@ _DRAWER_ERROR_JS_TEMPLATE = r"""
 })();
 """
 
-# One read of the sub-agent: its header and its run (S.fillDrawer). A fill
-# for a drawer since closed, or another sub-agent's, is dropped there.
+# One read of the sub-agent (S.fillDrawer); a fill for a closed or other drawer is dropped.
 _DRAWER_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -7492,18 +7415,8 @@ _DRAWER_FILL_JS_TEMPLATE = r"""
 
 
 def _json_for_js(data) -> str:
-    """Never string-interpolate individual fields directly into JS source.
-    json.dumps always produces a syntactically valid JS expression, so this
-    is the one substitution point that needs to be safe against whatever
-    the gateway's numbers/text happen to contain (e.g. a goal description
-    with quotes or backslashes).
-
-    json.dumps does NOT escape "<" by default, so a value containing a
-    literal "</script>" would terminate an enclosing <script> tag early if
-    this code ever ends up placed into HTML rather than passed straight to
-    a JS execution call -- escaping "<" to the equivalent \\u003c unicode
-    escape is a no-op for JSON.parse but closes that off regardless of how
-    the execute event happens to deliver this string."""
+    """JSON for JS source: the one safe substitution point. "<" is escaped to
+    \\u003c so a "</script>" value cannot end an enclosing tag."""
     return json.dumps(data).replace("<", "\\u003c")
 
 
@@ -7525,9 +7438,7 @@ def _render_limits_fill_js(data: dict) -> str:
 
 
 def _limits_windows_for(usage, provider) -> list:
-    """The active provider's rate-limit windows from a `usage.status`-shaped
-    payload, reshaped for the Rate Limits section. Windows with no known
-    usedPercent are dropped."""
+    """The active provider's rate-limit windows with a known usedPercent."""
     windows_data = []
     for p in (usage or {}).get("providers", []):
         if p.get("provider") != provider:
@@ -7540,10 +7451,7 @@ def _limits_windows_for(usage, provider) -> list:
                 "label": w.get("label"),
                 "usedPercent": used,
                 "resetIn": _relative_time(w.get("resetAt")),
-                # Raw ms timestamp, not a server-formatted clock
-                # time -- the absolute time is rendered client-side
-                # so it shows in the browser's own local timezone
-                # rather than whatever timezone this container is in.
+                # Raw ms: rendered client-side in the browser's timezone.
                 "resetAtMs": w.get("resetAt"),
             })
         break
@@ -7577,11 +7485,8 @@ def _billing_value(row) -> str:
 
 
 def _limits_entry_for(usage, provider):
-    """What the active provider's `usage.status` entry says when it has no
-    usable windows (xAI SuperGrok answers a plan, a summary such as "Included
-    usage omitted" and billing rows only): its name, plan, summary and billing
-    rows for the Rate Limits section. None when there is no entry, or it has
-    none of plan, summary and billing to show."""
+    """The provider's entry when it has no usable windows (xAI SuperGrok sends
+    only plan, summary and billing), or None."""
     for p in (usage or {}).get("providers", []):
         if p.get("provider") != provider:
             continue
@@ -7600,13 +7505,9 @@ def _limits_entry_for(usage, provider):
 
 
 async def _claude_cli_usage_windows(conn) -> list:
-    """Fallback for Claude-CLI-only setups. Since OpenClaw 2026.9.1
-    (openclaw#129052) `usage.status` never resolves the claude-cli login, so
-    with no other Anthropic credential it has no `anthropic` entry at all.
-    The companion gateway plugin (gateway-plugins/claude-cli-usage) serves
-    the same windows read-only over `claudeCliUsage.status`. A gateway
-    without that plugin answers "unknown method"; that is logged and the
-    section keeps its empty-windows note."""
+    """Fallback for Claude-CLI-only setups: since OpenClaw 2026.9.1
+    (openclaw#129052) `usage.status` never resolves the claude-cli login. The
+    gateway-plugins/claude-cli-usage plugin serves `claudeCliUsage.status`."""
     try:
         snapshot = await conn.send_request("claudeCliUsage.status", {}, timeout=10)
     except Exception as ex:
@@ -7617,11 +7518,9 @@ async def _claude_cli_usage_windows(conn) -> list:
     return _limits_windows_for({"providers": [snapshot or {}]}, "anthropic")
 
 
-# A child session's run status, in the words the Subagents section and drawer
-# colour and print (they were written against the removed Tasks API).
+# Child run status in the words the section and drawer use.
 _SUBAGENT_STATUS_WORDS = {"done": "completed", "killed": "cancelled", "timeout": "timed_out"}
 _RUNTIME_CONTEXT_MARKER_RE = re.compile(r"^<<<(?:BEGIN|END)_OPENCLAW_INTERNAL_CONTEXT>>>$", re.M)
-# The header on a line of its own; 2026.10 also names it inside the context sentence.
 _SUBAGENT_TASK_HEADER_RE = re.compile(r"^\[Subagent Task\][ \t]*$", re.M)
 
 
@@ -7630,10 +7529,8 @@ def _subagent_status(status):
 
 
 def _subagent_task_text(text):
-    """The task out of a spawn's first message, which the Gateway wraps as
-    "[Subagent Context] ... [Subagent Task] <task> Begin. Execute ...".
-    2026.10 adds internal-context marker lines around the wrapper. None if
-    the text is not a spawn message."""
+    """The task out of a spawn's first message ("[Subagent Context] ...
+    [Subagent Task] <task> Begin. ..."), or None."""
     parts = _SUBAGENT_TASK_HEADER_RE.split(text) if isinstance(text, str) else []
     if len(parts) < 2:
         return None
@@ -7642,8 +7539,7 @@ def _subagent_task_text(text):
     return task or None
 
 
-# A spawn's first message in any whitespace form: lastMessagePreview flattens
-# it to one line, so the header-on-its-own-line test above does not apply.
+# A spawn message in any whitespace form: lastMessagePreview flattens it.
 _SUBAGENT_SPAWN_RE = re.compile(
     r"^\s*(?:<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\s*)?\[Subagent Context\].*\[Subagent Task\]", re.S)
 
@@ -7653,9 +7549,8 @@ def _is_spawn_message(text):
 
 
 def _subagent_task_texts(previews_resp):
-    """{child key: task text} from a sessions.preview answer. The preview
-    holds a session's newest items, so a long-running child's first message
-    may be gone; that child has no entry."""
+    """{child key: task text} from sessions.preview; a long child's first
+    message may be gone from it."""
     out = {}
     for p in (previews_resp or {}).get("previews") or []:
         for item in p.get("items") or []:
@@ -7667,8 +7562,7 @@ def _subagent_task_texts(previews_resp):
 
 
 def _run_error_text(error):
-    """A run's error as `agent.wait` gives it, readable: a provider's JSON
-    error body becomes "<status>: <message>"."""
+    """A run's error, readable: a provider's JSON body becomes "<status>: <message>"."""
     text = str(error or "").strip()
     try:
         body = json.loads(text) if text.startswith("{") else None
@@ -7684,30 +7578,20 @@ def _run_error_text(error):
 
 
 def _subagent_error(run_error, summary):
-    """A failed child's error line: what its run reported first, then the
-    Gateway's `lastRunError`. That one is canned copy picked by the error's
-    class (a 402 billing error read "needs a short break", a 400 "not
-    supported with this account" read "model was not found"), so on its own
-    it can name the wrong cause (ELI-277)."""
+    """A failed child's error: its run's own first, then `lastRunError`, whose
+    canned copy can name the wrong cause (ELI-277)."""
     if run_error and summary and run_error not in summary:
         return f"{run_error} (Gateway: {summary})"
     return run_error or summary
 
 
 def _subagent_row(row, task_text=None, latest=None):
-    """One Subagents row out of a child session row. The title is the spawn
-    label, else the task's first sentence, else the key; the whole task is
-    the drawer's to show (ELI-155). A running child's preview is the row's
-    own last message when the list read carried it (a claude-cli child's
-    text so far is nowhere else), else `latest` (sessions.preview). An ended
-    child's result is `latest` only: the list's copy is flattened markdown,
-    read from a transcript index that catches up after the reply's append
-    with no push, so a row filled from either would read differently in the
-    open dialog and after a reopen (ELI-264)."""
+    """One Subagents row from a child session row (ELI-155). An ended child's
+    result is `latest` only: the list's copy is flattened and lags, so it would
+    read differently after a reopen (ELI-264)."""
     status = _subagent_status(row.get("status"))
     if status is None and (row.get("endedAt") or row.get("gone")):
-        # A visible spawn's session carries no run status; a child whose
-        # session is gone and whose end was not recorded ended unread.
+        # A visible spawn has no run status; a gone child ended unread.
         status = "ended"
     run_error = _run_error_text(row.get("runError"))
     live = status in _LIVE_SUBAGENT_STATUSES
@@ -7725,8 +7609,7 @@ def _subagent_row(row, task_text=None, latest=None):
         "error": _subagent_error(run_error, row.get("lastRunError")),
         "childSessionKey": row["key"],
         "startedAt": row.get("startedAt"),
-        # An ended child's duration stops at its last update when the
-        # Gateway kept no end time.
+        # No end time kept: stop at the last update.
         "endedAt": row.get("endedAt") or (None if live else row.get("updatedAt")),
     }
 
@@ -7737,9 +7620,8 @@ _SUBAGENT_LIST_CAP = 20
 
 
 def _is_child_of(row, parent_key):
-    """A session the parent spawned. `sessions.list {spawnedBy}` keeps an
-    ended child for 30 minutes only, so the dialog's open reads the whole
-    list and picks the children itself (ELI-152)."""
+    """A session the parent spawned. `spawnedBy` keeps ended children only 30
+    minutes, so the whole list is read (ELI-152)."""
     return row.get("key") not in (None, parent_key) and parent_key in (
         row.get("spawnedBy"), row.get("parentSessionKey"))
 
@@ -7757,9 +7639,8 @@ _RUN_WAIT_STATUSES = {"ok": "done", "error": "failed", "aborted": "killed"}
 
 
 async def _ended_child_row(conn, parent, key, run):
-    """The row of a child whose session is gone (spawned with cleanup
-    "delete"), from its run while the Gateway still holds it, else a bare
-    row that says it ended. Every child the agent ran stays listed."""
+    """A gone child's row (cleanup "delete"), from its run while the Gateway
+    holds it, else a bare ended row."""
     row = {"key": key, "spawnedBy": parent, "gone": True,
            **({"label": run["label"]} if run.get("label") else {})}
     if run.get("runId"):
@@ -7787,8 +7668,7 @@ async def _lookup_child(conn, key):
 
 
 def _running_row(desc_task):
-    """Whether the session `desc_task` (a done `sessions.describe`) described
-    has a run: its row's `hasActiveRun`, which stays set through a
+    """The described session has a run: `hasActiveRun` stays set through a
     `sessions_yield` gap, unlike its status."""
     if desc_task.cancelled() or desc_task.exception() is not None:
         return False
@@ -7827,11 +7707,8 @@ def _card_text(item):
 
 
 def _agent_call_rows(chat):
-    """The chat's in-process Agent calls (Claude Code sub-agents), newest
-    first, out of its replies' own tool cards (ELI-152). The Gateway never
-    lists them as child sessions, so a card is all there is: the call's
-    description, its reply's start time, and a state its result tells.
-    "launched" is a background agent whose report comes later on its own."""
+    """The chat's in-process Agent calls, newest first, from its tool cards
+    (ELI-152): the Gateway never lists them. "launched" is a background agent."""
     rows = []
     for msg in _owui_branch(chat):
         output = msg.get("output") or []
@@ -7865,30 +7742,22 @@ def _agent_call_rows(chat):
                 "subagentType": args.get("subagent_type"),
                 "state": state,
                 "startedAt": int(ts * 1000) if isinstance(ts, (int, float)) else None,
-                # What its detail shows (ELI-155), capped like a card's text.
+                # Shown in its detail (ELI-155), capped.
                 "task": prompt[:_AGENT_TEXT_MAX] if isinstance(prompt, str) and prompt.strip() else None,
                 "result": text[:_AGENT_TEXT_MAX] if result is not None and text else None,
-                # A background agent holds its reply open until its report is in.
                 "replyDone": bool(msg.get("done")),
             })
     return rows[::-1]
 
 
-# How many of the chat's newest messages (its current branch) In-process
-# agents and Background read: their time must not grow with the chat.
+# The newest messages In-process agents and Background read, so time does not grow with the chat.
 _RECENT_MESSAGES = 40
 
 
 async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=_RECENT_MESSAGES,
                          chat_id=None):
-    """The last `limit` messages of a chat's current branch, chat-shaped
-    ({"history": {"currentId", "messages"}, "truncated"}) for the section
-    builders. `links` maps each message that has a row to its parent;
-    `read_rows(ids)` reads those messages ({id: message}) in one go;
-    `read_blob_message(id)` reads one message the chat's own copy holds but
-    no row does yet (Open WebUI writes some straight into the chat). A reply
-    of `chat_id` that this process's Pipe is streaming lists what it shows
-    so far."""
+    """The last `limit` messages of a chat's branch, chat-shaped. A reply this
+    process's Pipe is streaming lists what it shows so far."""
     order, blob, seen, mid = [], {}, set(), current_id
     while mid and mid not in seen and len(order) < limit:
         seen.add(mid)
@@ -7904,8 +7773,7 @@ async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=
         mid = parent
     with_rows = [m for m in order if m not in blob]
     rows = await read_rows(with_rows) if with_rows else {}
-    # Open WebUI saves a reply's calls only when it ends, in its row and in
-    # the chat alike (ELI-186): a running reply's are with the Pipe.
+    # Open WebUI saves a reply's calls only when it ends (ELI-186).
     for m in order:
         msg = blob.get(m) or rows.get(m)
         if isinstance(msg, dict) and msg.get("role") == "assistant" and not msg.get("done"):
@@ -7934,12 +7802,9 @@ async def _recent_of_chat(chat, limit=_RECENT_MESSAGES, chat_id=None):
 
 
 async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
-    """The chat's last `limit` messages when it is this user's, read from
-    Open WebUI's message rows: the chat row's head, every row's parent link
-    (two short columns), then those messages' rows. Building the whole chat
-    costs about 14x its JSON in Python (ELI-115) and grows with the chat.
-    None on any failure (the sections then list no Agent calls); the whole
-    chat, cut the same way, where the rows cannot be read at all."""
+    """The chat's last `limit` messages from Open WebUI's message rows, when
+    it is this user's. Building the whole chat costs about 14x its JSON
+    (ELI-115). None on failure."""
     try:
         from sqlalchemy import select
         from open_webui.internal.db import get_async_db_context
@@ -7997,8 +7862,7 @@ async def _owui_chat_title(chat_id, user_id):
 
 
 async def _load_owui_chat(chat_id, user_id):
-    """The chat as Open WebUI stores it, when it is this user's; None outside
-    Open WebUI or on any failure (the section then lists no Agent calls)."""
+    """The chat as Open WebUI stores it when it is this user's, else None."""
     try:
         from open_webui.models.chats import Chats
         row = Chats.get_chat_by_id(chat_id)
@@ -8025,14 +7889,12 @@ def _render_agents_fill_js(data: dict) -> str:
 
 
 def _render_section_error_js(section: str, message: str) -> str:
-    """One section's error in its place, under its own title; the others
-    keep what they show."""
+    """One section's error in its place; the others keep what they show."""
     return (_SECTION_ERROR_JS_TEMPLATE.replace("__OPENCLAW_SECTION__", _json_for_js(section))
             .replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message)))
 
 
-# The dialog's sections in their order: id suffix and title. The page draws
-# them all at open (_MODAL_OPEN_JS_TEMPLATE), each fills on its own.
+# The dialog's sections in order: id suffix and title.
 _DIALOG_SECTIONS = (
     ("context", "Context"),
     ("limits", "Rate limits"),
@@ -8040,16 +7902,13 @@ _DIALOG_SECTIONS = (
     ("subagents", "Subagents"),
     ("agents", "In-process agents"),
 )
-# The sections the Gateway fills; In-process agents reads Open WebUI only.
+# The sections the Gateway fills.
 _GATEWAY_SECTIONS = ("context", "limits", "background", "subagents")
 
 
 # ---------------------------------------------------------------------------
-# Open Status dialogs (ELI-163), by the id the open hands the page: whose it
-# is, its session, the Subagents rows a folded section has yet to detail,
-# and a `closed` flag the page sets when it is dismissed, so nothing is read
-# for a dialog nobody looks at. In this process only; an entry lasts the
-# dialog's follow bound at most.
+# Open Status dialogs (ELI-163) by id, in this process only. The page sets
+# `closed` on dismiss so nothing is read for a dialog nobody looks at.
 
 _open_dialogs: dict = {}
 
@@ -8073,9 +7932,7 @@ def _dialog_of(body: dict, user_id: str):
 
 
 def _subagent_previews(previews_resp) -> tuple:
-    """({key: task text}, {key: newest message}) from a sessions.preview
-    answer: the spawn's task when the preview still reaches it, and what the
-    child said last (none while its newest message is still the spawn)."""
+    """({key: task}, {key: newest message}) from sessions.preview."""
     latest = {}
     for p in (previews_resp or {}).get("previews") or []:
         texts = [i.get("text") for i in p.get("items") or [] if isinstance(i.get("text"), str) and i["text"].strip()]
@@ -8096,9 +7953,7 @@ async def _read_automations(conn) -> "list | None":
 
 
 async def _background_data(tasks_task, jobs_task, chat_task, session_key: str, source: str) -> dict:
-    """The Background section's fill from its three reads (tasks, automations,
-    Open WebUI's copy of the chat): a failed Gateway read says so in the
-    section and the rest still shows."""
+    """The Background section's fill; a failed Gateway read says so and the rest shows."""
     errors = []
     try:
         tasks = await tasks_task
@@ -8118,12 +7973,9 @@ async def _background_data(tasks_task, jobs_task, chat_task, session_key: str, s
 
 
 # ---------------------------------------------------------------------------
-# The Background section (ELI-163): what runs for this chat outside a reply.
-# Read once when the dialog opens, never polled.
+# The Background section (ELI-163). Read at open; the page polls while a row runs.
 
-# The Gateway's task kinds the section lists, as the row's kind label. Its
-# other kinds are listed elsewhere (a sub-agent or ACP child is the
-# Subagents section's) or are its own upkeep (context maintenance).
+# Task kinds the section lists, as row labels. Sub-agents and upkeep go elsewhere.
 _BACKGROUND_KINDS = {
     "exec": "Command",
     "image_generation": "Image",
@@ -8131,12 +7983,10 @@ _BACKGROUND_KINDS = {
     "video_generation": "Video",
     "automation_run": "Automation",
 }
-# How many finished items of this chat the section keeps, newest first; a
-# running one is always listed.
+# Finished items kept, newest first; running ones always show.
 _BACKGROUND_FINISHED_CAP = 5
 _LIVE_TASK_STATUSES = ("running", "queued")
-# The exec tool's answer for a command left running: "Command still running
-# (session good-lagoon, pid 2816)". The session is the task's sourceId.
+# "Command still running (session good-lagoon, pid 2816)": the session is the task's sourceId.
 _EXEC_SESSION_RE = re.compile(r"\(session ([\w.-]+)")
 
 
@@ -8145,12 +7995,8 @@ def _is_unknown_method(ex: Exception) -> bool:
 
 
 async def _read_background_tasks(conn, session_key: str) -> "list | None":
-    """The adapter between the section and the Gateway's background work for
-    one session, as task rows. OpenClaw 2026.9 lists it with `tasks.list`;
-    2026.10 removed that method, and a session's background commands are
-    `sessions.processes.list` (media jobs have no per-session list there). A
-    Gateway with neither gives None: the section then says it is not
-    available here instead of failing."""
+    """This session's background work as task rows: `tasks.list` (2026.9) or
+    `sessions.processes.list` (2026.10). None when the Gateway has neither."""
     try:
         resp = await conn.send_request("tasks.list", dict(sessionKey=session_key, limit=100), timeout=5)
         return (resp or {}).get("tasks") or []
@@ -8171,10 +8017,7 @@ _PROCESS_STATUSES = {"running": "running", "completed": "completed", "failed": "
 
 
 def _process_task(process: dict, session_key: str) -> dict:
-    """One `sessions.processes.list` row as the task row `_task_row` reads: an
-    exec task whose sourceId is the process (the session its tool card
-    names), titled by the Gateway's short name until a card gives the
-    command, and a finished one's last line of output as its summary."""
+    """One `sessions.processes.list` row as a task row (`_task_row`)."""
     lines = [ln for ln in (_clean_line(ln) for ln in (process.get("tail") or "").splitlines()) if ln]
     status = _PROCESS_STATUSES.get(process.get("status"), process.get("status"))
     if status == "completed" and process.get("exitCode") not in (None, 0):
@@ -8201,23 +8044,20 @@ def _clean_line(text: str) -> str:
     return line if len(line) <= _LINE_MAX else line[:_LINE_MAX - 1].rstrip() + "…"
 
 
-# ELI-232: how a command without a title reads. Steps that only set up the
-# shell are skipped, wrappers dropped, and an inline script is left out.
+# ELI-232: how a command without a title reads: setup steps and wrappers skipped.
 _SETUP_WORDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "umask", "trap", "shopt",
                 "true", ":", "ulimit", "alias"}
 _WRAPPER_WORDS = {"setsid", "nohup", "exec", "env", "time", "nice", "stdbuf"}
 _SCRIPT_FLAGS = {"-c", "-e", "--eval"}
 _INTERPRETER_RE = re.compile(r"(python[\d.]*|node|bun|deno|perl|ruby|php|bash|sh|zsh|dash)$")
-# A loop or a condition reads by its head: "for n in 142 136 …".
 _COMPOUND_WORDS = {"for", "while", "until", "if", "case", "select"}
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHORT_COMMAND_MAX = 80
 
 
 def _short_command(command: str) -> str:
-    """The first command in `command` that does the work, in a few words:
-    `cd /x && python3 -c "..."` reads "python3 -c …". Empty when it only
-    sets up the shell."""
+    """The first working command in a few words: `cd /x && python3 -c "..."`
+    reads "python3 -c …". Empty when it only sets up the shell."""
     lex = shlex.shlex(command or "", posix=True, punctuation_chars="();<>|&\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
@@ -8266,11 +8106,8 @@ def _cut(text: str, limit: int) -> str:
 
 
 def _exec_commands(chat) -> dict:
-    """{exec session id: {"command", "title"}} from the chat's own exec tool
-    cards. The Gateway's task for a background command is titled "CLI
-    command" (2026.9) or by the command's first words (2026.10); its sourceId
-    is the session the card's result names, and only the card has the
-    title the agent gave the call (ELI-232)."""
+    """{exec session id: {"command", "title"}} from the chat's exec tool cards:
+    only the card has the call's title (ELI-232)."""
     out = {}
     for msg in _owui_branch(chat):
         output = msg.get("output") or []
@@ -8315,25 +8152,21 @@ def _task_row(task: dict, commands: dict) -> dict:
         "status": status,
         "startedAt": task.get("startedAt") or task.get("createdAt"),
         "endedAt": None if live else (task.get("endedAt") or task.get("updatedAt")),
-        # A running command's progress is always "Command running": its chip says so.
+        # A running command's progress is always "Command running".
         "preview": (None if live and kind == "exec" else task.get("progressSummary") if live
                     else (task.get("error") or task.get("terminalSummary"))),
     }
 
 
-# 2026.9's summaries of a command, which its status chip already says.
+# 2026.9's command summaries, which the status chip already says.
 _GENERIC_COMMAND_SUMMARIES = {"Command running", "Command completed", "Command failed"}
 
 
 def _command_row(task: dict, card: dict, live: bool) -> dict:
-    """A background command (ELI-232). Titled by the title the agent gave
-    the call, else by its first real command. Under it: while it runs, that
-    command when the title is the agent's; once ended, how it ended (a
-    failure's exit code or the signal that stopped it) and its last line of
-    output. The whole command is the row's tap."""
+    """A background command row (ELI-232), titled by the agent's title, else
+    its first real command."""
     command = card.get("command") or ""
-    # 2026.9 titles every one "CLI command"; a 2026.10 process has the
-    # command's first words ("cd /tmp"), all there is without a card.
+    # 2026.9 titles every one "CLI command"; 2026.10 uses the first words.
     own = (task.get("title") or "").strip()
     short = _short_command(command or ("" if own == "CLI command" else own))
     title = card.get("title") or short or "Shell command"
@@ -8390,10 +8223,8 @@ def _automation_row(job: dict) -> dict:
 
 
 def _background_rows(tasks, jobs, agents, session_key: str, *, commands: dict) -> dict:
-    """The Background section's data. `tasks`: the Gateway's tasks for this
-    session (None: the Gateway has no task list). `jobs`: every automation
-    (None: not readable). `agents`: this chat's Agent call rows. Only what
-    belongs to this chat is listed, whoever asks (ELI-175)."""
+    """The Background section's data: only what belongs to this chat, whoever
+    asks (ELI-175). None `tasks` / `jobs`: not readable."""
     automations_available = jobs is not None
     jobs = [j for j in jobs or [] if j.get("enabled", True)]
     mine = [j for j in jobs if _job_bound_to(j, session_key)]
@@ -8410,7 +8241,6 @@ def _background_rows(tasks, jobs, agents, session_key: str, *, commands: dict) -
             continue
         rows.append({
             "id": a["id"], "kind": "Agent", "title": a["title"],
-            # Its reply stays open until its report is in.
             "status": "completed" if a.get("replyDone") else "running",
             "startedAt": a.get("startedAt"), "endedAt": None, "preview": None,
             "agent": a,
@@ -8432,13 +8262,8 @@ _TRAILING_UUID_RE = re.compile(
 
 
 def _control_ui_session_url(base: str, session_key: str) -> str | None:
-    """The session's page in the OpenClaw Control UI (ELI-141).
-
-    The UI's short-id route, `<base>/chat/<agentId>/<id>`, where `<id>` is the
-    hex of the UUID the session key ends in (OpenClaw docs/web/urls.md; the UI
-    resolves it with `sessions.resolve {shortId}`). Every key the dialog shows
-    ends in one: `agent:<id>:openwebui-<user>-<chat>` and `agent:<id>:subagent:<uuid>`.
-    None without an http(s) base or for any other key."""
+    """The session's Control UI page (ELI-141): `<base>/chat/<agentId>/<hex>`
+    of the key's trailing UUID (OpenClaw docs/web/urls.md). Else None."""
     base = (base or "").strip().rstrip("/")
     parts = (session_key or "").split(":", 2)
     if not base.lower().startswith(("http://", "https://")) or len(parts) != 3 or parts[0] != "agent":
@@ -8463,16 +8288,12 @@ def _render_drawer_fill_js(data: dict) -> str:
     return _DRAWER_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
-# How long the open Status dialog follows its running sub-agents' pushed
-# changes (a request held open), so a forgotten dialog cannot pin it forever.
+# Bound on following sub-agent pushes, so a forgotten dialog cannot pin it.
 _DIALOG_FOLLOW_MAX_S = 900
-# How often an open drawer refreshes a running sub-agent. The page polls,
-# not a held request, so the poll lives exactly as long as the drawer is open
-# and the sub-agent runs (ELI-155).
+# Drawer refresh period. The page polls, so it stops with the drawer (ELI-155).
 _SUBAGENT_POLL_INTERVAL_S = 2.5
-# How often the open dialog reads its Background section again while a row
-# runs: the Gateway pushes nothing when a background task ends (ELI-256).
-# Polled by the page too, so it stops with the dialog.
+# Background refresh period while a row runs: the Gateway pushes nothing when
+# a background task ends (ELI-256).
 _BACKGROUND_POLL_INTERVAL_S = 5
 
 
@@ -8485,10 +8306,9 @@ def _message_text_blocks(message: dict) -> list:
 
 
 def _spawn_message_text(message: dict) -> str | None:
-    """A child's spawn message as the wrapped prompt its model got, or None
-    when the message is not one. Up to OpenClaw 2026.9 `chat.history` shows
-    the wrapped prompt; from 2026.10.10 it shows the bare task and keeps the
-    prompt in `__openclaw.modelPromptProjection.text` (ELI-164)."""
+    """A spawn message as the wrapped prompt, or None. From 2026.10.10
+    `chat.history` shows the bare task and keeps the prompt in
+    `__openclaw.modelPromptProjection.text` (ELI-164)."""
     if message.get("role") != "user":
         return None
     text = "\n".join(_message_text_blocks(message))
@@ -8501,8 +8321,7 @@ def _spawn_message_text(message: dict) -> str | None:
 
 
 def _spawn_task_of(messages: list) -> str | None:
-    """The task out of the child's spawn message, when the history read
-    still holds it."""
+    """The task from the child's spawn message, if the history still holds it."""
     for m in messages or []:
         wrapped = _spawn_message_text(m)
         if wrapped:
@@ -8510,15 +8329,13 @@ def _spawn_task_of(messages: list) -> str | None:
     return None
 
 
-# A /compact run always ends "done": whether it compacted is only in its
-# reply, the Gateway's "⚙️ Compaction ..." line. These lead a refusal.
+# A /compact run always ends "done"; only its reply says whether it compacted.
 _COMPACT_REFUSALS = ("Compaction failed", "Compaction unavailable")
 
 
 def _compact_reply(messages: list, idempotency_key: str) -> str | None:
-    """The text of the compact run's own reply: the assistant message that
-    carries the run's idempotency key, else the first one after the
-    `/compact` turn (whose key is the run's plus ":user")."""
+    """The compact run's own reply: the message with its idempotency key, else
+    the first after the `/compact` turn."""
     def key_of(m):
         meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
         return m.get("idempotencyKey") or meta.get("idempotencyKey")
@@ -8540,10 +8357,8 @@ def _compact_refusal(reply: str | None) -> str | None:
     return head if head.startswith(_COMPACT_REFUSALS) else None
 
 
-# How the drawer reads a sub-agent's run: the Gateway's largest page
-# (CHAT_HISTORY_MAX_ENTRIES), text blocks up to 50000 characters, and a byte
-# budget per read: the newest steps that fit, the rest behind "Show earlier
-# steps", which reads with the larger budget.
+# The Gateway's largest history page (CHAT_HISTORY_MAX_ENTRIES), and byte
+# budgets: the newest steps that fit, the rest behind "Show earlier steps".
 _DRAWER_HISTORY_PAGE = 1000
 _DRAWER_TEXT_MAX_CHARS = 50000
 _DRAWER_RUN_BYTES = 512 * 1024
@@ -8551,9 +8366,7 @@ _DRAWER_RUN_BYTES_EARLIER = 4 * 1024 * 1024
 
 
 async def _read_child_history(conn, child_key: str, budget: int, *, all_pages: bool) -> tuple[list, bool]:
-    """The child's transcript, oldest first, and whether it is whole. One
-    page by default; with `all_pages`, older pages too while the Gateway has
-    more and the budget lasts."""
+    """The child's transcript, oldest first, and whether it is whole."""
     messages: list = []
     offset, size = 0, 0
     while True:
@@ -8572,10 +8385,8 @@ async def _read_child_history(conn, child_key: str, budget: int, *, all_pages: b
 
 
 def _drawer_run_items(messages: list) -> list:
-    """The child's run as the drawer's read-only chat, oldest first: the
-    turns it was sent after its task, and each stretch of its replies as
-    the chat's own rebuild draws it (`_history_renderer`): text, and a card
-    per tool call with its result."""
+    """The child's run as the drawer's read-only chat, drawn as the chat's own
+    rebuild draws it (`_history_renderer`)."""
     items: list = []
     stretch: list = []
 
@@ -8608,9 +8419,8 @@ def _drawer_run_items(messages: list) -> list:
 
 
 def _cap_run_items(items: list, budget: int) -> tuple[list, int]:
-    """The newest items that fit `budget` bytes, and how many older ones
-    did not. The last item always stays; when it alone is over, the end of
-    its text does (a reply's end is its conclusion)."""
+    """The newest items that fit `budget` bytes, and how many did not. The
+    last item always stays, cut to its end."""
     sizes = [len(json.dumps(i)) for i in items]
     total, dropped = sum(sizes), 0
     while total > budget and dropped < len(items) - 1:
@@ -8633,8 +8443,7 @@ _OWUI_SESSION_KEY_RE = re.compile(
 
 
 async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
-    """Where the sub-agent came from, for the header's "from" link: an Open
-    WebUI chat by its title, or the sub-agent that spawned it by its label."""
+    """The header's "from" link: the Open WebUI chat or the parent sub-agent."""
     key = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
     if not isinstance(key, str) or not key:
         return None
@@ -8652,10 +8461,8 @@ async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
 
 
 async def _previewed_task(conn, child_key: str) -> str | None:
-    """The child's task out of `sessions.preview`, which keeps the spawn
-    message as the model got it. 2026.10.5's `chat.history` shows the bare
-    task with nothing that marks it as the spawn (its display projection
-    strips the envelope), so the history read alone does not find it."""
+    """The child's task from `sessions.preview`: 2026.10.5's `chat.history`
+    shows the bare task with no spawn envelope to find it by."""
     try:
         resp = await conn.send_request("sessions.preview", dict(keys=[child_key], limit=20, maxChars=2000),
                                        timeout=5)
@@ -8666,17 +8473,15 @@ async def _previewed_task(conn, child_key: str) -> str | None:
 
 
 def _without_bare_task(items: list, task: str | None) -> list:
-    """The drawer's items without a first user turn that is the task the
-    header shows: the spawn message as 2026.10.5's history shows it."""
+    """The items without a first user turn that repeats the header's task."""
     if task and items and items[0].get("kind") == "user" and items[0].get("text", "").strip() == task.strip():
         return items[1:]
     return items
 
 
 async def _latest_preview(conn, child_key: str) -> str | None:
-    """A running child's newest message as the session list previews it:
-    what a claude-cli child has said so far, while its transcript is still
-    empty."""
+    """A running child's newest message as the list previews it: a claude-cli
+    child's transcript is empty until it ends."""
     try:
         resp = await conn.send_request(
             "sessions.list", dict(search=child_key.rsplit(":", 1)[-1], limit=10, includeLastMessage=True), timeout=5)
@@ -8688,10 +8493,8 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
 
 
-# The toolbar button's icon, the composer chip's crab claw (ELI-231); without
-# one Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
-# WebUI draws it as an <img>, so currentColor never resolves, and inverts it
-# 80% in dark mode; this gray stays a mid gray in both, like its own icons.
+# The crab claw icon (ELI-231). A fixed gray stroke: Open WebUI draws it as an
+# <img>, so currentColor never resolves, and inverts it 80% in dark mode.
 ICON_URL = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
@@ -8752,23 +8555,10 @@ class Action:
         self.icon_url = ICON_URL
 
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
-        """Dispatches on body["mode"]: the default ("status", or absent --
-        this is what OWUI sends for the actual message-toolbar click) opens
-        the dialog and shows live usage; "compact" and "subagent-detail" are
-        never sent by OWUI itself -- both are synthetic markers the dialog's
-        own in-page buttons fetch back with (see triggerCompact() and
-        openSubagentDrawer() in _MODAL_OPEN_JS_TEMPLATE), reusing this same
-        endpoint rather than registering a second Action.
-
-        A real toolbar click on an old sub-agent-finished message (written
-        by bridge versions before ELI-100) is also mode-less (OWUI itself
-        never sends a "mode"), but carries a hidden
-        `<!-- openclaw:taskId=... -->` marker in `body["content"]` -- there's deliberately no separate Action/button for
-        this: a second OWUI Function, plus flipping the existing one off
-        "global", was more infra and config risk than the payoff of a
-        visually distinct icon. Detected here and redirected
-        straight into the same subagent-detail drawer instead of the
-        general status dialog, keyed off content rather than mode."""
+        """Dispatches on body["mode"]: absent or "status" (the toolbar click)
+        opens the dialog; the other modes come from the dialog's own buttons.
+        A mode-less click carrying `<!-- openclaw:taskId=... -->` (pre-ELI-100
+        sub-agent messages) opens the sub-agent drawer instead."""
         mode = body.get("mode")
         if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
@@ -8794,13 +8584,9 @@ class Action:
         try:
             return await self._run_status(body, __user__, __event_emitter__)
         finally:
-            # Every status run (re)delivers the composer Status button, so one
-            # spark click is enough to install it in this tab. Sent last so it
-            # never delays the dialog; idempotent and best effort (never
-            # raises). Not on compact/drawer runs: the dialog that sends those
-            # was opened by a status run, which already delivered it. The
-            # Action is global (its spark shows under every model's replies),
-            # so the chat is only vouched for when its model is the Pipe's.
+            # Every status run redelivers the composer Status button, last so
+            # it never delays the dialog. The Action is global, so only for
+            # chats on the Pipe's model.
             model = body.get("model")
             ours = isinstance(model, str) and model.startswith(_COMPOSER_DEFAULT_MODEL_PREFIX)
             await _emit_composer_button(
@@ -8811,19 +8597,9 @@ class Action:
             )
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True, notice=None):
-        """Opens the dialog at once with every section's title, then fills
-        each section on its own the moment its own data is in (ELI-163): a
-        slow or failing source shows in its section only.
-
-        One request per source per open, all sent together: sessions.describe
-        (Context, and the provider Rate limits needs), usage.status,
-        sessions.list (Subagents: the store's rows, no transcripts read),
-        tasks.list and cron.list (Background), and Open WebUI's copy of the
-        chat (In-process agents, and Background's commands and agents). Read
-        only when needed: the claude-cli usage fallback when usage.status has
-        no windows, and the sub-agents' transcripts (sessions.preview) only
-        when the Subagents section opens, at once when a child runs, else on
-        the reader's first tap (mode "subagent-rows")."""
+        """Open the dialog with every section's title, then fill each section
+        when its own data is in (ELI-163). All sources are requested at once;
+        sub-agent transcripts wait for the section to open."""
         chat_id = body.get("chat_id")
         user_id = (__user__ or {}).get("id") or "unknown"
 
@@ -8835,8 +8611,7 @@ class Action:
             return {"status": "error", "detail": "missing chat_id"}
 
         session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
-        # A refresh from inside the dialog (after a compact) replaces the
-        # open's reads: the open stops following.
+        # A refresh after a compact replaces the open's reads.
         previous = _dialog_of(body, user_id)
         if previous:
             _open_dialogs.pop(body["dialogId"], None)
@@ -8846,10 +8621,6 @@ class Action:
         async def emit(code):
             await __event_emitter__({"type": "execute", "data": {"code": code}})
 
-        # chat_id/message_id/session_id/model never depend on any RPC --
-        # they're already in `body` -- so they're embedded once at open
-        # time (IDENTITY in _MODAL_OPEN_JS_TEMPLATE) rather than threaded
-        # through every section's own fill payload.
         if show_loading:
             identity = {
                 "chatId": chat_id,
@@ -8863,14 +8634,10 @@ class Action:
             }
             await emit(_render_modal_open_js(identity))
         else:
-            # Post-compact refresh: the dialog is already open, but
-            # _MODAL_COMPACTING_JS replaced the sections with its spinner;
-            # put the sections back before the refreshed reads.
+            # Post-compact refresh: put the sections back first.
             await emit(_RESET_SECTIONS_JS.replace("__OPENCLAW_DIALOG_ID__", _json_for_js(dialog_id)))
 
-        # The chat's newest messages from Open WebUI: no Gateway in it, so it
-        # is read before connecting and its section fills even with no
-        # Gateway.
+        # Open WebUI only, so this section fills even with no Gateway.
         chat_task = asyncio.ensure_future(_load_owui_recent(chat_id, user_id))
 
         async def fill_agents():
@@ -8893,8 +8660,7 @@ class Action:
             await agents_ready
             return {"status": "error", "detail": str(ex)}
 
-        # The chat's run state and its children, which the open follows while
-        # the chat runs (ELI-260): taken before the reads they guard.
+        # Followed while the chat runs (ELI-260); taken before the reads they guard.
         def chat_events():
             return [conn.session_change_event(session_key), conn.session_child_event(session_key)]
         watched = chat_events()
@@ -8903,15 +8669,9 @@ class Action:
         desc_task = asyncio.ensure_future(
             conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
         usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
-        # The parent's child sessions (ELI-152), without reading every
-        # session: `spawnedBy` gives the current ones (running, or ended in
-        # the last 30 minutes), the child index (state.py) every child the
-        # Pipe saw spawned with its last row. A new index is seeded once, from
-        # one full list, after the section's first fill. With each child's
-        # last message, as the open dialog's refills list them
-        # (`list_children`): the Gateway flattens its markdown there, unlike
-        # the transcript read, so a row read one way at an open and the other
-        # in place would differ (ELI-264).
+        # `spawnedBy` gives current children (ELI-152), the child index the
+        # rest. With each child's last message, as refills read it: the
+        # transcript read differs, so the row would change in place (ELI-264).
         current_task = asyncio.ensure_future(conn.send_request(
             "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5))
         seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
@@ -8925,11 +8685,7 @@ class Action:
             )
 
         async def fill_context(described=None):
-            """Also resolves provider/session_row for fill_limits to reuse
-            (returned, not re-fetched) -- still reuses emit.py's small
-            formatting primitives (_fmt_tokens, _format_goal_line) so
-            wording matches the status line exactly. `described`: a later
-            read of the session than the open's."""
+            """Also returns provider/session_row for fill_limits."""
             try:
                 desc = await (described or desc_task)
             except Exception as ex:
@@ -8943,8 +8699,8 @@ class Action:
             context_tokens = session_row.get("contextTokens")
             total_tokens = session_row.get("totalTokens")
             if context_tokens and total_tokens is None:
-                # OpenClaw 2026.10.10 writes no totals to a session's row
-                # after its first run (ELI-223): the newest call's own usage.
+                # OpenClaw 2026.10.10 writes no totals after a session's first
+                # run (ELI-223): use the newest call's own usage.
                 try:
                     history = await conn.send_request(
                         "chat.history", dict(sessionKey=session_key, limit=20), timeout=5)
@@ -8985,8 +8741,6 @@ class Action:
             return provider, session_row
 
         async def fill_limits():
-            # Which provider's windows to show is the session's: Context's
-            # read of it, the same request.
             provider, session_row = await context_ready
             if provider is None:
                 await emit(_render_limits_fill_js(
@@ -9006,13 +8760,8 @@ class Action:
             await emit(_render_limits_fill_js({
                 "provider": provider,
                 "windows": windows_data,
-                # Only read when there are no windows (the Rate limits section).
                 "entry": None if windows_data else _limits_entry_for(usage, provider),
-                # Only used to word the empty-windows note -- a live run is
-                # the one confirmed case (2026-07-11 live debugging) where
-                # usage.status can transiently report zero windows for the
-                # active provider, most likely because its rate-limit cache
-                # refreshes from that run's own API response headers.
+                # A live run is when usage.status can report zero windows.
                 "sessionActive": session_row.get("status") == "running",
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
@@ -9023,20 +8772,14 @@ class Action:
             await emit(_render_background_fill_js(
                 await _background_data(tasks_task, jobs_task, chat_task, session_key, source)))
 
-        # Every child seen so far by key, and what their transcripts told.
         children_seen, task_texts, latest = {}, {}, {}
-        # The listed running children with no task to title them yet.
         untitled: list = []
-        # Children seen running here, those of them that ended done with
-        # their last message in their row, and those still waiting for it: a
-        # claude-cli child's messages reach its transcript after its run
-        # settles (ELI-262).
+        # A claude-cli child's messages reach its transcript after its run
+        # settles (ELI-262), so track who still owes them.
         ran, landed, finishing = set(), set(), []
 
         async def read_transcripts(keys, again=(), fresh=()):
-            """The task and newest message of each of `keys` not read yet,
-            of each of `again` whose read found no task, and of each of
-            `fresh`."""
+            """Task and newest message of each child not read yet, or to read again."""
             unread = [k for k in keys if k not in task_texts or k in fresh
                       or (k in again and task_texts[k] is None)]
             if not unread:
@@ -9052,13 +8795,11 @@ class Action:
             texts, newest = _subagent_previews(previews)
             task_texts.update({k: None for k in unread})
             task_texts.update(texts)
-            # What each read child said last as of this read, not an earlier one.
             latest.update({k: newest.get(k) for k in unread})
 
         async def read_children():
-            """The current children, then each indexed child they lack: its
-            kept row when it had ended, else a lookup by its key. A failed
-            list still shows the indexed children."""
+            """The current children plus each indexed child they lack. A failed
+            list still shows the indexed ones."""
             known = _subagent_children(session_key)
             error = None
             try:
@@ -9070,9 +8811,8 @@ class Action:
             stale = [k for k, snap in known.items() if k not in rows and not _subagent_final(snap)][:_SUBAGENT_LIST_CAP]
             looked = await asyncio.gather(*(_lookup_child(conn, k) for k in stale))
             found = [r for r in looked if r]
-            # A recorded child no lookup finds has no session any more: its
-            # row comes from its run (ELI-276). Not when the list itself
-            # failed, which says nothing about the session.
+            # A recorded child no lookup finds is gone: its row comes from its
+            # run (ELI-276). Not when the list itself failed.
             runs = _subagent_runs(session_key)
             gone = [] if error is not None else await asyncio.gather(*(
                 _ended_child_row(conn, session_key, k, runs.get(k) or {})
@@ -9094,8 +8834,8 @@ class Action:
                                  if snap and k not in children_seen]}
 
         def subagent_rows(shown):
-            # A child's transcript may not hold its spawn message yet: then
-            # the task its spawn call was given titles it (ELI-178).
+            # Until the spawn message is in the transcript, the spawn call's
+            # task titles it (ELI-178).
             spawned = _subagent_tasks(session_key)
             return [{**_subagent_row(r, task_texts.get(r["key"]) or spawned.get(r["key"]),
                                      latest.get(r["key"])),
@@ -9103,14 +8843,9 @@ class Action:
                     for r in shown]
 
         async def fill_subagents(children, *, at_open=False):
-            """Lists every child session of this chat (ELI-152), ended ones
-            included, newest first, capped. Each row carries the fields its
-            click hands the detail drawer (see S.openSubagentDrawer /
-            Action._run_subagent_detail), so the drawer can paint its header
-            instantly before its own RPCs resolve. A row's id is the child
-            session key. At open, a section with no running child starts
-            folded (the page's rule), so its transcripts wait for a tap.
-            Returns the keys of the listed children still running."""
+            """Fill the Subagents section with every child (ELI-152), newest
+            first, capped. A row carries what the drawer needs to paint its
+            header at once. Returns the keys still running."""
             try:
                 children_resp = await children
             except Exception as ex:
@@ -9124,15 +8859,13 @@ class Action:
                     children_seen[r["key"]] = {**r, "runError": run_error} if run_error else r
             shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
             running = [r["key"] for r in shown if _subagent_status(r.get("status")) in _LIVE_SUBAGENT_STATUSES]
-            # Folded at the open, the section stays so until the reader taps
-            # it: a refill while the dialog follows the chat (ELI-260/262)
-            # reads no transcripts the tap has not asked for (ELI-266).
+            # Folded at the open, the section reads no transcripts until the
+            # reader taps it (ELI-260/262, ELI-266).
             pending = ((at_open or dialog["pending"]) and not dialog["tapped"]
                        and not running and bool(shown))
             dialog["pending"] = pending
-            # A running child with no label and no task from its spawn call is
-            # titled by its transcript, which may get its spawn message after
-            # the open: read again until it has.
+            # Read a running child's transcript again until its spawn message
+            # titles it.
             spawned = _subagent_tasks(session_key)
             want = [r["key"] for r in shown if r["key"] in running and not (r.get("label") or "").strip()
                     and not spawned.get(r["key"])]
@@ -9146,9 +8879,8 @@ class Action:
             finishing[:] = [k for k in waiting if k not in landed]
             ran.update(running)
             dialog["rows"], dialog["total"] = shown, len(children_seen)
-            # A refill that would show what the page already has is not sent:
-            # it would replace what the page made of it since, a failed tap's
-            # Retry or the rows the tap loaded (ELI-268).
+            # Skip a refill that matches what the page has: it would undo a
+            # failed tap's Retry or the tap's rows (ELI-268).
             sent = {"tasks": tasks, "total": len(children_seen), "pending": pending}
             if sent == dialog["subagents_sent"]:
                 return running
@@ -9183,23 +8915,14 @@ class Action:
             except Exception as ex:
                 pipe_log(f"[status-action] child index seed failed: {ex}")
 
-        # The ticker counts a running child up while the dialog is open, so a
-        # child that ends meanwhile must show its end (ELI-127). Hold this
-        # request open, as the drawer does, and refill the section on each
-        # pushed change to a listed child's run state, until none is listed
-        # and the chat's own run is done, the page closes the dialog, or the
-        # follow's bound passes. A running child with no task yet is titled
-        # once its spawn message reaches its transcript: the section refills
-        # on that append too (ELI-253). The chat's run may spawn a child after
-        # the open: a pushed change to a child of this session, a new one
-        # included, refills the section too (ELI-260). Each
-        # event is taken before the read it guards, so none slips between.
+        # Hold the request open and refill on each pushed change to a listed
+        # child (ELI-127), a title arriving (ELI-253) or a new child (ELI-260),
+        # until none runs, the dialog closes or the bound passes. Each event is
+        # taken before the read it guards.
         deadline = time.time() + _DIALOG_FOLLOW_MAX_S
         closed = dialog["closed"]
         subscribed = set()
-        # The chat runs while the Gateway has its run, or while the Pipe in
-        # this process streams a reply whose chat.send has not started one
-        # yet: a dialog opened right after a send (ELI-260).
+        # Or the Pipe streams a reply whose chat.send has not started a run yet (ELI-260).
         running = _running_row(desc_task) or conn.has_reply(session_key)
         refill = bool(listed)   # their events are taken only below
         while not closed.is_set():
@@ -9226,8 +8949,8 @@ class Action:
                     w.cancel()
             if not done or closed.is_set():
                 break
-            # Read the chat again: its run state, and its context, which a
-            # dialog opened right after a send had none of yet (ELI-262).
+            # Read the chat again: a dialog opened right after a send had no
+            # context yet (ELI-262).
             watched = chat_events()
             described = asyncio.ensure_future(
                 conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
@@ -9241,10 +8964,8 @@ class Action:
         return {"status": "ok"}
 
     async def _run_subagent_rows(self, body: dict, __user__, __event_emitter__):
-        """The reader opened a folded Subagents section (ELI-163): read the
-        listed children's transcripts, which the open left for this tap, and
-        fill the section again. The rows are the open's, kept with its
-        dialog, so the list is not read twice."""
+        """A folded Subagents section opened (ELI-163): read the open's listed
+        children's transcripts and refill."""
         user_id = (__user__ or {}).get("id") or "unknown"
         dialog = _dialog_of(body, user_id)
 
@@ -9276,9 +8997,8 @@ class Action:
         return {"status": "ok"}
 
     async def _run_background_rows(self, body: dict, __user__, __event_emitter__):
-        """The open dialog's Background section, read again (ELI-256): the
-        page asks every _BACKGROUND_POLL_INTERVAL_S while a row runs, since
-        the Gateway pushes nothing when a background task ends."""
+        """The Background section again (ELI-256): the page polls while a row
+        runs, since the Gateway pushes nothing when a task ends."""
         chat_id = body.get("chat_id")
         user_id = (__user__ or {}).get("id") or "unknown"
 
@@ -9292,41 +9012,23 @@ class Action:
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
         except Exception as ex:
-            # No fill: the page keeps the rows it shows and asks again (ELI-261).
+            # The page keeps its rows and asks again (ELI-261).
             pipe_log(f"[status-action] background-rows connect failed: {ex}")
             chat_task.cancel()
             return {"status": "error", "detail": str(ex)}
         data = await _background_data(
             asyncio.ensure_future(_read_background_tasks(conn, session_key)),
             asyncio.ensure_future(_read_automations(conn)), chat_task, session_key, source)
-        # A refill that failed keeps the rows shown and its follow (ELI-261).
+        # A failed refill keeps the rows shown (ELI-261).
         await emit(_render_background_fill_js({**data, "refill": True}))
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):
-        """Triggers /compact on the same session and waits for it to
-        finish, then refreshes the dialog with post-compaction numbers.
+        """Send /compact and poll until done, then refresh the dialog.
 
-        Uses chat.send(message="/compact") rather than the gateway's
-        sessions.compact RPC: traced sessions.compact's handler and it
-        explicitly rejects webchat-classified connections
-        (rejectWebchatSessionMutation / isWebchatClient in the installed
-        gateway bundle) -- and the Pipe's own connect params identify as
-        client.id="webchat", so any connection this Action reuses from the
-        Pipe is classified the same way. The RPC's own error message
-        confirms the intended alternative: "use chat.send for
-        session-scoped updates". This does mean the literal "/compact" text
-        becomes a real turn in the session's stored transcript (visible to
-        other surfaces that inspect that history), even though it never
-        appears in OWUI's own chat bubble UI (a separate HTTP path this
-        call never touches) -- a known, accepted trade-off, not an oversight.
-
-        Polls sessions.describe for completion rather than registering a
-        run consumer and reading the Pipe's event queue -- see the
-        Milestone 4 plan notes for why: this only needs a boolean "still
-        running" signal, not live text streaming, so the Pipe's much larger
-        consumption loop (idle probes, steering, preview recovery) would be
-        a lot of machinery for a narrow need.
+        chat.send, not sessions.compact: that RPC rejects webchat-classified
+        connections (rejectWebchatSessionMutation), as the Pipe's is. The
+        "/compact" text so becomes a turn in the stored transcript, accepted.
         """
         chat_id = body.get("chat_id")
         user_id = (__user__ or {}).get("id") or "unknown"
@@ -9359,10 +9061,6 @@ class Action:
             })
             return {"status": "error", "detail": "session busy"}
 
-        # Immediate, unambiguous visual feedback -- compaction can take a
-        # while (it's an LLM summarization call), so the dialog needs a
-        # definitive "in progress" state, not a skeleton that looks like
-        # it's about to finish in a second.
         await __event_emitter__({"type": "execute", "data": {"code": _MODAL_COMPACTING_JS}})
 
         idempotency_key = f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}"
@@ -9375,11 +9073,7 @@ class Action:
                 owui_chat_id=chat_id,
                 owui_user_id=user_id,
             )
-            # Explicit, not relying on the gateway's own default for an
-            # omitted field: this compact run should never trigger outbound
-            # delivery to other configured channels (Slack/Discord/etc.) --
-            # same reasoning gateway.py's existing send_stop already applies
-            # to its own chat.send("/stop") call.
+            # Never deliver this run to other channels (as send_stop does).
             compact_params["deliver"] = False
             send_resp = await _run_request(conn, RUN_SEND, compact_params, timeout=30)
         except Exception as ex:
@@ -9421,8 +9115,7 @@ class Action:
             })
             return {"status": "error", "detail": status}
 
-        # The run is done either way; its reply says whether it compacted
-        # (ELI-209). A reply that cannot be read leaves the numbers to speak.
+        # The run is done either way; its reply says whether it compacted (ELI-209).
         try:
             history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=10), timeout=8)
             refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
@@ -9438,13 +9131,9 @@ class Action:
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
 
     async def _run_subagent_detail(self, body: dict, __user__, __event_emitter__):
-        """Fills the sub-agent drawer once and returns. The open drawer asks
-        again every _SUBAGENT_POLL_INTERVAL_S while its sub-agent runs (its
-        own poll, `S.openDrawer`), so the refresh lives exactly as long as
-        the drawer is open, with no deadline and nothing left polling for a
-        closed one (ELI-155). A row click opens the drawer in the page and
-        sends `opened`; without it (an old sub-agent message's toolbar
-        click) the drawer is opened from here first."""
+        """Fill the sub-agent drawer once. The page polls every
+        _SUBAGENT_POLL_INTERVAL_S while it runs, so nothing outlives a closed
+        drawer (ELI-155). Without `opened`, the drawer is opened from here."""
         task_id = body.get("taskId")
         if not task_id:
             await __event_emitter__({"type": "execute", "data": {
@@ -9460,8 +9149,7 @@ class Action:
             })}})
 
         if not task_id.startswith("agent:"):
-            # A Tasks API id from a message written before ELI-100; only the
-            # removed tasks.get could resolve it to a child session.
+            # A pre-ELI-100 Tasks API id; only the removed tasks.get resolved it.
             await __event_emitter__({"type": "execute", "data": {
                 "code": _render_drawer_error_js("This sub-agent's details are no longer available.")
             }})
@@ -9486,10 +9174,9 @@ class Action:
 
     async def _fill_subagent_detail(self, conn, source, child_key, __event_emitter__, *,
                                     parent_for=False, earlier=False):
-        """One read of the child session and its whole run, pushed to the
-        drawer: its header, and the run as a read-only chat. `parent_for`:
-        the user to read the parent chat's title as, or False to skip it.
-        `earlier`: the reader asked for the steps a normal read leaves out."""
+        """Push one read of the child session and its run to the drawer.
+        `parent_for`: the user to read the parent chat as, or False to skip.
+        `earlier`: include the steps a normal read leaves out."""
         budget = _DRAWER_RUN_BYTES_EARLIER if earlier else _DRAWER_RUN_BYTES
         try:
             desc_resp, (messages, whole) = await asyncio.gather(
@@ -9507,8 +9194,8 @@ class Action:
         record = _subagent_record(child_key)
         gone = not session_row and record is not None
         if gone:
-            # Its session was removed when it ended (cleanup "delete"): what
-            # the child index kept of it is all there is (ELI-276).
+            # Removed when it ended (cleanup "delete"): the child index is all
+            # there is (ELI-276).
             session_row = {"spawnedBy": record["parent"], "gone": True, **(record["row"] or {})}
         if not session_row:
             await __event_emitter__({"type": "execute", "data": {
@@ -9527,9 +9214,8 @@ class Action:
         claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
         note = latest = None
         if claude_cli and task["status"] in _LIVE_SUBAGENT_STATUSES:
-            # A claude-cli run's messages reach its transcript when it ends
-            # (measured, Gateway 2026.9.3); until then its newest line is
-            # what the session list previews.
+            # A claude-cli run reaches its transcript only when it ends
+            # (Gateway 2026.9.3); until then the list preview is its newest line.
             note, latest = "cli-running", await _latest_preview(conn, child_key)
         elif claude_cli and task["status"] == "cancelled":
             note = "cli-stopped"   # stopped before it ended: nothing of it was saved
