@@ -117,9 +117,9 @@ class TheCheck(unittest.TestCase):
 
     def test_the_failure_shows_the_table_format(self):
         why = pr_media.check(DRAWER, "", [])
-        self.assertIn("| Before | After |", why)
-        self.assertIn("|---|---|", why)
-        self.assertIn("<img src=", why)
+        cell = '<img src="URL" alt="..." width="320">'
+        table = f"### What changed\n| Before | After |\n|---|---|\n| {cell} | {cell} |\n"
+        self.assertIn(table, why)
 
     def test_an_image_passes(self):
         self.assertIsNone(pr_media.check(DRAWER, IMG, []))

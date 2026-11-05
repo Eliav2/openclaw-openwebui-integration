@@ -111,7 +111,7 @@ def check(paths, body: str | None, labels) -> str | None:
             + (", ..." if len(touched) > MAX_LISTED_FILES else "") + ") but its description has no image.\n"
             "Add the Before and After from the Screenshots workflow, uploaded with gh pr edit --attach "
             "(AGENTS.md, \"Docs and screenshots ship with the feature\"), as a 2-column table, one row per change, "
-            "with a heading above saying what changed:\n"
+            "with one short heading above each table saying what changed:\n"
             "### What changed\n"
             "| Before | After |\n"
             "|---|---|\n"

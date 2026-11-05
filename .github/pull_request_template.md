@@ -8,8 +8,8 @@
 
 ## Before / After
 
-<!-- A UI change: a 2-column table, one row per change, with a short heading above each table saying
-what changed. Light theme, from the Screenshots workflow; a phone shot is 320 wide:
+<!-- A UI change: a 2-column table, one row per change, with one short heading above each table saying
+what changed (a second change gets its own heading and table, never a heading between rows). Light theme, from the Screenshots workflow; a phone shot is 320 wide:
 
 ### Notification shows the reply text
 | Before | After |
