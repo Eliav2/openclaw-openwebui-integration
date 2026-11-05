@@ -363,15 +363,10 @@ def _subagent_index_mark_seeded(rows=()) -> None:
 # ---------------------------------------------------------------------------
 # Turn identity (ELI-100, docs/design/agent-turns.md 2.2)
 # ---------------------------------------------------------------------------
-# Every run on an Open WebUI session key renders as one assistant message, and
-# which message is decided from the run id alone: any connection, deploy or
-# restarted process gets the same answer without shared memory.
-#
-#   msg-<chat>-<M>-<suffix>   a pipe-started run: its message is M, the reply
-#                             Open WebUI created for it (the user turn), or
-#                             the reply a resume / ask-user answer continues
-#   owui-action-<...>         the Status Action's own runs (/compact): none
-#   anything else             an agent turn: uuid5(TURN_NS, "<key>:<run>")
+# A run's message is decided from its run id alone, so any process agrees.
+#   msg-<chat>-<M>-<suffix>   pipe-started run: message M
+#   owui-action-<...>         Status Action runs (/compact): none
+#   anything else             agent turn: uuid5(TURN_NS, "<key>:<run>")
 
 TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")
 ACTION_RUN_PREFIX = "owui-action-"
@@ -380,16 +375,12 @@ _PIPE_RUN_RE = re.compile(rf"^msg-(?P<chat>{_UUID_RE})-(?P<message>{_UUID_RE})-(
 
 
 def pipe_run_id(chat_id: str, message_id: str, kind: str | None = None) -> str:
-    """The run id for a pipe-started run that writes into Open WebUI message
-    `message_id`: `msg-<chat>-<M>-<t>` for the reply itself, and
-    `msg-<chat>-<M>-<kind>-<t>` for a run continuing it (`input`, `resume`).
-    The trailing send time is what `_run_id_sent_at` reads."""
+    """Run id for a pipe run writing into `message_id`; `_run_id_sent_at` reads the trailing time."""
     return f"msg-{chat_id}-{message_id}-{kind + '-' if kind else ''}{time.time()}"
 
 
 def parse_pipe_run_id(run_id: str) -> dict | None:
-    """{chat, message, kind} of a pipe-started run id, else None. `kind` is
-    `reply` for the reply's own run, or the continuation kind."""
+    """{chat, message, kind} of a pipe-started run id, else None."""
     m = _PIPE_RUN_RE.match(run_id or "")
     if not m:
         return None
@@ -400,12 +391,7 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
 
 def parse_announce_run_id(run_id: str) -> dict | None:
     """{child_session, child_run} of a sub-agent announce run, else None.
-
-    The Gateway runs a child's completion in the parent session with run id
-    `announce:` + `v1:<childSessionKey>:<childRunId>` (announce-idempotency-
-    D7LnUTJR.mjs:4-10), suffixed `:wake` or `:retry-<n>` on redelivery. A
-    `announce:requester-settle:...` run wakes a yielded parent for a batch
-    of children and names no single child."""
+    Id shape: `announce:v1:<childSessionKey>:<childRunId>[:wake|:retry-<n>]` (announce-idempotency-D7LnUTJR.mjs:4-10)."""
     if not (run_id or "").startswith("announce:v1:"):
         return None
     rest = re.sub(r":(?:wake|retry-\d+)$", "", run_id[len("announce:v1:"):])
@@ -416,10 +402,8 @@ def parse_announce_run_id(run_id: str) -> dict | None:
 
 
 def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -> str | None:
-    """The Open WebUI message run `run_id` on `session_key` renders into, or
-    None when it renders nothing (the Status Action's own runs). A pipe run
-    id naming another chat than `chat_id` is treated as an agent turn: the
-    message id is only trusted inside the chat it was minted for."""
+    """The message `run_id` renders into, or None (Status Action runs). A pipe
+    run id is only trusted inside the chat it was minted for."""
     if not run_id or run_id.startswith(ACTION_RUN_PREFIX):
         return None
     parsed = parse_pipe_run_id(run_id)
@@ -431,18 +415,15 @@ def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -
 # ---------------------------------------------------------------------------
 # Claim: one message per run, anchored at the tail (DESIGN 2.3)
 # ---------------------------------------------------------------------------
-# The claim lives in Open WebUI's DB under the chat's row lock, not in a
-# process map, so an old deploy's connection, a new one and a restarted
-# process all agree: whoever inserts M first owns it, and two different runs
-# that start together chain off the tail each reads under the lock.
+# The claim lives in Open WebUI's DB under the chat's row lock, so every
+# process agrees: whoever inserts M first owns it.
 
 _TURN_WRITERS_ATTR = "_openclaw_turn_writers"
 
 
 def _live_turn_writers() -> set:
-    """Writer ids of the connections alive in this Open WebUI process. Kept on
-    `open_webui.socket.main` so every load of this Function (a redeploy keeps
-    the old module objects alive until they are reaped) shares one set."""
+    """Writer ids alive in this process. Kept on `open_webui.socket.main` so
+    every load of this Function (a redeploy keeps old modules alive) shares it."""
     mod = sys.modules.get("open_webui.socket.main")
     if mod is None:
         return set()
@@ -461,14 +442,9 @@ def _retire_turn_writer(writer_id: str) -> None:
     _live_turn_writers().discard(writer_id)
 
 
-# Writer ids name their process, so another Open WebUI worker's writer can
-# be judged: `<host>/<boot>/<pid>.<start>:<uuid>`, with the
-# kernel's boot id and the process start time guarding against a reused pid.
-# A writer of this process is alive while its connection is (the set above);
-# one of another process on this host while that process runs. A writer of
-# another host or boot, or an older pipe's `<pid>:<uuid>`, is judged gone, as
-# before: a takeover across hosts needs a shared lease, which a single-host
-# Open WebUI does not.
+# Writer id: `<host>/<boot>/<pid>.<start>:<uuid>`; boot id and start time
+# guard against a reused pid. Another host's or boot's writer is judged gone:
+# a takeover across hosts would need a shared lease.
 _WRITER_ID_RE = re.compile(r"^(?P<host>[^/]*)/(?P<boot>[^/]*)/(?P<pid>\d+)\.(?P<start>\d+):")
 
 
@@ -510,21 +486,17 @@ def _turn_writer_alive(writer: str | None) -> bool:
 
 
 def _writer_may_take_over(existing: dict) -> bool:
-    """A message another writer recorded can be taken only when that writer
-    is gone (its connection retired or its process exited) and the message
-    is unfinished. A message with no recorded writer is Open WebUI's own stub
-    for a user turn; only its own inline request hands it over
-    (`takeover=True`, DESIGN 2.6)."""
+    """A recorded writer's message can be taken only when that writer is gone
+    and the message is unfinished. A stub with no writer is handed over only
+    with `takeover=True` (DESIGN 2.6)."""
     writer = (existing.get("meta") or {}).get("openclaw_writer")
     return bool(writer) and existing.get("done") is False and not _turn_writer_alive(writer)
 
 
 async def _uncancellable(coro):
-    """Await `coro`, a write to Open WebUI's DB, to its end even when this task
-    is cancelled meanwhile (a Stop), then let the cancel go on. A cancel inside
-    Open WebUI's DB call (BEGIN IMMEDIATE or the commit run in aiosqlite's
-    thread) can wedge it and keep SQLite's write lock for good, so every later
-    write fails (ELI-205)."""
+    """Await `coro`, a write to Open WebUI's DB, to its end even if this task is
+    cancelled meanwhile, then let the cancel go on. A cancel inside the DB call
+    can wedge it and hold SQLite's write lock for good (ELI-205)."""
     task = spawn_background(coro)
     try:
         return await asyncio.shield(task)
@@ -543,19 +515,10 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
 
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
                               writer_id: str, takeover: bool = False) -> dict:
-    """Claim message `message_id` for run `run_id` in chat `chat_id`.
+    """Claim `message_id` for `run_id` under the chat's row lock, inserting it
+    under the deepest leaf. Never cut short by a cancel (ELI-205).
 
-    Under the chat's row lock (`Chats._chat_transaction`): if the message
-    exists, it is someone's already, unless `takeover` (a pipe run taking its
-    own stub, DESIGN 2.6) or its recorded writer is gone. Another live
-    writer's message is never taken. Otherwise it
-    is inserted under the deepest leaf, which becomes its parent, and
-    `currentId` moves to it. The `chat_message` row is mirrored as
-    `insert_chat_turn` does.
-
-    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}:
-    `messages` holds the changed nodes, for the `chat:messages` introduce.
-    Never cut short by a cancel (ELI-205)."""
+    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}."""
     return await _uncancellable(_claim_turn_message_now(
         chat_id, user_id, message_id, run_id, writer_id, takeover))
 
@@ -615,32 +578,23 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
 # ---------------------------------------------------------------------------
 # Owner rule: who continues an interrupted run (DESIGN 2.7)
 # ---------------------------------------------------------------------------
-# Read from the run's PERSISTED session row: the settled push after its
-# terminal (hasActiveRun false), or the first sessions.list after hello-ok.
 # The Gateway recovers only rows still `running`; the pipe resumes only rows
-# already terminal with an outside kill, so one run never gets two
-# continuations.
+# already terminal with an outside kill, so a run never gets two continuations.
 
 MAX_TURN_RESUMES = 3
-# The child's exit reaches the row only as this text (no structured field;
-# dist cli-transport line pinned in test_fixture_openclaw_exit_errors.json,
-# re-checked against the installed dist by ExitTextFixtureTest): SIGTERM
-# (143) and SIGKILL / OOM (137) by exit code, or a raw signal.
+# The exit reaches the row only as text (pinned in
+# test_fixture_openclaw_exit_errors.json): SIGTERM 143, SIGKILL / OOM 137.
 _EXTERNAL_KILL_RE = re.compile(r"process exited with (?:code (?:143|137)\b|signal SIG[A-Z]+)")
 
 
 def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     """`gateway`, `pipe` or `none` for an interrupted run's settled row.
-
-    `stop_notice_before`: a `shutdown` event without `restartExpectedMs`
-    reached this connection before the run's terminal (a stop-mode abort,
-    which the Gateway never recovers)."""
+    `stop_notice_before`: a stop-mode shutdown came first (never recovered)."""
     status = (row or {}).get("status")
     if status == "running":
         return "gateway"
     if status == "interrupted":
-        # 2026.10: marked for restart recovery, not started yet (probe
-        # 2026-10-17); a recovery it gives up on tombstones the row to failed.
+        # 2026.10: marked for restart recovery, not started yet.
         return "gateway"
     if status == "failed" and _EXTERNAL_KILL_RE.search(str(row.get("lastRunError") or "")):
         return "pipe"
@@ -650,31 +604,18 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
 
 
 def judges_cut_runs_after_listening(version) -> bool:
-    """A 2026.10+ Gateway serves session rows before its restart-recovery pass
-    has judged the runs a crash cut (about 8 s, probe 2026-10-17). 2026.9.3
-    keeps a cut run's row `running` (persisted at lifecycle start,
-    session-lifecycle-state-C7hBzJwC.mjs:77, 102) and marks within ms. An
-    unknown version is treated as the old one: never wait on a no-status row."""
+    """A 2026.10+ Gateway serves rows before its recovery pass judged cut runs
+    (about 8 s). 2026.9.3 marks within ms. Unknown versions count as old."""
     m = re.match(r"\s*(\d{4})\.(\d{1,2})\.", str(version or ""))
     return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
-    """What the writer of M does when its run settles: `gateway` (keep M open
-    for the recovery run), `wait` (another run holds the session: send
-    nothing, decide again on its settle), `resume` (send
-    msg-<chat>-<M>-resume-<t>), or `finalize`. A resume sent into a busy
-    session is queued as a follow-up, and after a restart recovery that
-    follow-up fails (M3-crash 04351f67), so a session with an active run
-    never gets one. The budget is counted on M, so a resume that is cut the
-    same way again (an OOM loop) ends after MAX_TURN_RESUMES.
-
-    `after_restart`: the Gateway restarted since the run's first event, the
-    run never reached its terminal, and the Gateway judges cut runs only after
-    it listens (`judges_cut_runs_after_listening`). Its idle no-status row is
-    then not a settle: the next pushed row decides, or the next transcript
-    append (a recovery's turn, or a give-up's tombstone notice)."""
+    """`gateway`, `wait`, `resume` or `finalize` for M's writer when its run settles.
+    A resume into a busy session fails after a restart recovery (M3-crash
+    04351f67), so it is never sent then. MAX_TURN_RESUMES stops an OOM loop.
+    `after_restart`: the idle no-status row is not a settle yet."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
@@ -705,13 +646,8 @@ def _history_user_turns(messages: list) -> list:
 
 
 def recovery_source_run(messages: list, run_id: str) -> str | None:
-    """Rule E: for a restart-recovery run (its `<id>:user` turn carries the
-    `main_session_restart_recovery` provenance, dist
-    main-session-restart-recovery-CPJjd8da.mjs:441, 452-456), the run it
-    recovers: the newest non-recovery admitted turn before it, which is what
-    the Gateway's restartRecoveryDeliverySourceRunId names
-    (chat-send-handler-kZQfUabO.mjs:635-636, agent-command-C9QUtzmi.mjs:1019).
-    None for any other run."""
+    """Rule E: the run a restart-recovery run recovers, the newest non-recovery
+    turn before it (main-session-restart-recovery-CPJjd8da.mjs:441). Else None."""
     turns = _history_user_turns(messages)
     for i, (run, tool) in enumerate(turns):
         if run == run_id:
@@ -722,8 +658,7 @@ def recovery_source_run(messages: list, run_id: str) -> str | None:
 
 
 def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list | None = None) -> str | None:
-    """The message run `run_id` writes into: its source run's for a restart
-    recovery (rule E), else its own (turn_message_id)."""
+    """The message `run_id` writes into: its source run's for a recovery (rule E)."""
     source = recovery_source_run(messages, run_id) if messages else None
     return turn_message_id(session_key, source or run_id, chat_id)
 
@@ -731,34 +666,20 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # ---------------------------------------------------------------------------
 # Cron wakes: one run id for every wake into a session (ELI-103)
 # ---------------------------------------------------------------------------
-# The cron executor runs a session wake with runId = the session's sessionId
-# (run-executor.runtime-ro-4Z0fM.mjs:499), so the id names no single wake.
-# What does: the wake's own admitted user turn, `<logicalTurnId>:user` with the
-# prompt `[cron:<jobId> <name>] ...` (isolated-agent-C_VaOV3U.mjs:1066) and no
-# provenance. On claude-cli it is committed before the CLI starts, so before
-# the wake's first event (cli-runner-9MSP9PU4.mjs:1370 awaits it ahead of
-# runCliRecovery). The next wake's turn is committed only once this wake's
-# execution has ended (session work admission). So the wake's turn is the
-# newest one committed at or before the event's `ts`. The run's closing
-# message is keyed `cli-assistant:<sessionId>` and deduplicated by that key
-# (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
-# session ever gets one: never end or rebuild a wake from it.
+# The cron executor runs a wake with runId = the session's sessionId
+# (run-executor.runtime-ro-4Z0fM.mjs:499), so the wake is found by its own
+# `[cron:<jobId> <name>]` user turn: the newest committed at or before the
+# event's `ts`. Its closing `cli-assistant:<sessionId>` message is deduplicated
+# by key, so only the first wake gets one: never end a wake from it.
 
-#
-# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
-# text but the cron provenance ({kind: internal_system, sourceTool: cron,
-# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
-# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
-# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
-# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+# 2026.10.2+ marks the wake turn by cron provenance instead and runs it under
+# its own run id: an ordinary agent turn.
 
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
 def _cron_turn_job(m: dict) -> str | None:
-    """The cron job a wake turn names: its provenance's (10.2+), else its
-    prompt's header (9.3, no provenance; 10.10, whose cron provenance names
-    neither). None for any other turn."""
+    """The cron job a wake turn names (provenance, else prompt header), else None."""
     prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
     if prov:
         if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
@@ -771,11 +692,8 @@ def _cron_turn_job(m: dict) -> str | None:
 
 
 def wake_turns(messages: list) -> list:
-    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
-    order: `key` is the turn id (its `:user` key without the suffix), `at` its
-    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
-    True when the wake runs under the session's id (9.3, ELI-103). Reads
-    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in order.
+    `shared_run`: the wake runs under the session's id (9.3, ELI-103)."""
     out = []
     for m in messages or []:
         if not isinstance(m, dict):
@@ -794,17 +712,13 @@ def wake_turns(messages: list) -> list:
 
 
 def _shared_wake_turns(messages: list) -> list:
-    """The wake turns whose wake runs under the session's id: the only ones a
-    sessionId event can belong to."""
+    """Wake turns running under the session's id: the only ones a sessionId event can belong to."""
     return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
-    """The wake whose event was emitted at `at_ms`: the newest wake turn
-    committed at or before it that no earlier wake on this session took
-    (`bound`). None while it is not committed yet (the embedded runtime writes
-    the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
-    caller tries again on the wake's next event."""
+    """The wake whose event was emitted at `at_ms`, not already `bound`. None
+    while its turn is not committed yet (embedded-agent-DNQn_PMM.mjs:5891)."""
     for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
@@ -812,11 +726,8 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
 
 
 def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset()) -> dict | None:
-    """The wake turn cron job `job`'s run that started at `start_ms` wrote:
-    its newest turn committed since, unless an earlier wake took it. None
-    while it is not committed yet: the embedded runtime writes it after the
-    run's first events, so a turn is not looked for before the event (as
-    `wake_turn_at` must, knowing no run)."""
+    """The wake turn job `job`'s run started at `start_ms` wrote, or None while
+    not committed yet."""
     for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
@@ -824,11 +735,8 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
 
 
 def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
-    """A wake's assistant messages: runs on one session are serialized, and
-    claude-cli imports its transcript stamped with the CLI's own times, so
-    everything the wake wrote lies between its turn's commit and its terminal.
-    A user turn queued meanwhile is committed inside that window too; it is
-    not the wake's and is left out."""
+    """A wake's assistant messages: those between its turn's commit and its
+    terminal, minus user turns queued meanwhile."""
     out = []
     for m in messages or []:
         if not isinstance(m, dict) or m.get("role") != "assistant":
@@ -4893,7 +4801,6 @@ async def _list_all_sessions(conn, *, timeout: float = 30, **filters) -> dict:
 
 # --- emit ------------------------------------------------------------------
 
-
 async def _emit_status(__event_emitter__, description, *, done=False):
     """Send an OWUI status event when the current pipe call supports events."""
     if not __event_emitter__:
@@ -4903,16 +4810,14 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     )
 
 
-# Claude Code's in-process sub-agent tool, and what its card's result says for
-# one started in the background: its report comes later, and the run stays
-# open until it is in (ELI-163).
+# Claude Code's sub-agent tool; a background one keeps the run open until its
+# report is in (ELI-163).
 _AGENT_TOOL_NAME = "Agent"
 _AGENT_LAUNCHED_PREFIX = "Async agent launched"
 
 
 def _is_agent_tool(name) -> bool:
-    """Claude Code calls it `Agent`; in any case, as the Gateway lowercases
-    the names of some tools. OpenClaw has no tool of its own by that name."""
+    """Claude Code's `Agent`, in any case: the Gateway lowercases some tool names."""
     return (name or "").strip().lower() == _AGENT_TOOL_NAME.lower()
 
 
@@ -4926,14 +4831,11 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
-# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
-# are, so they must be plain ids.
+# Live view ids go into the URL as they are.
 _LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
-# Words a shell command can start with that are not the command: loop and
-# condition keywords, and wrappers that run what follows. An assignment
-# (`FOO=1 cmd`) is skipped the same way.
+# Words before the real command: keywords, wrappers. `FOO=1 cmd` is skipped too.
 _SHELL_LEAD_WORDS = frozenset({"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(",
                                "time", "env", "nohup", "setsid", "sudo", "exec"})
 _SHELL_WRAPPER_WITH_ARG = frozenset({"timeout"})   # `timeout 60 cmd`: one more word to skip
@@ -4960,11 +4862,8 @@ def _command_position(segment: str) -> str:
 
 
 def _command_segments(command: str) -> list[str]:
-    """The commands a shell line runs, each from its command word on: a line is
-    split at `;` `&&` `||` `|` a lone `&`, newlines, `$(` and backticks, outside
-    quotes. Quoted text is emptied and heredoc bodies are dropped, so a browser
-    word in a string, a grep pattern or a script being written is not a
-    command."""
+    """The commands a shell line runs, each from its command word on. Quoted
+    text and heredoc bodies are dropped, so a browser word in a string is no command."""
     segments: list[str] = []
     cur: list[str] = []
     pending: list[tuple[str, bool]] = []   # heredocs whose bodies start after this line
@@ -5030,8 +4929,7 @@ def _command_segments(command: str) -> list[str]:
 
 
 def _tool_command(args_str) -> str:
-    """The `command` argument of a tool call given as a JSON object; "" when
-    there is none."""
+    """The `command` argument of a JSON tool call, else ""."""
     try:
         args = json.loads(args_str or "")
     except (TypeError, ValueError):
@@ -5041,15 +4939,9 @@ def _tool_command(args_str) -> str:
 
 
 def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
-    """The embed URL for a reply whose tool call really starts or drives a
-    browser, or None. None when the valve is off, the user is not in
-    LIVE_VIEW_USERS, the call does not match LIVE_VIEW_TOOLS, or the URL would
-    not be an http(s) URL: Open WebUI renders any other embed string as HTML.
-
-    LIVE_VIEW_TOOLS is searched in the tool's name and in each command of the
-    call's `command` argument, from its command word on. Nothing else about the
-    call is read: a file being written, a message or a query that names a
-    browser is no browser use."""
+    """The live view embed URL for a call that really drives a browser, or None.
+    Only the tool name and the commands are matched, and only an http(s) URL is
+    returned: Open WebUI renders any other embed string as HTML."""
     template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
     if not template or not re.match(r"^https?://", template, re.I):
         return None
@@ -5132,12 +5024,8 @@ def _relative_time(reset_at_ms) -> str | None:
 
 
 def _window_reset_line(w: dict) -> str | None:
-    """Full detail line for one rate-limit window, only when it has a known
-    reset time -- e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
-    without a `resetAt` (e.g. Gemini's Pro/Flash aren't time-windows), since
-    there'd be nothing new to say beyond what the thin combined line already
-    shows.
-    """
+    """Detail line for one rate-limit window with a known reset time, e.g.
+    '⏱ 5h 18% left (resets in 22m)'."""
     bit = _window_bit(w)
     rel = _relative_time(w.get("resetAt"))
     if not bit or not rel:
@@ -5147,34 +5035,13 @@ def _window_reset_line(w: dict) -> str | None:
 
 async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
                                     run_usage: dict | None = None) -> list[str]:
-    """Best-effort final status lines: context window fill (combined with the
-    provider's primary/nearest-term rate-limit window on the same line, kept
-    deliberately thin -- no reset time), one full detail line per rate-limit
-    window that has a known reset time (e.g. both '5h' and 'Week' for
-    Anthropic/OpenAI), and the active session goal (if any) on its own line.
-    Returned as separate short lines (rather than one combined line) because
-    OWUI's status UI hard-clamps every line to a single row (`line-clamp-1`,
-    no way to disable per-event) -- one line per fact keeps each row inside
-    that clamp instead of getting cut off mid-number.
+    """Best-effort final status lines: context fill with the primary window,
+    a reset line per window, and the goal. One fact per line, since OWUI clamps
+    each status row to one line; the thin line goes last since OWUI shows only
+    the last one. Errors are swallowed so the reply is never affected.
 
-    OWUI shows only the *last* emitted status line by default (the rest
-    only appear once the user expands that message's status history), so
-    the thin context+primary-window line is placed last on purpose. Goal and
-    the per-window reset-time detail lines still show up immediately on
-    expand.
-
-    Both RPCs are read-only and already used elsewhere by the pipe
-    (`sessions.describe`) or are simple/cheap (`usage.status`); any failure
-    here must not affect the actual reply, so every error is swallowed and
-    just omits that line. They're fetched concurrently (not one after the
-    other) so this adds at most one round trip's worth of latency, not two,
-    to the moment the status line settles after the reply text is done.
-
-    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
-    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
-    session's first totals to its row just after the run ends, so a new
-    chat's first reply found none there, and every later reply read the run
-    before it (ELI-177). The window (`contextTokens`) still comes from the row.
+    `run_usage`: the run's own usage gives the context fill, since OpenClaw
+    2026.10 writes a first reply's totals to the row only after the run (ELI-177).
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -5213,10 +5080,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
                     primary_bit = f"⏱ {bits[0]}"
                 elif p.get("summary"):
                     primary_bit = f"⏱ {p['summary']}"
-                # A full "(resets in ...)" line per window that actually has
-                # a known reset time -- including the same window already
-                # folded into `primary_bit`, since that one stays thin (no
-                # reset time) on purpose.
+                # The primary window gets its reset line here too.
                 reset_lines = [
                     line for line in (_window_reset_line(w) for w in windows) if line
                 ]
@@ -5230,13 +5094,9 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
 
 async def _emit_message_snapshot(__event_emitter__, content):
-    """Write `content` to the reply's stored message with a `replace` event.
-
-    Open WebUI 0.12 writes it even while the message is `done: false` (the
-    message upsert has no done guard), and its end-of-reply save then sets
-    `content` from `output`, over it. So it shows when a reply never reaches
-    that save, and to a chat read that spans it (`_live_output`). Probed on
-    0.12.0 (ELI-160 slice 8).
+    """Write `content` to the stored reply with a `replace` event. Open WebUI
+    0.12 writes it even while `done: false`, and its end-of-reply save
+    overwrites it (ELI-160 slice 8).
     """
     if not __event_emitter__ or not content:
         return
@@ -5246,17 +5106,9 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
 
 async def _live_output(request, chat_id: str | None, message_id: str | None) -> list | None:
-    """Open WebUI's live copy of a streaming reply's `output`: the text and
-    tool cards a chat read shows while the reply streams. None when there is
-    none (no request, a chat that is not saved, the reply not streaming).
-
-    Open WebUI 0.12's chat read (`GET /api/v1/chats/{id}`) takes the saved
-    message, then, a few awaits later, lays this copy over it. The saved
-    message has no `output` until Open WebUI's end-of-reply save, which then
-    drops the copy: a read whose two halves span that save gets the message
-    as saved before it, and nothing live over it (ELI-267). Open WebUI
-    refreshes the copy after each line of the reply it reads, so at the end
-    of the Pipe's stream it holds the whole reply."""
+    """Open WebUI's live copy of a streaming reply's `output`, or None.
+    A chat read spanning the end-of-reply save gets neither copy nor output
+    (ELI-267); at the end of the Pipe's stream the copy holds the whole reply."""
     if request is None or not chat_id or not message_id:
         return None
     try:

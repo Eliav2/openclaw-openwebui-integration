@@ -369,15 +369,10 @@ def _subagent_index_mark_seeded(rows=()) -> None:
 # ---------------------------------------------------------------------------
 # Turn identity (ELI-100, docs/design/agent-turns.md 2.2)
 # ---------------------------------------------------------------------------
-# Every run on an Open WebUI session key renders as one assistant message, and
-# which message is decided from the run id alone: any connection, deploy or
-# restarted process gets the same answer without shared memory.
-#
-#   msg-<chat>-<M>-<suffix>   a pipe-started run: its message is M, the reply
-#                             Open WebUI created for it (the user turn), or
-#                             the reply a resume / ask-user answer continues
-#   owui-action-<...>         the Status Action's own runs (/compact): none
-#   anything else             an agent turn: uuid5(TURN_NS, "<key>:<run>")
+# A run's message is decided from its run id alone, so any process agrees.
+#   msg-<chat>-<M>-<suffix>   pipe-started run: message M
+#   owui-action-<...>         Status Action runs (/compact): none
+#   anything else             agent turn: uuid5(TURN_NS, "<key>:<run>")
 
 TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")
 ACTION_RUN_PREFIX = "owui-action-"
@@ -386,16 +381,12 @@ _PIPE_RUN_RE = re.compile(rf"^msg-(?P<chat>{_UUID_RE})-(?P<message>{_UUID_RE})-(
 
 
 def pipe_run_id(chat_id: str, message_id: str, kind: str | None = None) -> str:
-    """The run id for a pipe-started run that writes into Open WebUI message
-    `message_id`: `msg-<chat>-<M>-<t>` for the reply itself, and
-    `msg-<chat>-<M>-<kind>-<t>` for a run continuing it (`input`, `resume`).
-    The trailing send time is what `_run_id_sent_at` reads."""
+    """Run id for a pipe run writing into `message_id`; `_run_id_sent_at` reads the trailing time."""
     return f"msg-{chat_id}-{message_id}-{kind + '-' if kind else ''}{time.time()}"
 
 
 def parse_pipe_run_id(run_id: str) -> dict | None:
-    """{chat, message, kind} of a pipe-started run id, else None. `kind` is
-    `reply` for the reply's own run, or the continuation kind."""
+    """{chat, message, kind} of a pipe-started run id, else None."""
     m = _PIPE_RUN_RE.match(run_id or "")
     if not m:
         return None
@@ -406,12 +397,7 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
 
 def parse_announce_run_id(run_id: str) -> dict | None:
     """{child_session, child_run} of a sub-agent announce run, else None.
-
-    The Gateway runs a child's completion in the parent session with run id
-    `announce:` + `v1:<childSessionKey>:<childRunId>` (announce-idempotency-
-    D7LnUTJR.mjs:4-10), suffixed `:wake` or `:retry-<n>` on redelivery. A
-    `announce:requester-settle:...` run wakes a yielded parent for a batch
-    of children and names no single child."""
+    Id shape: `announce:v1:<childSessionKey>:<childRunId>[:wake|:retry-<n>]` (announce-idempotency-D7LnUTJR.mjs:4-10)."""
     if not (run_id or "").startswith("announce:v1:"):
         return None
     rest = re.sub(r":(?:wake|retry-\d+)$", "", run_id[len("announce:v1:"):])
@@ -422,10 +408,8 @@ def parse_announce_run_id(run_id: str) -> dict | None:
 
 
 def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -> str | None:
-    """The Open WebUI message run `run_id` on `session_key` renders into, or
-    None when it renders nothing (the Status Action's own runs). A pipe run
-    id naming another chat than `chat_id` is treated as an agent turn: the
-    message id is only trusted inside the chat it was minted for."""
+    """The message `run_id` renders into, or None (Status Action runs). A pipe
+    run id is only trusted inside the chat it was minted for."""
     if not run_id or run_id.startswith(ACTION_RUN_PREFIX):
         return None
     parsed = parse_pipe_run_id(run_id)
@@ -437,18 +421,15 @@ def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -
 # ---------------------------------------------------------------------------
 # Claim: one message per run, anchored at the tail (DESIGN 2.3)
 # ---------------------------------------------------------------------------
-# The claim lives in Open WebUI's DB under the chat's row lock, not in a
-# process map, so an old deploy's connection, a new one and a restarted
-# process all agree: whoever inserts M first owns it, and two different runs
-# that start together chain off the tail each reads under the lock.
+# The claim lives in Open WebUI's DB under the chat's row lock, so every
+# process agrees: whoever inserts M first owns it.
 
 _TURN_WRITERS_ATTR = "_openclaw_turn_writers"
 
 
 def _live_turn_writers() -> set:
-    """Writer ids of the connections alive in this Open WebUI process. Kept on
-    `open_webui.socket.main` so every load of this Function (a redeploy keeps
-    the old module objects alive until they are reaped) shares one set."""
+    """Writer ids alive in this process. Kept on `open_webui.socket.main` so
+    every load of this Function (a redeploy keeps old modules alive) shares it."""
     mod = sys.modules.get("open_webui.socket.main")
     if mod is None:
         return set()
@@ -467,14 +448,9 @@ def _retire_turn_writer(writer_id: str) -> None:
     _live_turn_writers().discard(writer_id)
 
 
-# Writer ids name their process, so another Open WebUI worker's writer can
-# be judged: `<host>/<boot>/<pid>.<start>:<uuid>`, with the
-# kernel's boot id and the process start time guarding against a reused pid.
-# A writer of this process is alive while its connection is (the set above);
-# one of another process on this host while that process runs. A writer of
-# another host or boot, or an older pipe's `<pid>:<uuid>`, is judged gone, as
-# before: a takeover across hosts needs a shared lease, which a single-host
-# Open WebUI does not.
+# Writer id: `<host>/<boot>/<pid>.<start>:<uuid>`; boot id and start time
+# guard against a reused pid. Another host's or boot's writer is judged gone:
+# a takeover across hosts would need a shared lease.
 _WRITER_ID_RE = re.compile(r"^(?P<host>[^/]*)/(?P<boot>[^/]*)/(?P<pid>\d+)\.(?P<start>\d+):")
 
 
@@ -516,21 +492,17 @@ def _turn_writer_alive(writer: str | None) -> bool:
 
 
 def _writer_may_take_over(existing: dict) -> bool:
-    """A message another writer recorded can be taken only when that writer
-    is gone (its connection retired or its process exited) and the message
-    is unfinished. A message with no recorded writer is Open WebUI's own stub
-    for a user turn; only its own inline request hands it over
-    (`takeover=True`, DESIGN 2.6)."""
+    """A recorded writer's message can be taken only when that writer is gone
+    and the message is unfinished. A stub with no writer is handed over only
+    with `takeover=True` (DESIGN 2.6)."""
     writer = (existing.get("meta") or {}).get("openclaw_writer")
     return bool(writer) and existing.get("done") is False and not _turn_writer_alive(writer)
 
 
 async def _uncancellable(coro):
-    """Await `coro`, a write to Open WebUI's DB, to its end even when this task
-    is cancelled meanwhile (a Stop), then let the cancel go on. A cancel inside
-    Open WebUI's DB call (BEGIN IMMEDIATE or the commit run in aiosqlite's
-    thread) can wedge it and keep SQLite's write lock for good, so every later
-    write fails (ELI-205)."""
+    """Await `coro`, a write to Open WebUI's DB, to its end even if this task is
+    cancelled meanwhile, then let the cancel go on. A cancel inside the DB call
+    can wedge it and hold SQLite's write lock for good (ELI-205)."""
     task = spawn_background(coro)
     try:
         return await asyncio.shield(task)
@@ -549,19 +521,10 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
 
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
                               writer_id: str, takeover: bool = False) -> dict:
-    """Claim message `message_id` for run `run_id` in chat `chat_id`.
+    """Claim `message_id` for `run_id` under the chat's row lock, inserting it
+    under the deepest leaf. Never cut short by a cancel (ELI-205).
 
-    Under the chat's row lock (`Chats._chat_transaction`): if the message
-    exists, it is someone's already, unless `takeover` (a pipe run taking its
-    own stub, DESIGN 2.6) or its recorded writer is gone. Another live
-    writer's message is never taken. Otherwise it
-    is inserted under the deepest leaf, which becomes its parent, and
-    `currentId` moves to it. The `chat_message` row is mirrored as
-    `insert_chat_turn` does.
-
-    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}:
-    `messages` holds the changed nodes, for the `chat:messages` introduce.
-    Never cut short by a cancel (ELI-205)."""
+    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}."""
     return await _uncancellable(_claim_turn_message_now(
         chat_id, user_id, message_id, run_id, writer_id, takeover))
 
@@ -621,32 +584,23 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
 # ---------------------------------------------------------------------------
 # Owner rule: who continues an interrupted run (DESIGN 2.7)
 # ---------------------------------------------------------------------------
-# Read from the run's PERSISTED session row: the settled push after its
-# terminal (hasActiveRun false), or the first sessions.list after hello-ok.
 # The Gateway recovers only rows still `running`; the pipe resumes only rows
-# already terminal with an outside kill, so one run never gets two
-# continuations.
+# already terminal with an outside kill, so a run never gets two continuations.
 
 MAX_TURN_RESUMES = 3
-# The child's exit reaches the row only as this text (no structured field;
-# dist cli-transport line pinned in test_fixture_openclaw_exit_errors.json,
-# re-checked against the installed dist by ExitTextFixtureTest): SIGTERM
-# (143) and SIGKILL / OOM (137) by exit code, or a raw signal.
+# The exit reaches the row only as text (pinned in
+# test_fixture_openclaw_exit_errors.json): SIGTERM 143, SIGKILL / OOM 137.
 _EXTERNAL_KILL_RE = re.compile(r"process exited with (?:code (?:143|137)\b|signal SIG[A-Z]+)")
 
 
 def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     """`gateway`, `pipe` or `none` for an interrupted run's settled row.
-
-    `stop_notice_before`: a `shutdown` event without `restartExpectedMs`
-    reached this connection before the run's terminal (a stop-mode abort,
-    which the Gateway never recovers)."""
+    `stop_notice_before`: a stop-mode shutdown came first (never recovered)."""
     status = (row or {}).get("status")
     if status == "running":
         return "gateway"
     if status == "interrupted":
-        # 2026.10: marked for restart recovery, not started yet (probe
-        # 2026-10-17); a recovery it gives up on tombstones the row to failed.
+        # 2026.10: marked for restart recovery, not started yet.
         return "gateway"
     if status == "failed" and _EXTERNAL_KILL_RE.search(str(row.get("lastRunError") or "")):
         return "pipe"
@@ -656,31 +610,18 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
 
 
 def judges_cut_runs_after_listening(version) -> bool:
-    """A 2026.10+ Gateway serves session rows before its restart-recovery pass
-    has judged the runs a crash cut (about 8 s, probe 2026-10-17). 2026.9.3
-    keeps a cut run's row `running` (persisted at lifecycle start,
-    session-lifecycle-state-C7hBzJwC.mjs:77, 102) and marks within ms. An
-    unknown version is treated as the old one: never wait on a no-status row."""
+    """A 2026.10+ Gateway serves rows before its recovery pass judged cut runs
+    (about 8 s). 2026.9.3 marks within ms. Unknown versions count as old."""
     m = re.match(r"\s*(\d{4})\.(\d{1,2})\.", str(version or ""))
     return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
-    """What the writer of M does when its run settles: `gateway` (keep M open
-    for the recovery run), `wait` (another run holds the session: send
-    nothing, decide again on its settle), `resume` (send
-    msg-<chat>-<M>-resume-<t>), or `finalize`. A resume sent into a busy
-    session is queued as a follow-up, and after a restart recovery that
-    follow-up fails (M3-crash 04351f67), so a session with an active run
-    never gets one. The budget is counted on M, so a resume that is cut the
-    same way again (an OOM loop) ends after MAX_TURN_RESUMES.
-
-    `after_restart`: the Gateway restarted since the run's first event, the
-    run never reached its terminal, and the Gateway judges cut runs only after
-    it listens (`judges_cut_runs_after_listening`). Its idle no-status row is
-    then not a settle: the next pushed row decides, or the next transcript
-    append (a recovery's turn, or a give-up's tombstone notice)."""
+    """`gateway`, `wait`, `resume` or `finalize` for M's writer when its run settles.
+    A resume into a busy session fails after a restart recovery (M3-crash
+    04351f67), so it is never sent then. MAX_TURN_RESUMES stops an OOM loop.
+    `after_restart`: the idle no-status row is not a settle yet."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
@@ -711,13 +652,8 @@ def _history_user_turns(messages: list) -> list:
 
 
 def recovery_source_run(messages: list, run_id: str) -> str | None:
-    """Rule E: for a restart-recovery run (its `<id>:user` turn carries the
-    `main_session_restart_recovery` provenance, dist
-    main-session-restart-recovery-CPJjd8da.mjs:441, 452-456), the run it
-    recovers: the newest non-recovery admitted turn before it, which is what
-    the Gateway's restartRecoveryDeliverySourceRunId names
-    (chat-send-handler-kZQfUabO.mjs:635-636, agent-command-C9QUtzmi.mjs:1019).
-    None for any other run."""
+    """Rule E: the run a restart-recovery run recovers, the newest non-recovery
+    turn before it (main-session-restart-recovery-CPJjd8da.mjs:441). Else None."""
     turns = _history_user_turns(messages)
     for i, (run, tool) in enumerate(turns):
         if run == run_id:
@@ -728,8 +664,7 @@ def recovery_source_run(messages: list, run_id: str) -> str | None:
 
 
 def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list | None = None) -> str | None:
-    """The message run `run_id` writes into: its source run's for a restart
-    recovery (rule E), else its own (turn_message_id)."""
+    """The message `run_id` writes into: its source run's for a recovery (rule E)."""
     source = recovery_source_run(messages, run_id) if messages else None
     return turn_message_id(session_key, source or run_id, chat_id)
 
@@ -737,34 +672,20 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # ---------------------------------------------------------------------------
 # Cron wakes: one run id for every wake into a session (ELI-103)
 # ---------------------------------------------------------------------------
-# The cron executor runs a session wake with runId = the session's sessionId
-# (run-executor.runtime-ro-4Z0fM.mjs:499), so the id names no single wake.
-# What does: the wake's own admitted user turn, `<logicalTurnId>:user` with the
-# prompt `[cron:<jobId> <name>] ...` (isolated-agent-C_VaOV3U.mjs:1066) and no
-# provenance. On claude-cli it is committed before the CLI starts, so before
-# the wake's first event (cli-runner-9MSP9PU4.mjs:1370 awaits it ahead of
-# runCliRecovery). The next wake's turn is committed only once this wake's
-# execution has ended (session work admission). So the wake's turn is the
-# newest one committed at or before the event's `ts`. The run's closing
-# message is keyed `cli-assistant:<sessionId>` and deduplicated by that key
-# (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
-# session ever gets one: never end or rebuild a wake from it.
+# The cron executor runs a wake with runId = the session's sessionId
+# (run-executor.runtime-ro-4Z0fM.mjs:499), so the wake is found by its own
+# `[cron:<jobId> <name>]` user turn: the newest committed at or before the
+# event's `ts`. Its closing `cli-assistant:<sessionId>` message is deduplicated
+# by key, so only the first wake gets one: never end a wake from it.
 
-#
-# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
-# text but the cron provenance ({kind: internal_system, sourceTool: cron,
-# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
-# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
-# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
-# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+# 2026.10.2+ marks the wake turn by cron provenance instead and runs it under
+# its own run id: an ordinary agent turn.
 
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
 def _cron_turn_job(m: dict) -> str | None:
-    """The cron job a wake turn names: its provenance's (10.2+), else its
-    prompt's header (9.3, no provenance; 10.10, whose cron provenance names
-    neither). None for any other turn."""
+    """The cron job a wake turn names (provenance, else prompt header), else None."""
     prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
     if prov:
         if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
@@ -777,11 +698,8 @@ def _cron_turn_job(m: dict) -> str | None:
 
 
 def wake_turns(messages: list) -> list:
-    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
-    order: `key` is the turn id (its `:user` key without the suffix), `at` its
-    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
-    True when the wake runs under the session's id (9.3, ELI-103). Reads
-    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in order.
+    `shared_run`: the wake runs under the session's id (9.3, ELI-103)."""
     out = []
     for m in messages or []:
         if not isinstance(m, dict):
@@ -800,17 +718,13 @@ def wake_turns(messages: list) -> list:
 
 
 def _shared_wake_turns(messages: list) -> list:
-    """The wake turns whose wake runs under the session's id: the only ones a
-    sessionId event can belong to."""
+    """Wake turns running under the session's id: the only ones a sessionId event can belong to."""
     return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
-    """The wake whose event was emitted at `at_ms`: the newest wake turn
-    committed at or before it that no earlier wake on this session took
-    (`bound`). None while it is not committed yet (the embedded runtime writes
-    the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
-    caller tries again on the wake's next event."""
+    """The wake whose event was emitted at `at_ms`, not already `bound`. None
+    while its turn is not committed yet (embedded-agent-DNQn_PMM.mjs:5891)."""
     for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
@@ -818,11 +732,8 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
 
 
 def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset()) -> dict | None:
-    """The wake turn cron job `job`'s run that started at `start_ms` wrote:
-    its newest turn committed since, unless an earlier wake took it. None
-    while it is not committed yet: the embedded runtime writes it after the
-    run's first events, so a turn is not looked for before the event (as
-    `wake_turn_at` must, knowing no run)."""
+    """The wake turn job `job`'s run started at `start_ms` wrote, or None while
+    not committed yet."""
     for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
@@ -830,11 +741,8 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
 
 
 def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
-    """A wake's assistant messages: runs on one session are serialized, and
-    claude-cli imports its transcript stamped with the CLI's own times, so
-    everything the wake wrote lies between its turn's commit and its terminal.
-    A user turn queued meanwhile is committed inside that window too; it is
-    not the wake's and is left out."""
+    """A wake's assistant messages: those between its turn's commit and its
+    terminal, minus user turns queued meanwhile."""
     out = []
     for m in messages or []:
         if not isinstance(m, dict) or m.get("role") != "assistant":
@@ -1657,7 +1565,6 @@ def _fit_image_attachments(attachments: list, max_bytes: int) -> list:
 
 # --- emit ------------------------------------------------------------------
 
-
 async def _emit_status(__event_emitter__, description, *, done=False):
     """Send an OWUI status event when the current pipe call supports events."""
     if not __event_emitter__:
@@ -1667,16 +1574,14 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     )
 
 
-# Claude Code's in-process sub-agent tool, and what its card's result says for
-# one started in the background: its report comes later, and the run stays
-# open until it is in (ELI-163).
+# Claude Code's sub-agent tool; a background one keeps the run open until its
+# report is in (ELI-163).
 _AGENT_TOOL_NAME = "Agent"
 _AGENT_LAUNCHED_PREFIX = "Async agent launched"
 
 
 def _is_agent_tool(name) -> bool:
-    """Claude Code calls it `Agent`; in any case, as the Gateway lowercases
-    the names of some tools. OpenClaw has no tool of its own by that name."""
+    """Claude Code's `Agent`, in any case: the Gateway lowercases some tool names."""
     return (name or "").strip().lower() == _AGENT_TOOL_NAME.lower()
 
 
@@ -1690,14 +1595,11 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
-# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
-# are, so they must be plain ids.
+# Live view ids go into the URL as they are.
 _LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
-# Words a shell command can start with that are not the command: loop and
-# condition keywords, and wrappers that run what follows. An assignment
-# (`FOO=1 cmd`) is skipped the same way.
+# Words before the real command: keywords, wrappers. `FOO=1 cmd` is skipped too.
 _SHELL_LEAD_WORDS = frozenset({"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(",
                                "time", "env", "nohup", "setsid", "sudo", "exec"})
 _SHELL_WRAPPER_WITH_ARG = frozenset({"timeout"})   # `timeout 60 cmd`: one more word to skip
@@ -1724,11 +1626,8 @@ def _command_position(segment: str) -> str:
 
 
 def _command_segments(command: str) -> list[str]:
-    """The commands a shell line runs, each from its command word on: a line is
-    split at `;` `&&` `||` `|` a lone `&`, newlines, `$(` and backticks, outside
-    quotes. Quoted text is emptied and heredoc bodies are dropped, so a browser
-    word in a string, a grep pattern or a script being written is not a
-    command."""
+    """The commands a shell line runs, each from its command word on. Quoted
+    text and heredoc bodies are dropped, so a browser word in a string is no command."""
     segments: list[str] = []
     cur: list[str] = []
     pending: list[tuple[str, bool]] = []   # heredocs whose bodies start after this line
@@ -1794,8 +1693,7 @@ def _command_segments(command: str) -> list[str]:
 
 
 def _tool_command(args_str) -> str:
-    """The `command` argument of a tool call given as a JSON object; "" when
-    there is none."""
+    """The `command` argument of a JSON tool call, else ""."""
     try:
         args = json.loads(args_str or "")
     except (TypeError, ValueError):
@@ -1805,15 +1703,9 @@ def _tool_command(args_str) -> str:
 
 
 def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
-    """The embed URL for a reply whose tool call really starts or drives a
-    browser, or None. None when the valve is off, the user is not in
-    LIVE_VIEW_USERS, the call does not match LIVE_VIEW_TOOLS, or the URL would
-    not be an http(s) URL: Open WebUI renders any other embed string as HTML.
-
-    LIVE_VIEW_TOOLS is searched in the tool's name and in each command of the
-    call's `command` argument, from its command word on. Nothing else about the
-    call is read: a file being written, a message or a query that names a
-    browser is no browser use."""
+    """The live view embed URL for a call that really drives a browser, or None.
+    Only the tool name and the commands are matched, and only an http(s) URL is
+    returned: Open WebUI renders any other embed string as HTML."""
     template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
     if not template or not re.match(r"^https?://", template, re.I):
         return None
@@ -1896,12 +1788,8 @@ def _relative_time(reset_at_ms) -> str | None:
 
 
 def _window_reset_line(w: dict) -> str | None:
-    """Full detail line for one rate-limit window, only when it has a known
-    reset time -- e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
-    without a `resetAt` (e.g. Gemini's Pro/Flash aren't time-windows), since
-    there'd be nothing new to say beyond what the thin combined line already
-    shows.
-    """
+    """Detail line for one rate-limit window with a known reset time, e.g.
+    '⏱ 5h 18% left (resets in 22m)'."""
     bit = _window_bit(w)
     rel = _relative_time(w.get("resetAt"))
     if not bit or not rel:
@@ -1911,34 +1799,13 @@ def _window_reset_line(w: dict) -> str | None:
 
 async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
                                     run_usage: dict | None = None) -> list[str]:
-    """Best-effort final status lines: context window fill (combined with the
-    provider's primary/nearest-term rate-limit window on the same line, kept
-    deliberately thin -- no reset time), one full detail line per rate-limit
-    window that has a known reset time (e.g. both '5h' and 'Week' for
-    Anthropic/OpenAI), and the active session goal (if any) on its own line.
-    Returned as separate short lines (rather than one combined line) because
-    OWUI's status UI hard-clamps every line to a single row (`line-clamp-1`,
-    no way to disable per-event) -- one line per fact keeps each row inside
-    that clamp instead of getting cut off mid-number.
+    """Best-effort final status lines: context fill with the primary window,
+    a reset line per window, and the goal. One fact per line, since OWUI clamps
+    each status row to one line; the thin line goes last since OWUI shows only
+    the last one. Errors are swallowed so the reply is never affected.
 
-    OWUI shows only the *last* emitted status line by default (the rest
-    only appear once the user expands that message's status history), so
-    the thin context+primary-window line is placed last on purpose. Goal and
-    the per-window reset-time detail lines still show up immediately on
-    expand.
-
-    Both RPCs are read-only and already used elsewhere by the pipe
-    (`sessions.describe`) or are simple/cheap (`usage.status`); any failure
-    here must not affect the actual reply, so every error is swallowed and
-    just omits that line. They're fetched concurrently (not one after the
-    other) so this adds at most one round trip's worth of latency, not two,
-    to the moment the status line settles after the reply text is done.
-
-    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
-    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
-    session's first totals to its row just after the run ends, so a new
-    chat's first reply found none there, and every later reply read the run
-    before it (ELI-177). The window (`contextTokens`) still comes from the row.
+    `run_usage`: the run's own usage gives the context fill, since OpenClaw
+    2026.10 writes a first reply's totals to the row only after the run (ELI-177).
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -1977,10 +1844,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
                     primary_bit = f"⏱ {bits[0]}"
                 elif p.get("summary"):
                     primary_bit = f"⏱ {p['summary']}"
-                # A full "(resets in ...)" line per window that actually has
-                # a known reset time -- including the same window already
-                # folded into `primary_bit`, since that one stays thin (no
-                # reset time) on purpose.
+                # The primary window gets its reset line here too.
                 reset_lines = [
                     line for line in (_window_reset_line(w) for w in windows) if line
                 ]
@@ -1994,13 +1858,9 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
 
 async def _emit_message_snapshot(__event_emitter__, content):
-    """Write `content` to the reply's stored message with a `replace` event.
-
-    Open WebUI 0.12 writes it even while the message is `done: false` (the
-    message upsert has no done guard), and its end-of-reply save then sets
-    `content` from `output`, over it. So it shows when a reply never reaches
-    that save, and to a chat read that spans it (`_live_output`). Probed on
-    0.12.0 (ELI-160 slice 8).
+    """Write `content` to the stored reply with a `replace` event. Open WebUI
+    0.12 writes it even while `done: false`, and its end-of-reply save
+    overwrites it (ELI-160 slice 8).
     """
     if not __event_emitter__ or not content:
         return
@@ -2010,17 +1870,9 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
 
 async def _live_output(request, chat_id: str | None, message_id: str | None) -> list | None:
-    """Open WebUI's live copy of a streaming reply's `output`: the text and
-    tool cards a chat read shows while the reply streams. None when there is
-    none (no request, a chat that is not saved, the reply not streaming).
-
-    Open WebUI 0.12's chat read (`GET /api/v1/chats/{id}`) takes the saved
-    message, then, a few awaits later, lays this copy over it. The saved
-    message has no `output` until Open WebUI's end-of-reply save, which then
-    drops the copy: a read whose two halves span that save gets the message
-    as saved before it, and nothing live over it (ELI-267). Open WebUI
-    refreshes the copy after each line of the reply it reads, so at the end
-    of the Pipe's stream it holds the whole reply."""
+    """Open WebUI's live copy of a streaming reply's `output`, or None.
+    A chat read spanning the end-of-reply save gets neither copy nor output
+    (ELI-267); at the end of the Pipe's stream the copy holds the whole reply."""
     if request is None or not chat_id or not message_id:
         return None
     try:
@@ -2621,34 +2473,20 @@ async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=
 
 # --- composer_watch --------------------------------------------------------
 #
-# Pipe only (the Action artifact does not include this fragment). Uses the
-# snippet helpers from composer.py.
+# Pipe only (the Action artifact does not include this fragment).
 
 
 # ---------------------------------------------------------------------------
 # (c) Composer watcher: push the snippet when a tab opens an OpenClaw chat.
 #
-# Open WebUI 0.12 tabs emit `events:chat` join/leave, and the server keeps the
-# joined ids in SESSION_POOL[sid]["chat_ids"] (socket/main.py). There is no
-# hook on the join itself, so this polls the pool. For each (sid, chat) pair,
-# after a short settle delay, it reads the chat's head (`_composer_chat_head`:
-# its owner and its branch's newest messages, never the whole chat), checks
-# that the socket's own user owns it and that it is on one of this Pipe's
-# models, and sends the snippet to that one socket (`to=sid`, never the user
-# room) targeting the chat's latest user message.
-#
-# It is sent with `sio.call`, not `emit`: Chat.svelte acks an `execute` event
-# only after actually running it, and drops it (no ack) while the tab has not
-# loaded that chat's history yet. No ack means a retry a few seconds later, up
-# to _COMPOSER_WATCH_ATTEMPTS times. Leaving and re-joining a chat re-arms the
-# pair. The watcher idles while this Pipe function is disabled and stops when
-# it is deleted. Every failure is logged once and swallowed: on an Open WebUI
-# without `chat_ids` the loop simply finds nothing.
+# Open WebUI 0.12 has no hook on a tab's `events:chat` join, so this polls
+# SESSION_POOL[sid]["chat_ids"] (socket/main.py). It sends with `sio.call` to
+# that one socket: Chat.svelte acks `execute` only after running it and drops
+# it (no ack) until the chat's history is loaded, so no ack means retry.
 # ---------------------------------------------------------------------------
 
-# Until the snippet lands, a toolbar Status click takes Open WebUI's slow path
-# (it uploads the chat's messages and saves the whole chat), so a newly opened
-# chat gets it within a second. A poll reads SESSION_POOL, in memory.
+# Until the snippet lands, a Status click takes Open WebUI's slow path (it saves
+# the whole chat), so poll fast. SESSION_POOL is in memory.
 _COMPOSER_WATCH_INTERVAL_S = 0.5
 _COMPOSER_WATCH_SETTLE_S = 0.5
 _COMPOSER_WATCH_ACK_TIMEOUT_S = 4.0
@@ -2656,11 +2494,8 @@ _COMPOSER_WATCH_RETRY_S = 3.0
 _COMPOSER_WATCH_ATTEMPTS = 3
 _COMPOSER_WATCH_LIVENESS_S = 30.0
 
-# Stashed on `open_webui.socket.main` (OWUI's own stable module, see
-# `_STALE_CONN_ATTR` in gateway.py for why) so a redeploy can cancel the
-# previous deploy's watcher task instead of leaving two running. One slot per
-# Pipe function (`_composer_watch_slot`): a second copy of the Pipe runs its
-# own watcher and must not cancel the first copy's.
+# Kept on `open_webui.socket.main` (see `_STALE_CONN_ATTR` in gateway.py) so a
+# redeploy can cancel the old watcher. One slot per Pipe function id.
 _COMPOSER_WATCH_ATTR = "_openclaw_composer_watcher_v1"
 
 
@@ -2672,11 +2507,8 @@ _composer_watcher_task = None
 
 
 async def _composer_chat_head(user_id, current_id, message) -> dict:
-    """What a push needs of a chat: {"user_id", "message_id", "model"}.
-    `message(id)` reads one message as (role, parent_id, model_id), or None.
-    `message_id` is the snippet's targetMessageId(): the latest user message
-    on the current branch, else the current message. `model` is the newest
-    assistant message's on the branch, the model the chat replies with."""
+    """{"user_id", "message_id", "model"} of a chat: `message_id` is the snippet's
+    targetMessageId(), `model` the newest assistant message's."""
     target, model, message_id = None, None, current_id
     for _ in range(500):
         if not message_id:
@@ -2720,10 +2552,8 @@ class _ComposerWatcher:
 
     @staticmethod
     async def _chat_head(chat_id):
-        """`_composer_chat_head` of a chat, from Open WebUI's DB: the chat
-        row's owner and current message id, then one `chat_message` row per
-        step up the branch. Open WebUI builds a whole chat in Python, about
-        14x its JSON, for every read of the chat itself (ELI-115)."""
+        """`_composer_chat_head` from the DB, one `chat_message` row per step.
+        Reading the chat itself builds it all in Python, about 14x its JSON (ELI-115)."""
         from sqlalchemy import select
         from open_webui.internal.db import get_async_db_context
         from open_webui.models.chats import Chat
@@ -2834,9 +2664,8 @@ class _ComposerWatcher:
         message_id = head["message_id"]
         if not message_id:
             return "skip"
-        # The Stop / Send now intent hook and the auto-send hook ride along: a
-        # tab that opens the chat after a turn writer started must still
-        # answer its cancel query (ELI-100 case 8) and send what it queues.
+        # The intent and auto-send hooks ride along: a tab opened after a turn
+        # writer started must still answer its cancel query (ELI-100 case 8).
         code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id,
                                              chat_model=model))
@@ -2868,7 +2697,6 @@ class _ComposerWatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
-                # Logged once per distinct failure, not every interval.
                 if str(ex) != last_error:
                     last_error = str(ex)
                     pipe_log(f"[composer] watcher tick failed: {ex}")
@@ -2879,10 +2707,8 @@ _composer_known_prefixes = [_COMPOSER_DEFAULT_MODEL_PREFIX]
 
 
 def _composer_note_model(model_id=None) -> list:
-    """Remember the Pipe's own function id and the prefix of a model it
-    actually served, so the button also recognises chats when the Pipe is
-    installed under a non-default id. Returns the known prefixes. Pipe only:
-    in the Action artifact the module name is the Action's id."""
+    """Remember the Pipe's function id and served model prefixes, so chats are
+    recognised under a non-default id. Returns the known prefixes."""
     for p in _composer_model_prefixes(model_id, own_id=_composer_own_function_id()):
         if p not in _composer_known_prefixes:
             _composer_known_prefixes.append(p)
@@ -2890,9 +2716,8 @@ def _composer_note_model(model_id=None) -> list:
 
 
 def _ensure_composer_watcher(valves_getter):
-    """Start the watcher once per deploy, inside Open WebUI only. Cancels a
-    previous deploy's watcher found on the stable socket module. Returns the
-    running task, or None when not inside OWUI, disabled, or on failure."""
+    """Start the watcher once per deploy inside Open WebUI, cancelling a
+    previous deploy's. Returns the task, or None."""
     global _composer_watcher_task
     try:
         if not bool(getattr(valves_getter(), "COMPOSER_STATUS_BUTTON", True)):
@@ -2924,7 +2749,6 @@ def _ensure_composer_watcher(valves_getter):
 
 # --- askuser ---------------------------------------------------------------
 
-
 _USER_INPUT_TRIGGER_PREFIXES = ("Codex needs input:", "OpenClaw needs input:")
 
 
@@ -2935,16 +2759,9 @@ def _is_user_input_prompt(text: str) -> bool:
 
 
 def _could_be_user_input_prefix(normalized_text: str) -> bool:
-    """Return True while `normalized_text` (already left-stripped) is still
-    ambiguous: either a strict prefix of one of the trigger phrases (so more
-    streamed text could still complete it), or already a full match.
-
-    Used to decide whether to keep withholding assistant-delta text instead
-    of yielding it immediately -- real token-by-token streaming (e.g. Claude)
-    delivers the trigger phrase a few characters at a time, so checking each
-    raw delta in isolation (as `_is_user_input_prompt` does) never matches.
-    Only once the buffered text diverges from every trigger prefix do we know
-    for sure this message isn't a needs-input prompt.
+    """True while `normalized_text` could still become (or is) a trigger phrase.
+    Streaming delivers the phrase a few characters at a time, so a single delta
+    never matches alone.
     """
     if not normalized_text:
         return True
@@ -2954,16 +2771,15 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
-# CommonMark 4.5: a fence is 3+ backticks or tildes indented up to 3 spaces;
-# a backtick fence's info string has no backtick; only a run of the same
-# character, at least as long and followed by nothing but spaces, closes it.
+# CommonMark 4.5: a fence is 3+ backticks or tildes, indented up to 3 spaces;
+# only an equal-or-longer run of the same character closes it.
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 
 def _fence_of(state) -> str:
-    """A fence state as the open fence's run ("" when none). `True` is an
-    open backtick fence of unknown length (older callers passed a bool)."""
+    """A fence state as the open fence's run ("" when none). `True` is a
+    backtick fence of unknown length (older callers passed a bool)."""
     if state is True:
         return "```"
     return state or ""
@@ -2983,8 +2799,7 @@ def _fence_step(line: str, fence: str) -> str:
 
 
 def _fence_open_after(text: str, in_fence=False) -> str:
-    """The fenced code block open at the end of `text` (its fence run, "" when
-    none), when `in_fence` was open where `text` starts. Truthy when open."""
+    """The fence run open at the end of `text` ("" when none)."""
     fence = _fence_of(in_fence)
     for line in (text or "").split("\n"):
         fence = _fence_step(line, fence)
@@ -2993,15 +2808,8 @@ def _fence_open_after(text: str, in_fence=False) -> str:
 
 def _marker_line_index(text: str, in_fence=False):
     """Index of the first line that opens a needs-input block, else None.
-
-    The marker only counts at the start of a line, but it does NOT have to be
-    the start of the message: a reply usually explains itself first and asks at
-    the end. Every line is checked, not only the text after the last newline,
-    because a provider can deliver the whole reply as one cumulative chunk with
-    the marker mid-string.
-
+    Every line is checked: a provider can deliver the whole reply as one chunk.
     A line inside a fenced code block is a quote, not a prompt (ELI-107).
-    `in_fence`: a fence is open where `text` starts.
     """
     start, fence = 0, _fence_of(in_fence)
     while True:
@@ -3017,25 +2825,13 @@ def _marker_line_index(text: str, in_fence=False):
 
 def _advance_input_prompt_buffer(pending: str, delta: str,
                                  in_fence=False, at_line_start=True) -> tuple[str, str]:
-    """Feed a new assistant-delta chunk into the needs-input buffering state.
+    """Feed an assistant delta into the needs-input buffer; returns
+    `(text_to_yield_now, new_pending)`. A trigger counts only at a line start,
+    and deltas need not split at lines, so after divergence only the text after
+    the last newline is held again.
 
-    Returns `(text_to_yield_now, new_pending)`. `pending` is text already
-    withheld because it might still become a needs-input trigger.
-
-    A trigger is only meaningful as the start of a line, so once the
-    combined text (`pending + delta`) diverges from every trigger prefix,
-    only the text after the LAST newline is worth re-examining as a fresh
-    candidate -- a real streaming delta doesn't necessarily break exactly at
-    a line boundary (e.g. a single chunk can contain the tail of one
-    paragraph, the blank-line separator, *and* the start of the next one),
-    so checking `delta.endswith("\\n")` at the yield site isn't enough on
-    its own.
-
-    `in_fence`: a fenced code block is open where `pending + delta` starts
-    (the shown text left it open); nothing in a fence is held (ELI-107).
-    `at_line_start`: the shown text ends at the start of a line. When it
-    does not, the first line of `delta` continues a line and opens no
-    prompt, wherever the deltas happen to split (ELI-147).
+    `in_fence`: nothing in a fence is held (ELI-107). `at_line_start`: when
+    False, the first line of `delta` opens no prompt (ELI-147).
     """
     candidate = pending + delta
     if not (pending or at_line_start):
@@ -3048,8 +2844,7 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
         return head + flush, held
     if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
-    # A complete marker may sit mid-candidate when the whole reply arrives at
-    # once. Flush what precedes it and hold from the marker onward.
+    # The whole reply may arrive at once: flush up to the marker, hold the rest.
     marker_at = _marker_line_index(candidate, in_fence)
     if marker_at is not None:
         return candidate[:marker_at], candidate[marker_at:]
@@ -3063,18 +2858,9 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
 
 def _strip_input_marker_line(text: str) -> str:
-    """Remove a leading needs-input marker ("OpenClaw needs input:" /
-    "Codex needs input:") and keep the prompt after it. The one place a
-    prompt is split from its marker: the card, the modal and the text
-    fallback all read the prompt through it.
-
-    A needs-input prompt is normally intercepted into a modal and never
-    rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
-    that ended before the modal could fire -- can still reach a raw ``yield``
-    with the marker intact, leaking the literal directive line into the chat.
-    The marker is only ever meaningful at the start, so drop exactly the
-    marker and keep the rest (the actual question), including a question
-    written on the marker line itself (ELI-151).
+    """Drop a leading needs-input marker and keep the prompt after it, including
+    a question on the marker line (ELI-151). Card, modal and text fallback all
+    split the prompt here, so no fallback leaks the raw directive.
     """
     if not text:
         return text
@@ -3090,10 +2876,8 @@ def _strip_input_marker_line(text: str) -> str:
 
 
 def _strip_needs_input_lines(text: str) -> str:
-    """Drop every needs-input directive (and the blank lines after a lone
-    one) that is outside a fenced code block: the question it opens stays as
-    readable text, a question on the marker line included (ELI-151), and a
-    quoted block in a fence stays as written (ELI-107)."""
+    """Drop every needs-input directive outside a fence, keeping its question
+    (ELI-151); a fenced quote stays as written (ELI-107)."""
     if not text:
         return text
     out, fence, skip_blank = [], "", False
@@ -3112,14 +2896,8 @@ def _strip_needs_input_lines(text: str) -> str:
 
 
 def _truncate_at_repeated_marker(text: str) -> str:
-    """Keep only the FIRST needs-input block.
-
-    An agent that emits the marker block twice (seen live: the second copy glued
-    straight onto the last option, "3. Park itOpenClaw needs input: ...") turned
-    a 3-option question into a 6-button dialog, one of whose labels was the raw
-    internal directive. The agent misbehaved, but the pipe owns what the user
-    sees, so it should not render that. Everything from a second marker onward
-    is a repeat, not part of the prompt.
+    """Keep only the first needs-input block: an agent once glued a second
+    copy onto the last option, doubling the dialog's buttons.
     """
     if not text:
         return text
@@ -3139,11 +2917,7 @@ def _truncate_at_repeated_marker(text: str) -> str:
 
 
 def _dedupe_options(options):
-    """Drop repeated option labels, keeping first-seen order.
-
-    Belt and braces behind _truncate_at_repeated_marker: a dialog that offers
-    the same answer twice is always wrong, whatever produced it.
-    """
+    """Drop repeated option labels, keeping first-seen order."""
     seen, out = set(), []
     for opt in options:
         key = opt.strip().lower()
@@ -3154,24 +2928,22 @@ def _dedupe_options(options):
 
 
 def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
-    """Return [(index_str, label), ...] for a numbered option list, in prompt
-    order, or [] if there are none. Matches lines like "1. foo" / "2) bar"."""
+    """[(index_str, label), ...] for lines like "1. foo" / "2) bar", else []."""
     pattern = re.compile(r"(?m)^\s*(\d+)[.)]\s+(.+)$")
     return [(m.group(1), m.group(2).strip()) for m in pattern.finditer(prompt_text or "")]
 
 
 # What the Ask User block shows for a secret's answer.
 SECRET_ANSWER_SHOWN = "•••• (secret entered)"
-# What the agent gets once when the secret's dialog got no answer: the reply
-# tells the user not to type it into the chat, so no answer will come there.
+# Sent once when the secret's dialog got no answer: the reply tells the user
+# not to type it into the chat.
 SECRET_NOT_RECEIVED_FOR_AGENT = (
     "[Open WebUI] No answer: the masked dialog for the secret you asked for was not "
     "answered, so nothing was received. Do not ask for it in the chat, which stores "
     "what the user types. Use masked credential entry, or ask again when the user "
     "has this chat open."
 )
-# What the agent gets when the user cancels the secret's dialog (ELI-189),
-# and what the Ask User block shows for it.
+# Sent when the user cancels the secret's dialog (ELI-189); also shown in the block.
 SECRET_CANCELLED_FOR_AGENT = (
     "[Open WebUI] Cancelled: the user closed the masked dialog for the secret you "
     "asked for without entering it, so nothing was received. Do not ask for it in "
@@ -3188,11 +2960,10 @@ _MULTI_MARKERS = (
 
 
 def _parse_text_prompt(prompt_text: str) -> dict:
-    """The fields of a text needs-input prompt: `title`, `message`, `secret`,
-    `confirm` (a yes/no question), `options` (the numbered list) and `multi`
-    (a multi-select marker, stripped from the title and message)."""
+    """`title`, `message`, `secret`, `confirm`, `options` and `multi` of a
+    text needs-input prompt."""
     prompt_text = _truncate_at_repeated_marker(prompt_text or "")
-    # The marker goes as in the text fallback: a question on its line stays (ELI-151).
+    # A question on the marker line stays (ELI-151).
     lines = [line.strip() for line in _strip_input_marker_line(prompt_text).splitlines()]
     lines = [line for line in lines if line]
 
@@ -3211,8 +2982,7 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         title = title or "OpenClaw needs input"
         message = message or "Please answer so the run can continue."
 
-    # Yes/no only when the prompt clearly reads as binary: a free-text question
-    # turned into yes/no loses the real answer. A numbered list is a choice.
+    # Yes/no only when clearly binary: free text turned into yes/no loses the answer.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
     yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)", "כן/לא", "כן / לא", "نعم/لا", "نعم / لا")
     confirm_verbs = (
@@ -3221,11 +2991,9 @@ def _parse_text_prompt(prompt_text: str) -> dict:
     )
     # "؟" is the Arabic question mark.
     ends_question = message.rstrip().endswith(("?", "؟")) or title.rstrip().endswith(("?", "؟"))
-    # A secret unless it is clearly a choice (an explicit yes/no marker, or two
-    # or more numbered options) and nothing asks for the value itself: a
-    # choice that merely mentions a password keeps its answers (ELI-196), but
-    # a key typed into the card's Other field would land in the chat. Kept
-    # specific on purpose: a bare "key" matches innocent words ("monkey").
+    # A secret unless it is clearly a choice and nothing asks for the value: a
+    # choice that merely mentions a password keeps its answers (ELI-196). Kept
+    # specific: a bare "key" matches "monkey".
     mentions_secret = any(
         marker in text_lower for marker in ("secret", "password", "api key", "token"))
     asks_for_value = "may show your reply" in text_lower or bool(re.search(
@@ -3254,9 +3022,8 @@ def _is_secret_prompt(prompt_text: str) -> bool:
 
 
 def _secret_not_received_text(prompt_text: str) -> str:
-    """A secret nobody entered in its dialog, as the text that ends the
-    reply. Never the agent's own question: that asks for the value, and an
-    answer typed into the chat is stored in it."""
+    """The reply's closing text for a secret nobody entered. Never the agent's
+    question: an answer typed into the chat is stored there."""
     title = _parse_text_prompt(prompt_text)["title"]
     return (f"**{title}**: not received. A secret is entered only in its masked dialog, "
             "never in the chat, which keeps what you type. To enter it, open this chat "
@@ -3274,17 +3041,15 @@ def _masked_input_payload(title: str, message: str, placeholder: str = "Type you
 
 
 def _secret_input_payload(prompt_text: str) -> dict:
-    """OWUI's masked input dialog for a prompt asking for a secret: the card
-    has no masked field."""
+    """OWUI's masked input dialog for a secret: the card has no masked field."""
     fields = _parse_text_prompt(prompt_text)
     return _masked_input_payload(fields["title"], fields["message"])
 
 
 _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
 
-# OWUI clamps a request:user_input event call to 60..240s and, when it times
-# out, removes the card itself. We ask for the maximum; a card not answered
-# by then ends the reply with the question as text (ELI-142).
+# OWUI clamps a request:user_input call to 60..240s and removes the card on
+# timeout. An unanswered card ends the reply with the question as text (ELI-142).
 _NATIVE_CARD_TIMEOUT_MS = 240_000
 
 
@@ -3298,12 +3063,8 @@ def _split_option_description(text: str) -> tuple[str, str]:
 
 
 def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
-    """Questions from a JSON needs-input body, or None for the text form.
-
-    The body after the marker line may be a JSON object (optionally in a code
-    fence) shaped like OWUI's ask_user arguments:
-    {"questions": [{"header": ..., "question": ..., "options": [...]}]}.
-    Options are strings or {"label", "description"} objects.
+    """Questions from a JSON needs-input body (optionally fenced), shaped like
+    OWUI's ask_user arguments, or None for the text form.
     """
     body = _strip_input_marker_line(_truncate_at_repeated_marker(prompt_text or "")).strip()
     fence = re.match(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", body, re.DOTALL)
@@ -3353,12 +3114,8 @@ def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
 
 
 def _ask_user_fallback_text(prompt_text: str) -> str:
-    """A prompt nobody answered in a card, as the text that ends the reply.
-
-    The JSON form reads as its questions, numbered when there are several,
-    each with its options listed under it, then one line on how to answer
-    (ELI-142: it showed as the raw JSON). Any other prompt is its own text
-    without the marker line."""
+    """An unanswered prompt as the reply's closing text: the JSON form reads as
+    its questions and options, not raw JSON (ELI-142)."""
     questions = _parse_ask_user_json(prompt_text)
     if not questions and _is_secret_prompt(prompt_text):
         return _secret_not_received_text(prompt_text)
@@ -3376,17 +3133,14 @@ def _ask_user_fallback_text(prompt_text: str) -> str:
     return "\n".join(lines) + "\n\n_Answer in your next message._"
 
 
-# The card picks one option per question, so a multi-select question lists
-# its options by number in the question text and takes typed numbers. The
-# labels ride along under this key for mapping the answer back.
+# The card picks one option per question, so a multi-select question takes
+# typed numbers; its labels ride under this key to map the answer back.
 _MULTI_CHOICES_KEY = "openclaw_choices"
 
 
 def _native_ask_user_payload(prompt_text: str) -> dict | None:
-    """Build OWUI's native `request:user_input` question card for a prompt.
-
-    Returns None for a prompt asking for a secret: the card has no masked
-    input (see _secret_input_payload).
+    """OWUI's native `request:user_input` card for a prompt, or None for a
+    secret (the card has no masked input).
     """
     questions = _parse_ask_user_json(prompt_text)
     if questions is None:
@@ -3400,8 +3154,7 @@ def _native_ask_user_payload(prompt_text: str) -> dict | None:
             "options": [],
             "allow_other": True,
         }
-        # The numbered list moves out of the text: into `options`, or into
-        # one line of numbered choices for a multi-select question.
+        # The numbered list moves into `options`, or one line for a multi-select.
         message = re.sub(r"(?m)^\s*\d+[.)]\s+.*$\n?", "", fields["message"]).strip()
         if fields["confirm"]:
             question["options"] = [
@@ -3410,7 +3163,6 @@ def _native_ask_user_payload(prompt_text: str) -> dict | None:
             ]
             question["allow_other"] = False
         elif fields["options"] and fields["multi"]:
-            # The card shows the question as one line of plain text.
             listed = " · ".join(f"{n}. {label}" for n, label in enumerate(fields["options"], 1))
             question["question"] = (f"{message or fields['title']} {listed}. "
                                     "Type the numbers you pick, like 1, 3")
@@ -3432,12 +3184,8 @@ def _native_ask_user_payload(prompt_text: str) -> dict | None:
 
 
 def _map_multi_answer(text: str, choices: list[str]) -> str:
-    """A typed multi-select answer as the chosen options, comma-joined.
-
-    "1,3", "1 3", "Cheese, Mushrooms" and "1, Mushrooms" all name options;
-    an option's short label (before " - ") names it too. Anything that does
-    not name options only (a number out of range, other text) is the
-    answer as typed.
+    """A typed multi-select answer ("1,3", "Cheese, 1") as the chosen options,
+    comma-joined; anything else is the answer as typed.
     """
     text = (text or "").strip()
     picked = _picked_choices(text, choices)
@@ -3445,8 +3193,7 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
 
 
 def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
-    """The options a typed multi-select answer names, in order (see
-    _map_multi_answer); None when it does not name options only."""
+    """The options a typed multi-select answer names, or None."""
     by_name = {}
     for choice in choices:
         by_name.setdefault(choice.lower(), choice)
@@ -3470,12 +3217,8 @@ def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
 
 
 def _format_native_answers(questions: list[dict], answers: dict) -> str:
-    """Turn the card's {question_id: answer} into the text sent to the agent.
-
-    One question returns the bare answer (the label, or what was typed); a
-    Yes/No confirmation returns "yes"/"no"; a multi-select question returns
-    the chosen options, comma-joined. Several questions return one
-    "Header: answer" line each.
+    """The card's {question_id: answer} as the text sent to the agent: the bare
+    answer for one question, "Header: answer" lines for several.
     """
     lines = []
     for question in questions:
@@ -3504,10 +3247,8 @@ async def _call_on_chat_tab(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict,
     timeout_s: float,
 ):
-    """Show `payload` on the user's socket viewing the chat, or return None
-    when there is none. A question card goes as OWUI's own get_event_call
-    sends it: a fresh interaction_id, and the closing request:interaction:done
-    event that removes the card from the screen."""
+    """Show `payload` on a socket viewing the chat, or None when there is none.
+    Sent as OWUI's get_event_call does, closing with request:interaction:done."""
     try:
         from open_webui.socket.main import sio, SESSION_POOL
     except Exception as ex:
@@ -3561,10 +3302,9 @@ async def _ask_where_the_chat_is(
     poll_interval_s: float,
     owui_session_id: str | None,
 ):
-    """Ask once on the socket the turn started on (`owui_session_id`). Once
-    it is gone (a reload; no socket for an API caller) the question moves
-    once to the tab viewing the chat. Never re-shown after a timeout: that
-    keeps a reply open with nothing on screen (ELI-142)."""
+    """Ask on the turn's own socket, else once on a tab viewing the chat. Never
+    re-shown after a timeout: that keeps a reply open with nothing on screen
+    (ELI-142)."""
     response = await _event_call_while_session_lives(
         __event_call__, payload, owui_session_id, timeout_s + grace_s, poll_interval_s
     )
@@ -3591,12 +3331,9 @@ async def _ask_user_native_card(
     poll_interval_s: float,
     owui_session_id: str | None = None,
 ) -> str | None:
-    """Ask once through OWUI's native question card.
-
-    Only an answer or a cancel shows the card was seen. Anything else (OWUI's
-    timeout, a cancel the moment it arrives on a tab viewing another chat, a
-    socket that never answers) returns None, as a cancel does: the reply then
-    ends with the question as text (ELI-107).
+    """Ask once through OWUI's native card. Only an answer or a cancel proves it
+    was seen; anything else returns None and the reply ends with the question
+    as text (ELI-107).
     """
     response = await _ask_where_the_chat_is(
         __event_call__, payload, payload["data"]["timeout_ms"] / 1000, grace_s=15,
@@ -3620,9 +3357,8 @@ async def _ask_user_secret(
     poll_interval_s: float,
     owui_session_id: str | None = None,
 ) -> str | None:
-    """Ask for a secret through OWUI's masked input dialog, as the card is
-    asked. OWUI puts no timeout on this dialog, so `timeout_s` ends the wait;
-    unanswered, the question ends the reply as text."""
+    """Ask for a secret in OWUI's masked dialog. OWUI puts no timeout on it, so
+    `timeout_s` ends the wait."""
     try:
         response = await _ask_where_the_chat_is(
             __event_call__, _secret_input_payload(prompt_text), timeout_s,
@@ -3632,8 +3368,7 @@ async def _ask_user_secret(
     except asyncio.TimeoutError:
         response = {"error": f"no answer in {timeout_s:g} s"}
     if response is False:
-        # The dialog's Cancel (EventConfirmDialog resolves it with False),
-        # not a "no": the agent hears that the user cancelled.
+        # The dialog's Cancel (EventConfirmDialog resolves False), not a "no".
         pipe_log("  secret dialog cancelled by the user")
         return SECRET_CANCELLED_FOR_AGENT
     answer = _normalize_event_call_response(response)
@@ -3643,26 +3378,16 @@ async def _ask_user_secret(
 
 
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
-    """Render an answered ask-user prompt as a native OWUI tool-call block.
-
-    OWUI's frontend only special-cases a handful of `<details type="...">`
-    values with a nice icon + collapsible UI (confirmed by grepping the
-    compiled frontend bundle): "tool_calls", "reasoning", "code_interpreter".
-    There's no dedicated type for Q&A, so we reuse "tool_calls" (labelled as
-    an "Ask User" call) to get the same familiar rendering users already
-    know from real tool calls, inserted inline at the point the question
-    was asked/answered -- instead of showing nothing (previous behavior:
-    the raw prompt text was fully suppressed once answered).
+    """An answered ask-user prompt as an "Ask User" `<details type="tool_calls">`
+    block: OWUI has no Q&A type, and tool_calls renders collapsible.
     """
     json_questions = _parse_ask_user_json(prompt_text)
     if SECRET_NOT_RECEIVED_FOR_AGENT in answer:
-        # The agent was told nothing came: the reply shows the question as
-        # not received, as an unanswered secret ends any reply.
         return "\n" + _secret_not_received_text(prompt_text) + "\n"
     if SECRET_CANCELLED_FOR_AGENT in answer:
         answer = SECRET_CANCELLED_SHOWN
     elif _is_secret_prompt(prompt_text):
-        # The block is written into the chat, so into Open WebUI's database.
+        # The block is stored in Open WebUI's database.
         answer = SECRET_ANSWER_SHOWN
     if json_questions:
         question_display = "\n\n".join(
@@ -3686,14 +3411,9 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
 
 @dataclass
 class UserInputResult:
-    """Outcome of trying to answer a needs-input prompt via an OWUI modal.
-
-    handled=False  -> not a prompt, user cancelled, or delivery failed;
-                      the caller should show the text as a fallback.
-    handled=True, new_run_id=None -> answer delivered, the run resumed in
-                      place (steer); keep consuming the current run.
-    handled=True, new_run_id="..." -> answer spawned a new run; the caller
-                      should switch its consumer to that run.
+    """Outcome of answering a needs-input prompt via an OWUI modal.
+    handled=False: the caller shows the text as a fallback. new_run_id: the
+    answer started a new run to follow; None means the run went on in place.
     """
 
     handled: bool
@@ -3705,26 +3425,21 @@ class UserInputResult:
 
 
 def _normalize_event_call_response(response) -> str:
-    """Extract text from common OWUI __event_call__ return shapes.
-    Returns empty string for errors, None, or unrecognized shapes.
-    """
+    """Text from common OWUI __event_call__ return shapes, else empty string."""
     if response is None:
         return ""
-    # Confirmation modals resolve to a bare boolean: True=confirm, False=cancel.
-    # (bool is a subclass of int, so this must be handled before dict/str.)
+    # Confirmation modals resolve to a bare bool; bool is an int, so check it first.
     if isinstance(response, bool):
         return "yes" if response else "no"
     if isinstance(response, str):
         return response.strip()
     if isinstance(response, dict):
-        # Error responses
         if "error" in response:
             return ""
         for key in ("value", "text", "content", "message", "response"):
             value = response.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        # Confirm type with options
         value = response.get("option")
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -3736,18 +3451,10 @@ def _normalize_event_call_response(response) -> str:
 
 
 def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = None) -> str | None:
-    """Find a currently-connected OWUI session_id belonging to user_id.
-
-    session_pool is OWUI's own SESSION_POOL dict (sid -> user dict with an
-    'id' field), imported live from the running process: the pipe runs
-    inside the OWUI backend, so it can import its `sio` and SESSION_POOL.
-
-    With `chat_id`, only a socket viewing that chat: OWUI 0.12 records the
-    chats a socket has joined (`chat_ids`, events:chat join/leave). The
-    user's first socket can be another tab or another client, where the card
-    never shows (ELI-58). The newest such socket is the tab the
-    user opened last; with none, None, so the card waits for the user to
-    open the chat. An OWUI that records no `chat_ids` gets any socket.
+    """A connected OWUI session_id of `user_id` (newest first), or None.
+    With `chat_id`, only a socket viewing that chat: the user's first socket may
+    be another tab where the card never shows (ELI-58). An OWUI without
+    `chat_ids` gets any socket.
     """
     mine = [(sid, s) for sid, s in list(session_pool.items()) if s and s.get("id") == user_id]
     if chat_id and any("chat_ids" in s for _sid, s in mine):
@@ -3758,11 +3465,8 @@ def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = 
 
 async def _event_call_while_session_lives(__event_call__, payload: dict, session_id: str | None,
                                           timeout_s: float, poll_interval_s: float):
-    """`__event_call__(payload)`, given up once the socket it is bound to
-    leaves OWUI's SESSION_POOL (the tab was reloaded or closed): OWUI answers
-    a call on a gone socket only at its own timeout, up to 240 s, and the
-    card can be shown on the user's new socket only after that (ELI-58).
-    Answers as OWUI does for a gone socket."""
+    """`__event_call__(payload)`, given up once its socket leaves SESSION_POOL:
+    OWUI answers a gone socket only at its own timeout, up to 240 s (ELI-58)."""
     call = asyncio.ensure_future(asyncio.wait_for(__event_call__(payload), timeout=timeout_s))
     try:
         from open_webui.socket.main import SESSION_POOL
@@ -3791,10 +3495,8 @@ async def _ask_user_input_modal(
     poll_interval_s: float = 5,
     owui_session_id: str | None = None,
 ) -> str | None:
-    """Ask the user a needs-input prompt in the chat's tab: OWUI's question
-    card (see _ask_user_native_card), or for a secret its masked input
-    dialog (_ask_user_secret). None when unanswered: the question then ends
-    the reply as text."""
+    """Ask a needs-input prompt in the chat's tab: the question card, or the
+    masked dialog for a secret. None when unanswered."""
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
     native_payload = _native_ask_user_payload(prompt_text)
@@ -3823,34 +3525,21 @@ async def _ask_user_input_modal(
 # ---------------------------------------------------------------------------
 # Secret requests from the Gateway (ELI-96)
 # ---------------------------------------------------------------------------
-# The agent's `secrets` tool, action=request, is a Gateway question with one
-# store-bound secret question: {questionId: "secret_value", isSecret: true,
-# secretStore: {name, kind: "secret", allowedHosts?, reason?}}. The Gateway
-# broadcasts it as `question.requested`. `question.resolve {id, answers:
-# {answers: {secret_value: [value]}}}` from an operator makes the Gateway
-# itself write the value into its secret store, register it for log
-# redaction and answer the agent "stored"; `{id, cancel: true}` answers it
-# "cancelled". `question.resolved` follows either way, and on expiry
-# (2026.10.10-beta.1 dist: secrets-tool-f-CystZd.mjs:1253 request, :1298-1301
-# the agent's statuses; question-CtUDaC2R.mjs:230 broadcast, :289-370 resolve).
+# The `secrets` tool's request is a Gateway question with one store-bound
+# question {questionId: "secret_value", isSecret: true, secretStore}.
+# `question.resolve` makes the Gateway itself store the value and answer the
+# agent "stored" (2026.10.10-beta.1 dist: secrets-tool-f-CystZd.mjs:1253,
+# question-CtUDaC2R.mjs:289-370).
 #
-# It is asked as the ask-user secret is (ELI-148): the masked input dialog on
-# the reply's own socket, moved once to the tab viewing the chat. The typed
-# value goes from the dialog's answer straight into question.resolve. It is
-# never yielded, emitted, persisted or logged, so the chat, the database, the
-# transcript and the model only ever see the request and "stored".
-#
-# It is asked whenever the Gateway offers that question protocol (hello-ok
-# features), whatever its version. Whether a run can then use the stored value
-# is the Gateway's config (secrets.egressProxy), the same on every release line
-# (ELI-97); the dialog only replaces the Control UI as the place to type it.
+# Asked like the ask-user secret (ELI-148). The typed value goes straight into
+# question.resolve and is never yielded, emitted, persisted or logged. Whether
+# a run can use it is Gateway config (secrets.egressProxy, ELI-97).
 
 SECRET_REQUEST_METHODS = ("question.resolve",)
 SECRET_REQUEST_EVENTS = ("question.requested", "question.resolved")
 # question id -> the task asking for it
 _SECRET_REQUESTS: dict = {}
-# session key -> the reply streaming its run, which asks the run's Gateway
-# questions (secret requests, the ask_user tool's) on its own socket
+# session key -> the reply streaming its run, which asks its Gateway questions
 _SECRET_ASKERS: dict = {}
 
 
@@ -3878,8 +3567,7 @@ def _secret_request_question(record) -> dict | None:
 
 
 def _secret_request_payload(question: dict) -> dict:
-    """The masked dialog for a secret request. Built from the request's
-    metadata only: there is no value to put in it."""
+    """The masked dialog for a secret request, from its metadata only."""
     store = question["secretStore"]
     lines = [str(store.get("reason") or "The agent asks for a secret.")]
     hosts = store.get("allowedHosts") or []
@@ -3901,8 +3589,7 @@ def _secret_asker_leave(turn) -> None:
 
 def secret_request_seen(conn, record) -> bool:
     """`question.requested`: ask a secret request made in an Open WebUI chat.
-    False for anything else, or on a Gateway that does not offer the question
-    protocol it needs."""
+    False otherwise, or when the Gateway lacks the question protocol."""
     question = _secret_request_question(record)
     if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
         return False
@@ -3917,8 +3604,7 @@ def secret_request_seen(conn, record) -> bool:
 
 
 def secret_request_resolved(payload) -> None:
-    """`question.resolved`: answered elsewhere (the Control UI), cancelled or
-    expired. The dialog's wait ends; whatever it gets later is dropped."""
+    """`question.resolved`: the dialog's wait ends; a later answer is dropped."""
     task = _SECRET_REQUESTS.pop((payload or {}).get("id"), None)
     if task is not None:
         task.cancel()
@@ -3928,12 +3614,10 @@ GUEST_SECRET_NOTE = "_The agent asked for the secret `{name}`. That needs the ow
 
 
 async def _cancel_guest_secret_request(conn, record: dict, name: str) -> None:
-    """Cancel a secret request made in a guest's chat and say so in the reply
-    of the run that asked, as a note of its own (ELI-229)."""
+    """Cancel a secret request from a guest's chat and note it in the run's reply (ELI-229)."""
     qid = record["id"]
-    # Out of the registry before the request, as the owner path does: the
-    # Gateway broadcasts `question.resolved` right behind its answer, and
-    # `secret_request_resolved` would cancel this task before it says so.
+    # Out of the registry first: `question.resolved` follows the answer right
+    # away, and `secret_request_resolved` would cancel this task.
     if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
         del _SECRET_REQUESTS[qid]
     try:
@@ -3955,13 +3639,9 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
     timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
     payload = _secret_request_payload(question)
     if not await _sender_is_owner(conn, record.get("sessionKey") or ""):
-        # The store is the owner's: a guest's chat cannot write into it. Nor is
-        # it left pending: answered in the Control UI, it would hand the
-        # owner's secret to a run whose output the guest reads, and until then
-        # the run waits out the request (15 minutes by default). A run the
-        # guest sends cannot ask at all (its connection lacks
-        # operator.questions); one the agent starts in the guest's chat (a
-        # cron wake, an announce) can (ELI-229).
+        # The store is the owner's: a guest's chat cannot write it, and a
+        # pending request answered in the Control UI would hand the owner's
+        # secret to a run the guest reads (ELI-229).
         await _cancel_guest_secret_request(conn, record, name)
         return
     turn = _SECRET_ASKERS.get(record.get("sessionKey"))
@@ -3981,11 +3661,10 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
         return
     del _SECRET_REQUESTS[qid]
     if response is None:
-        # Expired with the dialog open, or no tab shows the chat: the Gateway
-        # expires it and the agent hears "No credential arrived".
+        # The Gateway expires it and the agent hears "No credential arrived".
         pipe_log(f"  secret request: {name} not answered in Open WebUI")
         return
-    # Only typed text is a value: a cancelled dialog answers False.
+    # A cancelled dialog answers False.
     value = response.strip() if isinstance(response, str) else ""
     params = ({"id": qid, "answers": {"answers": {question["questionId"]: [value]}},
                "resolvedBy": "openwebui"} if value
@@ -4010,36 +3689,23 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
 # ---------------------------------------------------------------------------
 # The agent's ask_user tool (ELI-216)
 # ---------------------------------------------------------------------------
-# OpenClaw's `ask_user` tool registers a Gateway question as the secret
-# request does: `question.requested` with up to three questions, each
-# {questionId, header, question, options: [{label, description?}],
-# multiSelect?, isOther: true}, and waits on `question.waitAnswer` for
-# `question.resolve {id, answers: {answers: {questionId: [values]}}}`
-# (2026.10.5 dist: ask-user-tool-*.mjs, ask-user-tool-normalization-*.mjs;
-# 2026.9.3 the same calls in openclaw-tools-*.mjs). A Gateway client chat
-# gets no prompt of its own: unanswered, the run waited out the tool's
-# timeout (15 minutes by default) on "Thinking".
+# `ask_user` registers a Gateway question (`question.requested`, up to three
+# questions) and waits on `question.waitAnswer` (2026.10.5 dist:
+# ask-user-tool-*.mjs). A Gateway client chat gets no prompt of its own, so
+# the run used to wait out the 15 minute timeout.
 #
-# It is asked in Open WebUI's question card, on the newest tab that has
-# loaded the chat (else the reply's own socket while it shows the chat). A
-# question asked with no such tab stays pending: the card shows once a tab
-# opens the chat, and moves to a newer one (a reload, a phone back from
-# sleep). The card gets no timeout of its own: Open WebUI answers its timeout
-# as it answers Cancel. So the question ends only on the card's Cancel, an
-# answer here or elsewhere (the Control UI), or the Gateway's own timeout.
-#
-# "Loaded the chat" is the composer watcher's ack (composer_watch.py): a tab
-# acks an `execute` only once it shows the chat, and cancels a card at once
-# while it does not, which must not read as the user's Cancel.
+# Asked in Open WebUI's card on the newest tab that loaded the chat, moving to
+# newer tabs. The card has no timeout: Open WebUI answers its timeout as a
+# Cancel. "Loaded" is the composer watcher's ack: a tab cancels a card at once
+# while it does not show the chat, which must not read as the user's Cancel.
 
 # question id -> the task asking it
 _AGENT_QUESTIONS: dict = {}
 
 
 def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
-    """Open WebUI's question card for an ask_user question record, or None
-    for anything else (a secret, no questions). `timeout_ms` None: the card
-    has no countdown of its own."""
+    """Open WebUI's card for an ask_user question record, or None (a secret,
+    no questions)."""
     questions = record.get("questions") if isinstance(record, dict) else None
     if not isinstance(questions, list) or not questions:
         return None
@@ -4061,8 +3727,7 @@ def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
             "allow_other": not options or raw.get("isOther") is not False,
         }
         if raw.get("multiSelect") and options:
-            # The card picks one option, so the options are listed by
-            # number and the picks typed, as for a needs-input multi-select.
+            # The card picks one option, so picks are typed as numbers.
             listed = " · ".join(f"{n}. {o['label']}" for n, o in enumerate(options, 1))
             question.update(question=f"{text} {listed}. Type the numbers you pick, like 1, 3",
                             options=[], allow_other=True)
@@ -4073,9 +3738,7 @@ def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
 
 
 def _agent_question_answers(questions: list[dict], answers) -> dict:
-    """The card's {question id: answer} as question.resolve's
-    {questionId: [values]}: the option's label as the agent wrote it, the
-    typed text, or a multi-select question's picked options."""
+    """The card's answers as question.resolve's {questionId: [values]}."""
     out = {}
     for question in questions:
         answer = answers.get(question["id"]) if isinstance(answers, dict) else None
@@ -4091,8 +3754,7 @@ def _agent_question_answers(questions: list[dict], answers) -> dict:
 
 
 def agent_question_seen(conn, record) -> bool:
-    """`question.requested`: ask an ask_user question made in an Open WebUI
-    chat. False for anything else."""
+    """`question.requested`: ask an ask_user question from an Open WebUI chat."""
     if not isinstance(record, dict) or record.get("status", "pending") != "pending" \
             or not record.get("id") or record["id"] in _AGENT_QUESTIONS:
         return False
@@ -4106,8 +3768,7 @@ def agent_question_seen(conn, record) -> bool:
 
 
 def _open_writer_message_id(conn, chat_id: str, session_key: str) -> str | None:
-    """The reply a turn writer streams the session's run into, for a run no
-    inline reply streams (one the agent started)."""
+    """The reply a turn writer streams the session's run into (agent-started runs)."""
     for writer in list(getattr(conn, "_turn_writers", {}).values()):
         if writer.chat_id == chat_id and writer.session_key == session_key and not writer.closed:
             return writer.message_id
@@ -4177,10 +3838,8 @@ def _chat_tab_signal(chat_id):
 
 
 async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline):
-    """Show the card on `sid` until it answers: (response, None), or
-    (None, "moved") once a newer tab has loaded the chat or `sid` stops
-    showing it, or (None, None) at the deadline. The card leaves the screen
-    when the wait ends, however it ends."""
+    """Show the card on `sid`: (response, None), (None, "moved") when a newer
+    tab loads the chat or `sid` leaves it, or (None, None) at the deadline."""
     interaction_id = str(uuid.uuid4())
     data = {**payload["data"], "interaction_id": interaction_id}
     pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
@@ -4196,9 +3855,8 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
                     return None, None
                 tab_change = asyncio.ensure_future(newer.wait())
                 try:
-                    # The wait wakes on the answer, on a tab that loads the
-                    # chat, or every few seconds to see this socket is still
-                    # there (Open WebUI keeps a call to a gone socket open).
+                    # Wake often enough to notice a gone socket: Open WebUI
+                    # keeps a call to one open.
                     done, _ = await asyncio.wait({call, tab_change}, timeout=min(left, 5.0),
                                                  return_when=asyncio.FIRST_COMPLETED)
                 finally:
@@ -4210,7 +3868,6 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
                         pipe_log(f"  ask_user: the card on {sid[:8]}... failed: {ex!r}")
                         return None, "moved"
                     if not _views_chat(session_pool, sid, user_id, chat_id):
-                        # Cancelled by a tab that left the chat, not by the user.
                         return None, "moved"
                     return response, None
                 newer.clear()
@@ -4228,8 +3885,7 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
 
 
 async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline):
-    """The card's response, shown on whichever tab has the chat, or None at
-    the deadline."""
+    """The card's response from whichever tab has the chat, or None at the deadline."""
     try:
         from open_webui.socket.main import sio, SESSION_POOL
     except Exception as ex:
@@ -4264,8 +3920,7 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
     if not message_id:
-        # A card needs the reply it belongs to: Open WebUI cancels one for a
-        # message the tab does not have. Left to the Control UI.
+        # Open WebUI cancels a card for a message the tab lacks: left to the Control UI.
         _AGENT_QUESTIONS.pop(qid, None)
         pipe_log(f"  ask_user: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
         return
@@ -4275,7 +3930,6 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
         return
     del _AGENT_QUESTIONS[qid]
     if response is None:
-        # The Gateway's timeout ends it and tells the agent.
         pipe_log("  ask_user: not answered before the question expired")
         return
     answers = (_agent_question_answers(questions, response.get("answers"))
@@ -4299,8 +3953,7 @@ def question_requested(conn, record) -> bool:
 
 
 def question_resolved(payload) -> None:
-    """`question.resolved`: answered elsewhere, cancelled or expired; the
-    card's or dialog's wait ends and whatever it gets later is dropped."""
+    """`question.resolved`: the pending wait ends; a later answer is dropped."""
     secret_request_resolved(payload)
     task = _AGENT_QUESTIONS.pop((payload or {}).get("id"), None)
     if task is not None:
@@ -12620,32 +12273,18 @@ def _slash_prompts_on_metadata_changed(payload: dict) -> None:
 # ---------------------------------------------------------------------------
 # Channels: one OpenClaw session per Open WebUI channel thread.
 #
-# Open WebUI calls a model in a channel only for an @mention or a reply to the
-# model's message (routers/channels.py `model_response_handler`), and answers
-# in a thread on that message (`channels.model_response_mode`, default
-# "thread"). With that:
-#
-# - The thread is the conversation: its session is
-#   `agent:<AGENT_ID>:openwebui:channel:<channel id>:thread:<root message id>`.
-# - The mention that opens a thread sends the channel's messages since the
-#   agent last saw the channel, and the mention itself, as one block of
-#   `[HH:MM] Name (user id): text` lines. A mention in a thread the agent
-#   follows sends the thread's messages since its last turn.
-# - The agent then follows the thread: a watcher reads the thread's new
-#   messages (no mention needed). A short judge on the Gateway's utility model
-#   (`sessions.companion.ask`) decides whether one is meant for the agent; if
-#   so, or when there is no judge, a full turn runs and may answer `[skip]`,
-#   which posts nothing. Messages it does not answer reach it as context with
-#   its next turn.
-# - Every channel turn goes over the same Gateway connection whoever sent it
-#   (`_sender_is_owner`): owner and non-owner turns alternating in one session
-#   would change its tool list, and claude-cli then starts the session over.
-#
-# State (cursors, followed threads) is one JSON file in STATE_DIR, read and
-# written under an flock, so several Open WebUI workers share it. A follow-up
-# turn is claimed with its `idempotencyKey` (`chanfollow-<message id>`): of
-# several watchers that send it, only the one the Gateway answers `started`
-# posts the reply.
+# Open WebUI calls a model in a channel only for an @mention or a reply to its
+# message (routers/channels.py `model_response_handler`), answering in a thread.
+# - Session: `agent:<AGENT_ID>:openwebui:channel:<channel id>:thread:<root id>`.
+# - The opening mention sends the channel's messages since the agent last saw it.
+# - The agent then follows the thread: a judge on the utility model
+#   (`sessions.companion.ask`) picks messages meant for it; a full turn may
+#   answer `[skip]`.
+# - Every channel turn uses one Gateway connection whoever sent it: owner and
+#   non-owner turns alternating would change the tool list, and claude-cli then
+#   starts the session over.
+# State is one JSON file under an flock, shared by Open WebUI workers. A
+# follow-up turn is claimed by its `idempotencyKey` (`chanfollow-<message id>`).
 # ---------------------------------------------------------------------------
 
 _CHANNEL_CHAT_PREFIX = "channel:"
@@ -12658,8 +12297,7 @@ _CHANNEL_JUDGE_CONTEXT_CHARS = 15000
 _CHANNEL_WATCH_ATTR = "_openclaw_channel_watcher_v1"
 _CHANNEL_MENTION_RE = re.compile(r"<@([A-Z]):([^|>]+)(?:\|[^>]+)?>")
 
-# `{name}` is the model's name in the channel. The Gateway takes at most 400
-# characters here; the thread goes in `selectionContext`.
+# The Gateway takes at most 400 characters here; the thread goes in `selectionContext`.
 _CHANNEL_JUDGE_QUESTION = (
     "Classify, don't answer: should the assistant {name} reply to the NEW message(s) in the "
     "selection? YES if they ask or name it, or ask nobody in particular something it could answer "
@@ -12677,8 +12315,7 @@ _CHANNEL_MENTION_NOTE = "You were mentioned in the last message above: answer it
 
 
 def _channel_id_of(chat_id) -> "str | None":
-    """The channel id when Open WebUI calls the Pipe for a channel mention
-    (`chat_id = "channel:<id>"`), else None."""
+    """The channel id of a channel mention call (`chat_id = "channel:<id>"`), else None."""
     if isinstance(chat_id, str) and chat_id.startswith(_CHANNEL_CHAT_PREFIX):
         return chat_id[len(_CHANNEL_CHAT_PREFIX):] or None
     return None
@@ -12693,16 +12330,9 @@ def _channel_mentions_a_model(content) -> bool:
 
 
 def _channel_trigger(msg: dict, *, followed, bot_message_ids=()) -> "str | None":
-    """What a new channel message asks of the agent. The one place this is
-    decided, so a later "answer when addressed by name" changes only here.
-
-    - None: the agent's own message, or an empty one.
-    - "answer": a mention of a model, or a reply to the agent's message.
-      Open WebUI sends these to the model itself (this Pipe's or another
-      one), so the watcher leaves them alone.
-    - "judge": a message in a thread the agent follows: maybe for it.
-    - "context": anything else: the agent sees it with its next turn there.
-    """
+    """What a new channel message asks of the agent: None, "answer" (Open WebUI
+    sends it to the model itself, so the watcher leaves it), "judge" (in a
+    followed thread) or "context"."""
     if (msg.get("meta") or {}).get("model_id") or not (msg.get("content") or "").strip():
         return None
     if _channel_mentions_a_model(msg.get("content")) or (
@@ -12732,8 +12362,7 @@ def _channel_line(msg: dict, names: dict) -> str:
 
 
 def _channel_block(msgs: list, names: dict, limit: int, title: str) -> str:
-    """The messages as one block, oldest first, at most `limit` of them; the
-    first line says how many earlier ones were left out."""
+    """At most `limit` messages as one block, oldest first, noting how many were left out."""
     shown = msgs[-limit:] if limit > 0 else []
     dropped = len(msgs) - len(shown)
     lines = [f"{title} ({len(shown)}):"]
@@ -12744,8 +12373,7 @@ def _channel_block(msgs: list, names: dict, limit: int, title: str) -> str:
 
 
 def _channel_reply_text(text) -> "str | None":
-    """What to post for a follow-up turn's final text: None for `[skip]` (or
-    nothing), else the text without a leading `[skip]`."""
+    """The text to post for a follow-up's final text, or None for `[skip]`."""
     t = (text or "").strip()
     if t.startswith(_CHANNEL_SKIP):
         t = t[len(_CHANNEL_SKIP):].strip()
@@ -12760,10 +12388,7 @@ def _channel_state_path(state_dir) -> str:
 
 @contextlib.contextmanager
 def _channel_state(state_dir):
-    """The channel state, read and written back under an flock:
-    {"channels": {cid: {"cursor": ns}},
-     "threads": {root: {"channel", "cursor", "judged", "active", "model_id", "model_name",
-                        "function"}}}"""
+    """The channel state, read and written back under an flock."""
     path = _channel_state_path(state_dir)
     with open(path + ".lock", "a") as lock:
         try:
@@ -12793,10 +12418,8 @@ def _channel_followed(state_dir, idle_hours: float, now_ns: "int | None" = None)
 
 async def _channel_rows(channel_id: str, *, parent_id=None, top_level=False,
                         after_ns: int = 0, upto_ns: "int | None" = None, parents=None) -> list:
-    """Channel messages as dicts, oldest first: the thread of `parent_id`, or
-    the top-level timeline, or replies to any of `parents`; newer than
-    `after_ns` (and not newer than `upto_ns`). One query through Open WebUI's
-    own engine (SQLite or Postgres)."""
+    """Channel messages as dicts, oldest first, in one query through Open
+    WebUI's own engine (SQLite or Postgres)."""
     from sqlalchemy import select
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.messages import Message
@@ -12843,8 +12466,7 @@ async def _channel_names(user_ids) -> dict:
 
 async def _channel_post_reply(channel_id: str, root_id: str, user_id: str, model_id: str,
                               model_name: str, text: str) -> "str | None":
-    """Post the agent's reply in the thread through Open WebUI's own message
-    path (insert, the live `events:channel` updates, membership checks)."""
+    """Post the reply through Open WebUI's own message path (live updates, membership checks)."""
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.messages import MessageForm
     from open_webui.models.users import Users
@@ -12864,9 +12486,8 @@ async def _channel_post_reply(channel_id: str, root_id: str, user_id: str, model
 
 async def _channel_mention_context(state_dir: str, channel_id: str, reply_message_id, model_id: str,
                                    limit: int) -> dict:
-    """For a mention Open WebUI sent: the thread root (the parent of the
-    reply bubble Open WebUI made), the turn's text, and `commit()` to run once
-    the Gateway took the turn (advances the cursors, follows the thread)."""
+    """For a mention: the thread root, the turn's text, and `commit()` to run
+    once the Gateway took the turn."""
     reply = await _channel_message(reply_message_id) if reply_message_id else None
     root = (reply or {}).get("parent_id") or reply_message_id
     upto = (reply or {}).get("created_at") or time.time_ns()
@@ -12875,8 +12496,7 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
         thread = dict(st["threads"].get(root) or {})
         chan_cursor = (st["channels"].get(channel_id) or {}).get("cursor", 0)
     if reply_message_id and thread.get("reply_id") == reply_message_id and thread.get("text"):
-        # Open WebUI called the Pipe again for the same reply: the same text,
-        # so the Pipe follows the run the first call started.
+        # Open WebUI called again for the same reply: follow the first call's run.
         return {"root": root, "text": thread["text"], "commit": lambda: None, "messages": 0}
     if thread:
         msgs = await _channel_rows(channel_id, parent_id=root, after_ns=thread.get("cursor", 0), upto_ns=upto)
@@ -12886,7 +12506,6 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
         replies = await _channel_rows(channel_id, parent_id=root, upto_ns=upto)
         msgs = sorted(timeline + replies, key=lambda m: m["created_at"])
         title = "Channel messages since you last looked"
-    # Not the agent's own replies: its session already has them.
     msgs = [m for m in msgs if m["id"] != reply_message_id and (m["content"] or "").strip()
             and not (m.get("meta") or {}).get("model_id")]
     names = await _channel_names(m["user_id"] for m in msgs)
@@ -12916,12 +12535,8 @@ def _channel_judge_question(name) -> str:
 
 async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool,
                          name: str = "") -> "bool | None":
-    """YES/NO from the Gateway's utility model (`sessions.companion.ask`), or
-    None when there is no judge right now (no utility model, rate limited,
-    an error, a timeout, the Side chat already answering a question in
-    this session). Never retried: a refusal means the full turn
-    decides instead, so the judge never competes with the Control UI's Side
-    chat for its shared rate limit."""
+    """YES/NO from the utility model, or None when no judge is available. Never
+    retried, so it never competes with the Side chat for its shared rate limit."""
     target = conn if owner else await _get_restricted_connection(conn._valves)
     try:
         r = await asyncio.wait_for(target.send_request(
@@ -12943,14 +12558,10 @@ async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool,
 
 async def _channel_run(conn, session_key: str, message: str, idempotency_key: str,
                        *, owner: bool, still_needed=None) -> "tuple[str, str | None]":
-    """Run one follow-up turn and wait for its final text. Returns
-    ("started", text) for the watcher that got the turn, ("taken", None)
-    when another one already sent this key, ("covered", None) when a turn
-    that ran meanwhile (a mention) already carried the messages, and
-    ("failed", None) otherwise."""
-    # As a chat message does: wait for the session's run to end before
-    # sending, under the per-session send lock. A send into a running turn
-    # (a mention in the same thread) is merged into it and never ends.
+    """Run one follow-up turn: ("started", text), or ("taken" | "covered" |
+    "failed", None)."""
+    # A send into a running turn is merged into it and never ends, so wait for
+    # the session's run under the send lock first.
     async with conn.send_section(session_key):
         async def thread_active():
             return await _session_list_active(conn, session_key, missing=False)
@@ -12970,8 +12581,7 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
             conn.unregister_consumer(session_key, run_id, queue=queue)
             pipe_log(f"[channels] follow-up send failed: {ex}")
             return "failed", None
-        # Only the first sender of a key gets "started"; another gets
-        # "in_flight" (or the finished run's status) for the same run.
+        # Only the first sender of a key gets "started".
         if (resp or {}).get("status") != "started":
             conn.unregister_consumer(session_key, run_id, queue=queue)
             pipe_log(f"[channels] follow-up {idempotency_key[:24]} is {(resp or {}).get('status')}: not mine")
@@ -12981,9 +12591,6 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
             run_id = resp["runId"]
             queue = conn.register_consumer(session_key, run_id)
     try:
-        # Until the run ends, however long that takes: its end arrives as the
-        # run's own final / error event, a restart marker, or the row after a
-        # reconnect (`_channel_run_text`).
         return await _channel_run_text(conn, session_key, run_id, queue)
     finally:
         conn.unregister_consumer(session_key, run_id)
@@ -13004,8 +12611,7 @@ async def _channel_run_text(conn, session_key: str, run_id: str, queue) -> "tupl
                 try:
                     hist = await conn.session_history(session_key, limit=10)
                 except Exception as ex:
-                    # A reconnect right at the end: the streamed text is the
-                    # reply (the run is over), or there is none to post.
+                    # A reconnect at the end: the streamed text is the reply.
                     pipe_log(f"[channels] follow-up {run_id[:24]}: transcript unreadable ({ex!r}); "
                              "using the streamed text")
                     return ("started", text) if text else ("failed", None)
@@ -13027,9 +12633,8 @@ async def _channel_run_text(conn, session_key: str, run_id: str, queue) -> "tupl
 
 async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: dict, pending: list,
                              *, use_judge: bool = True, post=None) -> str:
-    """Handle a followed thread's new messages (after the debounce): judge,
-    then maybe a full turn, then maybe a post. Returns what happened:
-    "judged-no", "skip", "posted", "taken" or "failed"."""
+    """Judge, maybe run, maybe post. Returns "judged-no", "skip", "posted",
+    "taken" or "failed"."""
     post = post or _channel_post_reply
     channel_id = thread["channel"]
     agent_id = getattr(valves, "AGENT_ID", "main") or "main"
@@ -13088,9 +12693,7 @@ async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: di
 # --- the watcher ----------------------------------------------------------------
 
 class _ChannelWatcher:
-    """Reads the followed threads' new messages every `_CHANNEL_POLL_S` while
-    at least one thread is followed, and stops when none is (the next mention
-    starts it again). One per Pipe function (`_ensure_channel_watcher`)."""
+    """Polls followed threads every `_CHANNEL_POLL_S`; stops when none is followed."""
 
     def __init__(self, valves_getter, function_id=None, conn_getter=None, now=time.time_ns):
         self.valves_getter = valves_getter
@@ -13107,8 +12710,7 @@ class _ChannelWatcher:
         state_dir = _state_dir(getattr(valves, "STATE_DIR", ""))
         idle = float(getattr(valves, "CHANNEL_THREAD_IDLE_HOURS", 24) or 24)
         debounce_ns = int(float(getattr(valves, "CHANNEL_THREAD_DEBOUNCE_S", 15) or 0) * 1e9)
-        # Only this Pipe function's threads: another copy of the Pipe (its own
-        # AGENT_ID) follows the threads its model was mentioned in.
+        # Another copy of the Pipe follows its own threads.
         followed = {r: t for r, t in _channel_followed(state_dir, idle, self.now()).items()
                     if t.get("function") == self.function_id}
         if not followed:
@@ -13121,8 +12723,7 @@ class _ChannelWatcher:
                 continue
             after = min(t.get("judged", 0) for t in threads.values())
             rows = await _channel_rows(channel_id, parents=threads.keys(), after_ns=after)
-            # A reply to the agent's message is Open WebUI's to send (as is a
-            # mention): leave it to that turn.
+            # A reply to the agent's message is Open WebUI's own turn.
             bot_ids = {m["id"] for m in rows if (m.get("meta") or {}).get("model_id")}
             for ref in {m.get("reply_to_id") for m in rows} - bot_ids - {None, ""}:
                 ref_row = await _channel_message(ref)
@@ -13177,10 +12778,8 @@ def _channel_watch_slot(function_id) -> str:
 
 
 def _ensure_channel_watcher(valves_getter):
-    """Start the watcher when a thread is followed and none runs for this Pipe
-    function. Its task sits in a slot (per function id) on Open WebUI's own
-    socket module, so a new load of the Pipe cancels the previous load's
-    watcher and two copies of the Pipe keep their own."""
+    """Start the watcher when a thread is followed. Its slot (per function id)
+    on Open WebUI's socket module lets a new load cancel the old one."""
     global _channel_watcher_task
     try:
         if _channel_watcher_task is not None and not _channel_watcher_task.done():
