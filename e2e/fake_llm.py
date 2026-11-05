@@ -276,15 +276,11 @@ def _load_scenes() -> list:
 SCENES = _load_scenes()
 
 
-def _scene_step(user_text: str, n_results: int, offered: list, fallback: bool = False) -> dict | None:
+def _scene_step(user_text: str, n_results: int, offered: list) -> dict | None:
     """The scripted reply for this request, if the user's message names a scene.
-    Returns {"text": str, "tool"?: name, "args"?: dict, "delay"?: s}. A scene
-    marked `"fallback": true` answers a part of the turn that only continues it
-    (the Gateway's own "Advance the active goal" message): it is looked for
-    only after no other scene matched, so a user's message before it is still
-    the one answered."""
+    Returns {"text": str, "tool"?: name, "args"?: dict, "delay"?: s}."""
     for scene in SCENES:
-        if scene["match"] not in user_text or bool(scene.get("fallback")) != fallback:
+        if scene["match"] not in user_text:
             continue
         steps = scene["steps"]
         step = steps[min(n_results, len(steps) - 1)]
@@ -345,10 +341,6 @@ def plan_reply(body: dict) -> dict:
     # generic answer to a question before the scene for that answer is seen.
     for start in range(len(users) - 1, -1, -1):
         plan = _scene_step("\n".join(users[start:]), len(tool_results), offered)
-        if plan is not None:
-            return plan
-    for start in range(len(users) - 1, -1, -1):
-        plan = _scene_step("\n".join(users[start:]), len(tool_results), offered, fallback=True)
         if plan is not None:
             return plan
     for start in range(len(users) - 1, -1, -1):

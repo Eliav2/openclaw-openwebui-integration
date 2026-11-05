@@ -611,17 +611,6 @@
           "delay": 0.03
         }
       ]
-    },
-    {
-      "_comment": "The goal's own continuation turn (OpenClaw 2026.10.10: after each turn the Gateway queues \"[System] Advance the active goal...\"). A slow answer, a word a second, keeps the loop at a turn every ten seconds; the default answer came at once and the loop ran ~200 turns in 2 minutes. No tool call: a tool result left in the transcript would make the scripted answer to the scene's next message skip its own tool.",
-      "match": "Advance the active goal",
-      "steps": [
-        {
-          "say": "Still working through the deploy script and the smoke check.",
-          "delay": 1.0
-        }
-      ],
-      "fallback": true
     }
   ]
 }
