@@ -327,7 +327,18 @@
     window.ocPushReply = { mode, text };
   }
 
+  // A chat on screen, however it was opened: its notifications on this device
+  // are read, close them (the tag is oc-sw.js's, one per chat).
+  const TAG_PREFIX = "chat-";
+  async function seen(id) {
+    if (!id || document.visibilityState !== "visible") return;
+    const reg = await navigator.serviceWorker.getRegistration("/");
+    for (const n of (await reg?.getNotifications({ tag: TAG_PREFIX + id })) || []) n.close();
+    window.ocPushRead = id;   // for tests and tools, like ocPushState
+  }
+
   async function chatPage() {
+    seen(chatIdNow()).catch(() => {});
     if (!store.get("token")) return;
     if (mutes === null) await loadMutes().catch(() => {});
     placeBell();
@@ -374,8 +385,9 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     navigator.serviceWorker.getRegistration("/").then((r) => r && r.update()).catch(() => {});
-    // Mutes may have changed on another device.
     const id = chatIdNow();
+    seen(id).catch(() => {});
+    // Mutes may have changed on another device.
     if (store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
 
