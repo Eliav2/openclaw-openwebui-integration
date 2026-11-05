@@ -643,12 +643,17 @@ def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
     assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
 
 
-def chat_menu(page, chat_id):
-    """Open WebUI's own chat menu (⋯) for a chat in the sidebar; returns the menu."""
+def sidebar_link(page, chat_id):
+    """A chat's entry in the sidebar, the sidebar opened (a phone-sized window keeps it closed)."""
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)   # Open WebUI drawn
     if not page.locator(f'a[href="/c/{chat_id}"]').is_visible():
         page.locator("#sidebar-toggle-button").first.click()
-    item = page.locator(f'a[href="/c/{chat_id}"]')
+    return page.locator(f'a[href="/c/{chat_id}"]')
+
+
+def chat_menu(page, chat_id):
+    """Open WebUI's own chat menu (⋯) for a chat in the sidebar; returns the menu."""
+    item = sidebar_link(page, chat_id)
     item.wait_for(timeout=WAIT_MS)
     # The chat's ⋯ (in the DOM, shown on hover), pressed as a pointer does.
     item.evaluate("""(a) => { let box = a, b = null;
@@ -1042,6 +1047,7 @@ def offline_on():
 
 
 needs_offline = pytest.mark.skipif("not offline_on()", reason="offline open is off on this stack (E2E_OFFLINE=0)")
+needs_offline_off = pytest.mark.skipif("offline_on()", reason="offline open is on on this stack (E2E_OFFLINE=1)")
 
 
 def opened(page, chat):
@@ -1094,6 +1100,8 @@ def test_the_error_page_after_a_network_change_reloads_once_into_the_chat(owui, 
 
 
 BOOT_READS = ("**/api/v1/users/user/settings", "**/api/v1/chats/?page=1", "**/api/v1/chats/pinned")
+PINNED_PATH = "/api/v1/chats/pinned"
+KEPT_APP = "oc-shell-v1"   # oc-sw.js SHELL
 NO_API_CACHES = "() => caches.keys().then((ks) => Promise.all(ks.filter((k) => k.startsWith('oc-api-')).map((k) => caches.delete(k))))"
 
 
@@ -1123,6 +1131,95 @@ def test_a_network_change_during_the_first_load_still_opens_the_chat(owui, brows
     finally:
         for r in BOOT_READS:
             ctx.unroute(r, fail_once)
+
+
+@needs_offline_off
+def test_start_reads_cut_by_a_network_change_still_open_the_chat(owui, pw):
+    """Offline open off (the worker answers nothing): Open WebUI's start reads cut once on their
+    way (a change of network) are asked once more by the page script, and the chat and the chat
+    list open. Its own browser: nothing kept from other tests."""
+    chat, _ = new_chat(owui, "stub", "Chat Start Cut")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"{BASE}/c/{chat}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        cut = []
+        def cut_once(route):
+            if route.request.method != "GET" or route.request.url in cut:
+                return route.fallback()
+            cut.append(route.request.url)
+            route.abort("connectionreset")   # a request cut on its way, as a network change does
+        for r in BOOT_READS:
+            ctx.route(r, cut_once)
+        try:
+            page.reload()
+            page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+            sidebar_link(page, chat).wait_for(timeout=WAIT_MS)   # the chat list's entry
+            assert len(cut) == len(BOOT_READS), cut
+        finally:
+            for r in BOOT_READS:
+                ctx.unroute(r, cut_once)
+    finally:
+        ctx.close()
+
+
+# Counts the calls of fetch for a path made from the outside (Open WebUI's) and their ends. The
+# page script and Open WebUI each wrap window.fetch: whoever reads it gets the top wrapper at that
+# time, and a call counts only when it goes to the top one, not from one wrapper to the next.
+OUTER_FETCH = """(path) => {
+    const seen = window.__ocOuter = {calls: 0, ends: 0};
+    const layers = [window.fetch];
+    const view = (k) => function (input, init) {
+        const p = layers[k].call(this, input, init);
+        if (k !== layers.length - 1) return p;
+        if (new URL(input instanceof Request ? input.url : String(input), location.href).pathname !== path) return p;
+        seen.calls++;
+        return p.finally(() => { seen.ends++; });
+    };
+    Object.defineProperty(window, 'fetch', {configurable: true, get: () => view(layers.length - 1),
+                                            set: (f) => { layers.push(f); }});
+}"""
+
+
+@needs_offline
+def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui, pw):
+    """Offline open on: the worker already asks a cut start read once more (oc-sw.js again()). A
+    read that fails both times is final: the page script does not ask it again (two more
+    attempts through the worker)."""
+    chat, _ = new_chat(owui, "stub", "Chat Start Cut Twice")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    ctx.add_init_script(f"({OUTER_FETCH})({json.dumps(PINNED_PATH)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"{BASE}/c/{chat}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+        page.reload()   # a load the worker answers: the app is kept
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        settled(page, f"() => caches.has({json.dumps(KEPT_APP)})")
+        page.evaluate(NO_API_CACHES)   # no kept answer to fall back on: the failure reaches the page
+        attempts = []
+        def cut_always(route):
+            if route.request.method != "GET":
+                return route.fallback()
+            attempts.append(bool(route.request.service_worker))
+            route.abort("connectionreset")
+        ctx.route("**" + PINNED_PATH, cut_always)
+        try:
+            page.reload()
+            page.locator("#chat-input").wait_for(timeout=WAIT_MS)   # (the pinned list failing for good, no chat list)
+            # Every call Open WebUI made has its answer (it may ask the list more than once).
+            page.wait_for_function("() => window.__ocOuter.ends >= 1 && window.__ocOuter.ends === window.__ocOuter.calls",
+                                   timeout=WAIT_MS)
+            calls = page.evaluate("() => window.__ocOuter.calls")
+            assert attempts == [True] * (CUT_ATTEMPTS * calls), (calls, attempts)
+        finally:
+            ctx.unroute("**" + PINNED_PATH, cut_always)
+    finally:
+        ctx.close()
 
 
 def test_the_error_page_reloads_only_once(owui, browser):

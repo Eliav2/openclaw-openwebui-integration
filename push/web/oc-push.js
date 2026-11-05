@@ -762,3 +762,45 @@
   navigator.serviceWorker?.startMessages?.();
   navigator.serviceWorker?.controller?.postMessage({ type: "oc-version-check" });
 })();
+
+// --- Open WebUI's start reads after a network change (ELI-362). A change of
+// network fails every request on its way (ERR_NETWORK_CHANGED), and Open WebUI
+// asks its start reads (config, user, settings, models, the chat list, the chat)
+// only once: one that fails leaves the app half drawn for good, with no error
+// page to recover from. A start read that fails on the network (no answer, not an
+// HTTP error) is asked once more at once, on the new network. With offline open
+// on, the service worker already does the same (oc-sw.js again()), and its failure
+// is final: the page does not ask a third and fourth time. This covers offline open
+// off (or no worker yet), where the worker answers nothing itself. Only these
+// reads, only GET, and only once each.
+(() => {
+  const START_READS = [
+    /^\/api\/config$/, /^\/api\/version$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
+    /^\/api\/v1\/users\/user\/settings$/, /^\/api\/v1\/configs\/banners$/, /^\/api\/v1\/folders\/$/,
+    /^\/api\/v1\/chats\/$/, /^\/api\/v1\/chats\/pinned$/, /^\/api\/v1\/chats\/all\/tags$/,
+    /^\/api\/v1\/chats\/[\w-]+$/, /^\/api\/v1\/chats\/[\w-]+\/tags$/,
+  ];
+  const GET = "GET";
+  const startRead = (input, init) => {
+    const req = input instanceof Request ? input : null;
+    const method = (init?.method || req?.method || GET).toUpperCase();
+    if (method !== GET) return false;
+    const url = new URL(req ? req.url : String(input), location.href);
+    return url.origin === location.origin && START_READS.some((r) => r.test(url.pathname));
+  };
+  // A worker with offline open on keeps the app in this cache; with it off, the
+  // worker drops every cache when it starts.
+  const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
+  const workerRetried = async () => !!navigator.serviceWorker?.controller && !!(await globalThis.caches?.has(KEPT_APP));
+  const original = window.fetch;
+  window.fetch = function (input, init) {
+    if (!startRead(input, init)) return original.call(this, input, init);
+    // A Request's body is used once: the second attempt gets a fresh copy.
+    const again = input instanceof Request ? input.clone() : input;
+    return original.call(this, input, init).catch(async (e) => {
+      if (init?.signal?.aborted || (input instanceof Request && input.signal.aborted)) throw e;   // Open WebUI cancelled it
+      if (await workerRetried()) throw e;
+      return original.call(this, again, init);
+    });
+  };
+})();
