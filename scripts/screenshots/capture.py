@@ -1236,8 +1236,12 @@ class Scenes:
         """The rebuild ran to its end in its own reply (nothing aborted it,
         and it did not move to the next reply), then the new message got
         its own answer."""
+        # Steered, the rebuild's reply ends at its tool: a closing line in it
+        # means the Gateway ran the old queued way.
+        no_closing = f"&& !a[0].innerText.includes({json.dumps(REBUILD_DONE)})" if self.steers else ""
         wait_js(page, f"""() => {{ const a = [...document.querySelectorAll('.chat-assistant')];
                  return a.length >= 2 && a[0].innerText.includes({json.dumps(self._rebuild_ends_with())})
+                   {no_closing}
                    && !a[0].querySelector('[role=button] .shimmer')
                    && a[a.length - 1].innerText.includes("It's on main")
                    && !a[a.length - 1].innerText.includes({json.dumps(REBUILD_DONE)}); }}""",
@@ -1259,6 +1263,7 @@ class Scenes:
             last = [(m.get("done"), (m.get("content") or "")[-60:]) for m in replies]
             if (len(replies) >= TWO_REPLIES and all(m.get("done") is True for m in replies)
                     and self._rebuild_ends_with() in (replies[0].get("content") or "")
+                    and (not self.steers or REBUILD_DONE not in (replies[0].get("content") or ""))
                     and (not self.steers or any(i.get("type") == TOOL_OUTPUT_ITEM
                                                 for i in replies[0].get("output") or []))
                     and "It's on main" in (replies[-1].get("content") or "")
