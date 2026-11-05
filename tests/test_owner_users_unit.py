@@ -185,7 +185,7 @@ def print_frames(path="test_fixture_owner_users_empty_valve.json"):
 
 
 class EmptyValveParityTests(unittest.TestCase):
-    """OWNER_USERS empty: the Gateway gets exactly what it got before."""
+    """OWNER_USERS empty: the Gateway gets exactly what it got before (the main identity now also names itself, see test_display_name_unit)."""
 
     def test_frames_match_the_code_before_the_valve(self):
         want = json.load(open(os.path.join(HERE, "tests", "fixtures", "test_fixture_owner_users_empty_valve.json")))

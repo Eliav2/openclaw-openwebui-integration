@@ -11,6 +11,7 @@
     "plugin-approvals"
    ],
    "client": {
+    "displayName": "owui-pipe",
     "id": "webchat",
     "mode": "cli",
     "platform": "linux",

@@ -1,6 +1,6 @@
 """The Gateway prunes a silently paired device when another with the same client id, mode
-and displayName pairs. The restricted identity uses its own displayName so others cannot
-evict it; the main identity (a legacy approved record) sends none."""
+and displayName pairs. Both Pipe identities use a displayName of their own so others cannot
+evict them; the main one is sent by the Pipe and the Status Action alike, which share it."""
 import asyncio
 import json
 import os
@@ -42,9 +42,20 @@ class DisplayNameTests(unittest.TestCase):
         frame = connect_frame(openclaw_pipe._new_restricted_connection, "identity-restricted.json")
         self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe-restricted")
 
-    def test_the_main_identity_keeps_sending_no_display_name(self):
+    def test_the_main_identity_connects_under_its_own_display_name(self):
         frame = connect_frame(openclaw_pipe._GatewayConnection, "identity.json")
-        self.assertNotIn("displayName", frame["params"]["client"])
+        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe")
+
+    def test_the_main_and_the_restricted_identity_never_share_a_name(self):
+        main = connect_frame(openclaw_pipe._GatewayConnection, "identity.json")["params"]["client"]["displayName"]
+        restricted = connect_frame(openclaw_pipe._new_restricted_connection, "identity-restricted.json")["params"]["client"]["displayName"]
+        self.assertTrue(main and restricted)
+        self.assertNotEqual(main, restricted)
+
+    def test_the_status_action_sends_the_pipes_name_for_the_shared_main_identity(self):
+        import openclaw_status_action
+        frame = connect_frame(openclaw_status_action._GatewayConnection, "identity.json")
+        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe")
 
     def test_the_client_id_and_mode_stay_what_the_signature_covers(self):
         client = connect_frame(openclaw_pipe._new_restricted_connection, "identity-restricted.json")["params"]["client"]
