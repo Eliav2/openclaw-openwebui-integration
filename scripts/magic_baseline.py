@@ -26,7 +26,7 @@ PATHS = ["src", "install.py", "install_action.py", "install_filter.py", "build.p
          "push/openclaw_web_push.py", "gateway-plugins"]
 
 
-def current() -> dict[str, Counter]:
+def current() -> tuple[dict[str, Counter], dict[tuple[str, str], list[int]]]:
     out = subprocess.run(
         ["uvx", "ruff@0.17.0", "check", "--config", "ruff-magic.toml",
          "--output-format", "json", *PATHS],
@@ -34,11 +34,17 @@ def current() -> dict[str, Counter]:
     if out.returncode not in (0, 1):
         sys.exit(f"ruff failed:\n{out.stderr}")
     found: dict[str, Counter] = {}
+    rows: dict[tuple[str, str], list[int]] = {}
     for hit in json.loads(out.stdout or "[]"):
         path = Path(hit["filename"]).relative_to(ROOT).as_posix()
         line = (ROOT / path).read_text().splitlines()[hit["location"]["row"] - 1].strip()
         found.setdefault(path, Counter())[line] += 1
-    return found
+        rows.setdefault((path, line), []).append(hit["location"]["row"])
+    return found, rows
+
+
+def baseline_count(known: dict[str, dict[str, int]], path: str, line: str) -> int:
+    return known.get(path, {}).get(line, 0)
 
 
 def new_hits(found: dict[str, Counter], known: dict[str, dict[str, int]]) -> list[tuple[str, str, int]]:
@@ -49,7 +55,7 @@ def new_hits(found: dict[str, Counter], known: dict[str, dict[str, int]]) -> lis
 
 
 def main() -> int:
-    found = current()
+    found, rows = current()
     if "--update" in sys.argv:
         BASELINE.write_text(json.dumps({p: dict(sorted(c.items())) for p, c in sorted(found.items())},
                                        indent=1, ensure_ascii=False) + "\n")
@@ -58,7 +64,10 @@ def main() -> int:
     known = json.loads(BASELINE.read_text())
     new = new_hits(found, known)
     for path, line, extra in new:
-        print(f"{path}: {extra} new magic value in a comparison: {line}")
+        # Identical lines count together: the baseline cannot say which of them is the new one.
+        where = ", ".join(f"{path}:{row}" for row in rows[(path, line)])
+        print(f"{where}: {extra} new magic value in a comparison (this exact line is in the baseline "
+              f"{baseline_count(known, path, line)} time(s), found {len(rows[(path, line)])}): {line}")
     if new:
         print("\nName the value (a module constant, an enum member, http.HTTPStatus) instead of comparing "
               "against a literal. 0, 1, -1 and \"\" are allowed. See AGENTS.md, 'No magic numbers or strings'.")
