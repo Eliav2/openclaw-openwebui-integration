@@ -291,15 +291,21 @@ def upload_media(name: str, data: bytes) -> None:
         raise RuntimeError(f"media upload failed: {body}")
 
 
+# The fake the stack-patch gives a key in provider config (see schedule_wake).
+AUTOMATION_MODEL = "openai/gpt-5.5"
+
+
 def schedule_wake(session_key: str, message: str, in_s: float) -> str:
     """Add a one-shot cron wake into the session; its job's id."""
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     # agentId: from OpenClaw 2026.10.10 a job needs its agent named when the
-    # Gateway has more than one (main, title-gen).
+    # Gateway has more than one (main, title-gen). model: and it needs a
+    # stored account or a key in provider config for the model it runs, which
+    # the stack's anthropic fake has not (its other fakes do).
     params = {"name": "nightly-build-check", "agentId": "main", "schedule": {"kind": "at", "at": at},
               "sessionTarget": f"session:{session_key}",
-              "payload": {"kind": "agentTurn", "message": message},
+              "payload": {"kind": "agentTurn", "message": message, "model": AUTOMATION_MODEL},
               "delivery": {"mode": "none"}, "deleteAfterRun": True}
     job = gateway_call("cron.add", params)
     return (job.get("job") or job).get("id")
@@ -324,9 +330,11 @@ def add_chat_automation(session_key: str) -> str:
     """A daily automation that runs in this chat (ELI-163), next due
     tomorrow morning; its id, to remove it after the scene."""
     job = gateway_call("cron.add", {
-        "name": "Morning forecast chart", "schedule": {"kind": "cron", "expr": "0 7 * * *", "tz": "UTC"},
+        "name": "Morning forecast chart", "agentId": "main",
+        "schedule": {"kind": "cron", "expr": "0 7 * * *", "tz": "UTC"},
         "sessionTarget": f"session:{session_key}",
-        "payload": {"kind": "agentTurn", "message": "Morning chart for the forecast app"},
+        "payload": {"kind": "agentTurn", "message": "Morning chart for the forecast app",
+                    "model": AUTOMATION_MODEL},
         "delivery": {"mode": "none"}})
     return job.get("id") or job.get("job", {}).get("id")
 
