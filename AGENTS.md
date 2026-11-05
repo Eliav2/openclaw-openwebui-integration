@@ -40,6 +40,16 @@ A PR that removes a feature removes its bullet, its section, its scene and its i
 
 A PR that adds a user flow (something a user does in the chat, the Status dialog or the composer) adds its test to `e2e/test_browser_flows.py` in the same PR: Playwright on the E2E stack, asserting on what the user sees (DOM state), waiting on state and never on time, with no retries. A PR that changes a flow keeps its test passing. These tests run on GitHub runners only, in the E2E job.
 
+## No magic numbers or strings
+
+A literal that carries meaning gets a name: a timeout, a count, a limit, a status code, an event type, a role, a state word. Comparing against `3`, `200`, `"final"` or `"assistant"` inline is a finding, in a review and in CI.
+
+- Name it where it belongs: a module constant with a comment saying what it is, an `http.HTTPStatus` member, an enum or a frozen set of the values. Not a local alias that hides the number.
+- `0`, `1`, `-1` and `""` need no name.
+- Python is checked by ruff `PLR2004` with strings on (`ruff-magic.toml`), through `scripts/magic_baseline.py`. JavaScript and TypeScript are checked by ESLint `no-magic-numbers` plus a string-comparison rule (`eslint.config.mjs`), through `scripts/lint-js/run.sh`. Both fail CI on a hit their baseline (`scripts/magic-baseline.json`, `scripts/lint-js/eslint-suppressions.json`) does not already hold.
+- The baselines hold the hits that existed when the rule arrived. Touching a baselined line is a good moment to fix it; fixing one only shrinks the baseline (`--update`, `--suppress-all`). Never add to a baseline to get a change through.
+- Tests, `e2e/` and the built `openclaw_*.py` files are not checked: a test asserts expected values, and the built files are generated from `src/`.
+
 ## Writing
 
 - No em dashes, in docs, code comments, commit messages or PR descriptions.
