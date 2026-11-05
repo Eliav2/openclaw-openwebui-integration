@@ -90,6 +90,7 @@ SHARDS = {
         f"{E2E}::test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_stays_open",
         f"{E2E}::test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chats_context",
         f"{E2E}::test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card",
+        f"{E2E}::test_a_silent_announce_of_a_deleted_sub_agent_still_shows_the_childs_result_as_its_card",
         f"{E2E}::test_a_wake_reply_ends_like_an_inline_reply",
         f"{E2E}::test_a_subagent_result_ends_like_an_inline_reply",
         f"{E2E}::test_two_subagent_results_that_land_together_both_stay_in_the_chat",
