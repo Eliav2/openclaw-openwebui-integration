@@ -518,10 +518,15 @@ def test_opening_a_chat_clears_its_notifications(owui, browser):
     # ... or Open WebUI's own navigation to another chat (SvelteKit's pushState).
     page.evaluate("(c) => history.pushState({}, '', '/c/' + c)", chats["Y"])
     assert read(page, chats["Y"]) == [tag["Z"]]
-    # In the background, a chat on the page is not read; coming back to the front on it is.
-    other()
-    page.wait_for_function("() => document.visibilityState === 'hidden'", timeout=WAIT_MS)   # focus goes first
+    # Hidden, a chat on the page is not read; shown again on it, it is. Chrome under Xvfb does not
+    # reliably hide a page (another tab, a minimized window), so the page's visibility is set here:
+    # what the page script reads (visibilityState) and the event it listens to.
+    vis = """(v) => { Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => v});
+                      document.dispatchEvent(new Event('visibilitychange')); }"""
+    page.evaluate(vis, "hidden")
     page.evaluate("(c) => history.replaceState({}, '', '/c/' + c)", chats["Z"])
     assert page.evaluate("() => window.ocPushRead") == chats["Y"]
-    page.bring_to_front()
+    page.evaluate(vis, "visible")
     assert read(page, chats["Z"]) == []
+    page.evaluate("() => delete document.visibilityState")
+    other()
