@@ -52,7 +52,7 @@ Which OpenClaw agent handles these chats. Leave as 'main' unless your Gateway de
 
 Type: `bool`. Default: `True`.
 
-Start a small HTTP server on port 18791 to serve agent-generated images and files. Only used as a fallback when USE_OWUI_FILES is off or an upload fails. Note it is unauthenticated -- leave off if port 18791 is exposed.
+Start a small HTTP server on port 18791 to serve agent-generated images and files. Only used as a fallback when USE_OWUI_FILES is off or an upload fails. Note it is unauthenticated -- leave off if port 18791 is exposed. With it off, a file that cannot be uploaded shows as an error in the reply, not as a link that never loads.
 
 ### USE_OWUI_FILES
 

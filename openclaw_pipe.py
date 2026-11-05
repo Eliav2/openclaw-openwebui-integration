@@ -1133,17 +1133,27 @@ def _replace_media(text: str, directives, replacement) -> str:
     return out + text[pos:]
 
 
-def _resolve_media(text, base_url=None, ctx=""):
-    """Turn every MEDIA: directive outside code (ELI-111) into an image link."""
+def _resolve_media(text, base_url=None, ctx="", file_server=True):
+    """Turn every MEDIA: directive outside code (ELI-111) into an image link.
+
+    A bare filename links to the file server at `base_url`. With the file
+    server off (`file_server` False) nothing serves that link, so the line
+    becomes a plain error instead of an image that never loads; a URL
+    directive needs no server and stays an image either way."""
     if base_url is None:
         base_url = MEDIA_BASE_URL
     directives, _hold = _media_scan(text, ctx)
     if not directives:
         return text, False
-    # A URL, not base64: base64 breaks OWUI's streaming parser.
-    return _replace_media(text, directives,
-                          lambda fname: f"![{os.path.basename(fname)}]({fname})" if _is_media_url(fname)
-                          else f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
+
+    def shown(fname):
+        if _is_media_url(fname):
+            return f"![{os.path.basename(fname)}]({fname})"
+        if file_server:
+            # A URL, not base64: base64 breaks OWUI's streaming parser.
+            return f"![{fname}]({base_url.rstrip('/')}/{fname})"
+        return f"_(a file could not be uploaded: {fname})_"
+    return _replace_media(text, directives, shown), True
 
 
 def _is_media_url(fname: str) -> bool:
@@ -1293,7 +1303,10 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
         except Exception as ex:
             pipe_log(f"  OWUI file upload failed; falling back: {ex}")
     if not handled:
-        resolved, handled = _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx)
+        resolved, handled = _resolve_media(
+            text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=valves.ENABLE_FILE_SERVER)
+        if handled and not valves.ENABLE_FILE_SERVER and resolved != text:
+            pipe_log("  MEDIA: file not uploaded to OWUI and the file server is off; the reply says so")
     return resolved, handled
 
 
@@ -13256,7 +13269,9 @@ class Pipe:
             description="Start a small HTTP server on port 18791 to serve "
                 "agent-generated images and files. Only used as a fallback when "
                 "USE_OWUI_FILES is off or an upload fails. Note it is "
-                "unauthenticated -- leave off if port 18791 is exposed."
+                "unauthenticated -- leave off if port 18791 is exposed. With "
+                "it off, a file that cannot be uploaded shows as an error "
+                "in the reply, not as a link that never loads."
         )
         USE_OWUI_FILES: bool = Field(
             default=True,
