@@ -444,8 +444,10 @@
   const MENU_AFTER_MS = 2000;
   let pressed = null, contractLogged = false;
 
-  // The chat whose ⋯ was just pressed.
-  addEventListener("pointerdown", (e) => {
+  // The chat whose ⋯ was just pressed, by a pointer or from the keyboard
+  // (the menu also opens on Enter and Space).
+  const OPEN_KEYS = new Set(["Enter", " "]);
+  function press(e) {
     const b = e.target instanceof Element && e.target.closest("button[aria-haspopup]");
     let box = b;
     for (let i = 0; box && i < TRIGGER_DEPTH; i++, box = box.parentElement) {
@@ -455,7 +457,9 @@
         return;
       }
     }
-  }, true);
+  }
+  addEventListener("pointerdown", press, true);
+  addEventListener("keydown", (e) => { if (OPEN_KEYS.has(e.key)) press(e); }, true);
 
   // A menu just appeared: once it is drawn (next frame), the chat's menu gets the item.
   function menuOpened(menu) {
@@ -470,7 +474,10 @@
     if (!navigator.serviceWorker.controller) return;   // push not on for this device
     const unreadItem = [...menu.querySelectorAll(MENU_BOX + " > " + MENU_ITEM)]
       .find((b) => b.querySelector("path")?.getAttribute("d")?.startsWith(UNREAD_ICON));
-    if (!unreadItem) {
+    // Its label: the item's last div, holding all of the item's text.
+    const native = unreadItem?.textContent.trim();
+    const nativeLabel = unreadItem && [...unreadItem.querySelectorAll("div")].pop();
+    if (!unreadItem || !native || nativeLabel?.textContent.trim() !== native) {
       window.ocPushMenuContract = "missing";
       if (contractLogged) return;
       contractLogged = true;
@@ -479,12 +486,12 @@
     }
     window.ocPushMenuContract = "ok";
     const item = unreadItem.cloneNode(true);
-    const label = [...item.querySelectorAll("div")].pop();
-    if (label) label.textContent = "Mark as read";
+    [...item.querySelectorAll("div")].pop().textContent = "Mark as read";
     item.addEventListener("click", (e) => {
       e.stopPropagation();
-      // The service worker sends Open WebUI's own read event (as the notification's button does).
-      navigator.serviceWorker.controller?.postMessage({ type: "oc-push-act", action: "read", data: { chat_id: chat } });
+      // The service worker sends Open WebUI's own read event (as the notification's button does);
+      // if that fails it opens the chat, which reads it.
+      navigator.serviceWorker.controller?.postMessage({ type: "oc-push-act", action: "read", data: { chat_id: chat, url: CHAT_PATH + chat } });
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     });
     unreadItem.after(item);

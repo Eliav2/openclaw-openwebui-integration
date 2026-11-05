@@ -33,6 +33,7 @@ PUSH = os.path.dirname(HERE)
 CHROME = os.environ.get("E2E_CHROME", "/usr/bin/google-chrome")
 WAIT_MS = 60000  # a safety net for each state wait, never expected to expire
 CHAT_LOAD_DELAY_MS = 200  # chat F arrives just after the reply is in the box (inside Open WebUI's 500 ms draft-save debounce)
+MENU_DRAWN_WAIT_MS = 500  # a few frames: the script adds its item on the frame after the menu appears
 DRAFT_RESTORE_WAIT_MS = 4000  # Open WebUI has loaded the chat and handled its own draft by then
 SECRETS = ("STUB-SECRET-REPLY", "PIPE-SECRET-REPLY")
 
@@ -689,5 +690,17 @@ def test_mark_as_read_from_the_chat_menu(owui, browser):
     page.wait_for_function("() => window.ocPushMenuContract === 'missing'", timeout=WAIT_MS)
     assert page.locator("#not-owui [role=menuitem], #not-owui-2 [role=menuitem]").count() == 2
     assert len([l for l in logs if "chat menu" in l]) == 1, logs
-    page.evaluate("() => document.querySelectorAll('#not-owui, #not-owui-2, #fake-item').forEach(e => e.remove())")
+    # Open WebUI's structure and icon, but the label is not where the script looks: nothing either.
+    page.evaluate("""(icon) => { window.ocPushMenuContract = 'ok'; const b = document.querySelector('#fake-item button');
+        b.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+        const m = document.createElement('div'); m.setAttribute('role', 'menu'); m.id = 'bad-label';
+        m.innerHTML = `<div class="app-dropdown-menu"><button role="menuitem"><svg><path d="${icon} Z"></path></svg>`
+          + `<span>Mark as unread</span><div></div></button></div>`;
+        document.body.appendChild(m); }""", "M8 12L11 15L16 10")
+    page.wait_for_function("() => document.querySelector('#bad-label')?.dataset.ocPush === 'seen'", timeout=WAIT_MS)
+    page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+    assert page.locator("#bad-label [role=menuitem]").count() == 1, "an item was added to a menu with an unknown label"
+    assert page.evaluate("() => window.ocPushMenuContract") == "missing"
+    assert len([l for l in logs if "chat menu" in l]) == 1, logs
+    page.evaluate("() => document.querySelectorAll('#not-owui, #not-owui-2, #bad-label, #fake-item').forEach(e => e.remove())")
     page.set_viewport_size({"width": 390, "height": 844})
