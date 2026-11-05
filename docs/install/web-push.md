@@ -161,6 +161,26 @@ The bell and the Mute button read all your user valves and write them back with 
 - No buttons: no Reply, no Mute in the notification. Mute with the bell.
 - The preview, muted chats and muted folders work as on Android.
 
+## Offline open
+
+Off by default. Turned on, the service worker also keeps Open WebUI itself and the chats you read last, so the app opens on a slow network, or with none, read-only. Turn it on with the Cloudflare Worker's `OFFLINE` variable set to `"1"` (in `vars` of your `wrangler.jsonc`), or, with nginx, by replacing `__OC_OFFLINE__` with `1` in your copy of `oc-sw.js` (`sed -i s/__OC_OFFLINE__/1/ /srv/open-webui-push/oc-sw.js`).
+
+What it does, request by request (only `GET` requests to your own Open WebUI; everything else goes straight to the network):
+
+| Request | How |
+|---|---|
+| A page (`/`, `/c/<id>`, any route: Open WebUI is one page) | The network, for up to 3 s; after that, or with no network or a server error (5xx), the page kept from the last visit. |
+| Open WebUI's hashed files (`/_app/immutable/`) | Kept on first use and then read from the device: their names change with their content. |
+| `/static/`, `/assets/`, `/_app/version.json`, `/manifest.json` | The network first, as a page. |
+| The reads that draw the app, the chat list and a chat: `/api/config`, `/api/version`, `/api/models`, `/api/v1/auths/`, your settings, banners, folders, the chat list, pinned chats, tags, and each chat you open | The network for up to 4 s, else the copy from the last time. |
+
+- **Only clean answers are kept:** a `200` from your own site, never a redirect. A page is kept only if it is Open WebUI's (it loads `/_app/immutable/` files), so a Cloudflare Access login page or an error page never becomes the app.
+- **Per user:** the API answers are kept per signed-in user (in a cache named after a hash of the user's token). Signing in again or as someone else starts a new one and deletes the others.
+- **Updates:** a new Open WebUI build is a new page with new hashed files; when the page changes, the old build's files are deleted. Open WebUI reloads once when it sees the new version.
+- **Sizes:** at most 400 app files and 300 API answers per user, oldest first.
+- **Read-only:** sending, or anything else that writes, needs the network; Open WebUI shows its own error.
+- **Turning it off** (`OFFLINE` unset or not `"1"`): the next service worker that a device loads deletes everything it kept.
+
 ## Known limits
 
 - **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your user valves and write them all back with their one change, because Open WebUI's user-valve update replaces the whole set. If a second change reads them before the first one's write has landed, the second write puts back the old value of the first: the two read-and-write round trips overlap, so how long the window lasts depends on the network (longer on a slow phone connection). Any two writers can do this: two devices, two tabs, or a notification's Mute button next to an open tab. If a mute did not stick, change it again.

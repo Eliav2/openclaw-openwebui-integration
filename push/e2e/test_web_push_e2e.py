@@ -928,3 +928,74 @@ def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
     finally:
         api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "mutes": "{}", "folder_mutes": "{}"}, token)
         page.set_viewport_size({"width": 390, "height": 844})
+
+
+OFFLINE_CACHES = "() => caches.keys()"
+
+
+def warm(page, chat):
+    """The chat opened online under the service worker, so its reads and files are kept."""
+    page.goto(f"{BASE}/c/{chat}")
+    page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    page.reload()   # the first load ran before the worker controlled the page
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.wait_for_function("""(c) => caches.keys().then(async (ks) => {
+        for (const k of ks.filter((k) => k.startsWith('oc-api-')))
+            if (await (await caches.open(k)).match(location.origin + '/api/v1/chats/' + c)) return true;
+        return false; })""", arg=chat, timeout=WAIT_MS)
+
+
+def test_offline_open_shows_the_chat_read_last(owui, browser):
+    """ELI-352 phase 1: with no network, a reload opens the app and the chat read last, read-only."""
+    ctx, page = browser
+    token = owui
+    page.bring_to_front()
+    o_chat, o_msg = new_chat(token, "stub", "Chat Offline")
+    reply(token, "stub", o_chat, o_msg)
+    wait_done(token, o_chat, o_msg)
+    text = [m for m in api(f"/api/v1/chats/{o_chat}", token=token)["chat"]["history"]["messages"].values()
+            if m["role"] == "assistant"][0]["content"][:40]
+    warm(page, o_chat)
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.get_by_text(text.strip().splitlines()[0][:30], exact=False).first.wait_for(timeout=WAIT_MS)
+        if os.environ.get("E2E_SHOTS"):
+            page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offline-chat.png"))
+    finally:
+        ctx.set_offline(False)
+
+
+def test_offline_keeps_no_redirect_and_drops_an_old_builds_files(owui, browser):
+    """A redirect (an expired Cloudflare Access session) is never kept as the app's page; a new page
+    (a new Open WebUI build) drops the hashed files of the old one."""
+    ctx, page = browser
+    token = owui
+    page.bring_to_front()
+    r_chat, _ = new_chat(token, "stub", "Chat Redirect")
+    warm(page, r_chat)
+    kept = "() => caches.open('oc-shell-v1').then((c) => c.match('/')).then((r) => r ? r.text() : '')"
+    page_before = page.evaluate(kept)
+    assert "/_app/immutable/" in page_before
+    # Access's answer to an expired session: a redirect to its login page.
+    login = "<html><body>Cloudflare Access login</body></html>"
+    ctx.route("**/access-login", lambda r: r.fulfill(status=200, content_type="text/html", body=login))
+    ctx.route(f"**/c/{r_chat}", lambda r: r.fulfill(status=302, headers={"location": f"{BASE}/access-login"}))
+    try:
+        page.goto(f"{BASE}/c/{r_chat}")
+        page.wait_for_url("**/access-login", timeout=WAIT_MS)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        assert "Access login" not in page.evaluate(kept)
+    finally:
+        ctx.unroute(f"**/c/{r_chat}"); ctx.unroute("**/access-login")
+    # An old build's file and the page it came with; the next page load drops it.
+    page.goto(f"{BASE}/c/{r_chat}")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.evaluate("""() => caches.open('oc-shell-v1').then(async (c) => {
+        await c.put('/_app/immutable/old-build.js', new Response('// old'));
+        await c.put('/_oc/page-files', new Response('/_app/immutable/old-build.js')); })""")
+    page.reload()
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.wait_for_function("""() => caches.open('oc-shell-v1').then((c) => c.match('/_app/immutable/old-build.js'))
+        .then((r) => !r)""", timeout=WAIT_MS)
