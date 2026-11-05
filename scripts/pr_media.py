@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fail a pull request that changes what users see but shows no image.
 
-AGENTS.md: a PR with a visual change shows a Before and After pair in its
-description, from the Screenshots workflow. This is the check for it: when the
+AGENTS.md: a PR with a visual change shows its Before and After in its
+description, as a 2-column table with one row per change, from the Screenshots
+workflow. This is the check for it, and it asks only for an image, wherever it
+sits in the description (a table cell counts): when the
 PR's diff touches a file that draws the UI (VISUAL below) or an image under
 docs/img/, its description needs an image: an `<img src=...>` tag or a markdown
 image `![alt](url)` whose source is an http(s) URL (`gh pr edit --attach`
@@ -107,9 +109,14 @@ def check(paths, body: str | None, labels) -> str | None:
         return None
     return ("This PR changes what users see (" + ", ".join(touched[:MAX_LISTED_FILES])
             + (", ..." if len(touched) > MAX_LISTED_FILES else "") + ") but its description has no image.\n"
-            "Add a Before and After pair from the Screenshots workflow, uploaded with gh pr edit --attach "
-            "(AGENTS.md, \"Docs and screenshots ship with the feature\"), or, when nothing "
-            f"on screen changes, add the label `{SKIP_LABEL}`.")
+            "Add the Before and After from the Screenshots workflow, uploaded with gh pr edit --attach "
+            "(AGENTS.md, \"Docs and screenshots ship with the feature\"), as a 2-column table, one row per change, "
+            "with one short heading above each table saying what changed:\n"
+            "### What changed\n"
+            "| Before | After |\n"
+            "|---|---|\n"
+            "| <img src=\"URL\" alt=\"...\" width=\"320\"> | <img src=\"URL\" alt=\"...\" width=\"320\"> |\n"
+            f"Or, when nothing on screen changes, add the label `{SKIP_LABEL}`.")
 
 
 def main(argv=None) -> int:

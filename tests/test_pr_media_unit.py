@@ -115,8 +115,19 @@ class TheCheck(unittest.TestCase):
         self.assertIn("src/openclaw_pipe_pkg/action.py", why)
         self.assertIn(pr_media.SKIP_LABEL, why)
 
+    def test_the_failure_shows_the_table_format(self):
+        why = pr_media.check(DRAWER, "", [])
+        cell = '<img src="URL" alt="..." width="320">'
+        table = f"### What changed\n| Before | After |\n|---|---|\n| {cell} | {cell} |\n"
+        self.assertIn(table, why)
+
     def test_an_image_passes(self):
         self.assertIsNone(pr_media.check(DRAWER, IMG, []))
+
+    def test_a_before_after_table_passes(self):
+        table = ("### Notification shows the reply text\n| Before | After |\n|---|---|\n"
+                 f"| {IMG} | {IMG} |")
+        self.assertIsNone(pr_media.check(DRAWER, table, []))
 
     def test_the_label_passes(self):
         self.assertIsNone(pr_media.check(DRAWER, "", ["bug", pr_media.SKIP_LABEL]))
