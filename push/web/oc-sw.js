@@ -313,27 +313,57 @@ const OFFLINE = OFFLINE_SETTING === ON;
 const SHELL = "oc-shell-v1";          // the app: its page, its hashed files, /static
 const API_PREFIX = "oc-api-";         // + a hash of the user's token: one user's reads
 const OURS = (name) => name === SHELL || name.startsWith(API_PREFIX);
-const NAV_TIMEOUT_MS = 3000;          // a page load waits this long for the network
-const READ_TIMEOUT_MS = 4000;         // an API read too
+// How long a request waits for a network that does not answer at all (lie-fi)
+// before the kept copy is used. Not a speed setting: it never fires on a network
+// that answers at Slow 3G speed. Measured 2026-11-05 on DevTools' Slow 3G (2 s
+// round trip, 50 KB/s), a cold open of a chat: the slowest answer an open waits
+// for the network for was the page itself, 2.09 s (the chat 2.08 s). A network
+// silent for twice that is taken as gone.
+const SLOW_3G_SLOWEST_MS = 2100;
+const SILENT_FACTOR = 2;
+const LIE_FI_MS = SLOW_3G_SLOWEST_MS * SILENT_FACTOR;
 const SHELL_MAX = 400;                // entries kept, the oldest go first
 const API_MAX = 300;
 const PAGE_KEY = "/";                 // Open WebUI is one page for every route
+// The /api/version answer the kept page came with: the kept app runs only
+// against that same Open WebUI.
+const VERSION_KEY = "/_oc/version";
+const VERSION_PATH = "/api/version";
 const IMMUTABLE = "/_app/immutable/";
-const FRESH_FIRST = ["/static/", "/assets/", "/_app/version.json", "/manifest.json"];
-// The reads Open WebUI needs to draw the app, the chat list and an opened chat.
-const READS = [
-  /^\/api\/config$/, /^\/api\/version$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
-  /^\/api\/v1\/users\/user\/settings$/, /^\/api\/v1\/configs\/banners$/, /^\/api\/v1\/folders\/$/,
-  /^\/api\/v1\/chats\/$/, /^\/api\/v1\/chats\/pinned$/, /^\/api\/v1\/chats\/all\/tags$/,
-  /^\/api\/v1\/chats\/[\w-]+$/, /^\/api\/v1\/chats\/[\w-]+\/tags$/,
+// Kept files of this Open WebUI version: the kept copy at once, refreshed behind.
+const SAVED_FIRST = ["/static/", "/assets/"];
+const FRESH_FIRST = ["/_app/version.json", "/manifest.json"];
+// The reads Open WebUI needs to draw the app. Its settings, models and config
+// change rarely: the kept copy at once, refreshed behind (one open late at most).
+const SHELL_READS = [
+  /^\/api\/config$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
+  /^\/api\/v1\/users\/user\/settings$/, /^\/api\/v1\/configs\/banners$/,
+  /^\/api\/v1\/chats\/all\/tags$/, /^\/api\/v1\/chats\/[\w-]+\/tags$/,
+  /^\/api\/v1\/functions\/$/, /^\/api\/v1\/skills\/$/,
 ];
+// The chat list and an opened chat: what a notification is opened for, so the
+// network's answer, the kept copy only offline. /api/version too: Open WebUI
+// reloads itself when it changes while the page is open.
+const FRESH_READS = [
+  /^\/api\/version$/, /^\/api\/v1\/folders\/$/, /^\/api\/v1\/chats\/$/, /^\/api\/v1\/chats\/pinned$/,
+  /^\/api\/v1\/chats\/[\w-]+$/,
+];
+// Profile pictures (a model's, a user's): <img> loads, with the session cookie and
+// no Authorization header. Kept in the signed-in user's cache, the kept copy at
+// once; a model with no picture answers with a redirect to Open WebUI's own icon.
+const IMAGES = [/^\/api\/v1\/models\/model\/profile\/image$/, /^\/api\/v1\/users\/[\w-]+\/profile\/image$/];
+const NEW_VERSION = "oc-new-version";   // to the page: reload, the app it runs is not this server's
 const HTTP_OK = 200, HTTP_SERVER_ERROR = 500;
 const HASH_HEX = 16, HEX = 16, BYTE_DIGITS = 2;
-const SAME_ORIGIN = "basic", GET = "GET", NAVIGATE = "navigate";
+const SAME_ORIGIN = "basic", GET = "GET", NAVIGATE = "navigate", NO_STORE = "no-store", MANUAL = "manual";
+const never = new Promise(() => {});
+const after = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Only a clean answer is kept: never a redirect (an expired Cloudflare Access
 // session answers with one), an error or another site's answer.
 const keepable = (res) => res && res.status === HTTP_OK && res.type === SAME_ORIGIN && !res.redirected;
+// A picture may come through a redirect on this site (to Open WebUI's default icon).
+const keepableImage = (res) => res && res.status === HTTP_OK && res.type === SAME_ORIGIN;
 // The network gave nothing usable: no answer, or the server (or the tunnel in
 // front of it) is down.
 const down = (res) => !res || res.status >= HTTP_SERVER_ERROR;
@@ -352,7 +382,7 @@ async function trim(cache, max) {
 // thing being kept).
 async function freshFirst(e, req, cacheName, key, ms, onFresh, isIt) {
   const cache = await caches.open(cacheName);
-  const net = fetch(req).then(async (res) => {
+  const net = shared(req).then(async (res) => {
     if (keepable(res) && (!isIt || await isIt(res.clone()))) {
       await cache.put(key, res.clone());
       if (onFresh) await onFresh(res.clone(), cache);
@@ -360,13 +390,103 @@ async function freshFirst(e, req, cacheName, key, ms, onFresh, isIt) {
     return res;
   }, () => null);
   e.waitUntil(net);
-  const timer = new Promise((r) => setTimeout(() => r(undefined), ms));
-  const first = await Promise.race([net, timer]);
+  const first = await Promise.race([net, after(ms)]);
   if (first !== undefined && !down(first)) return first;
   const saved = await cache.match(key);
   if (saved) return saved;
   const res = await net;
   return res || Response.error();
+}
+
+// A read that fails on the network (no answer: a TypeError, not an HTTP error) is
+// asked once more at once. A change of network (Wi-Fi to mobile) fails every
+// request on its way with ERR_NETWORK_CHANGED, and Open WebUI does not ask again:
+// a read it needs to start fails and the app stays half drawn. The second
+// attempt goes out on the new network. Only reads (GET) come here.
+const again = (input, init) => fetch(input, init).catch(() => fetch(input, init));
+
+// The same read asked again while the first is on its way (Open WebUI loads an
+// opened chat twice) shares that one request: one round trip, not two.
+const inFlight = new Map();
+function shared(req) {
+  const key = req.url + "\n" + (req.headers.get("authorization") || "");
+  let p = inFlight.get(key);
+  if (!p) {
+    p = again(req);
+    inFlight.set(key, p);
+    const done = () => inFlight.delete(key);
+    p.then(done, done);
+  }
+  return p.then((res) => res.clone());
+}
+
+// The kept copy at once when there is one; the network's answer refreshes it for
+// the next open.
+async function savedFirst(e, req, cacheName, key, onFresh, keep = keepable) {
+  const cache = await caches.open(cacheName);
+  const net = again(req).then(async (res) => {
+    if (keep(res)) {
+      await cache.put(key, res.clone());
+      if (onFresh) await onFresh(res.clone(), cache);
+    }
+    return res;
+  }, () => null);
+  e.waitUntil(net);
+  return (await cache.match(key)) || (await net) || Response.error();
+}
+
+const bootVersion = new Map();   // page (client id) -> the /api/version answer its load got
+const JSON_TYPE = { "content-type": "application/json" };
+
+// A page load. The kept app is used only once this Open WebUI says it is the
+// version the app came with (a newer Open WebUI drops every cache and loads its
+// own); a page answer that comes first is used as it is (a redirect to a login,
+// a new page). With no network the kept app opens at once; with a network that
+// says nothing for LIE_FI_MS, too, and the page is told to reload if the version
+// that comes later is another one.
+async function navigate(e, req) {
+  const net = again(req).catch(() => null);
+  const asked = again(VERSION_PATH, { cache: NO_STORE, redirect: MANUAL })
+    .then((r) => (r.ok ? r.text() : null), () => null);
+  const cache = await caches.open(SHELL);
+  const saved = await cache.match(PAGE_KEY);
+  const kept = await (await cache.match(VERSION_KEY))?.text();
+  const other = (v) => v !== null && v !== kept;
+  const version = asked.then(async (v) => {
+    if (other(v)) await dropCaches(() => true);
+    return v;
+  });
+  // The page's own first /api/version read gets this answer: it is this load's.
+  bootVersion.clear();
+  asked.then((v) => v !== null && bootVersion.set(e.resultingClientId, v));
+  // A copy taken as the answer comes, before the page reads its body.
+  e.waitUntil(keepPage(net.then((res) => res && res.clone()), version));
+  if (!saved) return (await net) || Response.error();
+  const first = await Promise.race([
+    net.then((res) => (down(res) ? never : { res })),
+    version.then((v) => (v === null ? never : { v })),
+    Promise.all([net, version]).then(([res, v]) => (down(res) && v === null ? {} : never)),
+    after(LIE_FI_MS).then(() => ({ silent: true })),
+  ]);
+  if (first.res) return first.res;
+  if (first.v !== undefined && first.v !== kept) return (await net) || Response.error();
+  if (first.silent) {
+    e.waitUntil(version.then(async (v) => {
+      if (other(v)) (await self.clients.get(e.resultingClientId))?.postMessage({ type: NEW_VERSION });
+    }));
+  }
+  return saved;
+}
+
+// A page answer that is Open WebUI's app is kept, with the version it came with.
+async function keepPage(net, version) {
+  const [res, v] = await Promise.all([net, version]);
+  if (!keepable(res) || !(await isAppPage(res.clone()))) return;
+  const cache = await caches.open(SHELL);
+  await cache.put(PAGE_KEY, res.clone());
+  if (v === null) await cache.delete(VERSION_KEY);
+  else await cache.put(VERSION_KEY, new Response(v));
+  await pruneShell(res.clone(), cache);
 }
 
 // A new page means a new Open WebUI build: its hashed files are new too, so the
@@ -397,7 +517,7 @@ async function cacheFirst(e, req) {
   const cache = await caches.open(SHELL);
   const saved = await cache.match(req);
   if (saved) return saved;
-  const res = await fetch(req);
+  const res = await again(req);
   if (keepable(res)) e.waitUntil(cache.put(req, res.clone()));
   return res;
 }
@@ -416,25 +536,44 @@ async function apiCacheFor(auth) {
 }
 
 self.addEventListener("fetch", (e) => {
-  if (!OFFLINE) return;
   const req = e.request;
+  if (!OFFLINE) {
+    // Turned off: a cache the previous worker still wrote after this one's
+    // activate (its requests on their way) goes on the next page load.
+    if (req.mode === NAVIGATE) e.waitUntil(dropCaches(() => true));
+    return;
+  }
   if (req.method !== GET) return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
   const path = url.pathname;
   if (req.mode === NAVIGATE) {
-    e.respondWith(freshFirst(e, req, SHELL, PAGE_KEY, NAV_TIMEOUT_MS, pruneShell, isAppPage));
+    e.respondWith(navigate(e, req));
   } else if (path.startsWith(IMMUTABLE)) {
     e.respondWith(cacheFirst(e, req));
+  } else if (SAVED_FIRST.some((p) => path.startsWith(p))) {
+    e.respondWith(savedFirst(e, req, SHELL, req));
   } else if (FRESH_FIRST.some((p) => path.startsWith(p))) {
-    e.respondWith(freshFirst(e, req, SHELL, req, NAV_TIMEOUT_MS));
-  } else if (READS.some((r) => r.test(path))) {
-    const auth = req.headers.get("authorization");
-    if (!auth) {
-      e.respondWith(freshFirst(e, req, SHELL, req, READ_TIMEOUT_MS));   // public: /api/config, /api/version
-      return;
+    e.respondWith(freshFirst(e, req, SHELL, req, LIE_FI_MS));
+  } else if (IMAGES.some((r) => r.test(path))) {
+    // Whose: the user whose reads came last (a sign-in or another user changes that
+    // cache, and the old one goes with its pictures). None yet: the network only.
+    if (apiCache) {
+      e.respondWith(savedFirst(e, req, apiCache, req.url, async (_res, cache) => trim(cache, API_MAX), keepableImage));
     }
-    e.respondWith(apiCacheFor(auth).then((name) => freshFirst(e, req, name, req.url, READ_TIMEOUT_MS,
-      async (_res, cache) => trim(cache, API_MAX))));
+  } else if (path === VERSION_PATH && bootVersion.has(e.clientId)) {
+    const v = bootVersion.get(e.clientId);
+    bootVersion.delete(e.clientId);
+    e.respondWith(new Response(v, { headers: JSON_TYPE }));
+  } else {
+    const fresh = FRESH_READS.some((r) => r.test(path));
+    if (!fresh && !SHELL_READS.some((r) => r.test(path))) return;
+    const auth = req.headers.get("authorization");
+    const read = (name, onFresh) => (fresh
+      ? freshFirst(e, req, name, req.url, LIE_FI_MS, onFresh)
+      : savedFirst(e, req, name, req.url, onFresh));
+    // Public reads (/api/config, /api/version) go with the app; a user's in their own cache.
+    e.respondWith(auth ? apiCacheFor(auth).then((name) => read(name, async (_res, cache) => trim(cache, API_MAX)))
+      : read(SHELL));
   }
 });

@@ -129,6 +129,55 @@
     setTimeout(() => n.remove(), 8000);
   }
 
+  // With no network, while the service worker opens the app from what it kept
+  // (offline open on: its app cache is there), the chats are read-only: a pill
+  // says so and the message box is locked (inert: no typing, no keyboard, no
+  // send), so nothing typed offline is lost on a send that cannot go. Text already
+  // in the box stays there and can be sent once the network is back.
+  const OFFLINE_PILL = "oc-offline";
+  const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
+  const LOCKED = "ocOfflineLocked";   // data-oc-offline-locked on the locked composer
+  const LOCKED_OPACITY = "0.5";
+  const composer = () => document.getElementById("chat-input")?.closest("form");
+  function lockComposer(on) {
+    for (const f of document.querySelectorAll("[data-oc-offline-locked]")) {
+      if (on && f === composer()) continue;
+      f.inert = false;
+      f.style.opacity = "";
+      delete f.dataset[LOCKED];
+    }
+    const f = on && composer();
+    if (!f || f.dataset[LOCKED]) return;
+    f.inert = true;
+    f.style.opacity = LOCKED_OPACITY;
+    f.dataset[LOCKED] = "1";
+  }
+  // Open WebUI draws a new message box on each chat, and its first render can
+  // replace what is in the page: both again while offline.
+  const relock = new MutationObserver(() => { lockComposer(true); showPill(); });
+  async function offlinePill() {
+    const offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
+    lockComposer(offline);
+    if (!offline) {
+      relock.disconnect();
+      return document.getElementById(OFFLINE_PILL)?.remove();
+    }
+    relock.observe(document.documentElement, { childList: true, subtree: true });
+    showPill();
+  }
+  function showPill() {
+    if (document.getElementById(OFFLINE_PILL) || !document.body) return;
+    const p = document.createElement("div");
+    p.id = OFFLINE_PILL;
+    p.setAttribute("role", "status");
+    p.style.cssText = pill + ";padding:6px 14px;pointer-events:none";
+    p.textContent = "Offline: saved chats, read-only";
+    document.body.appendChild(p);
+  }
+  addEventListener("online", offlinePill);
+  addEventListener("offline", offlinePill);
+  offlinePill();
+
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
   const VISIBLE = "visible";
@@ -644,4 +693,56 @@
   window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
   window.ocPushMuteFolder = (seconds, id = chatFolder.folder) => setMute(FOLDERS, id, seconds);
   window.ocPushReady = run();
+})();
+
+// --- Open WebUI's error page after a network change (ELI-352). A network change
+// while the app loads fails Open WebUI's own files ("Failed to fetch dynamically
+// imported module"), and SvelteKit then puts its "500 Internal Error" page in
+// place of the app, which stays there. This reloads the app once, when the server
+// can be reached again: at once, or on the next 'online' or network change.
+// A guard in sessionStorage, cleared by a load that gets to the app, keeps it to
+// one reload: a page that fails again stays on the error page. Apart from the
+// push part above, so it also runs where push is not offered. The service worker
+// also asks for a reload when the app it gave from its cache turns out to be from
+// another Open WebUI version (oc-sw.js "oc-new-version").
+(() => {
+  const RELOADED = "ocReloadedAfterError";
+  const NEW_VERSION = "oc-new-version";
+  const PROBE = "/_app/version.json";   // HEAD: the service worker leaves it to the network
+  const session = {
+    get: (k) => { try { return sessionStorage.getItem(k); } catch (_) { return null; } },
+    set: (k, v) => { try { sessionStorage.setItem(k, v); } catch (_) {} },
+    drop: (k) => { try { sessionStorage.removeItem(k); } catch (_) {} },
+  };
+  // SvelteKit's own error page (its error.html), not one of Open WebUI's.
+  const errorPage = () => !!document.querySelector("body > .error > .status");
+  const appUp = () => !document.getElementById("splash-screen") && !errorPage();
+
+  let probing = false;
+  async function recover() {
+    if (probing || !errorPage() || session.get(RELOADED)) return;
+    probing = true;
+    try {
+      const r = await fetch(PROBE, { method: "HEAD", cache: "no-store" });
+      if (!r.ok) return;
+    } catch (_) {
+      return;   // still no network: the next 'online' or network change tries again
+    } finally {
+      probing = false;
+    }
+    session.set(RELOADED, "1");
+    location.reload();
+  }
+
+  const watch = new MutationObserver(() => {
+    if (errorPage()) { watch.disconnect(); recover(); } else if (appUp()) { watch.disconnect(); session.drop(RELOADED); }
+  });
+  watch.observe(document.documentElement, { childList: true, subtree: true });
+  recover();
+  addEventListener("online", recover);
+  navigator.connection?.addEventListener?.("change", recover);
+  navigator.serviceWorker?.addEventListener("message", (e) => {
+    if (e.data?.type === NEW_VERSION) location.reload();
+  });
+  navigator.serviceWorker?.startMessages?.();
 })();
