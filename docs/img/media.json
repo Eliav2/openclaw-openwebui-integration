@@ -197,24 +197,24 @@
       }
     },
     "demos/status-dialog.gif": {
-      "sha": "7b7c01f22b5aa422",
+      "sha": "511e8e4865bf3a07",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "demos/status-dialog.mp4": {
-      "sha": "7eb4d53ab8bd7d13",
+      "sha": "b3d9aceaadbd2454",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "demos/status-dialog.webm": {
-      "sha": "05396ef03fa633c4",
+      "sha": "c9402ea201175157",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "demos/stop.gif": {
@@ -369,52 +369,59 @@
       }
     },
     "status-dialog-background-light.png": {
-      "sha": "886c004fb0648f09",
+      "sha": "25f01cfe1c82f51f",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "status-dialog-folded-light.png": {
-      "sha": "87d7a6b30c1b198b",
+      "sha": "f58efd14747e35c9",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "status-dialog-light.png": {
-      "sha": "65c8b95d1212e5bf",
+      "sha": "ca06d834f52a9f59",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "status-dialog-loading-light.png": {
-      "sha": "3f8faa58b97b4092",
+      "sha": "af32db7d4bc5043a",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
+      }
+    },
+    "status-dialog-scheduled-light.png": {
+      "sha": "cc7baba5c02f7622",
+      "groups": {
+        "chrome": "05531e6ac29a5a41",
+        "status": "77ad43ea4351b97a"
       }
     },
     "status-dialog-scrolled-light.png": {
-      "sha": "6d091ec9e5291fe2",
+      "sha": "d4f495db989f39b2",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "status-subagents-retry-light.png": {
-      "sha": "89b40dedac990afc",
+      "sha": "4277605aff89b4ed",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "subagent-drawer-light.png": {
-      "sha": "5035e4845928fcd3",
+      "sha": "7270fa68b3bc7552",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "subagent-result-light.png": {
@@ -442,10 +449,10 @@
       }
     },
     "tile-status-dialog.jpg": {
-      "sha": "1ac8b16bf103e487",
+      "sha": "de0a57b317160448",
       "groups": {
         "chrome": "05531e6ac29a5a41",
-        "status": "e2b07a184ca8b6f1"
+        "status": "77ad43ea4351b97a"
       }
     },
     "tile-sub-agents.jpg": {
