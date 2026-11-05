@@ -1724,11 +1724,8 @@ class MarkStoppedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writes, [("c1", "m1", {openclaw_pipe.STOPPED_META: True})] * 2)
 
 
-class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
-    """Drive real reply generators through OWUI's ways of ending a response. A generator close must
-    not skip the cancel handler or lose lines in the gap before the next reply registers."""
-
-    SK = None
+class _TurnCase(unittest.IsolatedAsyncioTestCase):
+    """A Pipe turn against a fake Gateway connection: the shared setup and stream helpers."""
 
     async def asyncSetUp(self):
         import openclaw_pipe as ocp
@@ -1850,6 +1847,13 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(0.005)
         self.fail(f"{run_id} never registered")
+
+
+class NoDroppedMessagesTests(_TurnCase):
+    """Drive real reply generators through OWUI's ways of ending a response. A generator close must
+    not skip the cancel handler or lose lines in the gap before the next reply registers."""
+
+    SK = None
 
     def _hold_parked_timers(self):
         """Hold the parked run's fallback timer (`INTERRUPT_GRACE_SECONDS`) so the test drives the
@@ -3276,18 +3280,11 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(published, [])
 
 
-class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
+class GatewayImageBlockTests(_TurnCase):
     """ELI-322: a tool-made image reaches only the stored message as an `image` block; the live
     final has only text (lifecycle end, then the final)."""
 
     SK = None
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _reply = NoDroppedMessagesTests._reply
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     _collect = staticmethod(NoDroppedMessagesTests._collect)
 
     BLOCK = {
@@ -5877,16 +5874,10 @@ class AskUserSecretDialogTests(unittest.IsolatedAsyncioTestCase):
             "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Blue", "Blue"))
 
 
-class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
+class SecretAnswerNeverInTheChatTests(_TurnCase):
     """ELI-148: a secret typed into the masked dialog goes only to the agent: not the reply text or
     items, emitted events, turn-writer rewrites, or the pipe log."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     VALUE = "s3cret-VALUE-9f2"
 
     async def test_the_value_reaches_only_the_agent(self):
@@ -5940,16 +5931,10 @@ class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(self.VALUE, json.dumps(what, default=repr), where)
 
 
-class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
+class SecretNotReceivedTests(_TurnCase):
     """ELI-148: an unanswered secret dialog never asks for the secret in the chat. The reply says
     it was not received; the agent is told once."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key here so I can deploy"
     NOTICE = openclaw_pipe.SECRET_NOT_RECEIVED_FOR_AGENT
 
@@ -6015,16 +6000,10 @@ class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
         self.assert_never_invites_a_chat_answer(shown.replace("I need a key.", "").replace("Still need it.", ""))
 
 
-class SecretDialogCancelledTests(unittest.IsolatedAsyncioTestCase):
+class SecretDialogCancelledTests(_TurnCase):
     """ELI-189: Cancel on the masked dialog resolves with False (Open WebUI 0.12.3
     EventConfirmDialog `cancel`). The agent learns the user cancelled and the card says so."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key (password)"
 
     async def test_cancel_reaches_the_agent_as_a_cancel_and_the_card_says_cancelled(self):
@@ -7246,7 +7225,6 @@ class ThinkingRejectionRetryTests(unittest.TestCase):
         self.assertIsNone(second)
 
 
-
 class TestSpawnBackground(unittest.TestCase):
     """spawn_background keeps a task referenced; the loop holds only a weak one."""
 
@@ -7383,7 +7361,6 @@ class SettledTailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._turn(text_yielded=True).settled_tail({"status": "failed"}), "")
 
 
-
 class TurnIdentityTests(unittest.TestCase):
     """ELI-100 DESIGN 2.2: the message a run renders into, from its id alone."""
 
@@ -7428,7 +7405,6 @@ class TurnIdentityTests(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "openclaw_pipe_pkg",
                                 "action.py")).read()
         self.assertIn('idempotency_key = f"{ACTION_RUN_PREFIX}compact-', src)
-
 
 
 class ClaimTurnMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -7583,7 +7559,6 @@ class ClaimTurnMessageTests(unittest.IsolatedAsyncioTestCase):
         await self.claim("m1", "run-1", writer=conn.writer_id)   # never registered: retired
         r = await self.claim("m1", "run-1", writer="w2")
         self.assertEqual((r["claimed"], r["how"]), (True, "takeover"))
-
 
 
 def _row(status, err=None, aborted=False, run="R"):
@@ -7776,7 +7751,6 @@ class OomResumeLoopTest(unittest.TestCase):
         self.assertEqual(next_continuation(_row("done"), False, 0), "finalize")
 
 
-
 class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
     """ELI-100 DESIGN 2.1: restart recovery starts before the pipe subscribes. Every hello
     subscribes with list params, so its reply is the snapshot of runs already active."""
@@ -7830,7 +7804,6 @@ class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.conn.send_request = failing
         await self.conn._subscribe_all()
         self.assertEqual(self.conn.active_run_snapshot, {"k": ["r"]})
-
 
 
 class RecoveryLinkTests(unittest.TestCase):
@@ -7896,7 +7869,6 @@ class RecoveryLinkTests(unittest.TestCase):
         f = "04351f67-dbc3-4533-b2aa-2a0d88d79da0"
         self.assertIsNone(recovery_source_run(self.history(), f))
         self.assertNotEqual(run_message_id(self.KEY, self.CHAT, f, self.history()), self.M)
-
 
 
 def _owui_output_text(output) -> str:
@@ -9496,7 +9468,6 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIn("function_call", [i["type"] for i in self.m()["output"]])
 
 
-
 class ResumeRequestReviewTests(_TurnWriterCase):
     """The request a resume quotes survives a re-created writer, a long request, its own rule
     lines, a metadata block and attachments (#20)."""
@@ -10802,7 +10773,6 @@ class InlineRewriteWiringTests(unittest.TestCase):
         self.assertIn("thinking=self.resolved_thinking", src.split("conn.register_run_target(")[1][:200])
 
 
-
 class SupersededLoadTests(unittest.IsolatedAsyncioTestCase):
     """ELI-102: a turn an older Function load admitted is served by the current load, not lost on
     the retired connection."""
@@ -11788,7 +11758,6 @@ class RunSpanTests(unittest.TestCase):
         self.assertEqual(len(_history_span_messages(hist, parent)), 2, "the parent keeps its own")
 
 
-
 class GatewayTenRecoveryRowTests(unittest.TestCase):
     """ELI-164: on 2026.10.10 a crash-cut session reads idle for about 8 s, then `interrupted`,
     then `running`. 2026.9.3 reads `running`."""
@@ -12022,16 +11991,10 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q.get_nowait(), {"type": "event", "n": 1})
         self.assertEqual(q.get_nowait()["type"], "_pipe_gap")
 
-class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
+class NeedsInputMarkerTests(_TurnCase):
     """ELI-107: a needs-input block QUOTED in a fenced code block is not a live prompt; holding it
     stopped the stream and left the reply open for an hour."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     MARKER = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
     REPORT = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                                          "test_fixture_eli107_report.json")))["text"]
@@ -12200,17 +12163,10 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.MARKER, out)
 
 
-class ToolStatusEventTests(unittest.IsolatedAsyncioTestCase):
+class ToolStatusEventTests(_TurnCase):
     """ELI-115: every `status` event rewrites the whole chat, so a reply's statuses are
     "Thinking..." and its final done."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _reply = NoDroppedMessagesTests._reply
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
 
     def _tool(self, phase, tcid):
         data = {"phase": phase, "name": "Bash", "toolCallId": tcid, "args": {"command": "ls"}}
@@ -12252,14 +12208,10 @@ class ToolStatusEventTests(unittest.IsolatedAsyncioTestCase):
                                            ("function_call_output", "completed")])
 
 
-class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
+class InlineOwnerRuleTests(_TurnCase):
     """ELI-100 DESIGN 2.7: an interrupted inline turn hands M to the turn writer, whose settled row
     applies the owner rule. An error or Stop ends the reply."""
 
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _until_registered = NoDroppedMessagesTests._until_registered
     # A handover needs a session key the connection can parse.
     USER, CHAT = str(uuid.UUID(int=1)), str(uuid.UUID(int=2))
 
@@ -12452,7 +12404,6 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         reads the row itself."""
         await self._turn(self._restart)
         self.assertIn("sessions.list", self.rpc)
-
 
 
 class BackgroundAgentLineTests(unittest.IsolatedAsyncioTestCase):
@@ -13203,15 +13154,10 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((inline, writer), (expected, expected))
 
 
-class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
+class ApiCallerOwnerRuleTests(_TurnCase):
     """An API request names no message to hand over, so on interruption the reply applies the owner
     rule itself in its own stream: resume, follow the recovery run, or end."""
 
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     _event = InlineOwnerRuleTests._event
     _lifecycle_error = InlineOwnerRuleTests._lifecycle_error
     _restart = InlineOwnerRuleTests._restart
@@ -14011,9 +13957,6 @@ class SessionIdRunTests(_RoutingCase):
                 self.assertEqual(m["content"], "Second wake.")
 
 
-
-
-
 class WakeTurnTests(unittest.TestCase):
     def msg(self, key, text, at, **extra):
         return {"role": "user", "content": text, "idempotencyKey": f"{key}:user",
@@ -14156,7 +14099,6 @@ class RetiredWriterTests(_RoutingCase):
         self.assertEqual(await self.adopt(b, mid), "skip")
 
 
-
 class GatewayOwnerNeverRecoversTests(_RoutingCase):
     """A settled `running` row keeps M open for the recovery; the tombstone to failed
     (main-session-restart-recovery-CPJjd8da.mjs:1150) closes it."""
@@ -14204,7 +14146,7 @@ class GatewayOwnerNeverRecoversTests(_RoutingCase):
         self.assertFalse(self.conn._turn_pumps, "the interrupted run's pump leaked")
 
 
-class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
+class MediaDirectiveCodeAwareTests(_TurnCase):
     """ELI-111: media directives are code-aware (CommonMark), like the ask marker since ELI-107:
     text inside code spans and fences."""
 
@@ -14302,12 +14244,6 @@ class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(openclaw_pipe._media_directives("a `MEDIA:x.png b", True),
                          ["MEDIA:x.png"])
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     _stream = NeedsInputMarkerTests._stream
 
     async def test_the_report_streams_as_written(self):
@@ -14436,16 +14372,10 @@ def _item_order(output: list) -> list:
              if i.get("type") == "message" else None) for i in output]
 
 
-class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
+class LiveToolCardOrderTests(_TurnCase):
     """ELI-122 (seen in ELI-110): the tab's reducer splices an item before the last one, the
     backend appends. Live must match saved."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
 
     def _tool(self, phase, tcid, **data):
         return {"type": "event", "event": "agent", "payload": {
@@ -14503,12 +14433,10 @@ class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_item_order(live), _item_order(saved))
 
 
-class ModelPatchFailureTests(unittest.IsolatedAsyncioTestCase):
+class ModelPatchFailureTests(_TurnCase):
     """ELI-131: a failed model patch is reported, not retried after a sleep; since ELI-59's lock
     and cache every such failure failed twice."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
 
     async def test_a_failed_patch_is_one_rpc_and_an_explained_reply(self):
         self.conn.model_patch_cached = lambda *a, **k: False
@@ -14531,16 +14459,10 @@ class ModelPatchFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Model selection error", "".join(c for c in chunks if isinstance(c, str)))
 
 
-class LongToolOnlyRunTests(unittest.IsolatedAsyncioTestCase):
+class LongToolOnlyRunTests(_TurnCase):
     """ELI-132: a run sending thousands of tool events before its first text is live, not stuck; no
     "Timeout" after 5000 events."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     _tool = LiveToolCardOrderTests._tool
 
     async def test_thousands_of_tool_events_without_text_finish_the_reply(self):
@@ -14575,16 +14497,10 @@ def _card_names(output: list) -> dict:
             for i in output if i.get("type") == "function_call"}
 
 
-class LiveToolErrorMarkTests(unittest.IsolatedAsyncioTestCase):
+class LiveToolErrorMarkTests(_TurnCase):
     """ELI-124: a failed call's ❌ shows while streaming. `response.name.done` reaches only the
     backend's last item; the tab's reducer ignores it."""
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
     _tool = LiveToolCardOrderTests._tool
     _run = LiveToolCardOrderTests._run
 
@@ -14631,19 +14547,13 @@ class LiveToolErrorMarkTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(failed, {"t1": True, "t2": False, "t3": True})
 
 
-class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):
+class MediaDirectiveLineBreakTests(_TurnCase):
     """ELI-113: the line break after a directive survives a chunk ending right after it. Where a
     stream is cut must not change what Open WebUI saves."""
 
     BASE = "https://x"
     IMG = "![c.png](https://x/c.png)"
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _delta = NoDroppedMessagesTests._delta
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
 
     async def _saved(self, chunks):
         """Stream `chunks` as one run's deltas; (content, message texts) saved."""
@@ -14709,7 +14619,7 @@ def _card_output_text(output: list, call_id: str) -> str:
                    if p.get("type") != "input_image" and p.get("text") is not None)
 
 
-class ToolCardOutputTextTests(unittest.IsolatedAsyncioTestCase):
+class ToolCardOutputTextTests(_TurnCase):
     """ELI-121: a tool result is a string, content blocks, or the envelope (`content` + `details`,
     `sanitizeToolResult`). The card shows only the text."""
 
@@ -14729,11 +14639,6 @@ class ToolCardOutputTextTests(unittest.IsolatedAsyncioTestCase):
         ({"ok": True, "count": 2}, json.dumps({"ok": True, "count": 2})),
     )
 
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _queue = NoDroppedMessagesTests._queue
-    _final = NoDroppedMessagesTests._final
-    _until_registered = NoDroppedMessagesTests._until_registered
 
     def _tool(self, phase, **data):
         return {"type": "event", "event": "agent", "payload": {
@@ -15551,14 +15456,13 @@ class SteerChainTests(unittest.TestCase):
                                    "span_run": "r2", "before": [first]})
 
 
-class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
+class MidRunSteeringTests(_TurnCase):
     """2026.10.10 steers a mid-run message into the active run at its next tool boundary. Order
     (probe_steer_events.py): the run's deltas; the steered run's lone final; the answer on the
     active run, whose final repeats all its text."""
 
     SK = None
     CHAT = "c0ffee00-0000-4000-8000-000000000001"
-    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
 
     @classmethod
     def _run_id(cls, n):
@@ -15580,8 +15484,6 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
 
     def _reply(self, text, msg_id, **kw):
         return NoDroppedMessagesTests._reply(self, text, msg_id, chat=self.CHAT, **kw)
-    _delta = NoDroppedMessagesTests._delta
-    _until_registered = NoDroppedMessagesTests._until_registered
     _spin = staticmethod(NoDroppedMessagesTests._spin)
     _collect = staticmethod(NoDroppedMessagesTests._collect)
 
