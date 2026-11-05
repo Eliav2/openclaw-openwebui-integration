@@ -73,7 +73,7 @@ fixtures (`scripts/extract_openclaw_*.py --write`) default to the same dist.
 
 ### CI
 
-Every push and PR runs `.github/workflows/ci.yml`:
+Every push and PR runs `.github/workflows/ci.yml`. The E2E lanes run on every push to main and on a PR only when it can change what runs: a PR that touches only docs, Markdown, `tests/` (outside `tests/fixtures/`), the issue templates, or Python comments and docstrings skips them (`scripts/ci_scope.py`, job "Runtime scope"). Nothing requires an E2E check to merge, so a skipped lane blocks nothing.
 
 | Job | What it guards |
 |-----|----------------|
@@ -81,9 +81,8 @@ Every push and PR runs `.github/workflows/ci.yml`:
 | Unit (py3.10 to 3.13) | Drift guard for every artifact, the unit suite (coverage reported on 3.11), and a load check that execs each artifact the way Open WebUI's plugin loader does. |
 | OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source: the copy the tests run against the pinned version (`--copy pinned`), and the next release's `_v<tag>` copy, or that same copy, against `OWUI_NEXT_REF` (`--copy next`). A stale copy is how the tool cards once vanished while the suite stayed green. `scripts/check_owui_frontend_fixture.py` does the same for the chat tab's live reducer (`applyResponseStreamEvent`, run with bun by the live-order tests). |
 | Secret scan | gitleaks over the full history. |
-| E2E | The whole stack, real everywhere except the model (below), on the pinned Open WebUI and OpenClaw. |
-| E2E next | The same suite on the next OpenClaw (`OPENCLAW_NEXT_VERSION`), with the pinned Open WebUI. Blocking. |
-| E2E OWUI next | The same suite on the next Open WebUI (`OWUI_NEXT_IMAGE`), with the pinned OpenClaw. Blocking. |
+| E2E | The whole stack, real everywhere except the model (below), on the pinned Open WebUI and OpenClaw, which are what the live install runs. |
+| E2E oldest | The same suite on the oldest supported OpenClaw (`OPENCLAW_OLDEST_VERSION`), with the pinned Open WebUI. Reports, never blocks. Removed when the documented minimum moves up (ELI-356). |
 
 **E2E** (`.github/workflows/e2e.yml`, `e2e/`): starts a deterministic fake
 OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
@@ -133,19 +132,7 @@ fixes it, the `xfail` fails the run, the signal to drop the workaround.
 Compat watch runs the same suites against `open-webui:latest`, so it shows
 up there first.
 
-The versions it runs against are pinned in `e2e/versions.env`. The pins stay
-on what the live install runs. A new release first gets a "next" pin
-(`OPENCLAW_NEXT_VERSION`, `OWUI_NEXT_IMAGE` and `OWUI_NEXT_REF`) and a
-blocking lane of its own (E2E next, E2E OWUI next), in the PR that makes the
-code work with it. A vendored fixture whose upstream code changed gets a
-`_v<tag>` copy next to it (dots as underscores, `_v0_13_0`)
-(`python3 scripts/check_owui_fixture.py --ref <tag> --print-upstream`), so the
-fixture check and the compat watch match both releases while the unit tests
-run the pinned copy. Once the live install is upgraded, move the pin to the
-next release in one PR: the `_v<tag>` copy replaces the pinned one, and the
-matching pins in `requirements-dev.txt`, the CSS class list
-(`scripts/owui_css.py dump`) and the Stop button templates
-(`scripts/extract_owui_stop_button.py`) are extracted from the new release.
+The versions it runs against are pinned in `e2e/versions.env`. The pins stay on what the live install runs: move them in the PR that makes the code work with a new release, with the vendored fixtures re-extracted for it (the handler with `scripts/check_owui_fixture.py --ref <tag> --print-upstream`, the CSS class list with `scripts/owui_css.py dump`, the Stop button templates with `scripts/extract_owui_stop_button.py`) and the matching pins in `requirements-dev.txt`. The daily compat watch runs the suite against `open-webui:latest` and `openclaw@latest`, and checks the vendored handler against upstream's latest release and main, so a break shows up before a bump. To try an upcoming release in a PR, run the E2E workflow by hand (Actions > E2E > Run workflow) with the release in `openclaw_version` or `owui_image`; a release that needs a fixture of its own gets a `_v<tag>` copy next to it (dots as underscores, `_v0_13_0`), and setting `OWUI_NEXT_REF` in `e2e/versions.env` makes the fixture check match it too.
 
 **Compat watch** (`.github/workflows/compat-watch.yml`, daily): the same E2E
 stack against `open-webui:latest` and `openclaw@latest`, and the fixture
