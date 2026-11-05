@@ -776,8 +776,10 @@ def test_mute_from_open_webuis_own_menus(owui, browser):
         menu.get_by_role("menuitem", name="Mute folder").click()
         mm = page.locator("#oc-push-mute-menu")
         mm.wait_for(timeout=WAIT_MS)
-        # Ours closes Open WebUI's menu, as its own items do.
+        # Ours closes Open WebUI's menu, as its own items do, and the focus is on the first choice.
         page.wait_for_function("() => !document.querySelector('[role=menu]:not(#oc-push-mute-menu)')", timeout=WAIT_MS)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        assert page.evaluate("() => document.activeElement === document.querySelector('#oc-push-mute-menu [role=menuitem]')")
         # H3: the folder's name is isolated in the sentence.
         assert mm.locator("bdi").first.inner_text() == name
         shot(page, "web-push-g-folder-mute-menu")
@@ -820,6 +822,18 @@ def test_mute_from_open_webuis_own_menus(owui, browser):
         mm.get_by_role("menuitem", name="Mute for 1 hour").click()
         page.wait_for_function(f"() => window.ocPushMuted?.id === {json.dumps(g_chat)}", timeout=WAIT_MS)
         assert abs(json.loads(valves(token)["mutes"])[g_chat] - (time.time() + 3600)) < 60
+        # Moved to another folder: the chat's menu offers the new folder, not the one it was in.
+        second = api("/api/v1/folders/", {"name": "Second " + uuid.uuid4().hex[:4]}, token)
+        api(f"/api/v1/chats/{g_chat}/folder", {"folder_id": second["id"]}, token)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        if not page.locator(f'a[href="/c/{g_chat}"]').count():   # the sidebar redrew it into the new folder
+            page.locator(f'#folder-{second["id"]}-button button[aria-expanded]').first.click()
+            page.locator(f'a[href="/c/{g_chat}"]').wait_for(timeout=WAIT_MS)
+        menu = native_menu(page, CHAT_TRIGGER, g_chat)
+        menu.locator("[data-oc-push-item=mute]").click()
+        mm.wait_for(timeout=WAIT_MS)
+        assert second["name"] in mm.inner_text() and name not in mm.inner_text(), mm.inner_text()
+        close_menus(page)
 
         # Fail safe: a folder ⋯ whose menu is not Open WebUI 0.13's gets nothing, one console line.
         logs = []
@@ -858,17 +872,29 @@ def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
         page.goto(f"{BASE}/c/{g_chat}")
         bell = page.locator("#oc-push-bell")
         bell.wait_for(timeout=WAIT_MS)
+        bell.evaluate("(b) => b.click()")
+        mm.wait_for(timeout=WAIT_MS)
+        # Added after the menu, so only the top layer keeps the menu above it.
         page.evaluate("""() => { const t = document.createElement('div'); t.id = 'fake-toast';
             t.style.cssText = 'position:fixed;inset:0 0 auto 0;height:60vh;z-index:2147483647;background:#f008';
             document.body.appendChild(t); }""")
-        bell.evaluate("(b) => b.click()")
-        mm.wait_for(timeout=WAIT_MS)
         shot(page, "web-push-h2-toast")
         if not mm.evaluate("""(m) => { const i = m.querySelector('[role=menuitem]'); const r = i.getBoundingClientRect();
             return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === i; }"""):
             broken.append("H2: the toast covers the menu")
         close_menus(page)
         page.evaluate("() => document.getElementById('fake-toast').remove()")
+        # Escape closes it, and the next press on the bell opens it again.
+        bell.click()
+        mm.wait_for(timeout=WAIT_MS)
+        page.keyboard.press("Escape")
+        mm.wait_for(state="detached", timeout=WAIT_MS)
+        bell.click()
+        try:
+            mm.wait_for(timeout=MENU_DRAWN_WAIT_MS * 4)
+            close_menus(page)
+        except Exception:  # noqa: BLE001 - listed below
+            broken.append("Escape: the next bell press did not open the menu")
 
         # H5: a mute that ends on another day says which day.
         later = int(time.time()) + 2 * 86400
@@ -890,6 +916,13 @@ def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
         shot(page, "web-push-h4-h5-phone")
         if not (box["x"] >= 8 and box["x"] + box["width"] <= 390 - 8):
             broken.append(f"H4: no gutter, menu at {box}")
+        close_menus(page)
+        # A short window (a phone on its side): the menu stays inside it and scrolls.
+        page.set_viewport_size({"width": 390, "height": 260})
+        bell.click()
+        box = mm.bounding_box()
+        if not (box["y"] >= 8 and box["y"] + box["height"] <= 260 - 8):
+            broken.append(f"short window: menu out of it, at {box}")
         close_menus(page)
         assert not broken, broken
     finally:

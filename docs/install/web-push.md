@@ -150,7 +150,7 @@ In a chat that is in a folder, the bell's menu has a second part for that folder
 
 Folder mutes are kept like chat mutes, in the `folder_mutes` user valve (`{folder id: until}`). Only while one is in effect does the function read the chat's folder and your folders before it sends.
 
-The ⋯ menu items are added the same way as [Mark as read](#mark-a-chat-read-from-the-chat-list): to Open WebUI 0.13.0's menus, found by their structure and the "Mark as unread" or "Mark all as read" icon. A menu drawn differently gets nothing, and the console says once which menu it did not recognise; Open WebUI's own items are never changed, and ours come back if Open WebUI redraws the menu while it is open.
+The ⋯ menu items are added the same way as [Mark as read](#mark-a-chat-read-from-the-chat-list): to Open WebUI 0.13.0's menus, found by their structure and the "Mark as unread" or "Mark all as read" icon. A menu drawn differently gets nothing, and the console says once which menu it did not recognise (except on a folder's page, where its ⋯ cannot be told from the page's other menus, such as the icon picker: there it is only left alone); Open WebUI's own items are never changed, and ours come back if Open WebUI redraws the menu while it is open.
 
 The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two devices changing them in the same instant can lose one change; change it again.
 

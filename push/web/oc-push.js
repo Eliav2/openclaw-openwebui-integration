@@ -239,7 +239,7 @@
     m.style.cssText = "position:fixed;inset:auto;margin:0;border:0;z-index:" + TOP_LAYER + ";min-width:170px;" +
       "max-width:calc(100vw - " + GUTTER + "px - " + GUTTER + "px);padding:4px;border-radius:12px;" +
       `font:14px system-ui,sans-serif;background:${dark ? "#222" : "#fff"};color:${dark ? "#eee" : "#111"};` +
-      "box-shadow:0 4px 16px #0003;";
+      "box-shadow:0 4px 16px #0003;max-height:calc(100vh - " + GUTTER + "px - " + GUTTER + "px);overflow-y:auto;";
     // A line of text; a folder's name is isolated (<bdi>), so a Hebrew name keeps
     // its own direction inside the sentence and the punctuation stays outside it.
     const line = (parts, el) => {
@@ -285,7 +285,8 @@
       if (by) item(["Unmute folder ", name(by)], FOLDERS, by, null);
     }
     const away = (e) => {
-      if (e.type === KEYDOWN ? e.key === "Escape" : !m.contains(e.target)) { closedBy = e.target; close(); }
+      if (e.type === KEYDOWN) { if (e.key === "Escape") close(); }
+      else if (!m.contains(e.target)) { closedBy = e.target; close(); }   // that press must not open it again
     };
     function close() {
       m.remove();
@@ -306,6 +307,9 @@
     const top = below + h <= innerHeight - GUTTER ? below : clamp(anchor.top - GAP - h, innerHeight - h);
     m.style.left = Math.round(left) + "px";
     m.style.top = Math.round(top) + "px";
+    // The first choice gets the focus, after a native menu that opened this one has
+    // given the focus back to its own trigger.
+    requestAnimationFrame(() => setTimeout(() => m.isConnected && m.querySelector(MENU_ITEM)?.focus({ preventScroll: true })));
     return m;
   }
 
@@ -332,7 +336,7 @@
     b.onclick = (e) => {
       e.stopPropagation();
       if (closedBy && b.contains(closedBy)) { closedBy = null; return; }   // that press closed it
-      loadFolder(id).catch(() => {}).then(() => muteMenu(b.getBoundingClientRect(), { chat: id, folder: chatFolder.folder }));
+      loadFolder(id).catch(() => {}).then(() => muteMenu(b.getBoundingClientRect(), { chat: id, folder: chatFolder.chat === id ? chatFolder.folder : null }));
     };
     box.prepend(b);
     drawBell();
@@ -594,7 +598,7 @@
     window[CONTRACT[chat ? "chat" : "folder"]] = "ok";
     if (!store.get("token")) return;
     if (mutes === null) await loadMutes().catch(() => {});
-    if (chat && chatFolder.chat !== chat) await loadFolder(chat).catch(() => {});
+    if (chat) await loadFolder(chat).catch(() => {});   // a chat can move to another folder
     if (!chat) await loadFolders().catch(() => {});
     const put = () => {
       if (!menu.isConnected) return;
