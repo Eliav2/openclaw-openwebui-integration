@@ -22,7 +22,7 @@
   },
   "push/web/oc-push.js": {
     "no-magic-numbers": {
-      "count": 10
+      "count": 8
     },
     "no-restricted-syntax": {
       "count": 10
