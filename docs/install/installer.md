@@ -148,10 +148,11 @@ Step 4 is why re-running this is safe: the function is never deleted and recreat
 Every run of `install` or `repair` writes these valves from your env vars, flags and defaults, even when you changed them in the admin panel since:
 
 - `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `STATE_DIR`, `OWUI_BASE_URL`
-- `ENABLE_FILE_SERVER`, `USE_OWUI_FILES` and `SEND_STOP_ON_CANCEL`, all set to `True`
 - `OWUI_API_KEY` and `FILE_SERVER_BASE_URL`, only when you pass them
 
-So pass the same values on every run. A re-run without `GATEWAY_URL` sets it back to `localhost:18789`; one without `--state-dir` sets `STATE_DIR` back to `/data/openclaw-bridge`. If you turned `ENABLE_FILE_SERVER` off, turn it off again after an update.
+So pass the same values on every run. A re-run without `GATEWAY_URL` sets it back to `localhost:18789`; one without `--state-dir` sets `STATE_DIR` back to `/data/openclaw-bridge`.
+
+`ENABLE_FILE_SERVER`, `USE_OWUI_FILES` and `SEND_STOP_ON_CANCEL` are set to `True` only when the function has no stored value for them (a first install). A re-run keeps what you set, so turning `ENABLE_FILE_SERVER` off in the admin panel (its server is unauthenticated, see [Security](../security.md)) survives an update.
 
 `DEVICE_IDENTITY` and every other valve (`DEFAULT_MODEL`, `MAX_MODELS`, `AUTO_TITLE` and the rest) keep their current values. All valves: [Configuration](../configuration.md).
 

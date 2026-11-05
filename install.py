@@ -736,19 +736,24 @@ def update_valves(client: OwuiClient, cfg: Config, preserved_valves: dict | None
         "GATEWAY_URL": cfg.gateway_url,
         "GATEWAY_TOKEN": cfg.gateway_token,
         "AGENT_ID": cfg.agent_id,
-        "ENABLE_FILE_SERVER": True,
         "DEVICE_IDENTITY": ident_json,
         "STATE_DIR": cfg.state_dir,
+        "OWUI_BASE_URL": cfg.owui_api_base_url,
+    }
+    # Switches an operator may turn off in the admin panel (ENABLE_FILE_SERVER
+    # is the one to keep off: its server is unauthenticated). They start on,
+    # and a re-run keeps what is stored, so a deploy does not turn one back on.
+    initial = {
+        "ENABLE_FILE_SERVER": True,
         "USE_OWUI_FILES": True,
         "SEND_STOP_ON_CANCEL": True,
-        "OWUI_BASE_URL": cfg.owui_api_base_url,
     }
     if cfg.owui_api_key:
         required["OWUI_API_KEY"] = cfg.owui_api_key
     if cfg.file_server_base_url:
         required["FILE_SERVER_BASE_URL"] = cfg.file_server_base_url
 
-    desired = {**existing, **required}
+    desired = {**initial, **existing, **required}
     changed = post_valves(client, FUNCTION_ID, current, desired)
     info(f"Updated valves: {', '.join(changed)}" if changed else "Valves already up to date")
     return desired
