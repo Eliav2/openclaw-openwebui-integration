@@ -4,13 +4,10 @@
 # ------------------------------------------------------------------
 
 
-# Session states that `sessions.describe` reports for a genuinely in-progress
-# run. Blacklisting terminal states is unsafe: an idle session reports "idle"
-# (and "done"), so a `not in (done, failed, cancelled)` test would treat every
-# resting session as active and hang every message. Only these gate the queue.
+# Run states that gate the queue. A blacklist of terminal states is unsafe:
+# an idle session reports "idle", which it would count as active.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
-# ELI-216) are asked in the chat (askuser.py).
+# Gateway questions (secret requests, ELI-96; the ask_user tool, ELI-216).
 _QUESTION_HOOKS = (question_requested, question_resolved)
 # Plugin approvals are asked in the chat (approvals.py).
 _APPROVAL_HOOKS = (plugin_approval_requested, plugin_approval_resolved)
@@ -19,18 +16,10 @@ _SLASH_PROMPTS_HOOK = _slash_prompts_on_metadata_changed
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
-    """Decide whether a session has an in-progress run from the two gateway
-    signals the pipe can observe over RPC (ELI-56).
-
-    `sessions.describe` only exposes a persisted `status`, which flips to
-    'done' the instant a turn calls `sessions_yield` to await a subagent -- even
-    though the run is merely suspended and WILL resume, and the gateway still
-    steer-merges any message sent into that window (→ a phantom "no reply
-    text" bubble). `sessions.list` additionally exposes `hasActiveRun`, the
-    authoritative live signal derived from the gateway's chatAbortControllers
-    map + isEmbeddedAgentRunActive(sessionId); it stays true across the whole
-    yield gap. So a session is "active" if EITHER describe says a run state OR
-    list says a run is live.
+    """A session has a run if `sessions.describe` says a run state or
+    `sessions.list` says `hasActiveRun` (ELI-56). describe's status flips to
+    'done' during a `sessions_yield` gap, while the Gateway still steer-merges
+    a message sent then; `hasActiveRun` stays true.
     """
     if describe_status in _ACTIVE_RUN_STATES:
         return True
@@ -38,26 +27,9 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
 
 
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
-    """Decide whether a textless ("PHANTOM") turn's preview-recovered text is
-    the Gateway's permanent-brick thinking-level rejection, and build the
-    retry body if so (ELI-85 follow-up).
-
-    `clamp_to_ladder` passes a requested level straight through whenever the
-    model's real ladder is unknown -- and if the target model can't honour it,
-    the Gateway hard-rejects the turn. That rejection never streams as a normal
-    event (the run delivers a single contentless `final`), so it only surfaces
-    via preview recovery at the caller's final fallback.
-
-    Detection is `parse_thinking_rejection`, the same parser that extracts the
-    ladder, so the thing that decides to retry and the thing that learns from
-    the retry can never disagree about what a rejection is.
-
-    Returns None when `recovered` isn't that rejection (nothing to retry).
-    Otherwise returns a fresh dict body with `reasoning_effort` stripped, so
-    resending it can no longer hit the same rejection -- which is also what
-    makes recursing on this once safe: the retried call resolves
-    `resolved_thinking` to None (`clamp_to_ladder` short-circuits on no
-    requested level), so this can't match twice in a row.
+    """The retry body for a textless turn whose preview-recovered text is the
+    Gateway's thinking-level rejection, else None (ELI-85 follow-up). The retry
+    drops `reasoning_effort`, so it cannot match twice in a row.
     """
     if not recovered or resolved_thinking is None:
         return None
@@ -68,34 +40,22 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     return retry_body
 
 
-# After a Send now the page sends its follow-up message, which claims the run
-# at once (`claim_cancelled_turn`). This bounds only a follow-up that never
-# comes: the tab was closed, crashed or reloaded in between. Nothing signals
-# that: the Gateway knows nothing of the browser, and Open WebUI's socket
-# disconnect is not it either, since a socket drop reconnects with a new sid
-# while the page and its queued message survive (ELI-95).
+# Bounds only a Send now follow-up that never comes (tab closed or reloaded).
+# Nothing signals that: a socket drop reconnects with a new sid while the
+# page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
 
-# The agent stream a Codex-runtime run reports its items on, an image its
-# image tool made among them.
+# The agent stream a Codex-runtime run reports its items on, images included.
 CODEX_ITEM_STREAM = "codex_app_server.item"
-# The Gateway attaches a run's images to its stored message after the run's
-# final and then pushes `sessions.changed` phase `message` (ELI-322); a reply
-# reads the transcript again on that push (`read_until_stored`). This bounds
-# only a Gateway that never stores them, and is logged when reached.
+# The Gateway attaches a run's images after its final, then pushes
+# `sessions.changed` phase `message` (ELI-322). This bounds a Gateway that never does.
 _RUN_IMAGES_MAX_WAIT_S = 30.0
 
 
 async def _current_load(pipe, request):
-    """The Pipe of the load Open WebUI serves now, when `pipe` belongs to an
-    older load of this Function; else None (ELI-102).
-
-    A deploy execs the new content into a new module, and the first request
-    there retires the old load's connection. A turn the old load admitted but
-    had not yet connected would meet the retired connection and be lost as
-    "gateway connection retired". Open WebUI's own lookup
-    (`get_function_module_by_id`, which also sets the valves) names the
-    current load."""
+    """The current load's Pipe when `pipe` belongs to an older load, else None
+    (ELI-102). A turn the old load admitted would otherwise meet its retired
+    connection and be lost."""
     prefix = _function_module_prefix(__name__)
     if request is None or not prefix.startswith("function_"):
         return None
@@ -113,10 +73,8 @@ async def _current_load(pipe, request):
 
 async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
                                 message_id=None, task_id=None):
-    """Ask the page whether this cancel was Stop or Send now, and settle the
-    parked turn accordingly (see `settle_parked_turn`). A Stop also marks
-    the reply `message_id` stopped, once its request `task_id` ended
-    (`_mark_stopped`)."""
+    """Ask the page whether the cancel was Stop or Send now and settle the
+    parked turn. A Stop also marks the reply stopped."""
     intent = None
     if event_call and chat_id:
         try:
@@ -130,17 +88,15 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
             pipe_log(f"  cancel intent query failed: {ex!r}")
     pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
     if intent == "stop" and chat_id and message_id:
-        # Before the request's own `done: true` save, which follows this
-        # cancel's handling.
+        # Before the request's own `done: true` save, which follows.
         await _mark_stopped(chat_id, message_id, _owui_request_task(task_id))
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
 # Open WebUI 0.12.3 creates a chat as "New Chat" (main.py, not translated).
 _OWUI_NEW_CHAT_TITLE = "New Chat"
-# What Open WebUI removes from a message before titling a chat with it
-# (middleware.py background_tasks_handler), and its skill mentions, which it
-# titles by their label (utils/skills.py SKILL_MENTION_STRIP_RE).
+# What Open WebUI strips before titling a chat from a message (middleware.py
+# background_tasks_handler), plus skill mentions (utils/skills.py).
 _OWUI_TITLE_STRIP_RE = re.compile(
     r'<details\b[^<>]*>(?:(?!<details\b).)*?<\/details>|!\[[^\[\]]*\]\([^()]*\)', re.S | re.I)
 _OWUI_SKILL_ID = r'(?:[a-z0-9_-]+|terminal:[^|>\s]+)'
@@ -158,16 +114,15 @@ def _message_text(content) -> str:
 
 
 def _owui_title_from_message(content) -> str:
-    """The title Open WebUI gives a chat from its first message when its own
-    title task gives none (the Pipe skips that task)."""
+    """The title Open WebUI would give a chat from its first message (the Pipe
+    skips its title task)."""
     text = _OWUI_TITLE_STRIP_RE.sub("", _message_text(content)).strip()
     return _OWUI_SKILL_MENTION_RE.sub(lambda m: m.group(2) or m.group(4) or m.group(0), text)
 
 
 def _title_is_owui_default(title, chat: dict) -> bool:
-    """True while nobody chose the chat's title: it is still the one Open
-    WebUI set by itself ("New Chat", or a first message of the chat). Any
-    other title was chosen, by the user or by Open WebUI's own title model."""
+    """True while the title is still one Open WebUI set by itself ("New Chat"
+    or the first message)."""
     if title in (None, "", _OWUI_NEW_CHAT_TITLE):
         return True
     messages = ((chat or {}).get("history") or {}).get("messages") or {}
@@ -176,9 +131,8 @@ def _title_is_owui_default(title, chat: dict) -> bool:
 
 
 async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
-    """Title the chat, under its row lock, unless its title was chosen
-    meanwhile (ELI-182). True when the title was set. Never cut short by a
-    cancel (ELI-205)."""
+    """Title the chat under its row lock unless a title was chosen meanwhile
+    (ELI-182). Never cut short by a cancel (ELI-205)."""
     return await _uncancellable(_set_title_unless_chosen_now(chat_id, title))
 
 
@@ -197,19 +151,10 @@ async def _set_title_unless_chosen_now(chat_id: str, title: str) -> bool:
 class _TurnState:
     """What one reply still owes the user if it is cancelled or closed now.
 
-    `unsent` are user messages it accepted but has not yet sent to the
-    Gateway (its own, plus any carried over from a cancelled reply).
-    `run_id` / `queue` are a run it is consuming, its own or one it adopted,
-    and the consumer queue buffering that run's events. `parked` is set once
-    the cancel was handed to `park_cancelled_turn`. `reply` is this reply's
-    own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
-    `waiting` are the earlier replies, cancelled before they sent their
-    message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188). `attachments` are
-    the images of the `unsent` messages, oldest first, sent with them.
-    `status_open`: the
-    last status line the reply showed is not done yet; `handed_over`: the
-    turn writer took the reply's message over.
+    `unsent`: accepted user messages not yet sent. `run_id` / `queue`: the run
+    being consumed. `waiting`: earlier cancelled replies whose messages are in
+    `unsent`, each ended with a note once those are sent or dropped (ELI-188).
+    `handed_over`: the turn writer took the message over.
     """
     conn: object = None
     session_key: str | None = None
@@ -227,12 +172,8 @@ class _TurnState:
 
 
 class Pipe:
-    """
-    Open WebUI Pipe that routes messages through OpenClaw Gateway via
-    a persistent WebSocket connection.
-
-    Valves (configured in the Open WebUI admin panel): see `Valves` below,
-    or docs/configuration.md, which is generated from it.
+    """Open WebUI Pipe that routes messages through the OpenClaw Gateway over
+    a persistent WebSocket. Valves: see `Valves` or docs/configuration.md.
     """
 
     class Valves(BaseModel):
@@ -309,8 +250,7 @@ class Pipe:
                 "a /stop, so a tool it is running is actually killed -- aborting "
                 "the stream alone can leave the tool running."
         )
-        # A bound, not a wait: a client that cannot say Stop or Send now (no
-        # page hook, API use) sends no signal at all (ELI-95).
+        # A bound, not a wait: a client with no page hook sends no signal (ELI-95).
         INTERRUPT_GRACE_SECONDS: float = Field(
             default=10.0,
             description="Recommended: 10. Fallback only: the Pipe asks the "
@@ -503,43 +443,32 @@ class Pipe:
                 "queues behind your conversation."
         )
 
-    # Set from the live valves so the DEFAULT_MODEL dropdown (a classmethod with
-    # no access to self.valves) reads the same cache pipes() writes.
+    # The DEFAULT_MODEL dropdown is a classmethod: it reads the cache via this.
     _last_state_dir = ""
 
     def __init__(self):
         self.valves = self.Valves()
 
     async def pipes(self):
-        """Expose multiple OWUI model-selector entries from one pipe.
-        
-        Dynamically discovers models from the OpenClaw Gateway (or cache)
-        and returns one entry per model plus a 'Default' entry.
-        """
+        """One model-selector entry per Gateway model, plus 'Default'."""
         type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         # The first model list after a deploy: with the valve off, close a
         # file server an earlier load left on the port.
         if not self.valves.ENABLE_FILE_SERVER:
             _stop_file_server()
-        # Every page load lists models, so this is the earliest point the
-        # composer watcher can start after an Open WebUI restart or redeploy.
+        # Every page load lists models: the earliest point to start the
+        # watchers after an Open WebUI restart or redeploy.
         _ensure_composer_watcher(lambda: self.valves)
-        # ...and the earliest point to finish replies a restart orphaned.
         _ensure_orphan_reconcile(lambda: self.valves)
-        # ...and to follow the channel threads again.
         _ensure_channel_watcher(lambda: self.valves)
-        # ...and to mirror the Gateway's slash commands into Prompts.
         _ensure_slash_prompts(lambda: self.valves, force=True)
         models, source = await _discover_models_with_source(self.valves)
 
-        # Apply safety cap
         if len(models) > self.valves.MAX_MODELS:
             models = models[:self.valves.MAX_MODELS]
 
-        # A hardcoded list is a guess, not a discovery. Say so in the only place
-        # the user is looking -- the selector itself -- rather than letting five
-        # invented models masquerade as their Gateway's. Suffixing the display
-        # name is deliberate: `id` stays the untouched routing key.
+        # A hardcoded list is a guess: say so in the selector. `id` stays the
+        # untouched routing key.
         unverified = source == MODELS_SOURCE_FALLBACK
         entries = []
         for m in models:
@@ -550,12 +479,8 @@ class Pipe:
                 name += UNVERIFIED_MODEL_SUFFIX
             entries.append({"id": m["key"], "name": name})
 
-        # Always prepend Default at top. It is the one entry that always works
-        # in this state: it clears the override and uses the agent's own model,
-        # so it needs no Gateway round trip to be correct.
-        #
-        # If discovery ever comes back empty (fallback list included), say the
-        # warning on Default instead of leaving a bare, unexplained selector.
+        # Default always works: it clears the override and uses the agent's own
+        # model. It carries the warning when discovery came back empty.
         default_name = "OpenClaw · Default"
         if unverified and not entries:
             default_name += UNVERIFIED_MODEL_SUFFIX
@@ -563,26 +488,16 @@ class Pipe:
 
     @classmethod
     def get_model_options(cls):
-        """Return model options for the DEFAULT_MODEL valve dropdown.
-
-        Reads synchronously from the model cache or fallback list.
-
-        Uses the state dir the running Pipe last resolved (recorded in
-        _last_state_dir) rather than _state_dir() with no argument. Being a
-        classmethod there is no self.valves here, and the no-argument form
-        resolves to OPENCLAW_BRIDGE_STATE_DIR or /data/openclaw-bridge -- so for
-        anyone who set the STATE_DIR valve it read a path nothing ever writes,
-        never found the cache, and therefore labelled every option
-        "Gateway not reached" permanently, long after successful discovery.
+        """Model options for the DEFAULT_MODEL valve dropdown. Reads the state
+        dir the running Pipe last resolved: a classmethod has no valves, and the
+        default dir would miss a custom STATE_DIR's cache.
         """
         cache = _read_json_file(
             os.path.join(_state_dir(cls._last_state_dir), "models-cache.json")
         )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
-        # Same honesty as pipes(): before the first successful connection this
-        # dropdown is a built-in example list, not a reference of what the
-        # Gateway actually offers.
+        # Before the first connection this is an example list, as in pipes().
         suffix = "" if cached else UNVERIFIED_MODEL_SUFFIX
         return [
             {
@@ -595,9 +510,7 @@ class Pipe:
     def _selected_preset(self, body):
         """Extract the model key from the OWUI model string."""
         model = str(body.get("model", ""))
-        # Split on the FIRST dot only: the function id (e.g. "openclaw_gateway")
-        # never contains a dot, but model keys can (e.g. "gemini-3.1-pro-preview").
-        # rsplit would wrongly cut inside the version number.
+        # Split on the FIRST dot: model keys can hold dots ("gemini-3.1-pro").
         suffix = model.split(".", 1)[-1]
         if suffix == "default":
             return "default"
@@ -609,16 +522,11 @@ class Pipe:
             return self.valves.DEFAULT_MODEL.strip() or None
         return preset
 
-    # ── Auto-title helpers ──────────────────────────────────────────
 
     async def _auto_title(self, body, conn, visible_message_text, owui_origin_chat_id,
                           session_key="", user_id="", message_id=None):
-        """Generate a chat title, set it and show it in the user's open tabs.
-
-        Fires after the SECOND successful exchange (first message + response),
-        when OWUI's chat_id is stable. The first request uses a temporary ID.
-        Replaces only a title nobody chose (`_title_is_owui_default`).
-        Best-effort, non-blocking -- failures are logged but never surfaced.
+        """Title the chat after the first exchange, when the chat_id is stable,
+        unless a title was chosen. Best effort: failures are only logged.
         """
         if not self.valves.AUTO_TITLE:
             return
@@ -627,14 +535,12 @@ class Pipe:
         if not messages or not owui_origin_chat_id or not visible_message_text:
             return
 
-        # Fire on the SECOND user message: one full exchange is now in history,
-        # and the chat_id is stable (OWUI replaces the temp ID after exchange 1).
+        # On the second user message the chat_id is stable (OWUI replaces the temp ID).
         user_msgs = [m for m in messages if m.get("role") == "user"]
         assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
         if len(user_msgs) != 2 or len(assistant_msgs) != 1:
             return
 
-        # Build title from the FIRST exchange, not the current message
         user_text = _message_text(user_msgs[0].get("content"))[:400]
         assistant_preview = _message_text(assistant_msgs[0].get("content"))[:400]
 
@@ -645,8 +551,7 @@ class Pipe:
                 pipe_log(f"Auto-title: chat {owui_origin_chat_id}: its title was chosen; no title")
                 return
             pipe_log(f"Auto-title: generating title for chat {owui_origin_chat_id}")
-            # The title run carries this chat's text, so it goes out with the
-            # chat's owner status (OWNER_USERS), not the owner's.
+            # The title run carries this chat's text, so it uses the chat's owner status.
             owner = await _sender_is_owner(conn, session_key)
             title = await self._generate_title_text(conn, user_text, assistant_preview, owner=owner)
             if not title:
@@ -655,8 +560,7 @@ class Pipe:
                 pipe_log(f"Auto-title: chat {owui_origin_chat_id}: its title was chosen meanwhile; kept")
                 return
             pipe_log(f"Auto-title: chat {owui_origin_chat_id}: set to '{title}'")
-            # What Open WebUI sends for its own titles: the open tab retitles
-            # itself and its sidebar.
+            # As Open WebUI does for its own titles: the tab and sidebar retitle.
             await _relay_emit_event(user_id, owui_origin_chat_id, message_id,
                                     {"type": "chat:title", "data": title})
         except Exception as e:
@@ -664,16 +568,9 @@ class Pipe:
 
     async def _generate_title_text(self, conn, user_msg: str,
                                     assistant_msg: str, owner: bool = True) -> str | None:
-        """Use a lightweight model call to generate a 3-5 word title + emoji.
-
-        Sends a chat.send to a temp session and reads the run from its own
-        signals: its assistant text up to its final event, or, when the final
-        was lost, its settle row and the transcript. No poll and no timer.
-
-        Runs under TITLE_GEN_AGENT_ID (a separate configured agent from
-        AGENT_ID), not the main conversation's agent: on the same agent it
-        would share the conversation's CLI process and queue lane and wait
-        behind any heavy turn.
+        """A 3-5 word title + emoji from a temp-session run, read from its own
+        signals. Runs under TITLE_GEN_AGENT_ID so it never queues behind the
+        conversation's CLI process.
         """
         prompt = (
             "Create a concise title (3-5 words) with a relevant emoji "
@@ -736,7 +633,6 @@ class Pipe:
     def _clean_title_text(raw: str) -> str | None:
         """Clean up raw model output into a valid title."""
         title = raw.strip('\"\' \n\r')
-        # Some models wrap in quotes or add explanatory text
         if "\n" in title:
             title = title.split("\n")[0].strip()
         if len(title) > 80:
@@ -746,10 +642,8 @@ class Pipe:
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None):
-        """Main pipe entry point -- called by Open WebUI for each user message.
-
-        Thin wrapper around _pipe_impl that hands a turn admitted by a
-        superseded load of this Function to the current load.
+        """Main entry point: hands a turn admitted by a superseded load of this
+        Function to the current load.
         """
         remember_owui_server()
         current = await _current_load(self, __request__)
@@ -766,9 +660,8 @@ class Pipe:
             return
         # Compares a timestamp; a due check runs in the background.
         _ensure_slash_prompts(lambda: self.valves)
-        # aclosing: when OWUI closes this generator, close the inner one now
-        # rather than whenever it is garbage-collected, so its cancel handling
-        # runs before the next message arrives.
+        # aclosing: close the inner generator now, so its cancel handling runs
+        # before the next message arrives.
         async with contextlib.aclosing(self._pipe_impl(
             body, __event_emitter__, __event_call__=__event_call__,
             __user__=__user__, __metadata__=__metadata__, __request__=__request__,
@@ -781,21 +674,13 @@ class Pipe:
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
                    _send_texts=None, _waiting=None, _send_attachments=None):
-        """One reply: runs `_pipe_turn`, and makes sure a cancel or close at
-        ANY point hands what the reply still owes to the next message (see
-        `park_cancelled_turn`) instead of dropping it.
+        """One reply: a cancel or close at any point hands what it still owes to
+        the next message (`park_cancelled_turn`). `_pipe_turn` parks for itself
+        while streaming; this catches every other point. OWUI ends a reply by
+        cancelling its task or closing the generator.
 
-        `_pipe_turn` parks for itself while it is streaming a run, where it
-        also snapshots and shows "Stopped". This catches every other point:
-        before the message is sent (model patch, queue wait, a yield outside
-        the stream loop) and around the adopt / retry recursion. OWUI ends a
-        reply either by cancelling its task (CancelledError at an await) or
-        by closing the generator (GeneratorExit at a yield); both land here.
-
-        `_send_texts` replaces this request's own text as what to send, for
-        the recursions that send messages carried over from earlier replies;
-        `_waiting` are the replies those messages came from (`_TurnState`),
-        `_send_attachments` the images that go with them.
+        `_send_texts`, `_waiting`, `_send_attachments`: carried-over messages to
+        send instead of this request's text.
         """
         turn = _TurnState(waiting=list(_waiting or []))
         emitter = None
@@ -807,19 +692,13 @@ class Pipe:
         request = _owui_request_task((__metadata__ or {}).get("task_id"))
         if request is not None and _send_texts is None:
             def _request_ended(_task):
-                # Open WebUI ended the request (its own save of the message
-                # done) with this reply's status line open, and nobody else
-                # owns the message: nothing will close the line now. A
-                # Stop as the reply ends does this (a question card cancelled
-                # by sending a new message, ELI-200), wherever the cancel
-                # lands: in the reply, or in Open WebUI's own code while the
-                # reply waits at a yield, which never closes the reply.
-                # A cancelled request is checked too: see `_close_reply_status`.
+                # Open WebUI ended the request with this reply's status line
+                # open and nobody else owns the message, so nothing would close
+                # it (ELI-200). See `_close_reply_status`.
                 if ((turn.status_open or _task.cancelled()) and not turn.parked
                         and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
-                # A reply that ended in its request is saved by Open WebUI now;
-                # a handed-over one is published by its turn writer instead.
+                # A handed-over reply is published by its turn writer instead.
                 elif (not _task.cancelled() and _task.exception() is None and not turn.parked
                         and not turn.handed_over and turn.reply
                         and getattr(self.valves, "PUBLISH_CHAT_FINISHED", False)):
@@ -846,8 +725,7 @@ class Pipe:
                     f"{len(turn.unsent)} unsent message(s), run "
                     f"{str(turn.run_id)[:20]}"
                 )
-                # This reply never sent its message: it waits for the reply
-                # that does (or for the Stop that drops it) to say so.
+                # This reply never sent its message: the reply that does says so.
                 waiting = list(turn.waiting)
                 if turn.unsent and turn.reply and turn.reply not in waiting:
                     waiting.append(turn.reply)
@@ -868,15 +746,9 @@ class Pipe:
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
                    _send_texts=None, _send_attachments=None, turn=None):
-        """Uses a shared persistent WS connection; no per-message reconnect,
-        no global lock, and no 60s timeout.
-
-        `_initial_visible_text` seeds the terminal snapshot for the
-        thinking-rejection retry recursion below: the retry note belongs to
-        the turn that's ending, not the one about to start, but this call's
-        own `visible_message_text` is what the forced terminal `replace`
-        snapshot persists -- a note recorded only on the caller's copy would
-        show while streaming and vanish on reload.
+        """One reply over the shared persistent WS connection.
+        `_initial_visible_text` seeds the snapshot for the thinking-rejection
+        retry, so its note persists on reload.
         """
         state = _PipeTurn(
             self, body, __event_emitter__, __event_call__, __user__, __metadata__,
@@ -888,10 +760,8 @@ class Pipe:
 
 
 class _PipeTurn:
-    """One reply of `Pipe._pipe_turn`, in four phases run in order (ELI-147):
-    `prepare`, `admit`, `consume` and `finish`. A phase that ends the reply
-    early sets `ended`. The closures the single function had are methods,
-    and the locals they or two phases shared are attributes."""
+    """One reply of `Pipe._pipe_turn`, in phases `prepare`, `admit`, `consume`
+    and `finish` (ELI-147). A phase that ends the reply early sets `ended`."""
 
     def __init__(self, pipe, body, __event_emitter__, __event_call__, __user__,
                  __metadata__, __request__, __task__, __task_body__,
@@ -925,8 +795,8 @@ class _PipeTurn:
             _secret_asker_leave(self)
 
     async def prepare(self):
-        """The message, the connection, the session key, a cancelled reply's
-        run to take over, and the model patch."""
+        """The message, connection, session key, a cancelled run to take over,
+        and the model patch."""
         if self.pipe.valves.ENABLE_FILE_SERVER:
             _start_file_server()
         else:
@@ -934,33 +804,21 @@ class _PipeTurn:
         preset = self.pipe._selected_preset(self.body)
         self.model_override = self.pipe._model_override_for_preset(preset)
 
-        # Per-chat thinking level (ELI-85). `reasoning_effort` is the single
-        # source of truth: Open WebUI's own Advanced Params control writes it,
-        # and so does the companion Thinking filter's toggle. Reading the field
-        # rather than a filter-specific one means either control works, and the
-        # bridge keeps working for anyone who never installs the filter.
-        # Absent means absent: no `thinking` is sent and the agent's configured
-        # level applies. Validation against the model's real ladder happens
-        # below, once describe has told us what this session resolves to.
+        # Per-chat thinking level (ELI-85): `reasoning_effort`, written by Open
+        # WebUI's Advanced Params and by the Thinking filter. Absent means the
+        # agent's own level; it is checked against the ladder after describe.
         self.requested_thinking = self.body.get("reasoning_effort") or None
         if self.requested_thinking is not None:
             self.requested_thinking = str(self.requested_thinking).strip().lower() or None
         self.session_thinking_ladder = None
         self.session_model_key = None
         self.session_runtime = None
-        # (model key, ladder) this turn last filed in the ladder cache: the
-        # queue wait probes every 1.5 s, and filing reads and writes a file.
+        # (model key, ladder) last filed: the queue wait probes every 1.5 s.
         self._ladder_recorded = None
 
-        # --- Short-circuit OWUI background tasks ---
-        # image_prompt_generation and function_calling are skipped too: both already have a documented, silent OWUI-side
-        # fallback for an empty response (raw user message / "no tool
-        # needed" respectively), so skipping them costs
-        # nothing and saves a full agent turn. moa_response_generation is
-        # deliberately excluded -- it is a user-triggered "Merge Responses"
-        # request whose only output path is the streamed content itself, so
-        # a no-op here would show as a visibly empty result rather than a
-        # graceful fallback.
+        # Skip OWUI background tasks. image_prompt_generation and
+        # function_calling have a silent OWUI fallback for an empty answer;
+        # moa_response_generation does not, so it is not skipped.
         if self.__task__ and self.__task__ in (
             "title_generation",
             "tags_generation",
@@ -975,12 +833,9 @@ class _PipeTurn:
             self.ended = True
             return
 
-        # --- Continue Response (ELI-184) ---
-        # Open WebUI's Continue sends the chat with the agent's own reply last,
-        # to be extended in place. OpenClaw has no way to continue a finished
-        # run, and forwarding that reply would send the agent its own words as
-        # the user's. So nothing goes to the agent and nothing is added to the
-        # reply (Open WebUI keeps it as it was); a toast says why.
+        # Continue Response (ELI-184): OpenClaw cannot continue a finished run,
+        # and forwarding the reply would send the agent its own words as the
+        # user's. So nothing is sent; a toast says why.
         messages = self.body.get("messages", [])
         if messages and messages[-1].get("role") == "assistant":
             pipe_log("Continue Response: the reply is complete, nothing sent to the agent")
@@ -992,13 +847,7 @@ class _PipeTurn:
             self.ended = True
             return
 
-        # --- Extract user message ---
-        # OWUI sends `content` as a plain string for text-only messages, but
-        # as a list of content blocks (`{"type": "text", ...}` /
-        # `{"type": "image_url", ...}`) whenever the user attaches an image.
-        # Coercing through _coerce_text (already used elsewhere for gateway
-        # event payloads with the same block shape) extracts and joins any
-        # text blocks and safely no-ops on plain strings.
+        # OWUI sends content as a string, or as blocks when an image is attached.
         raw_content = messages[-1]["content"] if messages else ""
         self.text = _coerce_text(raw_content)
         has_image = _content_has_image(raw_content)
@@ -1016,9 +865,7 @@ class _PipeTurn:
             return
 
         if has_image and not self.image_attachments:
-            # An image block was present but couldn't be turned into an
-            # attachment (e.g. not a base64 data URL) -- text still goes
-            # through, but say so rather than silently dropping the image.
+            # The image could not become an attachment: say so, text still goes.
             yield (
                 "_(Note: that image couldn't be relayed to the agent -- "
                 "only the text below was sent.)_\n\n"
@@ -1032,9 +879,7 @@ class _PipeTurn:
         self.channel_commit = None
         if (self.pipe.valves.COMPOSER_STATUS_BUTTON and not self._initial_visible_text
                 and not self.channel_id):
-            # Cheap and idempotent: installs the composer Status button in the
-            # tabs showing this chat (a no-op where it is already there). Once
-            # per turn: the thinking-retry recursion skips it.
+            # Installs the composer Status button in this chat's tabs; idempotent.
             _ensure_composer_watcher(lambda: self.pipe.valves)
             await _emit_composer_button(
                 self.__event_emitter__,
@@ -1046,7 +891,6 @@ class _PipeTurn:
         pipe_log(f"Messages: {len(messages)}, last role: "
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 
-        # --- Get the persistent connection ---
         try:
             self.conn = await _get_gateway_connection(lambda: self.pipe.valves)
         except GatewayError as e:
@@ -1055,7 +899,7 @@ class _PipeTurn:
             self.ended = True
             return
 
-        # --- Derive stable session key ---
+
         if self.__metadata__:
             self.chat_id = (
                 self.__metadata__.get("chat_id")
@@ -1074,15 +918,12 @@ class _PipeTurn:
             self.chat_id = f"owui-{uuid.uuid4().hex[:12]}"
             pipe_log("WARNING: no chat_id in metadata, generated random:", self.chat_id)
 
-        # Several models picked for one message: each Pipe model's reply runs
-        # in its own session, so they do not queue behind one another or share
-        # one model override (ELI-329).
+        # Several models for one message: each reply gets its own session, so
+        # they neither queue behind each other nor share an override (ELI-329).
         state_dir = _state_dir(getattr(self.pipe.valves, "STATE_DIR", ""))
         if self.channel_id:
-            # A channel mention: the session is the thread's (see channels.py),
-            # and the turn's text is what the agent has not seen there yet.
-            # (The thinking retry sends its first texts again, so only the
-            # thread and the commit come from here then.)
+            # A channel mention: the thread's session, and the text the agent
+            # has not seen there yet (see channels.py).
             self.column = 0
             ctx = await _channel_mention_context(
                 state_dir, self.channel_id, (self.__metadata__ or {}).get("message_id"),
@@ -1107,9 +948,7 @@ class _PipeTurn:
         self.turn.session_key = self.session_key
         self.turn.chat_id = self.owui_origin_chat_id
         # When the chat no longer shows what the agent remembers (Edit,
-        # Regenerate, a branch switch) or is a copy it never saw, the message
-        # says so first (ELI-183). Not for the thinking-retry recursion, whose
-        # texts already went out once.
+        # Regenerate, a branch switch, a copy), the message says so (ELI-183).
         history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
@@ -1123,25 +962,21 @@ class _PipeTurn:
                                "message_id": meta["message_id"],
                                "request_task_id": meta.get("task_id")}
         if self.owui_origin_chat_id and self.__event_emitter__ and not self.channel_id:
-            # Lets a later cancel ask the page whether it was Stop or Send
-            # now, and sends a message queued while this reply runs at once
-            # (AUTO_SEND_WHILE_RUNNING). Idempotent in the page; fire-and-forget.
+            # Page hooks: a later cancel can ask whether it was Stop or Send now,
+            # and AUTO_SEND_WHILE_RUNNING sends a queued message at once.
             try:
                 await self.__event_emitter__(
                     {"type": "execute", "data": {"code": _page_hooks_js(
                         self.owui_origin_chat_id, _auto_send_on(self.pipe.valves))}})
             except Exception as ex:
                 pipe_log(f"  intent hook install failed: {ex!r}")
-        # What actually went out in this turn's chat.send, for the
-        # thinking-rejection retry to send again.
+        # What went out, for the thinking-rejection retry to send again.
         self.sent_texts = list(self.turn.unsent)
         self.sent_attachments = list(self.turn.attachments)
 
-        # A cancel of this session's previous response that arrived just
-        # before this message is OWUI's "Send now" / interrupt, not a Stop:
-        # take over what it left (see `park_cancelled_turn`): its run, still
-        # running with its events buffered, and any message it had not sent
-        # yet. Claimed this early because the model patch below can take
+        # A cancel of the previous response just before this message is a
+        # "Send now", not a Stop: take over its run and unsent messages
+        # (`park_cancelled_turn`). Claimed early: the model patch can take
         # seconds and the grace window is short.
         self.adopted_run_id = None
         self.adopted_queue = None
@@ -1169,15 +1004,11 @@ class _PipeTurn:
                     "reply before sending the message"
                 )
 
-        # An image over the Gateway's cap would be refused whole: shrink it
-        # here, once, so every later send of this message carries the copy
-        # that fits. After the claim, which must not wait behind the fit (the
-        # parked turn's timer does not); a retry (`_send_texts`) already has its
-        # fitted images. The whole list is checked: a claimed turn carries the
-        # images of a reply that was cancelled before its own fit ended. Only an
-        # image over the cap leaves the event loop: a message with small images
-        # must not wait a thread hop behind the ones before it. One fit at a
-        # time: each holds the whole photo decoded.
+        # An image over the Gateway's cap is refused whole: shrink it once, after
+        # the claim (which must not wait behind the fit), so every later send
+        # carries the copy that fits. The whole list is checked, since a claimed
+        # turn carries a cancelled reply's images. Only an oversized image leaves
+        # the event loop, one fit at a time (each holds the decoded photo).
         if not self._send_texts and _images_over_cap(
                 self.turn.attachments, self.conn.gateway_max_image_bytes):
             try:
@@ -1192,19 +1023,14 @@ class _PipeTurn:
                 self.end_waiting_replies_unsent()
                 self.ended = True
                 return
-            # The retry copy and this message's own list hold the original
-            # objects: swap each for its fitted copy.
+            # The retry copy and this message's list hold the originals: swap in the fits.
             fitted_for = {id(a): f for a, f in zip(self.turn.attachments, fitted)}
             self.sent_attachments = [fitted_for.get(id(a), a) for a in self.sent_attachments]
             self.image_attachments = [fitted_for.get(id(a), a) for a in self.image_attachments]
             self.turn.attachments = fitted
 
-        # Apply the model. ELI-59: a burst's patches are all redundant -- same
-        # session, same model -- so (a) a per-session lock collapses them to one
-        # in-flight RPC, and (b) a TTL cache of the last applied model lets the
-        # waiters (and the next ~60s of same-model messages) skip the RPC
-        # entirely. Failure invalidates the cache so nothing sticks. A failure
-        # is reported, not retried: a model not allowed or a Gateway timeout
+        # Apply the model (ELI-59): a per-session lock and a TTL cache collapse a
+        # burst's identical patches. A failure is reported, not retried: it
         # fails the same way twice (ELI-131).
         patch_err = None
         async with self.conn.model_patch_lock(self.session_key):
@@ -1248,37 +1074,20 @@ class _PipeTurn:
             self.ended = True
             return
 
-        # Tool cards for this session's runs whoever started them, including
-        # this reply's own run after a reconnect (see `ensure_message_subscription`).
+        # Tool cards for this session's runs whoever started them (`ensure_message_subscription`).
         await self.conn.ensure_message_subscription(self.session_key)
 
     async def admit(self):
-        """The run this reply streams: a second Open WebUI call follows the one
-        it already sent (ELI-82), a taken-over run continues, else the message
-        waits for the session to be idle and is sent."""
-        # --- Concurrency: queue behind an active run, never steer-merge ---
-        # A message that arrives while a run is active must become its OWN run,
-        # not a steer-merge into the active run. Steer-merging (the gateway's
-        # default when a run is active) returns a *phantom* runId that never
-        # runs independently and emits no terminal -- the injected message just
-        # merges into the active run -- so a bubble bound to it renders nothing
-        # ("No visible response"). Instead we wait for the active run to reach a
-        # definite terminal, then send this message as a fresh run with its own
-        # runId + terminal. This matches OWUI's default "queue" UX and can never
-        # strand the bubble. (This is a deterministic wait on the gateway's own
-        # run status, not a heuristic timer.)
-        # Whether the session already has an in-progress run must be decided
-        # AUTHORITATIVELY by the gateway (sessions.describe), NOT by the
-        # per-worker `active_run_id_for_session` registry: OWUI runs multiple
-        # worker processes, so a run started while another worker handled the
-        # previous turn is invisible to this worker's registry.
+        """The run this reply streams: a duplicate Open WebUI call's (ELI-82), a
+        taken-over run, or a fresh send once the session is idle."""
+        # A message that arrives during a run becomes its own run, never a
+        # steer-merge: that returns a phantom runId with no terminal, and the
+        # bubble renders nothing. Whether a run is active is the Gateway's call
+        # (sessions.describe): OWUI's worker processes each see only their own runs.
 
-        # Open WebUI can call the pipe twice for one reply (ELI-82), the second
-        # call up to ten minutes later. Sending the message again runs it twice, and
-        # the second answer, written last, replaces the first in the same
-        # message. So a second call with the same text follows the run the
-        # first one started and ends with that run's reply, rebuilt from the
-        # transcript once the run is over.
+        # Open WebUI can call the pipe twice for one reply (ELI-82), up to ten
+        # minutes apart. A second call with the same text follows the first
+        # call's run instead of running it twice.
         reply_id = (self.__metadata__ or {}).get("message_id")
         prior = (self.conn.reply_sent(self.session_key, reply_id)
                  if self._send_texts is None and not self.adopted_run_id else None)
@@ -1299,9 +1108,7 @@ class _PipeTurn:
                 if found is None or found["closed"]:
                     break
                 if not await self._session_run_active():
-                    # The run's closing message can land between the read
-                    # above and this check: read the turn once more, and
-                    # keep the earlier one only if that read gives nothing.
+                    # The closing message can land after the read above: read once more.
                     try:
                         hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
                         found = _stub_turn(hist, reply_id, "", steers=steers) or found
@@ -1323,21 +1130,16 @@ class _PipeTurn:
 
         if (self.adopted_run_id and self.adopted_queue is None
                 and not await self._session_run_active()):
-            # It finished during the cancel/re-send gap and nothing buffered
-            # its events: nothing to continue. (With a parked queue the run's
-            # tail and final are waiting in it, so it is always adopted.)
+            # It ended in the cancel/re-send gap with nothing buffered: send normally.
             pipe_log("  adopted run already ended; sending the message normally")
             self.adopted_run_id = None
             self.adopted_run_text = None
             self.turn.run_id = None
             self.turn.run_text = None
         if self.adopted_run_id:
-            # Stream the rest of the adopted run into THIS reply. The message
-            # itself is sent afterwards, as its own run, by the recursive call
-            # at the end of this turn: sending it now would steer into the
-            # live run, and the claude-cli runtime has no steering hook (the
-            # gateway acks "started", then drops the message once the run
-            # ends).
+            # Stream the adopted run's rest here; this message is sent afterwards
+            # as its own run. claude-cli has no steering hook: the Gateway acks
+            # "started", then drops a steered message.
             self.our_run_id = self.adopted_run_id
             self.resolved_thinking = None
             self.pending_clamp_note = ""
@@ -1352,20 +1154,11 @@ class _PipeTurn:
                 done=False,
             )
         else:
-            # Serialize the queue-release -> chat.send -> run-registration critical
-            # section per session. Two messages released from the queue at the same
-            # instant would otherwise both send into the same idle window; the
-            # gateway steer-merges the second into the first, which then renders
-            # nothing ("no reply text"). Holding this lock only across the wait+send
-            # (NOT the event loop below) means the next waiter re-checks AFTER our
-            # run is registered and observes it active (sessions.list hasActiveRun),
-            # so it waits its turn instead of racing us (ELI-56).
-            # NOTE: do NOT prepend a `/queue followup` directive here: the
-            # Gateway does not strip it from a device chat.send, so it leaks
-            # verbatim into the delivered message.
-            # Messages that wait behind the same run go out together: a reply
-            # released when it settles hands its message to the newest one
-            # still waiting (`hand_on`), which sends them all as one turn.
+            # The per-session lock covers wait + send + registration, so the next
+            # waiter sees our run active instead of racing into the same idle
+            # window, where the Gateway steer-merges it (ELI-56). Never prepend
+            # `/queue followup`: the Gateway leaks it verbatim from a device send.
+            # Messages waiting behind one run go out together (`hand_on`).
             joins = self._send_texts is None and bool(self.turn.reply) and not self.channel_id
             if joins:
                 self.conn.send_waiters(self.session_key).append(self)
@@ -1380,19 +1173,14 @@ class _PipeTurn:
         self.register_target()
 
     def end_waiting_replies_unsent(self) -> None:
-        """The send that was to carry the messages of `turn.waiting` failed:
-        those replies say so, pointing at this one's error."""
+        """The send carrying `turn.waiting`'s messages failed: those replies say so."""
         _end_unsent_replies(self.conn, self.turn.waiting, sent=False, note=REPLY_SEND_FAILED_NOTE)
         self.turn.waiting = []
 
     def hand_on(self) -> bool:
-        """Hand this reply's message to the newest reply of the session that
-        waits to send, if there is one: it sends both as one turn, and ends
-        this reply with `REPLY_SENT_WITH_NEXT_NOTE` once it did (or with the
-        not-sent note, on a Stop), as for a reply interrupted while queued
-        (ELI-188). Its messages go before that reply's own, after any handed
-        to it earlier. Not when a waiting reply asks for another thinking
-        level: one send has one level, and the messages keep their order."""
+        """Hand this reply's message to the session's newest waiting reply,
+        which sends both as one turn (ELI-188). Not when that reply asks for
+        another thinking level: one send has one level."""
         self.conn.drop_send_waiter(self.session_key, self)
         waiters = self.conn.send_waiters(self.session_key)
         mine = self.turn.reply["message_id"]
@@ -1412,14 +1200,10 @@ class _PipeTurn:
         return True
 
     def steers_into_active_run(self) -> bool:
-        """Whether this reply's message goes to the Gateway while a run of its
-        session works, which then steers it into that run (2026.10.10+). Text
-        only: the Gateway keeps images for a later turn. Not for a channel
-        thread, whose turns wait for the thread's run (channels.py). Only
-        into a run a message of this chat started, not a cron wake's or an
-        announce's (`user_turn_run_active`), and at that run's model and
-        thinking level: the run answers at its own, so a message that changes
-        either waits for a run of its own."""
+        """Whether this message is steered into the session's running run
+        (2026.10.10+). Text only, since the Gateway keeps images for a later
+        turn; never in a channel thread; only into this chat's own run at the
+        same model and thinking level."""
         return (steers_mid_run_messages(self.conn.gateway_version)
                 and not self.turn.attachments and not self.channel_id
                 and self.conn.user_turn_run_active(self.session_key, self.chat_id)
@@ -1427,24 +1211,15 @@ class _PipeTurn:
                 == (self.model_override, self.requested_thinking))
 
     async def wait_and_send(self, reply_id):
-        """Wait for the session's run to settle, then send this reply's
-        messages as their own run (ELI-56), or hand them on (`hand_on`)."""
+        """Wait for the run to settle, then send as a fresh run (ELI-56) or hand on."""
         async with self.conn.send_section(self.session_key):
-            # Wait for the Gateway to push that the run settled
-            # (`sessions.changed`, see `session_change_event`), re-reading
-            # the authoritative state after each change. No poll, no
-            # settle window and no ceiling (ELI-88): a ceiling releases a
-            # message into a run that is still going, where the Gateway
-            # queues it and claude-cli drops it. A
-            # resume that starts right after a settle is caught after the
-            # send instead (see `enqueued_not_started`). Stop cancels this
-            # wait like any other.
+            # Wait on `sessions.changed` pushes, re-reading state after each.
+            # No poll and no ceiling (ELI-88): a ceiling would release a message
+            # into a live run, where claude-cli drops it.
             self.to_be_steered = False
 
             async def active():
-                # A run this message can be steered into: send it now, and
-                # the Gateway steers it in at the run's next tool boundary
-                # (`_steer` hands this reply the rest).
+                # Steerable: the Gateway steers it in at the next tool boundary.
                 busy = await self._session_run_active()
                 if busy and self.steers_into_active_run():
                     pipe_log("Session has an active run; sending now, to be steered into it")
@@ -1469,58 +1244,31 @@ class _PipeTurn:
                 self.ended = True
                 return
 
-            # --- Send this message as its own fresh run (still holding the lock
-            #     so the next waiter observes our run before deciding to send) ---
-            # The OWUI message id in the run id ties the run to the reply
-            # it streams into, so a reply orphaned by an Open WebUI restart
-            # is matched to its run by identity (ELI-90, `_stub_turn`).
+            # The OWUI message id in the run id ties a reply orphaned by a
+            # restart to its run (ELI-90, `_stub_turn`).
             idempotency_key = (pipe_run_id(self.chat_id, reply_id) if reply_id
                                else f"msg-{self.chat_id}-{time.time()}")
-            # Fit the requested level to what this session's model actually
-            # supports. The dropdown is a union across models, so a level that
-            # is real for one model can be unavailable here. Clamping is
-            # downward only and always explained: silently answering at a level
-            # other than the one asked for is worse than a short note, and
-            # silently erroring out is worse still.
-            #
-            # A ladder the Gateway STATED (by rejecting a send) beats the one
-            # describe reported, because describe answers this question without
-            # a model catalog and overreports for catalog-gated models. This is
-            # what makes the rejection cost one turn per model instead of one
-            # turn every turn.
-            #
-            # Look up by `model_override` (the runtime-namespaced routing key,
-            # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
-            # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
-            # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
-            # text names the model by its routing key, so that is where
-            # `_record_thinking_ladder` files the authoritative entry; reading
-            # back under the vendor key alone missed it every time and repeated
-            # the same round-trip rejection (and its note) on every turn.
+            # Clamp the level down to what this model supports, with a note.
+            # A ladder the Gateway stated by a rejection beats describe's, which
+            # overreports for catalog-gated models. Look up by `model_override`
+            # (the routing key) first: the rejection names that key, and the
+            # vendor key alone missed it every turn.
             _state_dir_valve = getattr(self.pipe.valves, "STATE_DIR", "")
             effective_ladder = (_read_model_thinking_ladder(self.model_override, _state_dir_valve)
                                 or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
                                 or self.session_thinking_ladder)
             self.resolved_thinking, thinking_note = clamp_to_ladder(
                 self.requested_thinking, effective_ladder)
-            # Held until `visible_message_text` exists below (it isn't defined
-            # yet at this point in the turn) so the note that streams here also
-            # ends up in the forced terminal snapshot -- otherwise it shows
-            # while streaming and is gone after a reload.
+            # Held until `visible_message_text` exists, so the note persists on reload.
             self.pending_clamp_note = ""
             if thinking_note:
                 pipe_log(f"thinking: {thinking_note}")
-                # Logged every time, shown once: the dropdown keeps the level
-                # selected, so an unchanged mismatch would otherwise stamp the
-                # same italic line above every answer in the chat.
+                # Logged every time, shown once: the dropdown keeps the level.
                 if self.conn.should_announce_thinking_note(self.session_key, thinking_note):
                     self.pending_clamp_note = f"_{thinking_note}_\n\n"
                     yield self.pending_clamp_note
-            # Listen before sending: the run's first events can arrive
-            # before chat.send returns, and with no consumer they would go
-            # to the turn writer, which takes this reply's message over
-            # while the reply still streams. The run id is the idempotency
-            # key.
+            # Listen before sending: early events with no consumer would go to
+            # the turn writer, which would take over the message mid-stream.
             self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
             self.conn.sent_settings[self.session_key] = (self.model_override, self.requested_thinking)
             try:
@@ -1564,12 +1312,9 @@ class _PipeTurn:
             self.turn.unsent = []
             self.turn.attachments = []
             if getattr(self, "to_be_steered", False):
-                # The Gateway has it; the agent takes it in at the run's
-                # next step, and this reply shows the answer from there.
                 await _emit_status(self.__event_emitter__, STEER_PENDING_STATUS, done=False)
             if self.channel_commit is not None:
-                # The Gateway has the turn: the agent saw these messages,
-                # and it now follows the thread.
+                # The Gateway has the turn: commit the thread's cursors.
                 self.channel_commit()
                 self.channel_commit = None
                 _ensure_channel_watcher(lambda: self.pipe.valves)
@@ -1581,11 +1326,9 @@ class _PipeTurn:
 
     def register_target(self):
         """After admission: tie the run to this reply's message."""
-        # Tell the persistent connection which OWUI message this run streams
-        # into, so a turn writer continues that message from a shadow renderer
-        # if this inline turn ends before the run does (cancel, close, a
-        # torn-down request). No-op without a stable message id. See
-        # _turn_route_now (writer.py) and _TurnRenderer (gateway.py).
+        # Tell the connection which OWUI message this run streams into, so a
+        # turn writer can continue it if this inline turn ends first (see
+        # _turn_route_now in writer.py).
         self.owui_message_id = (self.__metadata__ or {}).get("message_id")
         self.conn.register_run_target(
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
@@ -1593,24 +1336,20 @@ class _PipeTurn:
             request_task_id=(self.__metadata__ or {}).get("task_id"),
             steer_pending=bool(getattr(self, "to_be_steered", False)),
         )
-        # When the Gateway had admitted this reply's run (chat.send returned;
-        # an adopted run already ran). An idle row read after it means the
-        # run is over; one read before may show the previous run's settle.
+        # An idle row read after admission means the run is over; one read
+        # before may show the previous run's settle.
         self.admitted_at = float("-inf") if self.adopted_run_id else time.monotonic()
-        # A gap or a resync since: this run's own final and settle may be
-        # lost, so another run's settle row may be the first sign it ended.
+        # After a gap the run's own final may be lost, so another settle may be the first sign.
         self.signals_lost = False
         if self.adopted_run_id and self.adopted_queue is not None:
             self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue,
                                    run_text=self.adopted_run_text)
-        # The request's own token, for the auto-title request at the end.
         self.bearer_token = _extract_request_bearer(self.__request__)
 
     async def consume(self):
         """The run's events, until its end, a handover or a cancel."""
         # A secret the run requests is asked on this reply's socket (ELI-96).
         _secret_asker_join(self)
-        # --- Consume events ---
         self.done = False
         self.event_count = 0
         self.text_yielded = False
@@ -1619,44 +1358,31 @@ class _PipeTurn:
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
         self.run_usage = None
-        # The Gateway acks every chat.send with "started"; one that it queued
-        # behind a run (or steered into one) instead gets a lone `chat` final
-        # with no message as its first and only event.
+        # A send the Gateway queued or steered gets a lone `chat` final first.
         self.enqueued_not_started = False
-        # The run's text and tool cards, read by the renderer a turn writer
-        # uses (ELI-147). Its `received` text is everything the run sent,
-        # including what the text hooks still hold, so it is the baseline a
-        # cumulative event is diffed against (ELI-80).
+        # The renderer a turn writer uses too (ELI-147). Its `received` text is
+        # the baseline cumulative events are diffed against (ELI-80).
         self.renderer = _TurnRenderer()
-        # What the Status Action lists while this reply runs (ELI-186).
+        # Listed by the Status Action while this reply runs (ELI-186).
         live_key = (self.owui_origin_chat_id, getattr(self, "owui_message_id", None))
         if all(live_key):
             _live_replies()[live_key] = self.renderer
-        # The text this reply has shown, raw: the code state the text hooks
-        # read. Continuing a run another reply started, both carry over (see
-        # `park_cancelled_turn`), while what THIS reply shows,
-        # `visible_message_text`, starts empty.
+        # Raw shown text, the state the text hooks read. Carried over when
+        # continuing another reply's run; `visible_message_text` starts empty.
         self.assistant_stream_text = ""
         if self.adopted_run_text:
             self.renderer.seed(self.adopted_run_text)
             self.assistant_stream_text = self.adopted_run_text.get("stream", "")
         self.visible_message_text = self._initial_visible_text + self.pending_clamp_note
-        # Text the hooks hold back: a possible needs-input prompt, a MEDIA:
-        # directive whose filename is still arriving.
         self.pending_prompt_text = ""
         self.pending_media_text = ""
-        # Whether a MEDIA: directive of this reply showed its images; the
-        # run's Gateway image blocks are shown only when none did.
+        # Gateway image blocks show only when no MEDIA: directive did.
         self.media_shown = False
-        # The session's `chat.history` once the run ended, read once.
         self.end_history = None
-        # Images the run's Codex image tool made: the Gateway attaches them
-        # to the run's stored message only after its final (ELI-322).
+        # Codex images: attached to the stored message after the final (ELI-322).
         self.images_made = 0
-        # Files the reply named by path (a `MEDIA:/path` line, or an
-        # assistant event's `mediaUrls` when the Gateway already took the
-        # line out): the Gateway stores each as an image block of the run's
-        # message, also after its final (ELI-328).
+        # Paths the reply named: the Gateway stores each as an image block after
+        # the final (ELI-328).
         self.gateway_media: set[str] = set()
         self.event_media: set[str] = set()   # bare names and URLs of `mediaUrls`, shown once
         self.last_snapshot_text = ""
@@ -1664,35 +1390,28 @@ class _PipeTurn:
         self.snapshot_interval_s = 1.0
         self.snapshot_min_delta_chars = 250
         self.queued_shown = False
-        # An interrupted run is not continued here: its message goes to the
-        # turn writer, whose settled row decides who continues it (DESIGN 2.7).
+        # An interrupted run goes to the turn writer, whose settled row decides
+        # who continues it (DESIGN 2.7).
         self.handed_over = False
-        # A reply with no Open WebUI message (an API request) has nothing to
-        # hand over: it applies the owner rule itself, in its own stream.
-        # Set while it waits for the interrupted run's row.
+        # A reply with no Open WebUI message (API) applies the owner rule itself.
         self.awaiting_owner = False
         self.owner_notice_before = False
         self.owner_resumes = 0
         self.owner_run = None
-        # Claude Code Agent calls started in the background: the run stays
-        # open until their reports are in, so the reply says why (ELI-163).
+        # Background Agent calls keep the run open, so the reply says why (ELI-163).
         self.background_agents = 0
-        # The run this reply showed went on as a later message's answer
-        # (`_STEERED_MARKER_TYPE`): that message's run id.
+        # The run went on as a later steered message's answer: its run id.
         self.steered_into = None
 
         self.adopt_new_run = True
         try:
             while self.adopt_new_run:
                 self.adopt_new_run = False
-                # A new run's text is a new message item.
                 self.fence_item_start = len(self.assistant_stream_text)
                 try:
                     while not self.done:
-                        # No silence timer: a quiet queue is a long tool call or
-                        # model thinking as often as a dead run. The run's own
-                        # signals end the reply: its terminal event, its settle
-                        # row (below), a Gateway restart (handed over).
+                        # No silence timer: a quiet queue is often a long tool
+                        # call. The run's own signals end the reply.
                         msg = await self.queue.get()
 
                         if msg.get("type") == _ROW_MARKER_TYPE and self.awaiting_owner:
@@ -1714,14 +1433,11 @@ class _PipeTurn:
                             continue
 
                         if msg.get("_steered"):
-                            # This message was steered into the session's active
-                            # run (`_steer`): its answer is the rest of it.
                             await self.on_steered(msg["_steered"])
                             continue
 
                         if msg.get("type") == _STEERED_MARKER_TYPE:
-                            # A later message was steered into this run: the
-                            # rest of it is that message's answer, in its reply.
+                            # A later message was steered in: the rest is its answer.
                             self.steered_into = msg.get("into")
                             self.done = True
                             pipe_log(f"  a later message was steered into run "
@@ -1740,7 +1456,6 @@ class _PipeTurn:
                                 and not payload.get("message")):
                             self.enqueued_not_started = True
 
-                        # --- Double-check session/run match ---
                         evt_session = payload.get("sessionKey", "")
                         evt_run_id = payload.get("runId", "")
                         if evt_session and evt_session != self.session_key:
@@ -1750,7 +1465,6 @@ class _PipeTurn:
                             pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
                             continue
 
-                        # --- Completion signals (multiple sources) ---
                         err = (str(data.get("error", "unknown"))
                                if stream == "lifecycle" and phase == "error" else "")
                         aborted_run = state == "aborted" or data.get("aborted") is True
@@ -1759,9 +1473,7 @@ class _PipeTurn:
                         async for chunk in self.on_completion(payload, stream, phase, state, err, aborted_run):
                             yield chunk
 
-                        # --- Run text and tool cards ---
-                        # One renderer reads them, the one a turn writer uses
-                        # (ELI-147).
+                        # One renderer, shared with the turn writer (ELI-147).
                         if (stream == CODEX_ITEM_STREAM and phase == "completed"
                                 and data.get("type") == "imageGeneration"):
                             self.images_made += 1
@@ -1773,9 +1485,7 @@ class _PipeTurn:
                                 async for chunk in self.show_text(text):
                                     yield chunk
                         if stream == "assistant":
-                            # The `MEDIA:` lines the Gateway took out of the
-                            # text (ELI-328): a path is the run's stored
-                            # block, a bare name or URL is shown as its line.
+                            # `MEDIA:` lines the Gateway took out (ELI-328).
                             for url in _event_media_urls(data):
                                 if _is_gateway_media_name(url):
                                     self.gateway_media.add(url)
@@ -1784,21 +1494,15 @@ class _PipeTurn:
                                     async for chunk in self.show_text(f"\nMEDIA:{url}\n"):
                                         yield chunk
 
-                        # --- Tool call events ---
-                        # The cards come from `_TurnRenderer`, the same code a
-                        # turn writer shows them with (ELI-147): each event is
-                        # a Responses item Open WebUI folds into its own output
-                        # list, so a card is mutable and is never part of the
-                        # message text.
+                        # Tool cards are Responses items OWUI folds into its
+                        # output list, never part of the message text (ELI-147).
                         if stream == "tool":
                             events = [a for a in added if isinstance(a, dict)]
                             if phase == "start":
                                 pipe_log(f"  Tool start: {name}")
                                 await self.maybe_show_live_view(name, data.get("args"))
                                 if events and self.pending_media_text:
-                                    # The message item ends here, and with it
-                                    # any code span a held directive waited on
-                                    # (ELI-111): it shows before the card.
+                                    # A held directive's code span ends here (ELI-111).
                                     held, self.pending_media_text = self.pending_media_text, ""
                                     resolved = await self.settle_held_media(held)
                                     self.assistant_stream_text += held
@@ -1808,7 +1512,6 @@ class _PipeTurn:
                                 for event in events:
                                     yield event
                                 if events:
-                                    # Text after a tool call is a new message item.
                                     self.fence_item_start = len(self.assistant_stream_text)
 
                             elif phase == "result":
@@ -1822,19 +1525,15 @@ class _PipeTurn:
                                 if _is_background_agent_launch(name, _tool_result_text(data.get("result", {})),
                                                                data.get("isError") is True):
                                     self.background_agents += 1
-                                    # Until the reply ends: its usage rows replace it.
                                     await _emit_status(self.__event_emitter__,
                                                        _background_agents_line(self.background_agents))
 
-                        # --- The Pipe's own notes (ELI-197), compaction's
-                        # among them (ELI-283) ---
+                        # The Pipe's own notes (ELI-197), compaction's too (ELI-283).
                         if stream in (PIPE_NOTE_STREAM, COMPACTION_STREAM):
                             for event in (a for a in added if isinstance(a, dict)):
                                 yield event
-                            # Text after the note is a new message item.
                             self.fence_item_start = len(self.assistant_stream_text)
 
-                        # --- Item events (progress) ---
                         if stream == "item":
                             pipe_log(f"  Item: kind={data.get('kind','')} "
                                      f"status={data.get('status','')} "
@@ -1845,7 +1544,6 @@ class _PipeTurn:
                     raise
 
                 else:
-                    # Normal completion (no cancellation).
                     released = self.renderer.flush()
                     if released:
                         async for chunk in self.show_text(released):
@@ -1864,26 +1562,20 @@ class _PipeTurn:
                 _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
-            # The usage line is read while this reply still holds its
-            # consumer: dropping it closes a connection a redeploy retired,
-            # and a request sent then never gets its answer (#157 gate). The
-            # consumer is dropped even when a Stop lands during the read.
+            # Read the usage line while still holding the consumer: dropping it
+            # closes a retired connection and the request never answers (#157 gate).
             status_lines = []
             try:
                 if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
                     status_lines = await _build_usage_status_lines(
                         self.conn, self.session_key, run_usage=await self.own_run_usage())
             finally:
-                # A parked queue now belongs to whoever claims the run; releasing
-                # it here would drop the events it is buffering.
+                # A parked queue belongs to whoever claims the run.
                 if not self.turn.parked:
                     if (self.done and not self.aborted and self.our_run_id and not self.handed_over
                             and not self.steered_into):
-                        # The run ended in this reply. Its trailing `chat` final
-                        # lands after this consumer is gone and must not read as
-                        # "the reply ended before its run" (a handover would
-                        # rewrite the message OWUI is about to save) or as a run
-                        # nobody showed.
+                        # The run ended here: its trailing `chat` final must not
+                        # read as an early end or an unshown run.
                         self.conn.mark_delivered_live(self.session_key, self.our_run_id)
                         self.conn.unregister_run_target(self.session_key, self.our_run_id)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
@@ -1893,45 +1585,29 @@ class _PipeTurn:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
             elif status_lines:
-                # One `status` event per fact (context / rate-limit / goal) so
-                # each row stays inside OWUI's per-line clamp instead of one
-                # long combined line getting cut off. All of them already
-                # reflect final data by the time we get here (both RPCs in
-                # `_build_usage_status_lines` already completed) -- none of
-                # this is genuinely still "in progress", so every line is
-                # `done=True`. Marking earlier ones `done=False` made them
-                # shimmer for an instant before getting replaced by the last
-                # line, a visible flash for no reason.
+                # One `status` per fact, since OWUI clamps each to one line. All
+                # done=True: done=False made them shimmer before the last one.
                 for line in status_lines:
                     await _emit_status(self.__event_emitter__, line, done=True)
             else:
                 await _emit_status(self.__event_emitter__, "", done=True)
 
     async def on_steered(self, steered: dict) -> None:
-        """Continue the run this reply's message was steered into: its events
-        come to this reply's queue from here on, and what it sent before is the
-        earlier reply's, so its closing whole-text events are not shown again.
-        From a turn writer, those baselines come once it wrote the events
-        before the steer (`_turn_pump_loop`)."""
+        """Continue the run this message was steered into. What it sent before
+        belongs to the earlier reply, so its closing whole-text events are not
+        shown again."""
         run_text = steered.get("run_text")
         if isinstance(run_text, asyncio.Future):
             run_text = await run_text
         run_text = dict(run_text or {})
         earlier = run_text.pop("earlier", None)
-        # This reply's own run stays registered, steered, until its lone final
-        # (`_note_run_event`), so that final never reads as a run to write.
-        # The agent works on this message now: the reply reads like any whose
-        # run works, until its end replaces the line.
+        # Steered, its own run stays registered until its lone final.
         await _emit_status(self.__event_emitter__, "Thinking...", done=False)
-        # The reply that ended where this message went in, and this reply's
-        # own part of the transcript: both are settled from it once the run
-        # ends (`_settle_steered_replies`).
+        # Settled once the run ends (`_settle_steered_replies`).
         self.steered_earlier = steered.get("earlier") or earlier
         self.steered_span_run = self.our_run_id
         self.our_run_id = steered["run"]
         self.turn.run_id = self.our_run_id
-        # A turn writer that takes the rest over writes it into this reply's
-        # message, after what the earlier reply showed.
         self.conn.register_run_target(
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
             thinking=self.resolved_thinking, request_task_id=(self.__metadata__ or {}).get("task_id"),
@@ -1943,8 +1619,7 @@ class _PipeTurn:
         self.event_count = 0
 
     def steered_replies_before(self) -> list:
-        """The replies of the run this reply's message was steered into that
-        came before it, in order: each ended where a message went in."""
+        """Earlier replies of the run this message was steered into, in order."""
         earlier = getattr(self, "steered_earlier", None)
         if not earlier:
             return []
@@ -1963,8 +1638,7 @@ class _PipeTurn:
                 self.text_yielded = True
             self.done = True
         else:
-            # The reply continues in the run that continues
-            # this one: its events (held until now) and its end.
+            # Continue in the run that continues this one.
             _kind, new_run, new_queue = step
             self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
             self.queue, self.our_run_id = new_queue, new_run
@@ -1985,11 +1659,8 @@ class _PipeTurn:
                 "active response...",
                 done=False,
             )
-        # Read after this run was admitted, an idle session
-        # means it is over, whichever run settled last. That
-        # is the end signal once its own may have been lost
-        # in a gap. A row read before the admission shows
-        # nothing about it.
+        # An idle session read after admission means the run is over, whichever
+        # run settled last.
         admitted = msg.get("read_at", time.monotonic()) >= self.admitted_at
         if admitted and msg.get("resync"):
             self.signals_lost = True
@@ -1997,15 +1668,12 @@ class _PipeTurn:
         if row.get("hasActiveRun") is False and (
                 row.get("lastRunId") == self.our_run_id
                 or (admitted and self.signals_lost)):
-            # The run settled while its terminal event never
-            # reached this reply (dropped frame, socket gap).
-            # Its transcript has what was lost.
+            # Its terminal event never reached this reply; the transcript has it.
             pipe_log(f"  run settled (row status {row.get('status')}, "
                      f"last run {str(row.get('lastRunId'))[:24]}) without its final")
             tail = await self.settled_tail(row)
         elif row.get("hasActiveRun") and msg.get("resync") and admitted:
-            # After a gap the session is busy, maybe with a
-            # later run: this run's closer says it ended.
+            # The session is busy, maybe with a later run: only this run's closer says it ended.
             tail = await self.settled_tail(row, closer_only=True)
             if tail is not None:
                 pipe_log("  run closed in the transcript during a gap")
@@ -2019,10 +1687,8 @@ class _PipeTurn:
 
     def on_restart(self):
         """The Gateway process changed under the run."""
-        # A new Gateway process: the run may be recovered
-        # by it (a crash leaves its row `running`) or need
-        # a resume. Its row decides, in the turn writer,
-        # unless the reply `keeps_its_run`.
+        # A new Gateway process may recover the run or need a resume: its row
+        # decides in the turn writer, unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                 self.our_run_id, thinking=self.resolved_thinking, read_row=True):
             self.handed_over = self.done = self.turn.handed_over = True
@@ -2035,16 +1701,10 @@ class _PipeTurn:
 
     def on_gap(self):
         """Events were lost on the Gateway socket."""
-        # Events were lost on the Gateway socket. The turn
-        # writer rebuilds the message from the run's
-        # transcript, cards included, so the reply hands
-        # it over (ELI-147), with a copy of what it showed
-        # (it closes its own open cards next) and the
-        # events queued behind the gap. Its consumer goes
-        # before any await, so nothing later lands here.
-        # A reply that `keeps_its_run` keeps streaming, as
-        # does one with no message (an API request). What a
-        # gap lost there stays lost.
+        # The turn writer rebuilds the message from the transcript, so hand it
+        # over (ELI-147) with what it showed and the queued events. The consumer
+        # goes before any await. A reply that `keeps_its_run`, or has no
+        # message, keeps streaming and loses what the gap lost.
         self.signals_lost = True
         queued = []
         if not self.keeps_its_run and self.owui_message_id:
@@ -2067,16 +1727,10 @@ class _PipeTurn:
 
     def hand_over_after_kill(self, err, aborted_run) -> bool:
         """True when an outside kill or a shutdown abort took the run out of this reply."""
-        # DESIGN 2.7: an outside kill of the CLI, or an abort
-        # after a shutdown notice, may be continued by the
-        # Gateway (a `running` row) or by a resume. The reply
-        # decides neither: the turn writer takes the message
-        # and the settled row picks the owner. The row is
-        # read now too: its push can come before this
-        # reply reads the kill, with no pump to take it
-        # (ELI-159). Without a message to hand over, or in
-        # a reply that `keeps_its_run`, it ends here like
-        # any error.
+        # DESIGN 2.7: after an outside kill or a post-shutdown abort, the
+        # Gateway or a resume may continue the run, so the turn writer takes the
+        # message and the settled row picks the owner. Read the row now: its
+        # push can come before this reply reads the kill (ELI-159).
         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
             if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                     self.our_run_id, thinking=self.resolved_thinking, read_row=True):
@@ -2106,10 +1760,8 @@ class _PipeTurn:
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
-        # A run the Gateway refused before it started (an
-        # inline `/model` naming a model that is not allowed)
-        # says why only here (ELI-139). A thinking-level
-        # rejection is left to the retry below.
+        # A run refused before it started (an inline `/model` not allowed) says
+        # why only here (ELI-139).
         run_error = str(payload.get("errorMessage") or "").strip() \
             if state == "error" else ""
         if (run_error and not self.error_shown
@@ -2120,21 +1772,12 @@ class _PipeTurn:
             yield self.error_shown
 
     async def park(self, stop):
-        """OWUI ended this response; park the run (see below)."""
-        # OWUI ended this response: the Stop button, or Send now /
-        # interrupt, which stop it the same way and then send a
-        # new message. It arrives as a task cancel when we are
-        # awaiting, or as a generator close when we are suspended
-        # at a yield (OWUI busy with the last chunk), which is
-        # most of the time while text streams. Both paths land
-        # here, so neither loses the abort, the handover or the
-        # reply's own unsent message.
-        #
-        # Park first, synchronously: the run keeps going with its
-        # events buffered. On Send now it goes on in this reply's
-        # own message, through the turn writer (ELI-158); see
-        # `park_cancelled_turn`. The awaits after it may be
-        # interrupted themselves; nothing depends on them.
+        """OWUI ended this response: park the run."""
+        # Stop and Send now both end the response, as a task cancel or a
+        # generator close at a yield; both land here. Park first, synchronously:
+        # the run goes on with its events buffered, and on Send now continues
+        # in this message through the turn writer (ELI-158). The awaits after
+        # it may be interrupted themselves.
         self.aborted = True
         grace_s = float(getattr(self.pipe.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
         self.turn.parked = True
@@ -2170,23 +1813,12 @@ class _PipeTurn:
     async def finish_held_prompt(self):
         """The run ended with a needs-input prompt held back: ask it, or show it."""
         if self.pending_prompt_text:
-            # The buffered plain-text tail either fully resolved into a
-            # needs-input trigger (see `_could_be_user_input_prefix`
-            # above -- buffering only continues past the ambiguous
-            # prefix stage while it keeps matching) or the run ended
-            # mid-buffer without ever diverging. Either way, resolve it
-            # now that the full text is available. `maybe_answer_user_input`
-            # re-checks the trigger itself and returns False for a
-            # partial/non-match, in which case fall back to showing it
-            # as plain text so nothing is silently dropped.
+            # The held tail is a full trigger, or the run ended mid-buffer.
+            # `maybe_answer_user_input` re-checks; a non-match shows as text.
             answer_res = await self.maybe_answer_user_input(self.pending_prompt_text)
             if answer_res.handled:
-                # Answer delivered. Re-enter the main loop (via the outer
-                # `while adopt_new_run`) to consume the follow-up -- whether
-                # the run resumed in place (steer) or a new run was spawned
-                # -- so the continuation reuses the same needs-input
-                # re-detection, dedup and snapshot handling as any other
-                # run instead of a separate, drift-prone copy of the loop.
+                # Answered: the outer `while adopt_new_run` consumes the follow-up
+                # with the same loop, not a separate copy.
                 self.text_yielded = True
                 detail_block = ""
                 if answer_res.answer:
@@ -2201,7 +1833,6 @@ class _PipeTurn:
                 self.pending_prompt_text = ""
                 if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
                     pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
-                    # The answer run continues this reply.
                     self.switch_to_answer_run(answer_res)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
                     self.queue = answer_res.queue or self.conn.register_consumer(
@@ -2212,10 +1843,7 @@ class _PipeTurn:
                 self.done = False
                 self.adopt_new_run = True
             else:
-                # Modal not handled (cancelled / dismissed / gave up
-                # on reconnect). Show the prompt as a fallback, but
-                # never leak the literal "OpenClaw needs input:"
-                # directive line as visible text.
+                # Not handled: show the prompt as text, without the directive line.
                 fallback = _ask_user_fallback_text(self.pending_prompt_text)
                 self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                        self.pending_prompt_text, fallback)
@@ -2228,13 +1856,7 @@ class _PipeTurn:
     async def finish_held_media(self):
         """The run ended with a MEDIA: directive held back: resolve it now."""
         if self.pending_media_text:
-            # The run ended with a MEDIA: directive still buffered --
-            # either its filename never got a trailing whitespace
-            # before the stream closed, or "MEDIA:" itself was still
-            # incomplete. Nothing more is coming, so it's safe to
-            # resolve now; `_resolve_media_text` still falls back to
-            # showing it as plain text if resolution fails, so
-            # nothing is silently dropped.
+            # Nothing more is coming, so resolve it now; failure shows it as text.
             resolved = await self.settle_held_media(self.pending_media_text)
             self.record_visible_chunk(resolved)
             yield resolved
@@ -2251,11 +1873,9 @@ class _PipeTurn:
         return self.end_history
 
     async def finish_final_images(self):
-        """Show the images the run's stored messages carry as Gateway
-        `image` blocks: an agent's own image tool's (ELI-322), and each file
-        the reply named by path (ELI-328), whatever the model. A reply that
-        showed bare-name MEDIA: directives already has those images, so the
-        blocks are read for it only when it also named a path."""
+        """Show the Gateway `image` blocks of the run's stored messages: its
+        image tool's (ELI-322) and each path the reply named (ELI-328). Bare-name
+        MEDIA: images already showed."""
         if ((self.media_shown and not self.gateway_media) or self.handed_over or not self.our_run_id
                 or self.steered_into):
             return
@@ -2265,8 +1885,7 @@ class _PipeTurn:
         names = {os.path.basename(p) for p in self.gateway_media}
 
         def stored(hist):
-            # A file the Gateway could not store is an `attachment_error`
-            # block instead; only those of the paths named here count.
+            # A file the Gateway could not store is an `attachment_error` block.
             return (_history_image_blocks_for_run(hist, self.our_run_id),
                     [e for e in _history_media_errors_for_run(hist, self.our_run_id)
                      if os.path.basename(e) in names])
@@ -2300,22 +1919,11 @@ class _PipeTurn:
 
     async def close_open_cards(self):
         """Answer every tool card the run left open."""
-        # Resolve any tool call that was announced but never got a
-        # result (run cancelled, gateway dropped it, tool crashed).
-        # Its card is a spinner until something completes it, and
-        # OWUI's own "mark leftover in_progress items completed"
-        # sweep does NOT reliably reach this path, so close them
-        # here.
-        #
-        # A handed-over run is not over (its writer completes the
-        # cards from the renderer it was handed), but this
-        # request's output must still close them: Open WebUI's
-        # post-stream sweep executes every `function_call` of the
-        # stream that has no `function_call_output`, gets `Error:
-        # Tool "Bash" not found.` and sends that back as a new
-        # turn, whose stream then overwrites the writer's reply.
-        # Only the yielded items are
-        # closed; the handed renderer keeps the call open.
+        # Close every tool card left without a result: OWUI's own sweep does not
+        # reliably reach it. A handed-over run's cards must close here too:
+        # OWUI's post-stream sweep would run each open `function_call`, get
+        # `Error: Tool "Bash" not found.` and send that as a new turn over the
+        # writer's reply. The handed renderer keeps the call open.
         if not self.adopt_new_run:
             note = ("(interrupted -- the reply continues when the run resumes)"
                     if self.handed_over else TOOL_NO_RESULT_NOTE)
@@ -2325,30 +1933,24 @@ class _PipeTurn:
 
     @property
     def keeps_its_run(self) -> bool:
-        """The message holds more than this run: a Send now takeover (it owes
-        the user's message) or a continuation of an earlier reply's message.
-        The turn writer rebuilds from the run alone, so no handover (ELI-153)."""
+        """The message holds more than this run (a Send now takeover, or a
+        continued message): the turn writer rebuilds from the run alone, so no
+        handover (ELI-153)."""
         return bool(self.adopted_run_id or self._initial_visible_text)
 
     async def finish(self):
-        """After the run: the messages an adopted run held back, a queued message
-        taken back, a lost tail, the terminal snapshot, the title, and the
-        recovery or thinking retry of a reply with no text."""
+        """After the run: held messages, a queued message taken back, a lost
+        tail, the terminal snapshot, the title, and a textless reply's retry."""
         pipe_log(f"DONE -- {self.event_count} events processed, "
                  f"text yielded: {self.text_yielded}")
         if self.steered_into and not self.text_yielded and not self.aborted:
-            # A later message was steered into the run before it said anything
-            # here: the answer is in that message's reply.
+            # A later message was steered in first: the answer is in its reply.
             self.record_visible_chunk(REPLY_SENT_WITH_NEXT_NOTE)
             yield REPLY_SENT_WITH_NEXT_NOTE
             self.text_yielded = True
         if self.adopted_run_id and not self.aborted:
-            # The adopted run is over; now send the messages this reply owes
-            # (its own, plus any carried over from cancelled replies), in the
-            # same reply. The recursive call does the normal queue + send (it
-            # also waits out a subagent-yield gap if the run resumes), and
-            # owns the terminal snapshot, usage lines and auto-title. Seeding
-            # it with what streamed so far keeps that snapshot complete.
+            # The adopted run is over: send the owed messages via the recursive
+            # call, seeded with what streamed so far so its snapshot is complete.
             send_texts = list(self.turn.unsent)
             send_attachments = list(self.turn.attachments)
             pipe_log(
@@ -2359,8 +1961,7 @@ class _PipeTurn:
             if separator:
                 self.record_visible_chunk(separator)
                 yield separator
-            # From here the recursive reply owns them, and parks them itself
-            # if it is cancelled.
+            # The recursive reply owns them now.
             waiting, self.turn.waiting = self.turn.waiting, []
             self.turn.unsent = []
             self.turn.attachments = []
@@ -2377,14 +1978,11 @@ class _PipeTurn:
                     yield item
             return
         if self.handed_over:
-            # The turn writer owns the message now (DESIGN 2.6): no save of
-            # this request's part into it, and no recovery or retry of a
-            # reply that showed nothing (ELI-147).
+            # The turn writer owns the message now (DESIGN 2.6, ELI-147).
             return
         if (self.enqueued_not_started and not self.text_yielded and not self.aborted
                 and steers_mid_run_messages(self.conn.gateway_version)):
-            # Steered into a run no reply here shows (a wake, a reply another
-            # tab started): the agent has the message and answers it there.
+            # Steered into a run no reply here shows (a wake, another tab's).
             note = "_(Sent to the reply that was already running: the agent answers it there.)_"
             self.record_visible_chunk(note)
             yield note
@@ -2392,13 +1990,10 @@ class _PipeTurn:
         if (self.enqueued_not_started and not self.text_yielded and not self.aborted
                 and not self.adopted_run_id and self.session_runtime == "claude-cli"
                 and self.our_run_id and self.sent_texts):
-            # A run started between the idle read and the send (a sub-agent's
-            # parent resuming, a wake), and the Gateway queued this message
-            # behind it. claude-cli cannot run a queued turn: it fails with
-            # "Reply operation has no active tool authority snapshot" once the
-            # active run ends (the followup path binds no tool authority,
-            # ELI-87), so the message would be lost. Take it back while it is
-            # queued, wait for that run to settle, and send it again.
+            # A run started between the idle read and the send, and the Gateway
+            # queued this message behind it. claude-cli fails a queued turn
+            # ("no active tool authority snapshot", ELI-87), so take it back,
+            # wait for that run to settle, and send again.
             try:
                 await _run_request(
                     self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.our_run_id},
@@ -2433,28 +2028,20 @@ class _PipeTurn:
                 f"first_event_arrived={self.first_event_arrived} aborted={self.aborted}"
             )
 
-        # Terminal snapshot (ELI-57): the turn as it stands, written to the
-        # message (`save_end_snapshot`). Open WebUI's own end-of-reply save
-        # overwrites it; it shows when the reply never reaches that save
-        # (Open WebUI stopped mid-reply), until the orphan reconcile finishes
-        # the message, and to a chat read that spans that save (ELI-267). A
-        # mid-stream `replace` freezes the visible stream, so this is sent
-        # only at the end, when no deltas follow. Open WebUI writes it even
-        # for a `done: false` message and with no tab open.
+        # Terminal snapshot (ELI-57, `save_end_snapshot`): shows when the reply
+        # never reaches Open WebUI's own end save, and to a read spanning it
+        # (ELI-267). Only at the end: a mid-stream `replace` freezes the stream.
         if not self.aborted and self.text_yielded:
             await self.save_end_snapshot()
 
         if getattr(self, "steered_span_run", None) and not self.aborted:
-            # The run's live events give no point where this message went in
-            # on claude-cli (its commit can trail the answer's first delta);
-            # the transcript does.
+            # Only the transcript shows where this message went in on claude-cli.
             spawn_background(_settle_steered_replies(self.conn, self.session_key, [
                 *self.steered_replies_before(),
                 {"chat_id": self.owui_origin_chat_id, "message_id": self.owui_message_id,
                  "request_task_id": (self.__metadata__ or {}).get("task_id"),
                  "span_run": self.steered_span_run}]))
 
-        # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not self.aborted and self.text_yielded:
             spawn_background(
                 self.pipe._auto_title(
@@ -2465,23 +2052,19 @@ class _PipeTurn:
             )
 
         if not self.aborted and not self.text_yielded and self.error_shown:
-            # The error is the reply: nothing to recover, and no
-            # "no reply text" note under it.
+            # The error is the reply: nothing to recover.
             await self.maybe_emit_snapshot(force=True)
         elif not self.aborted and not self.text_yielded and self.renderer.silenced and any(
                 i.get("type") == "function_call" for i in self.renderer.output):
-            # The run said nothing on purpose after its tool calls: the cards
-            # are the reply (ELI-227).
+            # Silence after tool calls is on purpose: the cards are the reply (ELI-227).
             pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
                 self.body, recovered, self.resolved_thinking)
             if retry_body is not None:
-                # Learn from the rejection before retrying. The Gateway just
-                # named this model's real ladder, and it is the only place that
-                # truth is stated -- describe cannot supply it. Recording it
-                # here is what stops the next turn repeating this round trip.
+                # Record the ladder the Gateway just named before retrying:
+                # describe cannot supply it.
                 rejection = parse_thinking_rejection(recovered)
                 learned = None
                 if rejection:
@@ -2496,8 +2079,6 @@ class _PipeTurn:
                     f"thinking: Gateway rejected level {self.resolved_thinking!r} "
                     f"({recovered!r}); retrying once without an explicit level"
                 )
-                # Say only what was actually observed, never a cause that was
-                # not checked.
                 if learned:
                     supported = ", ".join(repr(lv) for lv in learned)
                     retry_note = (
@@ -2531,9 +2112,7 @@ class _PipeTurn:
                 yield recovered
                 await self.save_end_snapshot()
             else:
-                # No assistant text and preview recovery came up empty. Surface
-                # the run's REAL terminal state (from the gateway) instead of a
-                # scary generic "missing output event" placeholder.
+                # No text and nothing recovered: show the run's real terminal state.
                 reason = None
                 try:
                     desc = await self.conn.send_request(
@@ -2554,12 +2133,8 @@ class _PipeTurn:
                 await self.save_end_snapshot()
 
     async def _session_run_active(self) -> bool:
-        # Fast path: describe exposes a persisted `status`. When it names a
-        # live run state we're done. But describe.status flips to 'done'
-        # during a subagent-yield gap (the run is only suspended and will
-        # resume -- ELI-56), so a non-active status is NOT conclusive:
-        # confirm against sessions.list's authoritative hasActiveRun before
-        # treating the session as free to send into.
+        # describe.status flips to 'done' during a subagent-yield gap (ELI-56),
+        # so a non-active status is confirmed with sessions.list's hasActiveRun.
         try:
             desc = await self.conn.send_request(
                 "sessions.describe", dict(key=self.session_key), timeout=8
@@ -2567,39 +2142,25 @@ class _PipeTurn:
             row = desc.get("session") or {}
             status = row.get("status")
             self.session_runtime = (row.get("agentRuntime") or {}).get("id") or self.session_runtime
-            # Harvest the thinking ladder from the describe we are already
-            # making. This probe runs before every send, so the per-model
-            # validation below costs no extra round trip, and piggybacking
-            # rather than adding a describe of its own means the ladder can
-            # never be fresher or staler than the run state it was read
-            # alongside.
-            #
-            # Describe is a WEAK source and is treated as one. It resolves
-            # the ladder with no model catalog in scope, so for a
-            # catalog-gated model it reports the generic base profile
-            # rather than the truth -- live, it advertised all 8 levels for
-            # claude-cli/claude-opus-5, whose real ladder is ["off"]. Good
-            # enough to seed the dropdown; not good enough to clamp a send
-            # against once the Gateway itself has ruled.
+            # Harvest the ladder from this describe at no extra cost. It is a
+            # weak source: with no model catalog it overreports (all 8 levels
+            # for claude-cli/claude-opus-5, real ladder ["off"]). Good for the
+            # dropdown, not for clamping once the Gateway has ruled.
             self.session_model_key = _session_model_key(row)
             ladder = _session_thinking_ladder(desc)
             if ladder:
                 self.session_thinking_ladder = ladder
                 if (self.session_model_key, ladder) != self._ladder_recorded:
-                    # Marked only once the cache holds it, so a failed write
-                    # is retried by the next probe instead of skipped.
+                    # Marked only once cached, so a failed write is retried.
                     if _record_thinking_ladder(
                             ladder, model_key=self.session_model_key,
                             state_dir=getattr(self.pipe.valves, "STATE_DIR", "")):
                         self._ladder_recorded = (self.session_model_key, ladder)
-            # The row's own run facts: `hasActiveRun` (the Gateway's aggregate
-            # flag) or a non-empty `activeRunIds`, as well as the status. There
-            # is no `activeRunId`.
+            # There is no `activeRunId`.
             if row.get("hasActiveRun") or row.get("activeRunIds") or status in _ACTIVE_RUN_STATES:
                 return True
         except Exception as ex:
-            # Describe failed: fall back to the list probe below, and if
-            # that also fails, to the (per-worker, possibly-blind) registry.
+            # Fall back to the list probe, then to the per-worker registry.
             pipe_log(f"  active-check describe failed: {ex}")
             status = None
         list_active = await _session_list_active(self.conn, self.session_key, missing=None)
@@ -2612,15 +2173,9 @@ class _PipeTurn:
                 )
             return active
         if self.conn.reconnecting:
-            # Neither probe reached the Gateway, so its run state is unknown,
-            # and the registry below cannot stand in for it: a run the turn
-            # writer holds is not in it, so it would say idle, and a queued
-            # message would be sent into the dead socket and lost (ELI-199).
-            # Wait for the reconnect as a turn that needs the connection
-            # (ensure_connected: the loop tries at once, then every second
-            # through a Gateway that refuses connections), then read again. A
-            # message that reached this check just before the drop was seen
-            # used to wait passively, while the loop backed off to 30 s.
+            # Neither probe reached the Gateway, and the registry would say idle
+            # for a run the turn writer holds, sending into a dead socket
+            # (ELI-199). Wait for the reconnect, then read again.
             pipe_log("  active-check: the Gateway socket is reconnecting; "
                      "waiting for it before deciding")
             await self.conn.ensure_connected()
@@ -2635,13 +2190,12 @@ class _PipeTurn:
         spawn_background(self.conn.push_row(self.session_key))
 
     async def owner_step(self, row: dict):
-        """One row while the reply waits for its run's owner (DESIGN 2.7):
-        ("switch", run, queue) to continue in the Gateway's recovery run
-        or a resume sent here, ("end", note) to finish, None to wait."""
+        """One row while waiting for the run's owner (DESIGN 2.7): ("switch",
+        run, queue), ("end", note), or None to wait."""
         decision = next_continuation(row, self.owner_notice_before, self.owner_resumes)
         if decision == "gateway":
-            # The Gateway recovers it as a run whose turn names this one
-            # (rule E); until that turn is committed, the next row looks again.
+            # Recovered as a run whose turn names this one (rule E); until it is
+            # committed, the next row looks again.
             try:
                 messages = (await self.conn.session_history(self.session_key, limit=50,
                                                        max_chars=200)).get("messages") or []
@@ -2683,9 +2237,8 @@ class _PipeTurn:
         return ("end", None)
 
     async def own_run_usage(self) -> dict | None:
-        """This reply's run's last-call usage for its context line: from its
-        `chat` final, else from its own messages in the transcript (the final
-        may come after the run's lifecycle end has ended the reply)."""
+        """The run's last-call usage: from its `chat` final, else its transcript
+        messages (the final may come after the reply ended)."""
         if self.run_usage or not self.our_run_id:
             return self.run_usage
         try:
@@ -2699,9 +2252,8 @@ class _PipeTurn:
         return usage
 
     async def recover_from_transcript(self) -> str | None:
-        """The run's text read back: by its run id, else by its user text,
-        which only a run seen here may use. With nothing of it seen, the
-        session's last reply may be another run's."""
+        """The run's text read back by run id, else by user text (only for a run
+        seen here: otherwise the last reply may be another run's)."""
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
             found, whole = _history_text_for_run(hist, self.our_run_id)
@@ -2715,11 +2267,9 @@ class _PipeTurn:
         return await _recover_turn_text(self.conn, self.session_key, self.text)
 
     async def settled_tail(self, row: dict, closer_only: bool = False) -> str | None:
-        """What this reply still owes once its run settled with no final
-        event here: the run's text after what arrived (its closing message
-        in the transcript), or, for a run that showed nothing, why.
-        `closer_only`: the session is busy, maybe with a later run, so
-        only this run's own closer says it ended; None without one."""
+        """What this reply still owes once its run settled with no final here:
+        the text after what arrived, or why nothing showed. `closer_only`:
+        only this run's own closer counts; None without one."""
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
         except Exception as ex:
@@ -2762,11 +2312,8 @@ class _PipeTurn:
         self.last_snapshot_time = now
 
     async def save_end_snapshot(self):
-        """The terminal snapshot: the reply as it stands, saved to its message
-        before Open WebUI's own end-of-reply save. With Open WebUI's live copy
-        of the reply's output, its text and its tool cards in one write, so a
-        chat read that spans that save shows the cards too (ELI-267); with no
-        live copy, the text alone, as a `replace`."""
+        """Save the reply as it stands before Open WebUI's end save, cards
+        included via the live output copy (ELI-267), else text alone."""
         output = await _live_output(self.__request__, self.owui_origin_chat_id, self.owui_message_id)
         if output is None:
             await self.maybe_emit_snapshot(force=True)
@@ -2777,12 +2324,8 @@ class _PipeTurn:
         self.last_snapshot_time = time.time()
 
     async def maybe_answer_user_input(self, prompt_text: str) -> UserInputResult:
-        """Ask the user via an OWUI modal and deliver their answer.
-
-        See UserInputResult for the meaning of the return value. Crucially,
-        a delivered answer that steers the *same* run (no new runId) still
-        returns handled=True, so the caller suppresses the raw prompt text
-        instead of leaking it into the chat.
+        """Ask via an OWUI modal and deliver the answer (see UserInputResult).
+        An answer steered into the same run still returns handled=True.
         """
         if not _is_user_input_prompt(prompt_text):
             return UserInputResult(False, None)
@@ -2805,9 +2348,7 @@ class _PipeTurn:
             answer = None
         if answer is None:
             pipe_log("  user input modal cancelled or empty answer")
-            # The reply tells the user not to type a secret into the chat, so
-            # the agent is told nothing came, once per reply: an agent that
-            # asks again gets the text alone.
+            # The agent is told once per reply that the secret never came.
             if not _is_secret_prompt(prompt_text) or self.secret_not_received_sent:
                 return UserInputResult(False, None)
             self.secret_not_received_sent = True
@@ -2818,10 +2359,8 @@ class _PipeTurn:
         # The answer continues this reply: its run id names it (ELI-100 2.2).
         idempotency_key = (pipe_run_id(self.chat_id, self.owui_message_id, "input") if self.owui_message_id
                            else f"user-input-{self.chat_id}-{time.time()}")
-        # Listen before sending, as for the first send: the answer run's
-        # first events can arrive before chat.send returns, and with no
-        # consumer and no target they would open a second writer on this
-        # reply's message.
+        # Listen before sending: with no consumer, early events would open a
+        # second writer on this reply's message.
         answer_queue = self.conn.register_consumer(self.session_key, idempotency_key)
         self.conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key, shown=False)
 
@@ -2841,8 +2380,7 @@ class _PipeTurn:
                 timeout=30,
             )
         except Exception as ex:
-            # Delivery failed: report not-handled so the caller falls back
-            # to showing the prompt text (better than a silent stall).
+            # Not handled, so the caller shows the prompt text.
             pipe_log(f"  sending answer back failed: {ex}")
             unlisten()
             return UserInputResult(False, None)
@@ -2861,17 +2399,14 @@ class _PipeTurn:
                                queue=answer_queue)
 
     def switch_to_answer_run(self, answer_res: UserInputResult) -> None:
-        """The reply continues in the answer run. Its target moved before the
-        send when its consumer was registered then; the question run was
-        shown to its end either way."""
+        """Continue the reply in the answer run."""
         if answer_res.queue is not None:
             self.conn.mark_delivered_live(self.session_key, self.our_run_id)
         else:
             self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
 
     async def maybe_show_live_view(self, tool_name, args):
-        """Adds LIVE_VIEW_URL to this reply as an embed, once, at its first
-        browser tool call. Open WebUI saves it with the message."""
+        """Embed LIVE_VIEW_URL once, at the first browser tool call."""
         if getattr(self, "live_view_shown", False) or not self.__event_emitter__:
             return
         meta = self.__metadata__ or {}
@@ -2889,22 +2424,16 @@ class _PipeTurn:
             pipe_log(f"  live view embed failed: {ex!r}")
 
     async def show_text(self, text: str):
-        """New run text from the renderer, assistant or item alike, through
-        the reply's text hooks: held while it may open a needs-input prompt
-        (resolved when the run ends), held while a `MEDIA:` filename is still
-        arriving, and a complete directive shown as its image."""
-        # A fence the shown text of this message item left open makes a
-        # marker a quote (ELI-107), and a marker only opens a line; held text
-        # always starts outside a fence. A fence never spans items.
+        """New run text through the reply's text hooks: held while it may open
+        a needs-input prompt or a `MEDIA:` filename is arriving."""
+        # In an open fence a marker is a quote (ELI-107). A fence never spans items.
         shown = self.assistant_stream_text[self.fence_item_start:] + self.pending_media_text
         text, self.pending_prompt_text = _advance_input_prompt_buffer(
             self.pending_prompt_text, text, _fence_open_after(shown),
             at_line_start=not shown or shown.endswith("\n"))
         if not text:
             return
-        # A directive split across deltas is held until its filename is
-        # complete (`_advance_media_buffer`); one quoted in code is text
-        # (ELI-111), by the shown text of this item.
+        # A split directive is held until complete; one in code is text (ELI-111).
         text, self.pending_media_text = _advance_media_buffer(
             self.pending_media_text, text, self.assistant_stream_text[self.fence_item_start:])
         if not text:
@@ -2913,21 +2442,17 @@ class _PipeTurn:
         shown_as = text
         if "MEDIA:" in text:
             shown_as = await self.settle_held_media(text)
-        # The raw text sets the code state of what follows (ELI-111).
         self.assistant_stream_text += text
         self.record_visible_chunk(shown_as)
         yield shown_as
-        # No `replace` snapshot per plain delta: a mid-stream one freezes the
-        # visible stream. Open WebUI keeps the in-flight text itself.
+        # No `replace` per delta: a mid-stream one freezes the visible stream.
         if shown_as is not text:
             await self.maybe_emit_snapshot()
 
     async def settle_held_media(self, held: str) -> str:
-        """Text `_advance_media_buffer` held, once its message item ends:
-        resolved as a whole, a directive quoted in code left as text
-        (ELI-111), and recorded for a writer that takes the reply over. A
-        directive naming a path is taken out: its image is the run's stored
-        block, shown when the run ends (ELI-328)."""
+        """Resolve held `MEDIA:` text once its message item ends; one in code
+        stays text (ELI-111). A path directive is dropped: its image is the
+        run's stored block (ELI-328)."""
         ctx = self.assistant_stream_text[self.fence_item_start:]
         text, paths = _take_gateway_media(held, ctx)
         self.gateway_media.update(paths)
