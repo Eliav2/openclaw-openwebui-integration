@@ -152,7 +152,7 @@ Folder mutes are kept like chat mutes, in the `folder_mutes` user valve (`{folde
 
 The ⋯ menu items are added the same way as [Mark as read](#mark-a-chat-read-from-the-chat-list): to Open WebUI 0.13.0's menus, found by their structure and the "Mark as unread" or "Mark all as read" icon. A menu drawn differently gets nothing, and the console says once which menu it did not recognise (except on a folder's page, where its ⋯ cannot be told from the page's other menus, such as the icon picker: there it is only left alone); Open WebUI's own items are never changed, and ours come back if Open WebUI redraws the menu while it is open.
 
-The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two devices changing them in the same instant can lose one change (see [Known limits](#known-limits)).
+The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two changes at the same time can lose one of them (see [Known limits](#known-limits)).
 
 ### iPhone and iPad
 
@@ -162,7 +162,7 @@ The bell and the Mute button read all your user valves and write them back with 
 
 ## Known limits
 
-- **Two devices changing mutes at the same moment can lose one change.** The bell, the menus and the notification's Mute button read your user valves and write them all back with one change, because Open WebUI's user-valve update replaces the whole set. Two such writes within about 100 ms of each other keep only the later one; change it again.
+- **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your user valves and write them all back with their one change, because Open WebUI's user-valve update replaces the whole set. If a second change reads them before the first one's write has landed, the second write puts back the old value of the first: the two read-and-write round trips overlap, so how long the window lasts depends on the network (longer on a slow phone connection). Any two writers can do this: two devices, two tabs, or a notification's Mute button next to an open tab. If a mute did not stick, change it again.
 
 ## Turning it off
 
