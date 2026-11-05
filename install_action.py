@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import time
+from http import HTTPStatus
 
 from install import FUNCTION_ID as PIPE_FUNCTION_ID
 from install import ROOT, FunctionSpec, fail, function_cli, get_valves, info, post_valves
@@ -63,7 +64,7 @@ def smoke_test(client) -> bool:
          "id": f"install-smoke-msg-{stamp}", "session_id": "install-smoke"},
         timeout=30,
     )
-    if status != 200 or not isinstance(payload, dict) or "status" not in payload:
+    if status != HTTPStatus.OK or not isinstance(payload, dict) or "status" not in payload:
         fail(f"Smoke test: unexpected response: {payload}")
         return False
     info(f"Smoke test reached the Action (status={payload.get('status')!r})")

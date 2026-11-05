@@ -13,10 +13,14 @@ cd openclaw-openwebui-integration
 uv run --with-requirements requirements-dev.txt pytest -q   # unit tests, no setup needed
 uvx ruff@0.17.0 check .                                      # lint, as CI runs it
 python3 build.py --check-all                                 # the built files match src/
+python3 scripts/magic_baseline.py                            # no new magic number or string in a comparison
+scripts/lint-js/run.sh                                       # the same for JavaScript and TypeScript
 
 bun install
 bun run docs:build                                           # docs site, fails on a dead link
 ```
+
+Literals that carry meaning get a name (`AGENTS.md`, "No magic numbers or strings"); CI fails on a new one.
 
 `openclaw_pipe.py`, `openclaw_status_action.py` and `openclaw_thinking_filter.py` are built from `src/openclaw_pipe_pkg/`. Edit the source there, then run `python3 build.py --all`.
 

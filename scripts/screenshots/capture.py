@@ -41,6 +41,7 @@ DESKTOP = {"viewport": {"width": 1280, "height": 800}, "device_scale_factor": 2}
 # A small phone (iPhone SE): the Status dialog outgrows it and scrolls.
 SMALL_PHONE = {**PHONE, "viewport": {"width": 375, "height": 667}}
 TURN_TIMEOUT_MS = 150_000
+TWO_REPLIES = 2   # the first answer and the follow-up's
 
 DENY = [re.compile(p, re.I) for p in (
     r"\be2e(\b|_)", r"\btest(s|ing)?\b", r"\bfake\b", r"\bdemo\b", r"\blorem\b", r"@",
@@ -1227,7 +1228,7 @@ class Scenes:
             replies = sorted((m for m in msgs.values() if m.get("role") == "assistant"),
                              key=lambda m: m.get("timestamp") or 0)
             last = [(m.get("done"), (m.get("content") or "")[-60:]) for m in replies]
-            if (len(replies) >= 2 and all(m.get("done") is True for m in replies)
+            if (len(replies) >= TWO_REPLIES and all(m.get("done") is True for m in replies)
                     and "The cache is rebuilt" in (replies[0].get("content") or "")
                     and "It's on main" in (replies[-1].get("content") or "")
                     and "The cache is rebuilt" not in (replies[-1].get("content") or "")):
@@ -1379,7 +1380,7 @@ class Scenes:
             root = post(self.token, f"<@M:{MODEL}|OpenClaw> which of the two works for everyone, given Noa's train?")
             poll(answers, lambda a: len(a) >= 1, "the answer in the thread", TURN_TIMEOUT_MS / 1000)
             post(dana, "Perfect, Saturday it is. And what should we bring?", root)
-            poll(answers, lambda a: len(a) >= 2, "the answer to the follow-up", TURN_TIMEOUT_MS / 1000)
+            poll(answers, lambda a: len(a) >= TWO_REPLIES, "the answer to the follow-up", TURN_TIMEOUT_MS / 1000)
             page.goto(f"{BASE}/channels/{cid}")
             page.wait_for_selector("#chat-input", timeout=60_000)
             dismiss_popups(page)

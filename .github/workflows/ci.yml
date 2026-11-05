@@ -29,6 +29,14 @@ jobs:
       - name: Ruff (correctness rules, see ruff.toml)
         run: uvx ruff@0.17.0 check --output-format github .
 
+      - name: No new magic numbers or strings (Python, baseline in scripts/magic-baseline.json)
+        run: python3 scripts/magic_baseline.py
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: No new magic numbers or strings (JS and TS, baseline in scripts/lint-js)
+        run: scripts/lint-js/run.sh
+
       - name: Shell scripts
         run: shellcheck e2e/*.sh scripts/screenshots/*.sh
 

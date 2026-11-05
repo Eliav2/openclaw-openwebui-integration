@@ -64,6 +64,8 @@ LEGACY_PRESETS = {
     "glm": "openrouter/z-ai/glm-5.2",
 }
 
+# A date stamp (20250514) is not a version part; a real one is at most this many digits.
+MAX_VERSION_PART_DIGITS = 3
 _CLAUDE_FAMILY_RE = re.compile(r"claude-(opus|sonnet|haiku)-([0-9][0-9-]*)")
 
 
@@ -85,7 +87,7 @@ def _claude_family(key: str):
     m = _CLAUDE_FAMILY_RE.search(_model_name(key))
     if not m:
         return None
-    parts = [int(p) for p in m.group(2).split("-") if p.isdigit() and len(p) <= 3]
+    parts = [int(p) for p in m.group(2).split("-") if p.isdigit() and len(p) <= MAX_VERSION_PART_DIGITS]
     return m.group(1), tuple(parts)
 
 

@@ -28,6 +28,7 @@ import difflib
 import sys
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,7 +105,7 @@ def main() -> int:
             with urllib.request.urlopen(url, timeout=30) as resp:
                 upstream_src = resp.read().decode()
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+            if exc.code == HTTPStatus.NOT_FOUND:
                 continue  # an older ref without this module
             print(f"could not fetch {url}: {exc}", file=sys.stderr)
             return 2

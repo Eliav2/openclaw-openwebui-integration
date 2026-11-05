@@ -1,0 +1,49 @@
+{
+  "gateway-plugins/claude-cli-usage/index.js": {
+    "no-magic-numbers": {
+      "count": 3
+    },
+    "no-restricted-syntax": {
+      "count": 7
+    }
+  },
+  "gateway-plugins/claude-login/index.js": {
+    "no-magic-numbers": {
+      "count": 9
+    },
+    "no-restricted-syntax": {
+      "count": 4
+    }
+  },
+  "push/examples/cloudflare-worker/src/index.js": {
+    "no-restricted-syntax": {
+      "count": 2
+    }
+  },
+  "push/web/oc-push.js": {
+    "no-magic-numbers": {
+      "count": 10
+    },
+    "no-restricted-syntax": {
+      "count": 10
+    }
+  },
+  "push/web/oc-sw.js": {
+    "no-magic-numbers": {
+      "count": 4
+    },
+    "no-restricted-syntax": {
+      "count": 4
+    }
+  },
+  "scripts/owui_live_fold.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "scripts/screenshots/sample-usage/index.js": {
+    "no-magic-numbers": {
+      "count": 6
+    }
+  }
+}
