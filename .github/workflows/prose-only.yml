@@ -1,0 +1,33 @@
+name: Prose only
+
+# A PR labelled `prose-only` changes comments, docstrings and Markdown only:
+# every Python file it touches (src/, the built bundles, tests, scripts) has
+# the same AST once docstrings are dropped. Such a PR skips the live gate, so
+# this check must pass. Without the label it only reports.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  prose-only:
+    name: Prose only (AST unchanged)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compare the code with the base
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 'prose-only') }}
+        run: |
+          if python3 scripts/prose_only.py "origin/$BASE_REF"; then exit 0; fi
+          if [ "$LABELLED" = "true" ]; then
+            echo "::error::labelled prose-only, but code changed (above)"; exit 1
+          fi
+          echo "not labelled prose-only: reported only"
