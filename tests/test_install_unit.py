@@ -266,7 +266,10 @@ class UpdateValvesTests(unittest.TestCase):
     def _run(self, stored):
         owui = _FakeOwui([{"id": inst.FUNCTION_ID, "type": "pipe", "content": "pipe"}],
                          {inst.FUNCTION_ID: stored} if stored is not None else {})
-        inst.update_valves(owui, inst.Config(**self.CFG))
+        # The identity step generates keys and writes the local identity file; this test is about the switches.
+        from unittest import mock
+        with mock.patch.object(inst, "choose_identity", return_value={"id": "test-device"}):
+            inst.update_valves(owui, inst.Config(**self.CFG))
         return owui.valves[inst.FUNCTION_ID]
 
     def test_a_first_install_turns_the_switches_on(self):
