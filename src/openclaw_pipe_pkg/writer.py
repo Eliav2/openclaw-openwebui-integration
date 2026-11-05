@@ -2014,9 +2014,10 @@ class _RunPump:
         # message steered in later can take it over (`_GatewayConnection._steer`).
         self.started = False
         self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
-        # The run its writer shows, which a later message was steered into,
-        # ended cleanly: the next run's start settles it (`_turn_next_run`).
-        self.ended_clean = False
+        # The id of the run its writer shows, which a later message was steered
+        # into, once it ended cleanly: the next run's first event settles it
+        # (`_turn_next_run`).
+        self.ended_clean: str | None = None
 
 
 def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -2280,18 +2281,23 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
             pump.queue.put_nowait(("settled", row))
 
 
-def _turn_next_run(conn: "_GatewayConnection", session_key: str) -> None:
-    """A run of the session started, so every earlier one is over (a session
-    runs one at a time). The writers of a run a message was steered into,
-    which ended cleanly, end here from the transcript: when a message sent to
-    be steered missed the run and the Gateway ran it after (its follow-up
-    policy), the session's idle comes with no push (2026.10.10: that run's
-    last push is its `phase: end`, still `hasActiveRun: true`). As after a
-    clean own final (ELI-215), no row is waited for."""
-    for (sess, run), pump in list(conn._turn_pumps.items()):
-        if sess == session_key and pump.ended_clean:
-            pump.ended_clean = False
-            pipe_log(f"  next run started: run {run[:24]}... ends from the transcript")
+def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
+    """An event of a run of the session, so every other run before it is over
+    (a session runs one at a time). The writers of a run a message was steered
+    into, which ended cleanly, end here from the transcript: when a message
+    sent to be steered missed the run and the Gateway ran it after (its
+    follow-up policy), the session's idle comes with no push (2026.10.10: that
+    run's last push is its `phase: end`, still `hasActiveRun: true`, and a run
+    drained from the follow-up queue has no `phase: start` either). As after
+    a clean own final (ELI-215), no row is waited for. A terminal event starts
+    no run: a steered message's own lone final can come after the run's end."""
+    if _is_terminal_event(payload):
+        return
+    sess, run_id = payload.get("sessionKey"), payload.get("runId")
+    for (s, run), pump in list(conn._turn_pumps.items()):
+        if s == sess and pump.ended_clean and pump.ended_clean != run_id:
+            pump.ended_clean = None
+            pipe_log(f"  next run {str(run_id)[:24]}... started: run {run[:24]}... ends from the transcript")
             pump.queue.put_nowait(("settled", None))
 
 

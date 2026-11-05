@@ -1721,7 +1721,6 @@ _PUMP_STEERED_IN = "steered_in"
 # A run's clean end (its `chat` final or lifecycle end) and a run's start.
 _CHAT_FINAL = "final"
 _PHASE_END = "end"
-_PHASE_START = "start"
 
 
 def steers_mid_run_messages(version) -> bool:
@@ -3335,8 +3334,6 @@ class _GatewayConnection:
                 spawn_background(self._record_child_end(parent, key, {**payload, "key": key}))
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
-        elif _TURNS and key and payload.get("phase") == _PHASE_START:
-            _TURNS.next_run(self, key)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
@@ -4005,6 +4002,8 @@ class _GatewayConnection:
                 except Exception as ex:
                     pipe_log(f"  shadow renderer feed failed: {ex}")
 
+        if _TURNS and _evt_sess and _evt_run:
+            _TURNS.next_run(self, payload)
         consumers = self.consumers_for_event(payload)
 
         # ── ELI-100: a run no live request consumes is a turn ──
@@ -4066,10 +4065,10 @@ class _GatewayConnection:
             if pump is not None:
                 pump.terminal.set()
             if payload.get("state") == _CHAT_FINAL or (payload.get("data") or {}).get("phase") == _PHASE_END:
-                # Both writers end at the next run's start if no settle comes first.
+                # Both writers end at the next run's first event if no settle comes first.
                 for p in [pump, *(q.pump for q in consumer.queues)]:
                     if p is not None:
-                        p.ended_clean = True
+                        p.ended_clean = consumer.run_id
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
             self.unregister_run_target(consumer.session_key, consumer.run_id)
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
