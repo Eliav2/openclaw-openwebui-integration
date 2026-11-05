@@ -1125,6 +1125,38 @@ def test_a_network_change_during_the_first_load_still_opens_the_chat(owui, brows
             ctx.unroute(r, fail_once)
 
 
+def test_start_reads_cut_by_a_network_change_still_open_the_chat(owui, pw):
+    """Offline open on or off: Open WebUI's start reads cut once on their way (a change of network)
+    are asked once more (the service worker, or with offline open off the page script), and the
+    chat and the chat list open. Its own browser: nothing kept from other tests."""
+    chat, _ = new_chat(owui, "stub", "Chat Start Cut")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"{BASE}/c/{chat}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.evaluate(NO_API_CACHES)
+        cut = []
+        def cut_once(route):
+            if route.request.method != "GET" or route.request.url in cut:
+                return route.fallback()
+            cut.append(route.request.url)
+            route.abort("connectionreset")   # a request cut on its way, as a network change does
+        for r in BOOT_READS:
+            ctx.route(r, cut_once)
+        try:
+            page.reload()
+            page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+            page.get_by_text("Chat Start Cut").first.wait_for(timeout=WAIT_MS)
+            assert len(cut) == len(BOOT_READS), cut
+        finally:
+            for r in BOOT_READS:
+                ctx.unroute(r, cut_once)
+    finally:
+        ctx.close()
+
+
 def test_the_error_page_reloads_only_once(owui, browser):
     """The reload fails too: the page stays on the error page, and neither 'online' nor a
     network change reloads it again."""
