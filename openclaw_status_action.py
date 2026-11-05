@@ -2667,18 +2667,30 @@ class _RunQueue(asyncio.Queue):
         return items
 
 
-def _discards(consumer: "_Consumer") -> bool:
-    """`consumer` shows nothing: its queues only discard (`_DiscardQueue`)."""
-    return bool(consumer.queues) and all(isinstance(q, _DiscardQueue) for q in consumer.queues)
+def _feeds_writer(consumer: "_Consumer") -> bool:
+    """`consumer`'s queues go to a turn writer's pump (`_WriterQueue`)."""
+    return bool(consumer.queues) and all(isinstance(q, _WriterQueue) for q in consumer.queues)
 
 
-class _DiscardQueue(_RunQueue):
-    """Where a run's events go when nothing shows them: its message's reply
-    was steered on while a turn writer had it, which reads its answer from
-    the transcript (`_GatewayConnection._steer_handed_over`)."""
+class _WriterQueue(_RunQueue):
+    """Where a run's events go when a turn writer has the reply of the
+    message steered into it (`_GatewayConnection._steer_handed_over`): into
+    that writer's pump, which shows them live, after the baselines of the
+    reply before (`steered_in`). Other markers stay here: the writer ends from
+    the transcript when the session settles."""
+
+    def __init__(self, pump):
+        super().__init__()
+        self.pump = pump
 
     def put_nowait(self, item) -> None:
-        pass
+        if not isinstance(item, dict):
+            return
+        if item.get("_steered"):
+            self.pump.queue.put_nowait(("steered_in", item["_steered"]))
+        elif item.get("type") == "event":
+            self.pump.started = True
+            self.pump.queue.put_nowait(("event", item.get("payload") or {}))
 
 
 # Open WebUI's uvicorn Server, kept while it serves (see `owui_shutting_down`).
@@ -4018,9 +4030,10 @@ class _GatewayConnection:
             return False
         consumer.started = True
         consumer.ended = consumer.ended or terminal
-        if consumer.ended and _discards(consumer):
-            # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go,
-            # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
+        if consumer.ended and _feeds_writer(consumer):
+            # A turn writer shows the rest of its run (`_steer_handed_over`) and ends at the
+            # settle: the run's end lets it go, and a late event of it (its `chat` final
+            # after the lifecycle end) opens nothing.
             # Its writer's pump, which its events no longer reach, learns it ended: a
             # message committed before the settle is no steer into it (`_steer`).
             pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
@@ -4059,14 +4072,13 @@ class _GatewayConnection:
     def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
         """The steer target of a message whose reply a turn writer took over
         while it waited to be steered (a later message's Send now cancelled
-        its request, Eliav's chat c9dc45f0): the run's events stop reaching
-        its earlier reply at the commit and go nowhere until the next steer
-        (`_DiscardQueue`); both writers end from the transcript, split there.
-        None when no such writer waits."""
+        its request, Eliav's chat c9dc45f0): from the commit the run's events
+        go to that writer (`_WriterQueue`) until the next steer; both writers
+        end from the transcript, split there. None when no such writer waits."""
         pump = getattr(self, "_turn_pumps", {}).get((session_key, run_id))
         if pump is None or pump.started or not (pump.handover or {}).get("steer_pending"):
             return None
-        return _Consumer(session_key=session_key, run_id=run_id, queues=[_DiscardQueue()])
+        return _Consumer(session_key=session_key, run_id=run_id, queues=[_WriterQueue(pump)])
 
     def _steer(self, consumer: _Consumer, into: str | None = None) -> bool:
         """Switch the session's active run to the reply of `consumer`'s
@@ -4106,13 +4118,13 @@ class _GatewayConnection:
             earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
                                   "request_task_id": None, "span_run": run_id}
             run_text = asyncio.get_running_loop().create_future()
-            if not _discards(consumer):
-                pump.queue.put_nowait(("steered", run_text))
-            # Else (`_steer_handed_over`) the writer keeps M open: the run's
-            # events stop reaching it, and it ends when the session settles,
-            # from the transcript, which splits the run where it took the
-            # message in. Ended here, it would keep only what it streamed, which
-            # misses what an event gap (a socket drop) lost.
+            # A writer that has the steered reply (`_steer_handed_over`) gets
+            # the baselines only: M stays open, the run's events stop reaching
+            # it, and it ends when the session settles, from the transcript,
+            # which splits the run where it took the message in. Ended here,
+            # it would keep only what it streamed, which misses what an event
+            # gap (a socket drop) lost.
+            pump.queue.put_nowait(("baseline" if _feeds_writer(consumer) else "steered", run_text))
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
                 session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
         else:

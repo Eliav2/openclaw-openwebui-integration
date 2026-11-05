@@ -869,6 +869,16 @@ def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token)
         # The Gateway hands Claude Code the milk message once it took the
         # tomatoes one in, as live: after the tomatoes answer, in the same run.
         _until("the milk message in the turn", lambda: logged(f"injected {word}: 2"), timeout_s=60, every_s=0.2)
+        # W5's re-QA on 5246fcb: the tomatoes reply (its request cancelled by
+        # the milk's Send now) stayed blank until the run ended. The run still
+        # works here, and its answer is live under its message, which read as
+        # working until then.
+        _until("the tomatoes answer live under its message", lambda: f"tomatoes-{word}" in _output_text(
+            page.streamed(tomato)), timeout_s=60, every_s=0.2)
+        with page.cond:
+            lines = [(e.get("data") or {}).get("data") or {} for _t, e in page.events
+                     if e.get("message_id") == tomato and (e.get("data") or {}).get("type") == "status"]
+        assert {"description": "Thinking...", "done": False} in lines, lines
         open(done, "w").close()
         _until("all three replies done", lambda: all(
             _chat_messages(token, chat_id)[r].get("done") for r in (held, tomato, milk)))

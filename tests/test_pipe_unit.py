@@ -17265,12 +17265,19 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         q3 = conn.register_consumer(sk, self.R3)
 
         conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
-        self.assertTrue(host.queue.empty(), "the first reply ends from the transcript, not here")
+        kind, baseline = host.queue.get_nowait()
+        self.assertEqual(kind, "baseline", "the first reply only hands over what it showed")
+        self.assertTrue(host.queue.empty(), "and ends from the transcript, not here")
         with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()) as loop:
             await conn._dispatch_run_event(self._delta(self.R1, "tomato"))
         loop.assert_not_called()
         self.assertTrue(host.queue.empty(), "the tomato answer is not the first reply's")
-        self.assertTrue(tomato.queue.empty(), "tomato's writer reads its answer from the transcript")
+        # W5's re-QA on 5246fcb: tomato's reply stayed blank until the run
+        # ended. Its writer shows the answer live, from the commit on.
+        kind, steered = tomato.queue.get_nowait()
+        self.assertEqual(kind, "steered_in")
+        self.assertIs(steered["run_text"], baseline, "after what the first reply showed")
+        self.assertEqual(tomato.queue.get_nowait(), ("event", self._delta(self.R1, "tomato")["payload"]))
         self.assertEqual([k for k in conn._turn_pumps if k[1] == self.R1], [(sk, self.R1)],
                          "and no writer of its own")
 
@@ -17279,6 +17286,38 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         await conn._dispatch_run_event(self._delta(self.R1, "blue"))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R1)
         self.assertTrue(host.queue.empty(), "nothing of the run after the commit reached the first reply")
+        self.assertTrue(tomato.queue.empty(), "nor, after the next steer, tomato's")
+
+    async def test_a_turn_writer_that_hands_its_run_on_stays_open_and_the_next_shows_the_rest(self):
+        """The pumps' side of the steer above: the first reply's writer gives
+        its baselines and keeps going (it ends from the transcript at the
+        settle); tomato's writer starts after them and reads as working."""
+        conn, sk = self.conn, self.SK
+        host = openclaw_pipe._RunPump()
+        first = mock.Mock(chat_id=self.CHAT, message_id="w1", run_id=self.R1)
+        first.steered_away = lambda: {"received": "21-40", "stream": "21-40", "item": ""}
+        first.finalize, first.feed = mock.AsyncMock(), mock.AsyncMock()
+        host.writer, host.started = first, True
+        baseline = asyncio.get_running_loop().create_future()
+        host.queue.put_nowait(("baseline", baseline))
+        host.queue.put_nowait(("retired", None))
+        await openclaw_pipe._turn_pump_loop(conn, sk, self.R1, ("u1", self.CHAT), host)
+        self.assertEqual((await baseline)["stream"], "21-40")
+        first.finalize.assert_not_awaited()
+
+        tomato = openclaw_pipe._RunPump()
+        second = mock.Mock(chat_id=self.CHAT, message_id="w2", run_id=self.R2)
+        second.renderer = mock.Mock()
+        second.feed, second.working = mock.AsyncMock(), mock.AsyncMock()
+        tomato.writer = second
+        delta = self._delta(self.R1, " tomato")["payload"]
+        tomato.queue.put_nowait(("steered_in", {"run": self.R1, "run_text": baseline}))
+        tomato.queue.put_nowait(("event", delta))
+        tomato.queue.put_nowait(("retired", None))
+        await openclaw_pipe._turn_pump_loop(conn, sk, self.R2, ("u1", self.CHAT), tomato)
+        second.renderer.seed.assert_called_once_with({"received": "21-40", "stream": "21-40", "item": ""})
+        second.working.assert_awaited_once()
+        second.feed.assert_awaited_once_with(delta)
 
     async def test_a_run_whose_steered_reply_a_turn_writer_has_is_let_go_at_its_end(self):
         """The run's events after such a steer go nowhere until the next one;
@@ -17308,7 +17347,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             await conn._dispatch_run_event(self._final(self.R1, "21-40 tomato"))
             await self._spin()
         loop.assert_not_called()
-        self.assertTrue(host.queue.empty())
+        self.assertEqual([k for k, _ in host.queue._queue], ["baseline"], "only what it showed went to it")
 
     async def test_a_queued_message_committed_while_a_run_works_is_not_steered_into_it(self):
         """Sandbox e2e on the Send-now fix: "say blue" was sent to be steered,
@@ -17398,7 +17437,8 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             conn._on_session_message(self._commit(self.R2, "add tomatoes", into=self.R1)["payload"])
             self.assertIn(f"{sk}:{self.R1}", conn._consumers, "its commit takes the run")
             await conn._dispatch_run_event(self._delta(self.R1, "the list"))
-        self.assertTrue(host.queue.empty(), "the answer after the commit is not the first reply's")
+        self.assertEqual([k for k, _ in host.queue._queue], ["baseline"],
+                         "the answer after the commit is not the first reply's")
 
     async def test_a_retired_connection_closes_when_such_a_run_ends(self):
         """Review on #290: letting the run go was the connection's last

@@ -931,6 +931,13 @@ class _TurnWriter:
         self.handover_owed = True
         await self._stream()
 
+    async def working(self) -> None:
+        """M's message went into the running run: M reads like any reply whose
+        run works until its answer, and its end replaces the line."""
+        if self.opened:
+            emit = await self._emitter()
+            await emit({"type": "status", "data": {"description": "Thinking...", "done": False}})
+
     def _showable(self) -> bool:
         """Condition B: a tool call start, or text that is not a silent
         sentinel or a prefix of one. Whichever comes first."""
@@ -2375,6 +2382,23 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
+            if kind == "baseline":
+                # A message whose reply a turn writer has was steered into this
+                # run: that writer shows the rest after what M showed. M goes on
+                # and ends at the settle (`_steer`).
+                if not item.done():
+                    item.set_result(writer.steered_away() if writer is not None else None)
+                continue
+            if kind == "steered_in":
+                # M's message was steered into run `item["run"]`: its events come
+                # here from now on, after what the reply before showed.
+                run_text = item.get("run_text")
+                if isinstance(run_text, asyncio.Future):
+                    run_text = await run_text
+                if writer is not None:
+                    writer.renderer.seed(run_text)
+                    await writer.working()
+                continue
             if kind == "steered":
                 # A later message was steered into this run: M ends with what
                 # it streamed, and the rest goes to that message's reply,
