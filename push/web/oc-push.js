@@ -161,9 +161,13 @@
     hasDevices = parse(v.subscriptions, "[]").length > 0;
   }
 
+  async function loadFolders() {
+    folders = Object.fromEntries(((await call("/api/v1/folders/")) || []).map((f) => [f.id, f]));
+  }
+
   async function loadFolder(id) {
     const folder = (await call("/api/v1/chats/" + id))?.folder_id || null;
-    if (folder) folders = Object.fromEntries(((await call("/api/v1/folders/")) || []).map((f) => [f.id, f]));
+    if (folder) await loadFolders();
     chatFolder = { chat: id, folder };
   }
 
@@ -179,12 +183,20 @@
     });
     mutes = { ...mutes, [list]: parse(next[list], "{}") };
     drawBell();
+    window.ocPushMuted = { list, id, seconds };   // for tests and tools
   }
 
   const BELL = '<path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6 9v.75a8.967 8.967 0 0 1-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0"/>';
   const SLASH = '<path stroke-linecap="round" d="M3.5 3.5l17 17"/>';
-  const fmt = (until) => until === 0 ? "Muted" :
-    "Muted until " + new Date(until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  // In the user's locale; the day too when it is not today (an 8 hour mute set in the evening).
+  const CLOCK = { hour: "2-digit", minute: "2-digit" };
+  const MS_PER_S = 1000;
+  const fmt = (until) => {
+    if (until === 0) return "Muted";
+    const d = new Date(until * MS_PER_S);
+    const today = d.toDateString() === new Date().toDateString();
+    return "Muted until " + (today ? d.toLocaleTimeString([], CLOCK) : d.toLocaleString([], { weekday: "short", ...CLOCK }));
+  };
 
   const folderName = (id) => folders[id]?.name || "this folder";
   // What the bell says: the chat's own mute first, else its folder's.
@@ -206,64 +218,95 @@
     b.querySelector("svg").innerHTML = BELL + (muted === null ? "" : SLASH);
   }
 
-  function menu(b) {
-    document.getElementById("oc-push-mute-menu")?.remove();
-    const id = b.dataset.chat;
+  // The mute menu, under `anchor` (a DOMRect): the chat's own mute and its
+  // folder's (`chat`), or only a folder's (`folder`). It opens in the browser's
+  // top layer (a popover), so no toast or dialog of Open WebUI can sit over it
+  // and take a tap meant for it; elsewhere it gets the highest z-index.
+  const GUTTER = 8;   // px kept free at the screen's edges, as Open WebUI's own menus do
+  const GAP = 6;      // px between the anchor and the menu
+  const KEYDOWN = "keydown", RTL = "rtl", TEXT = "string";
+  const TOP_LAYER = "2147483647";
+  const MENU_ID = "oc-push-mute-menu";
+  let closedBy = null;   // what the press that last closed the menu landed on
+  function muteMenu(anchor, { chat = null, folder = null } = {}) {
+    document.getElementById(MENU_ID)?.remove();
     const m = document.createElement("div");
-    m.id = "oc-push-mute-menu";
+    m.id = MENU_ID;
     m.setAttribute("role", "menu");
-    m.dir = document.documentElement.dir || "auto";
-    const r = b.getBoundingClientRect();
-    const rtl = getComputedStyle(b).direction === "rtl";
+    const dir = document.documentElement.dir || "ltr";
+    m.dir = dir;
     const dark = document.documentElement.classList.contains("dark");
-    m.style.cssText = "position:fixed;z-index:10000;min-width:170px;padding:4px;border-radius:12px;" +
+    m.style.cssText = "position:fixed;inset:auto;margin:0;border:0;z-index:" + TOP_LAYER + ";min-width:170px;" +
+      "max-width:calc(100vw - " + GUTTER + "px - " + GUTTER + "px);padding:4px;border-radius:12px;" +
       `font:14px system-ui,sans-serif;background:${dark ? "#222" : "#fff"};color:${dark ? "#eee" : "#111"};` +
-      "box-shadow:0 4px 16px #0003;" + `top:${Math.round(r.bottom + 6)}px;` +
-      (rtl ? `left:${Math.round(r.left)}px` : `right:${Math.round(innerWidth - r.right)}px`);
-    const head = (text) => {
-      const h = document.createElement("div");
-      h.textContent = text;
-      h.style.cssText = "padding:6px 10px;opacity:.6;font-size:12px";
+      "box-shadow:0 4px 16px #0003;";
+    // A line of text; a folder's name is isolated (<bdi>), so a Hebrew name keeps
+    // its own direction inside the sentence and the punctuation stays outside it.
+    const line = (parts, el) => {
+      for (const p of parts) {
+        if (typeof p === TEXT) el.append(p);
+        else { const b = document.createElement("bdi"); b.textContent = p.name; el.append(b); }
+      }
+      return el;
+    };
+    const head = (...parts) => {
+      const h = line(parts, document.createElement("div"));
+      h.style.cssText = "padding:6px 10px;opacity:.6;font-size:12px;overflow-wrap:anywhere";
       m.appendChild(h);
     };
-    const item = (text, list, target, seconds) => {
-      const i = document.createElement("button");
+    const item = (parts, list, target, seconds) => {
+      const i = line(parts, document.createElement("button"));
       i.setAttribute("role", "menuitem");
-      i.textContent = text;
-      i.style.cssText = "display:block;width:100%;text-align:start;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:8px;cursor:pointer";
+      i.style.cssText = "display:block;width:100%;text-align:start;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:8px;cursor:pointer;overflow-wrap:anywhere";
       i.onclick = async () => {
         close();
         await setMute(list, target, seconds).catch(() => notice("Could not change notifications."));
       };
       m.appendChild(i);
     };
-    const own = until(CHATS, id);
-    head(own === null ? "This chat: notifications on" : "This chat: " + fmt(own));
-    for (const [text, s] of MUTE_FOR) item("Mute " + text, CHATS, id, s);
-    if (own !== null) item("Unmute", CHATS, id, null);
-    // The chat's folder: mute it (and the folders inside it), or unmute the
-    // folder that mutes it, which may be one above.
-    const folder = chatFolder.chat === id ? chatFolder.folder : null;
+    const name = (id) => ({ name: folderName(id) });
+    if (chat) {
+      const own = until(CHATS, chat);
+      head(own === null ? "This chat: notifications on" : "This chat: " + fmt(own));
+      for (const [text, s] of MUTE_FOR) item(["Mute " + text], CHATS, chat, s);
+      if (own !== null) item(["Unmute"], CHATS, chat, null);
+    }
+    // The folder: mute it (and the folders inside it), or unmute the folder
+    // that mutes it, which may be one above.
     if (folder) {
       const by = mutedFolder(folder);
-      const sep = document.createElement("hr");
-      sep.style.cssText = "margin:4px 0;border:0;border-top:1px solid currentColor;opacity:.15";
-      m.appendChild(sep);
-      head("Folder " + folderName(folder) + ": " + (by ? fmt(until(FOLDERS, by)) + (by === folder ? "" : " (by " + folderName(by) + ")") : "notifications on"));
-      for (const [text, s] of MUTE_FOR) item("Mute folder " + text, FOLDERS, folder, s);
-      if (by) item("Unmute folder " + folderName(by), FOLDERS, by, null);
+      if (chat) {
+        const sep = document.createElement("hr");
+        sep.style.cssText = "margin:4px 0;border:0;border-top:1px solid currentColor;opacity:.15";
+        m.appendChild(sep);
+      }
+      head("Folder ", name(folder), ": ", ...(by ? [fmt(until(FOLDERS, by)), ...(by === folder ? [] : [" (by ", name(by), ")"])] : ["notifications on"]));
+      for (const [text, s] of MUTE_FOR) item(["Mute folder " + text], FOLDERS, folder, s);
+      if (by) item(["Unmute folder ", name(by)], FOLDERS, by, null);
     }
     const away = (e) => {
-      if (e.type === "keydown" ? e.key === "Escape" : !m.contains(e.target) && !b.contains(e.target)) close();
+      if (e.type === KEYDOWN ? e.key === "Escape" : !m.contains(e.target)) { closedBy = e.target; close(); }
     };
     function close() {
       m.remove();
       removeEventListener("pointerdown", away, true);
       removeEventListener("keydown", away, true);
     }
-    addEventListener("pointerdown", away, true);
-    addEventListener("keydown", away, true);
+    // After this press (the one that opened it) has finished.
+    setTimeout(() => { addEventListener("pointerdown", away, true); addEventListener("keydown", away, true); });
     document.body.appendChild(m);
+    if (m.showPopover) { m.popover = "manual"; m.showPopover(); }
+    // Below the anchor, toward the start of the line; inside the screen with a gutter,
+    // and above the anchor when there is no room below.
+    const w = m.offsetWidth, h = m.offsetHeight;
+    const rtl = getComputedStyle(m).direction === RTL;
+    const clamp = (v, max) => Math.max(GUTTER, Math.min(v, max - GUTTER));
+    const left = clamp(rtl ? anchor.left : anchor.right - w, innerWidth - w);
+    const below = anchor.bottom + GAP;
+    const top = below + h <= innerHeight - GUTTER ? below : clamp(anchor.top - GAP - h, innerHeight - h);
+    m.style.left = Math.round(left) + "px";
+    m.style.top = Math.round(top) + "px";
+    return m;
   }
 
   // First in the header's right-hand controls (before the chat menu ⋯, which
@@ -286,7 +329,11 @@
     b.className = menuButton?.className || HEADER_BUTTON;
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" style="width:1.125rem;height:1.125rem"></svg>';
     // The chat may have moved to another folder since: read it again first.
-    b.onclick = (e) => { e.stopPropagation(); loadFolder(id).catch(() => {}).then(() => menu(b)); };
+    b.onclick = (e) => {
+      e.stopPropagation();
+      if (closedBy && b.contains(closedBy)) { closedBy = null; return; }   // that press closed it
+      loadFolder(id).catch(() => {}).then(() => muteMenu(b.getBoundingClientRect(), { chat: id, folder: chatFolder.folder }));
+    };
     box.prepend(b);
     drawBell();
   }
@@ -425,76 +472,160 @@
   });
   navigator.serviceWorker.startMessages?.();
 
-  // --- "Mark as read" in Open WebUI's chat menu (⋯ of a chat in the sidebar).
-  // The DOM contract with Open WebUI 0.13.0 (push/e2e tests it): a chat in the
-  // sidebar is a box whose child #sidebar-chat-item holds the chat's link, with
-  // its ⋯ (button[aria-haspopup]) further inside the box; the menu is a
-  // [role=menu] with .app-dropdown-menu holding button[role=menuitem] items,
-  // and its "Mark as unread" item carries this icon path. Found by structure and
-  // icon, not by text (the menu is translated). When a chat's menu does not match,
-  // nothing is added and the console says so once: the menu is never touched.
+  // --- Items in Open WebUI's own ⋯ menus: a chat's (Mark as read, Mute
+  // notifications) and a folder's (Mute folder), in the sidebar and on a folder's page.
+  // The DOM contract with Open WebUI 0.13.0 (push/e2e tests it), found by structure
+  // and icon, not by text (the menus are translated):
+  // - a chat in the sidebar is a box whose child #sidebar-chat-item holds the
+  //   chat's link, with its ⋯ (button[aria-haspopup]) further inside the box;
+  // - a folder in the sidebar is #folder-<id>-button holding its ⋯; on the
+  //   folder's page (/folders/<id>) the ⋯ is outside the sidebar;
+  // - the menu is a [role=menu] with .app-dropdown-menu holding
+  //   button[role=menuitem] items; a chat's has "Mark as unread", a folder's
+  //   "Mark all as read", each known by its icon path.
+  // Our items are copies of that native item (same look), placed after it.
+  // When a menu we expect does not match, nothing is added and the console says
+  // so once: the native items are never changed.
   const MENU_BOX = ".app-dropdown-menu";
   const MENU_ITEM = "button[role=menuitem]";
   const UNREAD_ICON = "M8 12L11 15L16 10";
+  const READ_ALL_ICON = "m4.5 12.75 6 6 9-13.5";
   const CHAT_LINK = ':scope > #sidebar-chat-item a[href^="/c/"]';
   const CHAT_PATH = "/c/";
+  const FOLDER_ROW = /^folder-(.+)-button$/;
+  const FOLDER_PAGE = /^\/folders\/([^/]+)/;
   // How far up from the ⋯ button its chat's box may be (Open WebUI 0.13: 5).
   const TRIGGER_DEPTH = 8;
   // A menu that opens later than this after the press is not that chat's.
   const MENU_AFTER_MS = 2000;
-  let pressed = null, contractLogged = false;
+  const OURS = "ocPushItem";   // data-oc-push-item on what we add
+  let pressed = null;
+  const logged = new Set();
 
-  // The chat whose ⋯ was just pressed, by a pointer or from the keyboard
-  // (the menu also opens on Enter and Space).
+  // What the pressed ⋯ belongs to, by a pointer or from the keyboard (the
+  // menu also opens on Enter and Space).
   const OPEN_KEYS = new Set(["Enter", " "]);
   function press(e) {
     const b = e.target instanceof Element && e.target.closest("button[aria-haspopup]");
-    let box = b;
-    for (let i = 0; box && i < TRIGGER_DEPTH; i++, box = box.parentElement) {
+    if (!b) return;
+    const row = b.closest('[id^="folder-"]');
+    const rowId = row && FOLDER_ROW.exec(row.id);
+    if (rowId) { pressed = { folder: rowId[1], at: Date.now() }; return; }
+    for (let box = b, i = 0; box && i < TRIGGER_DEPTH; i++, box = box.parentElement) {
       const link = box.querySelector(CHAT_LINK);
       if (link) {
         pressed = { chat: link.getAttribute("href").slice(CHAT_PATH.length), at: Date.now() };
         return;
       }
     }
+    // On a folder's page, a ⋯ outside the sidebar may be the folder's own (or
+    // another, like its icon picker: that menu has no "Mark all as read", and is left alone).
+    const page = FOLDER_PAGE.exec(location.pathname);
+    if (page && !b.closest("#sidebar")) pressed = { folder: page[1], page: true, at: Date.now() };
   }
   addEventListener("pointerdown", press, true);
   addEventListener("keydown", (e) => { if (OPEN_KEYS.has(e.key)) press(e); }, true);
 
-  // A menu just appeared: once it is drawn (next frame), the chat's menu gets the item.
+  // A menu just appeared: once it is drawn (next frame), it gets our items.
   function menuOpened(menu) {
     if (!pressed || Date.now() - pressed.at > MENU_AFTER_MS || menu.dataset.ocPush) return;
-    const chat = pressed.chat;
+    const what = pressed;
     pressed = null;
     menu.dataset.ocPush = "seen";
-    requestAnimationFrame(() => chatMenu(menu, chat));
+    requestAnimationFrame(() => addItems(menu, what));
   }
 
-  function chatMenu(menu, chat) {
-    if (!navigator.serviceWorker.controller) return;   // push not on for this device
-    const unreadItem = [...menu.querySelectorAll(MENU_BOX + " > " + MENU_ITEM)]
-      .find((b) => b.querySelector("path")?.getAttribute("d")?.startsWith(UNREAD_ICON));
+  // The native item ours go after, if this menu is the one we know.
+  function nativeItem(menu, icon) {
+    const it = [...menu.querySelectorAll(MENU_BOX + " > " + MENU_ITEM)]
+      .find((b) => !b.dataset[OURS] && b.querySelector("path")?.getAttribute("d")?.startsWith(icon));
     // Its label: the item's last div, holding all of the item's text.
-    const native = unreadItem?.textContent.trim();
-    const nativeLabel = unreadItem && [...unreadItem.querySelectorAll("div")].pop();
-    if (!unreadItem || !native || nativeLabel?.textContent.trim() !== native) {
-      window.ocPushMenuContract = "missing";
-      if (contractLogged) return;
-      contractLogged = true;
-      console.info("oc-push: Open WebUI's chat menu is not the one this script knows (0.13.0); no Mark as read added.");
-      return;
+    const text = it?.textContent.trim();
+    const label = it && [...it.querySelectorAll("div")].pop();
+    return it && text && label?.textContent.trim() === text ? it : null;
+  }
+
+  // For tests and tools: "ok" or "missing", per kind of menu.
+  const CONTRACT = Object.freeze({ chat: "ocPushMenuContract", folder: "ocPushFolderMenuContract" });
+  function contractMissing(kind) {
+    window[CONTRACT[kind]] = "missing";
+    if (logged.has(kind)) return;
+    logged.add(kind);
+    console.info(`oc-push: Open WebUI's ${kind} menu is not the one this script knows (0.13.0); nothing added.`);
+  }
+
+  // Our copies have none of the menu's own handlers: close it as a user does, with
+  // Escape and, where that is not heard, a press outside it.
+  const closeNative = () => {
+    document.dispatchEvent(new KeyboardEvent(KEYDOWN, { key: "Escape", bubbles: true }));
+    for (const type of ["pointerdown", "pointerup"]) document.body.dispatchEvent(new PointerEvent(type, { bubbles: true }));
+  };
+
+  // A copy of a native item, with our label and icon, after `prev`.
+  function ourItem(native, prev, key, label, icon, onclick) {
+    const item = native.cloneNode(true);
+    item.dataset[OURS] = key;
+    [...item.querySelectorAll("div")].pop().textContent = label;
+    if (icon) {
+      const svg = item.querySelector("svg");
+      svg.setAttribute("stroke", "currentColor");
+      svg.innerHTML = icon;
     }
-    window.ocPushMenuContract = "ok";
-    const item = unreadItem.cloneNode(true);
-    [...item.querySelectorAll("div")].pop().textContent = "Mark as read";
     item.addEventListener("click", (e) => {
       e.stopPropagation();
-      // The service worker sends Open WebUI's own read event (as the notification's button does);
-      // if that fails it opens the chat, which reads it.
-      navigator.serviceWorker.controller?.postMessage({ type: "oc-push-act", action: "read", data: { chat_id: chat, url: CHAT_PATH + chat } });
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      const r = item.getBoundingClientRect();
+      closeNative();
+      onclick(r);
     });
-    unreadItem.after(item);
+    prev.after(item);
+    return item;
+  }
+
+  const muteLabel = (state) => state.muted === null ? null : state.label;
+
+  async function addItems(menu, what) {
+    const chat = what.chat;
+    const native = nativeItem(menu, chat ? UNREAD_ICON : READ_ALL_ICON);
+    if (!native) {
+      // The folder page's other ⋯ menus (its icon picker) are not a folder menu.
+      if (!what.page) contractMissing(chat ? "chat" : "folder");
+      return;
+    }
+    window[CONTRACT[chat ? "chat" : "folder"]] = "ok";
+    if (!store.get("token")) return;
+    if (mutes === null) await loadMutes().catch(() => {});
+    if (chat && chatFolder.chat !== chat) await loadFolder(chat).catch(() => {});
+    if (!chat) await loadFolders().catch(() => {});
+    const put = () => {
+      if (!menu.isConnected) return;
+      let prev = native;
+      if (chat && navigator.serviceWorker.controller) {
+        // The service worker sends Open WebUI's own read event (as the notification's
+        // button does); if that fails it opens the chat, which reads it.
+        prev = ourItem(native, prev, "read", "Mark as read", null, () =>
+          navigator.serviceWorker.controller?.postMessage({ type: "oc-push-act", action: "read", data: { chat_id: chat, url: CHAT_PATH + chat } }));
+      }
+      if (!hasDevices) return;   // nothing to mute: no device of this user gets pushes
+      if (chat) {
+        const state = bellState(chat);
+        ourItem(native, prev, "mute", muteLabel(state) || "Mute notifications", BELL + (state.muted === null ? "" : SLASH),
+          (r) => muteMenu(r, { chat, folder: chatFolder.chat === chat ? chatFolder.folder : null }));
+      } else {
+        const by = mutedFolder(what.folder);
+        ourItem(native, prev, "mute", by ? fmt(until(FOLDERS, by)) + (by === what.folder ? "" : " (" + folderName(by) + ")") : "Mute folder",
+          BELL + (by ? SLASH : ""), (r) => muteMenu(r, { folder: what.folder }));
+      }
+    };
+    put();
+    // Open WebUI may redraw the menu's items while it is open: put ours back.
+    const watch = new MutationObserver(() => {
+      if (!menu.isConnected) return watch.disconnect();
+      if (!menu.querySelector("[data-oc-push-item]") && nativeItem(menu, chat ? UNREAD_ICON : READ_ALL_ICON)) {
+        watch.disconnect();
+        addItems(menu, what);
+      }
+    });
+    watch.observe(menu, { childList: true, subtree: true });
   }
 
   new MutationObserver((records) => {
