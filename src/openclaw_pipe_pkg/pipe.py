@@ -1055,7 +1055,6 @@ class _PipeTurn:
             self.ended = True
             return
 
-
         # --- Derive stable session key ---
         if self.__metadata__:
             self.chat_id = (
@@ -1169,6 +1168,36 @@ class _PipeTurn:
                     f"{self.adopted_run_id[:20]}... alive and continuing it in this "
                     "reply before sending the message"
                 )
+
+        # An image over the Gateway's cap would be refused whole: shrink it
+        # here, once, so every later send of this message carries the copy
+        # that fits. After the claim, which must not wait behind the fit (the
+        # parked turn's timer does not); a retry (`_send_texts`) already has its
+        # fitted images. The whole list is checked: a claimed turn carries the
+        # images of a reply that was cancelled before its own fit ended. Only an
+        # image over the cap leaves the event loop: a message with small images
+        # must not wait a thread hop behind the ones before it. One fit at a
+        # time: each holds the whole photo decoded.
+        if not self._send_texts and _images_over_cap(
+                self.turn.attachments, self.conn.gateway_max_image_bytes):
+            try:
+                async with _image_fit_lock:
+                    fitted = await asyncio.to_thread(
+                        _fit_image_attachments, self.turn.attachments,
+                        self.conn.gateway_max_image_bytes)
+            except ImageTooLargeError as e:
+                await _emit_status(self.__event_emitter__, "", done=True)
+                yield str(e)
+                # The messages claimed for this send will not go out with it.
+                self.end_waiting_replies_unsent()
+                self.ended = True
+                return
+            # The retry copy and this message's own list hold the original
+            # objects: swap each for its fitted copy.
+            fitted_for = {id(a): f for a, f in zip(self.turn.attachments, fitted)}
+            self.sent_attachments = [fitted_for.get(id(a), a) for a in self.sent_attachments]
+            self.image_attachments = [fitted_for.get(id(a), a) for a in self.image_attachments]
+            self.turn.attachments = fitted
 
         # Apply the model. ELI-59: a burst's patches are all redundant -- same
         # session, same model -- so (a) a per-session lock collapses them to one

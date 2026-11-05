@@ -493,6 +493,22 @@ def _content_has_image(raw_content) -> bool:
     )
 
 
+# Used only when hello-ok has no `policy.attachments.maxImageBytes`: the
+# Gateway's own cap, openclaw packages/media-core/src/constants.ts:2
+# (MAX_IMAGE_BYTES). chat.send refuses a bigger decoded image outright.
+GATEWAY_IMAGE_BYTES_FALLBACK = 6 * 1024 * 1024
+
+def _hello_max_image_bytes(hello_ok: dict) -> int:
+    """The image cap hello-ok advertises, else the Gateway's built-in one."""
+    policy = hello_ok.get("policy")
+    attachments = policy.get("attachments") if isinstance(policy, dict) else None
+    cap = attachments.get("maxImageBytes") if isinstance(attachments, dict) else None
+    # `True` is an int in Python: it is not a byte count.
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        return cap
+    return GATEWAY_IMAGE_BYTES_FALLBACK
+
+
 _DATA_URL_RE = re.compile(r"^data:([^;,]*)(?:;[^,]*)?,(.*)$", re.DOTALL)
 
 
@@ -1491,6 +1507,9 @@ class _GatewayConnection:
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
         self.gateway_version: str | None = None   # hello-ok.server.version
+        # hello-ok.policy.attachments.maxImageBytes: chat.send refuses an
+        # image bigger than this (decoded bytes), so bigger ones are shrunk.
+        self.gateway_max_image_bytes = GATEWAY_IMAGE_BYTES_FALLBACK
         # hello-ok.features, checked instead of version numbers.
         self.gateway_methods: frozenset = frozenset()
         self.gateway_events: frozenset = frozenset()
@@ -2965,6 +2984,7 @@ class _GatewayConnection:
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
         self.gateway_version = (hello_ok.get("server") or {}).get("version")
+        self.gateway_max_image_bytes = _hello_max_image_bytes(hello_ok)
         features = hello_ok.get("features") or {}
         self.gateway_methods = frozenset(features.get("methods") or ())
         self.gateway_events = frozenset(features.get("events") or ())

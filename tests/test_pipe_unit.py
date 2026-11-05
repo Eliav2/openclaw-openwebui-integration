@@ -8,6 +8,7 @@ import os
 import tempfile
 import textwrap
 import contextlib
+import base64
 import io
 import sqlite3
 import copy
@@ -2931,6 +2932,139 @@ class NoDroppedMessagesTests(_TurnCase):
         self._queue("run-1").put_nowait(self._final("run-1"))
         await nxt
         await r3.aclose()
+
+    async def _sent_or_answer(self, gen):
+        """The reply's first line, or None once chat.send went out (bounds a hang only)."""
+        first = asyncio.ensure_future(gen.__anext__())
+        for _ in range(3000):
+            if self.sent or first.done():
+                break
+            await asyncio.sleep(0.01)
+        return first
+
+    async def _answer(self, gen, first):
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 30)
+        if "OK" not in out:
+            out += await self._read(gen, "OK")
+        await gen.aclose()
+
+    @staticmethod
+    def _noise_png(size):
+        from PIL import Image
+        out = io.BytesIO()
+        Image.effect_noise(size, 60).convert("RGB").save(out, "PNG")
+        return base64.b64encode(out.getvalue()).decode("ascii")
+
+    async def test_a_photo_over_the_gateway_cap_is_sent_shrunk_under_it(self):
+        """A phone photo over hello-ok's maxImageBytes goes out as a JPEG under it, not whole
+        (the Gateway refuses the whole one: "image exceeds size limit", and no reply)."""
+        self.conn.gateway_max_image_bytes = 300_000
+        r = self._reply("what does the sign say?", "m2", image=self._noise_png((1600, 1200)))
+        first = await self._sent_or_answer(r)
+        self.assertFalse(first.done() and "Error" in str(first.result()))
+        [[(name, content)]] = self.sent_images
+        self.assertEqual(name, "image-2.jpg")
+        self.assertLessEqual(len(base64.b64decode(content)), 300_000)
+        await self._answer(r, first)
+
+    async def test_the_parked_turn_is_claimed_before_a_photo_is_shrunk(self):
+        """The parked turn's timer does not wait for a claim: a slow fit ahead of it could outlast
+        the grace window and the follow-up would find no run to adopt."""
+        self.conn.gateway_max_image_bytes = 300_000
+        order = []
+        claim, fit = self.conn.claim_cancelled_turn, self.ocp._fit_image_attachments
+
+        async def claiming(session_key):
+            order.append("claim")
+            return await claim(session_key)
+
+        def fitting(*args):
+            order.append("fit")
+            return fit(*args)
+
+        self.conn.claim_cancelled_turn = claiming
+        with mock.patch.object(self.ocp, "_fit_image_attachments", fitting):
+            r = self._reply("what does the sign say?", "m2", image=self._noise_png((1600, 1200)))
+            first = await self._sent_or_answer(r)
+        self.assertEqual(order, ["claim", "fit"])
+        await self._answer(r, first)
+
+    def _claiming(self, **claimed):
+        """A cancelled turn's leftovers, claimed by the reply that follows it."""
+        async def claim(session_key):
+            return {"run_id": None, "queue": None, "carried": [], "attachments": [],
+                    "waiting": [], **claimed}
+        self.conn.claim_cancelled_turn = claim
+
+    async def test_a_photo_carried_from_a_cancelled_reply_is_shrunk_too(self):
+        """A reply cancelled while its own fit ran leaves its photo whole in the claim: the next
+        reply, which has no photo of its own, must not send it over the cap."""
+        self.conn.gateway_max_image_bytes = 300_000
+        big = {"type": "image", "mimeType": "image/png", "fileName": "image-1.png",
+               "content": self._noise_png((1600, 1200))}
+        self._claiming(carried=["the photo question"], attachments=[big])
+        r = self._reply("and this one?", "m2")
+        first = await self._sent_or_answer(r)
+        [[(name, content)]] = self.sent_images
+        self.assertEqual(name, "image-1.jpg")
+        self.assertLessEqual(len(base64.b64decode(content)), 300_000)
+        await self._answer(r, first)
+
+    async def test_when_the_photo_cannot_be_shrunk_the_claimed_replies_are_told_not_sent(self):
+        self.conn.gateway_max_image_bytes = 300_000
+        self._claiming(waiting=["earlier reply"], carried=["earlier"])
+        with mock.patch.object(self.ocp, "_load_pil", lambda: None), \
+                mock.patch.object(self.ocp, "_end_unsent_replies") as ended:
+            out = await asyncio.wait_for(
+                self._drain(self._reply("hi", "m2", image=self._noise_png((1600, 1200)))), 30)
+        self.assertIn("Couldn't send the image", out)
+        ended.assert_called_once_with(self.conn, ["earlier reply"], sent=False,
+                                      note=self.ocp.REPLY_SEND_FAILED_NOTE)
+        self.assertEqual(self.sent, [])
+
+    async def test_photos_of_different_chats_are_shrunk_one_at_a_time(self):
+        """Each fit holds a whole photo decoded: two at once would hold two."""
+        self.conn.gateway_max_image_bytes = 300_000
+        running, most = [0], [0]
+
+        def fitting(attachments, max_bytes):
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+            time.sleep(0.15)
+            running[0] -= 1
+            return attachments
+
+        image = self._noise_png((1600, 1200))
+        with mock.patch.object(self.ocp, "_fit_image_attachments", fitting):
+            gens = [self._reply("hi", f"m{n}", image=image, chat=f"chat-{n}") for n in (2, 3)]
+            tasks = [asyncio.ensure_future(g.__anext__()) for g in gens]
+            for _ in range(500):
+                if len(self.sent) >= 2 or all(t.done() for t in tasks):
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(most[0], 1)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_a_photo_under_the_gateway_cap_is_sent_byte_for_byte(self):
+        image = self._noise_png((200, 150))
+        r = self._reply("hi", "m2", image=image)
+        first = await self._sent_or_answer(r)
+        self.assertEqual(self.sent_images, [[("image-2.png", image)]])
+        await self._answer(r, first)
+
+    async def test_without_pillow_a_photo_over_the_cap_gets_one_plain_sentence(self):
+        self.conn.gateway_max_image_bytes = 300_000
+        with mock.patch.object(self.ocp, "_load_pil", lambda: None):
+            out = await asyncio.wait_for(
+                self._drain(self._reply("hi", "m2", image=self._noise_png((1600, 1200)))), 30)
+        self.assertIn("Couldn't send the image", out)
+        self.assertNotIn("Error sending message", out)
+        self.assertEqual(self.sent, [])
 
     async def test_images_carried_through_a_kept_run_are_sent_after_it(self):
         """Send now twice while a run streams: the continuing reply sends the interrupted message
