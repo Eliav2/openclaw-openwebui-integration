@@ -89,10 +89,10 @@ class FitImageAttachmentsTests(unittest.TestCase):
         self.assertIn("Pillow is not installed", msg)
         self.assertNotIn("exceeds size limit", msg)
 
-    def test_an_image_that_cannot_fit_readably_is_refused_plainly(self):
+    def test_an_image_that_cannot_be_made_to_fit_is_refused_plainly(self):
         raw = noise_image((1600, 1200))
         with self.assertRaises(ImageTooLargeError) as caught:
-            _fit_image_attachments([attachment(raw)], 2_000)
+            _fit_image_attachments([attachment(raw)], 1)
         self.assertIn("couldn't be made small enough", str(caught.exception))
 
     def test_bytes_pillow_cannot_read_are_refused_plainly(self):

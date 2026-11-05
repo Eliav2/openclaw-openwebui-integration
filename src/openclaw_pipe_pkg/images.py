@@ -10,8 +10,8 @@ _FIT_JPEG_QUALITY = 85
 # JPEG size grows with the pixel count, so each try scales both sides by the
 # square root of (cap / size), a little under it so one try usually lands.
 _FIT_SCALE_MARGIN = 0.95
-# Below this long side a photo of text stops being readable: refuse instead.
-_FIT_MIN_LONG_SIDE = 640
+# `chat.send` attachment type of an image (the same value gateway.py sends).
+_IMAGE_ATTACHMENT_TYPE = "image"
 
 
 class ImageTooLargeError(Exception):
@@ -26,14 +26,14 @@ def _base64_decoded_size(data: str) -> int:
 
 
 def _images_over_cap(attachments: list, max_bytes: int) -> bool:
-    return any(a.get("type") == "image"
+    return any(a.get("type") == _IMAGE_ATTACHMENT_TYPE
                and _base64_decoded_size(a.get("content") or "") > max_bytes
                for a in attachments)
 
 
 def _shrink_to_jpeg(raw: bytes, max_bytes: int, PIL) -> bytes | None:
     """`raw` as a JPEG of at most `max_bytes`, EXIF orientation applied; None
-    when even a `_FIT_MIN_LONG_SIDE` image is too big."""
+    when even a 1x1 image is too big."""
     Image, ImageOps = PIL
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)))
     if img.mode in ("RGBA", "LA", "P"):
@@ -48,7 +48,7 @@ def _shrink_to_jpeg(raw: bytes, max_bytes: int, PIL) -> bytes | None:
     while out.tell() > max_bytes:
         scale = min(_FIT_SCALE_MARGIN, (max_bytes / out.tell()) ** 0.5 * _FIT_SCALE_MARGIN)
         size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-        if max(size) < _FIT_MIN_LONG_SIDE:
+        if size == (img.width, img.height):  # already 1x1: nothing left to shrink
             return None
         img = img.resize(size, Image.LANCZOS)
         out = io.BytesIO()
