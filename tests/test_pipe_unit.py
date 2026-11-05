@@ -17092,7 +17092,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         first_b = asyncio.ensure_future(gen_b.__anext__())
         await self._until_registered(self.R2)
         await self._dispatch(
-            self._commit(self.R2, "Stop and say banana"),
+            self._commit(self.R2, "Stop and say banana", into=self.R1),
             self._delta(self.R1, "\n\nStopped."),
             self._final(self.R2),
             self._delta(self.R1, " banana"),
@@ -17123,7 +17123,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             emitter, __metadata__={"chat_id": self.CHAT, "user_id": "u1", "message_id": "m2"})
         first_b = asyncio.ensure_future(gen_b.__anext__())
         await self._until_registered(self.R2)
-        await self._dispatch(self._commit(self.R2, "add tomatoes"))
+        await self._dispatch(self._commit(self.R2, "add tomatoes", into=self.R1))
         self.assertEqual(statuses[-1].get("description"), "Thinking...", statuses)
         self.assertIs(statuses[-1].get("done"), False)
         await self._dispatch(self._delta(self.R1, "\n\nAdded."), self._final(self.R2),
@@ -17147,7 +17147,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         first_b = asyncio.ensure_future(gen_b.__anext__())
         await self._until_registered(self.R2)
         await self._dispatch(
-            self._commit(self.R2, "Stop and say banana"),
+            self._commit(self.R2, "Stop and say banana", into=self.R1),
             self._delta(self.R1, "\n\nStopped. banana"),
             self._lifecycle(self.R1, "end"))
         self.active = False
@@ -17217,7 +17217,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         pump.writer, pump.started = writer, True
         conn._turn_pumps[(sk, self.R1)] = pump
         q2 = conn.register_consumer(sk, self.R2)
-        conn._on_session_message(self._commit(self.R2)["payload"])
+        conn._on_session_message(self._commit(self.R2, into=self.R1)["payload"])
         self.assertIn(f"{sk}:{self.R1}", conn._consumers, "the active run is consumed by the steered reply now")
         self.assertIs(conn._consumers[f"{sk}:{self.R1}"].queues[0], q2)
         await conn._dispatch_run_event(self._delta(self.R1, "\n\nStopped. banana"))
@@ -17274,7 +17274,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([k for k in conn._turn_pumps if k[1] == self.R1], [(sk, self.R1)],
                          "and no writer of its own")
 
-        conn._on_session_message(self._commit(self.R3, "say blue")["payload"])
+        conn._on_session_message(self._commit(self.R3, "say blue", into=self.R1)["payload"])
         self.assertEqual(q3.get_nowait()["_steered"]["run"], self.R1, "the next steer takes the run")
         await conn._dispatch_run_event(self._delta(self.R1, "blue"))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R1)
@@ -17309,6 +17309,49 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             await self._spin()
         loop.assert_not_called()
         self.assertTrue(host.queue.empty())
+
+    async def test_a_queued_message_committed_while_a_run_works_is_not_steered_into_it(self):
+        """Sandbox e2e on the Send-now fix: "say blue" was sent to be steered,
+        but the Gateway queued it (its row has no `steerTargetRunId`) and
+        committed it when its own run started, before the earlier run's end
+        reached the Pipe. Its reply took that run over and showed the
+        tomatoes answer above its own."""
+        self.conn.gateway_version = "2026.10.10"
+        conn, sk = self.conn, self.SK
+        q1 = conn.register_consumer(sk, self.R1)
+        await conn._dispatch_run_event(self._delta(self.R1, "tomato answer"))
+        q1.get_nowait()
+        q2 = conn.register_consumer(sk, self.R2)
+        conn._on_session_message(self._commit(self.R2, "say blue")["payload"])
+        self.assertTrue(q2.empty(), "blue waits for its own run")
+        self.assertTrue(q1.empty(), "the run's reply goes on")
+        conn._on_session_message(self._commit(self.R2, "say blue", into=self.R1)["payload"])
+        self.assertEqual(q2.get_nowait()["_steered"]["run"], self.R1, "a steered one takes it")
+
+    async def test_a_message_queued_behind_such_a_run_is_not_steered_into_it_after_its_end(self):
+        """Sandbox e2e on the Send-now fix: the run's events after such a
+        steer went to the discard consumer, so its writer's pump never saw
+        the run end. "say blue", queued and committed when its own run
+        started, between the run's end and the session's settle, was steered
+        into the run that had ended, and its reply never ended."""
+        self.conn.gateway_version = "2026.10.10"
+        conn = self.conn
+        # A session key the turn writer routes (an Open WebUI user id).
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
+        host = openclaw_pipe._RunPump()
+        host.started = True
+        conn._turn_pumps[(sk, self.R1)] = host
+        tomato = openclaw_pipe._RunPump()
+        tomato.handover = {"message_id": "w2", "steer_pending": True,
+                           "renderer": types.SimpleNamespace(received="", output=None)}
+        conn._turn_pumps[(sk, self.R2)] = tomato
+        conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
+        await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
+        q3 = conn.register_consumer(sk, self.R3)
+        conn._on_session_message(self._commit(self.R3, "say blue")["payload"])
+        self.assertTrue(q3.empty(), "blue waits for its own run")
+        self.assertTrue(host.terminal.is_set(), "its writer's run has ended")
 
     async def test_a_handed_over_message_the_gateway_did_not_steer_takes_no_run(self):
         """Review on #290: a handed-over message the Gateway queued instead
@@ -17387,7 +17430,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         pump.started = True
         conn._turn_pumps[(sk, self.R1)] = pump
         q2 = conn.register_consumer(sk, self.R2)
-        conn._on_session_message(self._commit(self.R2)["payload"])
+        conn._on_session_message(self._commit(self.R2, into=self.R1)["payload"])
         steered = q2.get_nowait()["_steered"]
         writer = mock.Mock(chat_id=self.CHAT, message_id="w1")
         writer.steered_away = lambda: {"received": "ROUND 1", "stream": "ROUND 1", "item": ""}
