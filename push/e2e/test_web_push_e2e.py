@@ -1085,6 +1085,38 @@ def test_the_error_page_after_a_network_change_reloads_once_into_the_chat(owui, 
         stop()
 
 
+BOOT_READS = ("**/api/v1/users/user/settings", "**/api/v1/chats/?page=1", "**/api/v1/chats/pinned")
+NO_API_CACHES = "() => caches.keys().then((ks) => Promise.all(ks.filter((k) => k.startsWith('oc-api-')).map((k) => caches.delete(k))))"
+
+
+@needs_offline
+def test_a_network_change_during_the_first_load_still_opens_the_chat(owui, browser):
+    """A change of network fails every request on its way (ERR_NETWORK_CHANGED). On a load with
+    nothing kept yet, Open WebUI's own reads failing leave it half drawn for good (no chat, no
+    error page): the service worker asks a failed read once more, and the chat opens."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Changed Network")
+    opened(page, chat)
+    page.evaluate(NO_API_CACHES)   # nothing kept: as on the first load the worker handles
+    failed = []
+    def fail_once(route):
+        if route.request.service_worker is None or route.request.url in failed:
+            return route.fallback()
+        failed.append(route.request.url)
+        route.abort("connectionreset")   # a request cut on its way, as a network change does
+    for r in BOOT_READS:
+        ctx.route(r, fail_once)
+    try:
+        page.reload()
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.get_by_text("Chat Changed Network").first.wait_for(timeout=WAIT_MS)   # the chat list too
+        assert len(failed) == len(BOOT_READS), failed
+    finally:
+        for r in BOOT_READS:
+            ctx.unroute(r, fail_once)
+
+
 def test_the_error_page_reloads_only_once(owui, browser):
     """The reload fails too: the page stays on the error page, and neither 'online' nor a
     network change reloads it again."""

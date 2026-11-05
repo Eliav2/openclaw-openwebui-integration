@@ -398,6 +398,13 @@ async function freshFirst(e, req, cacheName, key, ms, onFresh, isIt) {
   return res || Response.error();
 }
 
+// A read that fails on the network (no answer: a TypeError, not an HTTP error) is
+// asked once more at once. A change of network (Wi-Fi to mobile) fails every
+// request on its way with ERR_NETWORK_CHANGED, and Open WebUI does not ask again:
+// a read it needs to start fails and the app stays half drawn. The second
+// attempt goes out on the new network. Only reads (GET) come here.
+const again = (input, init) => fetch(input, init).catch(() => fetch(input, init));
+
 // The same read asked again while the first is on its way (Open WebUI loads an
 // opened chat twice) shares that one request: one round trip, not two.
 const inFlight = new Map();
@@ -405,7 +412,7 @@ function shared(req) {
   const key = req.url + "\n" + (req.headers.get("authorization") || "");
   let p = inFlight.get(key);
   if (!p) {
-    p = fetch(req);
+    p = again(req);
     inFlight.set(key, p);
     const done = () => inFlight.delete(key);
     p.then(done, done);
@@ -417,7 +424,7 @@ function shared(req) {
 // the next open.
 async function savedFirst(e, req, cacheName, key, onFresh, keep = keepable) {
   const cache = await caches.open(cacheName);
-  const net = fetch(req).then(async (res) => {
+  const net = again(req).then(async (res) => {
     if (keep(res)) {
       await cache.put(key, res.clone());
       if (onFresh) await onFresh(res.clone(), cache);
@@ -438,8 +445,8 @@ const JSON_TYPE = { "content-type": "application/json" };
 // says nothing for LIE_FI_MS, too, and the page is told to reload if the version
 // that comes later is another one.
 async function navigate(e, req) {
-  const net = fetch(req).catch(() => null);
-  const asked = fetch(VERSION_PATH, { cache: NO_STORE, redirect: MANUAL })
+  const net = again(req).catch(() => null);
+  const asked = again(VERSION_PATH, { cache: NO_STORE, redirect: MANUAL })
     .then((r) => (r.ok ? r.text() : null), () => null);
   const cache = await caches.open(SHELL);
   const saved = await cache.match(PAGE_KEY);
@@ -510,7 +517,7 @@ async function cacheFirst(e, req) {
   const cache = await caches.open(SHELL);
   const saved = await cache.match(req);
   if (saved) return saved;
-  const res = await fetch(req);
+  const res = await again(req);
   if (keepable(res)) e.waitUntil(cache.put(req, res.clone()));
   return res;
 }

@@ -182,6 +182,7 @@ A network that answers nothing at all (lie-fi) is given up on after 4.2 s (twice
 - **Updates:** a new Open WebUI version deletes everything kept (see the page row). A new build's page also drops the old build's hashed files.
 - **Sizes:** at most 400 app files and 300 API answers per user, oldest first.
 - **Read-only offline:** with no network a pill says "Offline: saved chats, read-only" and the message box is locked, so nothing is typed that cannot be sent. Text already in the box stays and can be sent once the network is back.
+- **A read cut on its way** (a change of network fails every request in flight): the service worker asks it once more at once, on the new network, because Open WebUI does not and would stay half drawn.
 - **After a network change:** a change of network while Open WebUI loads (Wi-Fi to mobile) can fail one of its files, and Open WebUI then shows "500 Internal Error" for good. The page script reloads once, as soon as the server can be reached again (at once, or on the next `online` or network change). It reloads only once per tab until a load gets to the app. This works with offline open on or off.
 - **Turning it off** (`OFFLINE` unset or not `"1"`): the next service worker that a device loads deletes everything it kept, and again on the next page load.
 
