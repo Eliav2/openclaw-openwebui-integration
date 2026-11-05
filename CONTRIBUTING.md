@@ -38,5 +38,6 @@ Security problems go through [SECURITY.md](./SECURITY.md), not a public issue.
 2. Branch from `main` and keep the PR to one change.
 3. Add or update a test for what you changed, and update the docs if users see it.
 4. Make sure the commands above pass. CI runs them too, plus the end-to-end suite.
+5. If the PR changes what users see, show the Before and After in the description as a 2-column table, one row per change, with a short heading above it saying what changed. The pull request template has the format and `AGENTS.md` the upload steps.
 
 By contributing you agree that your work is released under the [MIT License](./LICENSE).
