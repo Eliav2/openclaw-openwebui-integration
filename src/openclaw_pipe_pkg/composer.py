@@ -5,74 +5,32 @@
 
 
 # ---------------------------------------------------------------------------
-# Composer "Status" button (experiment).
+# Composer "Status" button.
 #
-# Open WebUI (0.12) has no hook for adding a button to the composer row:
-# filter chips there only toggle a filter or open its valves. So the button is
-# installed by an `execute` event, the same unsandboxed in-page JS channel the
-# Status dialog already uses. Chat.svelte runs an `execute` event only when
-# its chat_id is the chat the tab shows AND its message_id is already in that
-# tab's history; anything else is silently dropped. The snippet:
+# OWUI 0.12 has no hook for composer buttons, so an `execute` event installs
+# one. Chat.svelte runs it only if its chat_id is the shown chat and its
+# message_id is in that tab's history. The snippet is idempotent and
+# versioned, keeps the button alive with a debounced MutationObserver, shows
+# it only on chats of this Pipe's models, and on click POSTs to the Status
+# Action. It also takes over the toolbar's "OpenClaw Status" button, since
+# OWUI's handler uploads and saves the whole chat (8 s on a 14 MB chat).
+# The button moves out of the chip row when it does not fit, as that row
+# scrolls (OWUI 0.13's Model controls button narrows it on phones).
 #
-#   * is idempotent: it records itself on `window.__openclawComposerBtn` with a
-#     version, so a repeat delivery only refreshes its config, and a newer
-#     version tears the old one down before installing itself;
-#   * keeps the button present with one MutationObserver (debounced), across
-#     re-renders and chat switches (OWUI is a SPA, the composer is rebuilt
-#     freely), and gives up for good if it ever has to re-insert the button
-#     in a tight loop;
-#   * shows the button only on `/c/<id>` pages whose chat model is one of this
-#     Pipe's models (one chat fetch per chat, cached for the page lifetime),
-#     and removes it everywhere else;
-#   * places it right after the "OpenClaw Thinking" filter chip, or at the end
-#     of the composer's chip group when that chip is off; when neither anchor
-#     exists it shows nothing. The chip row scrolls sideways when it is full:
-#     a button that does not fit whole there moves to the end of the left
-#     group (after Integrations), which never scrolls. Open WebUI 0.13 added a
-#     Model controls button on the right, which leaves a 375 px phone's chip
-#     row 25 px narrower. It goes back to the chip row once the window is
-#     wider than when it moved;
-#   * on click POSTs to the Status Action with the same body shape the dialog's
-#     own Compact button uses, so the existing Action flow opens the real
-#     dialog. The body is built from what the page already has: the chat's
-#     model (each delivery names it) and the latest user message on screen,
-#     so a click never downloads the chat;
-#   * takes over the message toolbar's "OpenClaw Status" button the same way
-#     when it knows the chat's model. Open WebUI's own handler uploads every
-#     message of the branch before the Action runs and saves the whole chat
-#     after it returns: on a 14 MB chat over a phone connection that is 8 s
-#     before the dialog shows and a 14 MB upload after (perf/status_open.py).
-#     Unknown model: Open WebUI's handler runs as before;
-#   * never throws into the page: errors become one console warning each and,
-#     for a failed click, a small toast.
-#
-# It is delivered three ways, all cheap and all idempotent:
-#   (a) the Status Action emits it after every status run (one spark click
-#       installs it);
-#   (b) the Pipe emits it at the start of each turn;
-#   (c) the Pipe's composer watcher pushes it to one socket as soon as that
-#       socket opens a chat on one of this Pipe's models (Open WebUI 0.12
-#       records each socket's open chat in SESSION_POOL[sid]["chat_ids"]).
-#
-# (a) and (b) target whatever message the emitter is bound to. (c) targets the
-# chat's latest *user* message on purpose: OWUI's event handler writes back a
-# shallow copy of the targeted message after running the code, and a user
-# message is the one kind that never streams, so the push can never clobber a
-# reply that is streaming into the same tab.
+# Delivered by the Status Action, at each Pipe turn, and by the composer
+# watcher when a socket opens a Pipe chat. The watcher targets the latest
+# *user* message: OWUI writes the targeted message back after running the
+# code, and a user message never streams, so no reply gets clobbered.
 # ---------------------------------------------------------------------------
 
 _COMPOSER_BUTTON_VERSION = "9"
 
-# The Status Action's function id (install_action.py's FUNCTION_ID; the
-# dialog's own JS calls the same fixed id) and the Pipe's default function id.
-# A Pipe installed under another id still works: it adds its own id (from the
-# module name OWUI gives it) and the prefix of every model it serves.
+# Status Action id (install_action.py FUNCTION_ID) and the default Pipe id;
+# a Pipe under another id adds its own prefixes.
 _COMPOSER_ACTION_ID = "openclaw_status_action"
 _COMPOSER_DEFAULT_MODEL_PREFIX = "openclaw_gateway."
 
-# Name of the Thinking filter's chip (install_filter.py registers the filter
-# under this name, and OWUI renders it as the chip icon's alt text). The button
-# goes right after that chip when it is on screen.
+# The Thinking filter chip's alt text (install_filter.py); the button follows it.
 _COMPOSER_THINKING_CHIP_LABEL = "OpenClaw Thinking"
 
 _COMPOSER_BUTTON_JS_TEMPLATE = r"""
@@ -574,17 +532,13 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
 
 def _composer_own_function_id():
-    """This artifact's Open WebUI function id, from the module name OWUI's
-    loader gives it (`function_<id>_<32 hex>`, utils/plugin.py), or None
-    outside Open WebUI."""
+    """Function id from the module name `function_<id>_<32 hex>`, or None."""
     m = re.match(r"^function_(.+)_[0-9a-f]{32}$", globals().get("__name__") or "")
     return m.group(1) if m else None
 
 
 def _composer_model_prefixes(model_id=None, own_id=None) -> list:
-    """The model-id prefixes the button treats as OpenClaw chats: the default
-    Pipe id, the Pipe's own function id when known, and the function id of
-    `model_id` (a model this Pipe actually served)."""
+    """Model-id prefixes that count as OpenClaw chats."""
     prefixes = [_COMPOSER_DEFAULT_MODEL_PREFIX]
     extra = []
     if isinstance(own_id, str) and own_id:
@@ -599,10 +553,8 @@ def _composer_model_prefixes(model_id=None, own_id=None) -> list:
 
 def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=None,
                                chat_model=None) -> str:
-    """The install snippet with its config embedded as one JSON literal (same
-    no-interpolation rule as action.py's `_json_for_js`: `<` escaped so the
-    payload can never close an enclosing script tag). `chat_model` is the
-    vouched chat's model, carried only with `chat_id`."""
+    """The snippet with its config as one JSON literal, `<` escaped so it
+    cannot close a script tag. `chat_model` is sent only with `chat_id`."""
     config = {
         "version": _COMPOSER_BUTTON_VERSION,
         "actionId": _COMPOSER_ACTION_ID,
@@ -618,9 +570,7 @@ def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=
 
 async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=None,
                                 chat_id=None, model_prefixes=None, chat_model=None) -> bool:
-    """Emit the install snippet through an OWUI event emitter. Best effort:
-    returns False instead of raising, because a cosmetic button must never
-    fail the turn or the Action that carries it."""
+    """Emit the snippet; returns False rather than raise, so it never fails a turn."""
     if not __event_emitter__:
         return False
     try:

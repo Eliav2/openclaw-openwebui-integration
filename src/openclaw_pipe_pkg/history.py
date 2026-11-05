@@ -4,60 +4,25 @@
 # ------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
 # What the agent remembers vs what the chat shows (ELI-183).
 #
-# The Pipe sends only the newest user message, and the agent's session is one
-# line of messages. Open WebUI's chat is a tree: Edit sends a new sibling of a
-# user message, Regenerate a new sibling of a reply, and the arrows under a
-# message switch the branch shown. None of that reaches the agent by itself,
-# so its memory and the chat drift apart. A cloned or forked chat is a new chat,
-# so it gets a new session that has never seen the copied messages.
-#
-# Line: for each chat, the message ids the agent was last sent along the
-# branch (`HISTORY_TAIL_MAX` newest), kept in the bridge state dir. Each new
-# request names its user message and its reply (`user_message_id`,
-# `message_id` in Open WebUI's metadata). Walking up from the user message
-# through Open WebUI's `chat_message` rows (parent ids) to the first id on the
-# line says what changed:
-#   - the user message is already on the line: Regenerate. What came after it
-#     on the line is gone from the chat;
-#   - the line's tail after the meeting point is gone and the user message
-#     hangs right under it: Edit, when the replaced user message still exists
-#     as its sibling; deleted messages, when it does not;
-#   - other messages lie between the meeting point and the user message: the
-#     user switched branches.
-# Messages the chat gained without the agent losing any (a reply the agent
-# started, a cron wake) change nothing. Only then does the message carry a
-# short note (`_history_note`), so a normal send never does.
-#
-# Copy: on the first request of a chat Open WebUI marks as a clone or fork
-# (`originalChatId` on the chat) whose session the Gateway does not have, the
-# message carries the copied messages once (`_history_seed`), newest first up
-# to `HISTORY_SEED_MAX_CHARS`.
-#
-# Open WebUI can call the Pipe twice for one reply (ELI-82); the second call
-# must send the same text, so the line keeps the last reply id and what was
-# put before its message.
-#
-# Several models at once (ELI-329): Open WebUI calls the Pipe once per model,
-# together, for the same user message. Each Pipe model's reply gets its own
-# session ("column", see `_owui_session_key`) with its own line, so the replies
-# neither queue behind one another nor take each other for a Regenerate. A
-# column's session has not seen what the others said: when the user goes on
-# from another model's reply, the note carries that reply in full.
-# ---------------------------------------------------------------------------
+# The Pipe sends only the newest user message, but OWUI's chat is a tree
+# (Edit, Regenerate, branch arrows), so the agent's session drifts from it.
+# The "line" stores the message ids last sent per chat. Walking up from the
+# new user message's parents to the line tells regenerate, edit, deleted or
+# branch, and only then a short note (`_history_note`) goes before the message.
+# A clone or fork with no Gateway session gets the copied messages once
+# (`_history_seed`). OWUI may call twice for one reply (ELI-82), so the line
+# keeps the last reply id and its prefix. With several models at once
+# (ELI-329) each Pipe model gets its own session ("column") and line.
 
 HISTORY_TAIL_MAX = 64
-# About 8k tokens. Older copied messages are left out whole; the note says how
-# many.
+# About 8k tokens.
 HISTORY_SEED_MAX_CHARS = 32_000
 HISTORY_QUOTE_CHARS = 60
 HISTORY_LINE_DIR = "history-line"
 HISTORY_LINE_KEEP_S = 180 * 86400
-# Most Pipe models one message can go to side by side.
 MULTI_MODEL_COLUMNS_MAX = 16
-# One reply carried whole into another column's session.
 HISTORY_REPLY_MAX_CHARS = 8_000
 _history_line_pruned = False
 
@@ -65,17 +30,15 @@ _DETAILS_BLOCK = re.compile(r"<details\b[^>]*>.*?</details>", re.S | re.I)
 
 
 def _history_line_id(chat_id: str, column: int = 0) -> str:
-    """The name of a session's line file: the chat's id, then `-m<column>`."""
+    """Line file name: the chat id, plus `-m<column>` for columns > 0."""
     return f"{chat_id}-m{column}" if column else chat_id
 
 
 def _pipe_model_column(model, models, model_idx=None) -> tuple[int, int]:
-    """(column, how many Pipe models) of a request: `models` is the list the
-    user picked for the message (Open WebUI's `user_message.models`) and
-    `model` the one this request is for. A model is the Pipe's when it shares
-    `model`'s function id, so models of other providers take no column. The
-    same model picked twice is told apart by `model_idx`, the place of the
-    reply's model in `models`."""
+    """(column, Pipe model count) of a request among `user_message.models`.
+
+    Pipe models share `model`'s function id; `model_idx` tells a model picked twice apart.
+    """
     if not (isinstance(model, str) and "." in model and isinstance(models, list)):
         return 0, 1
     prefix = model.split(".", 1)[0] + "."
@@ -90,9 +53,8 @@ def _pipe_model_column(model, models, model_idx=None) -> tuple[int, int]:
 
 
 def _history_column_of(state_dir: str, chat_id: str, ids) -> int | None:
-    """The column whose line holds one of the message `ids`, if any: where a
-    reply the user goes on from was answered. Columns are made in order, so
-    the first one without a line is the last."""
+    """The column whose line holds one of `ids`, or None. Columns are made in
+    order, so stop at the first one without a line."""
     ids = [i for i in ids if i]
     for column in range(MULTI_MODEL_COLUMNS_MAX):
         path = _history_line_path(state_dir, _history_line_id(chat_id, column))
@@ -105,16 +67,12 @@ def _history_column_of(state_dir: str, chat_id: str, ids) -> int | None:
 
 
 async def _reply_column(state_dir: str, chat_id: str | None, model, metadata: dict) -> int:
-    """The column (session) this request's reply belongs to. With several Pipe
-    models picked it is the model's place among them. Otherwise the column
-    that holds the message it follows, so going on from the second model's
-    reply continues that model's session; a chat that never had more than one
-    column is always column 0."""
+    """The column (session) for this reply: the model's place when several are
+    picked, else the column holding the message it follows, else 0."""
     um = metadata.get("user_message") if isinstance(metadata.get("user_message"), dict) else {}
     models = um.get("models")
     model_idx = None
     if chat_id and isinstance(models, list) and models.count(model) > 1 and metadata.get("message_id"):
-        # The same model twice: the reply's column in Open WebUI says which.
         try:
             model_idx = await _owui_history_rows(chat_id).model_idx(metadata["message_id"])
         except Exception as ex:
@@ -142,8 +100,7 @@ def _history_line_read(state_dir: str, chat_id: str) -> dict:
 
 
 def _history_line_write(state_dir: str, chat_id: str, data: dict) -> None:
-    """Replace the chat's line under its lock (two Open WebUI workers may
-    answer the same chat). Nothing is awaited while the lock is held."""
+    """Replace the line under a lock: two OWUI workers may answer one chat."""
     global _history_line_pruned
     path = _history_line_path(state_dir, chat_id)
     try:
@@ -165,10 +122,8 @@ def _history_line_write(state_dir: str, chat_id: str, data: dict) -> None:
 
 
 def _history_line_prune(folder: str, cutoff: float) -> None:
-    """Drop the lines of chats not sent to since `cutoff` (a deleted chat's
-    line goes this way too: Open WebUI tells the Pipe nothing when a chat is
-    deleted). A line's age is its .json file's; its lock goes with it, since
-    a lock file is never written and its own age says nothing."""
+    """Drop lines older than `cutoff`; OWUI never reports chat deletion.
+    Age comes from the .json, since lock files are never written."""
     for name in os.listdir(folder):
         if not name.endswith(".json"):
             continue
@@ -183,9 +138,7 @@ def _history_line_prune(folder: str, cutoff: float) -> None:
 
 
 class _OwuiHistoryRows:
-    """The few reads of one chat that the line needs, from Open WebUI's
-    `chat_message` rows (one per message) and one field of the chat row, so
-    the chat itself is never loaded (ELI-115: about 14x its JSON per read)."""
+    """Reads the line needs, by row, never loading the whole chat (ELI-115)."""
 
     def __init__(self, chat_id: str):
         self.chat_id = chat_id
@@ -210,8 +163,7 @@ class _OwuiHistoryRows:
         return None if row is None else _coerce_text(row[0])
 
     async def model_idx(self, message_id: str) -> int | None:
-        """The place of a reply's model among the models picked for its
-        message (side by side), kept on the reply in the chat row."""
+        """The reply's `modelIdx` from the chat row."""
         from sqlalchemy import select
         from open_webui.internal.db import get_async_db_context
         from open_webui.models.chats import Chat
@@ -243,12 +195,11 @@ class _OwuiHistoryRows:
 
 async def _history_change(tail: list, user_id: str, reply_id: str, rows,
                           user_parent: str | None = None) -> dict:
-    """Compare a new request with the chat's line. Returns {kind, replaced,
-    shown, tail}: `kind` is None (nothing the agent knew is gone),
-    "regenerate", "edit", "deleted" or "branch"; `replaced` the line's ids no
-    longer on the chat's branch, `shown` the ids now between them and the user
-    message; `tail` the new line. `user_parent` stands in for the user
-    message's parent if its row is not there yet."""
+    """Compare a request with the line: {kind, replaced, shown, tail}.
+
+    `kind` is None, "regenerate", "edit", "deleted" or "branch". `user_parent`
+    is used if the user message's row is not written yet.
+    """
     if user_id in tail:
         meet, walked = tail.index(user_id), []
     else:
@@ -293,8 +244,7 @@ def _messages(n: int) -> str:
 
 
 async def _shown_in_full(shown: list, rows) -> str:
-    """The messages the chat now shows, whole (each cut at
-    `HISTORY_REPLY_MAX_CHARS`, all of them at `HISTORY_SEED_MAX_CHARS`)."""
+    """The shown messages in full, within the per-reply and total caps."""
     entries, used = [], 0
     for mid in shown:
         role, text, _ = await rows.message(mid)
@@ -312,8 +262,7 @@ async def _shown_in_full(shown: list, rows) -> str:
 
 
 async def _shown_from_other_model(shown: list, rows, model_prefix: str | None) -> bool:
-    """Whether the chat now shows a reply of a model that is not the Pipe's:
-    the agent has never seen it."""
+    """Whether a shown reply came from a non-Pipe model."""
     for mid in shown:
         role, _, model_id = await rows.message(mid)
         if role == "assistant" and model_id and model_prefix and not model_id.startswith(model_prefix):
@@ -322,11 +271,8 @@ async def _shown_from_other_model(shown: list, rows, model_prefix: str | None) -
 
 
 async def _history_note(change: dict, rows, in_full: bool = False) -> str:
-    """The short note put before the message when the chat no longer shows
-    what the agent remembers (about 50 tokens: counts plus two short quotes).
-    `in_full`: the user went on from a reply written in another session
-    (several models side by side), so a branch switch carries what the chat
-    now shows whole."""
+    """Short note for a history change. `in_full`: a branch note carries the
+    shown messages, since the agent never saw them."""
     kind, replaced, shown = change["kind"], change["replaced"], change["shown"]
     if kind == "regenerate":
         after = f" and the {_messages(len(replaced) - 1)} after it" if len(replaced) > 1 else ""
@@ -357,9 +303,7 @@ async def _history_note(change: dict, rows, in_full: bool = False) -> str:
 
 
 def _voice_note(metadata) -> str:
-    """The note put before a message the user spoke into an Open WebUI voice
-    call (`features.voice`): the reply is read aloud, so it must be short
-    spoken sentences with no markup. "" for every other message."""
+    """Note for an OWUI voice call (`features.voice`), else ""."""
     features = metadata.get("features") if isinstance(metadata, dict) else None
     if not (isinstance(features, dict) and features.get("voice") is True):
         return ""
@@ -370,10 +314,8 @@ def _voice_note(metadata) -> str:
 
 
 def _history_seed(messages: list, side_by_side: bool = False) -> str:
-    """The copied messages of a cloned chat, for its first message: newest
-    first while they fit in `HISTORY_SEED_MAX_CHARS`, tool-call details left
-    out. Empty when there is nothing to copy. `side_by_side`: the session is
-    a new model column of a chat that went on without it, not a copy."""
+    """Earlier messages for a new session, newest kept first within the cap.
+    `side_by_side`: a new model column rather than a copied chat."""
     entries = []
     for m in messages:
         role = m.get("role")
@@ -414,9 +356,7 @@ async def _gateway_has_session(conn, session_key: str) -> bool:
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
                           metadata: dict, messages: list, column: int = 0, model=None) -> str:
-    """What to put before this request's message so the agent's memory matches
-    the chat (see above): "" on a normal send. Updates the session's line
-    (`column`: which of the chat's sessions this reply is in)."""
+    """Prefix that syncs the agent with the chat ("" normally); updates the line."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
@@ -434,8 +374,6 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
         if change["kind"]:
             in_full = False
             if change["kind"] == "branch":
-                # The agent has not seen the reply the user went on from when
-                # it was written in another session or by another provider.
                 prefixed = isinstance(model, str) and "." in model
                 in_full = (len(um.get("models") or []) > 1 or await _shown_from_other_model(
                     change["shown"], rows, model.split(".", 1)[0] + "." if prefixed else None))

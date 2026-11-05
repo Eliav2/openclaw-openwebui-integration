@@ -5,14 +5,6 @@
 
 
 
-# ---------------------------------------------------------------------------
-# Pipe class (Open WebUI entry point)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Dynamic model discovery helpers
-# ---------------------------------------------------------------------------
-
 _FALLBACK_MODELS = [
     {"key": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash", "tags": ["configured", "alias:DeepSeek"]},
     {"key": "openai/gpt-5.5", "name": "gpt-5.5", "tags": ["configured"]},
@@ -23,16 +15,9 @@ _FALLBACK_MODELS = [
 
 
 def _friendly_name(model_entry: dict) -> str:
-    """Return a human-friendly name for a model entry.
+    """Display name: catalog name, else alias tag, else last key segment.
 
-    Priority: model name field → alias tag → last segment of key.
-
-    The catalog `name` is preferred because it carries the *version*
-    ("Claude Opus 4.8"), while the alias is a deliberately short handle
-    ("opus") that hides which version you're actually talking to -- the
-    selector then shows two indistinguishable "Opus"/"Sonnet" entries as
-    new versions land. Same complaint as upstream openclaw#111884.
-    Alias remains the fallback for models the gateway returns unnamed.
+    The name carries the version; an alias like "opus" hides it (openclaw#111884).
     """
     name = model_entry.get("name", "")
     if name:
@@ -46,17 +31,12 @@ def _friendly_name(model_entry: dict) -> str:
 
 
 def _provider_from_key(key: str) -> str:
-    """Extract the provider/vendor from a model key like 'anthropic/claude-opus-4-8'."""
+    """'anthropic/claude-opus-4-8' -> 'anthropic'."""
     return key.split("/", 1)[0] if "/" in key else ""
 
 
 def _normalize_model_entry(raw: dict) -> dict:
-    """Normalize a raw gateway `models.list` entry into the {key, name, tags}
-    shape used elsewhere in this module (matches _FALLBACK_MODELS).
-
-    The gateway's actual response shape is {id, name, provider, alias, ...} --
-    there is no combined "key" or "tags" field, so this bridges the two.
-    """
+    """Gateway `models.list` entry {id, name, provider, alias, ...} -> {key, name, tags}."""
     provider = raw.get("provider", "")
     model_id = raw.get("id", "")
     key = f"{provider}/{model_id}" if provider and model_id else (model_id or provider)
@@ -68,14 +48,9 @@ def _normalize_model_entry(raw: dict) -> dict:
 
 
 def _usable_models(raw_models: list[dict]) -> list[dict]:
-    """Normalize `models.list` entries, dropping the ones the Gateway marks
-    `available: false` (e.g. `unavailableReason: "missing-auth"`).
+    """Normalized entries, minus those marked `available: false` (e.g. missing auth).
 
-    An allowlisted model with no credentials still comes back from
-    `models.list`. Listing it put a selector entry in OWUI that could only
-    fail: `anthropic/claude-haiku-5-5` sat next to the working
-    `claude-cli/claude-haiku-5-5`, and picking it 401'd with "No API key
-    found for provider anthropic". Entries without the field count as usable.
+    The Gateway still lists allowlisted models with no credentials.
     """
     return [
         _normalize_model_entry(m) for m in raw_models
@@ -83,41 +58,18 @@ def _usable_models(raw_models: list[dict]) -> list[dict]:
     ]
 
 
-# Wording that points at the agent/session rather than the model. Kept NARROW
-# on purpose -- an earlier version also matched "not found", which misfiled
-# "model 'x/y' not found" as an AGENT_ID problem. Do not re-broaden these; the
-# tests in SessionPatchFailureAttributionTests assert both directions.
+# Keep narrow: "not found" also appears in model errors.
+# SessionPatchFailureAttributionTests assert both directions.
 _AGENT_ERROR_HINTS = ("agent", "session")
 
 
 def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
-    """Describe a failed sessions.patch without misattributing the cause.
+    """Explain a failed sessions.patch: model, AGENT_ID, or unknown.
 
-    The session key embeds AGENT_ID and this patch is the turn's first
-    agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
-    reported as "Model selection error", sending the user to fix
-    DEFAULT_MODEL, which was never the problem.
-
-    Classifying by substring is genuinely ambiguous, so the ordering matters and
-    is deliberate:
-
-    * "model" (or the model key) present -> a MODEL error. Checked FIRST and
-      allowed to win outright, because gateway model errors routinely mention
-      the agent too ("model x/y is not configured for this agent"), whereas an
-      agent error rarely mentions a model. An earlier version of this matched
-      "not found" as an agent hint, which misfiled "model 'x/y' not found" --
-      the exact misattribution this function exists to prevent, just pointed
-      the other way.
-    * otherwise, agent/session wording -> an AGENT error.
-    * otherwise -> say we don't know, and name both valves. Guessing wrong is
-      worse than admitting ambiguity: it sends the user to edit a valve that
-      was correct.
+    This is the first agent-scoped RPC, so a bad AGENT_ID fails here too.
+    Model wording wins first, since model errors often mention the agent.
     """
-    # Transient and transport failures are neither valve's fault, and the retry
-    # comment in pipe() says they are the common ones under load. Classify by
-    # TYPE first: substring matching cannot see them, and str(TimeoutError()) is
-    # "", which rendered as a dangling colon followed by advice to edit two
-    # valves that were both correct.
+    # Transport errors are no valve's fault, and str(TimeoutError()) is "".
     if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
         return (
             "**The Gateway did not respond in time while starting this "
@@ -157,26 +109,17 @@ MODELS_SOURCE_LIVE = "live"
 MODELS_SOURCE_CACHE = "cache"
 MODELS_SOURCE_FALLBACK = "fallback"
 
-# Appended to selector entries built from _FALLBACK_MODELS. Display text only --
-# the entry's `id` (the routing key) is untouched, so this cannot affect routing.
+# Display-only suffix for _FALLBACK_MODELS entries; the routing `id` is untouched.
 UNVERIFIED_MODEL_SUFFIX = " -- example, Gateway not reached"
 
 
 async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
-    """Discover models, and report where the list came from.
+    """Return (models, source), source being "live", "cache" or "fallback".
 
-    Returns (models, source), source being "live", "cache" or "fallback".
-
-    Callers need that distinction because the three are not interchangeable to
-    a user. `pipes()` never initiates a connection -- it only reuses one that a
-    previous chat established -- so on a fresh install the live branch is skipped
-    and no cache exists yet, and the selector filled up with five hardcoded
-    models bearing no relationship to the user's Gateway, rendered identically
-    to genuinely discovered ones. Picking one the Gateway doesn't have then
-    failed with a bare "Model selection error", with nothing to suggest the list
-    itself had been fabricated.
+    `pipes()` only reuses an open connection, so a fresh install gets the
+    fallback list, which the selector must label as examples.
     """
-    # 1. Try live gateway (fast path only if already connected)
+    # Live only if a connection is already open.
     global _gateway_connection
     conn = _gateway_connection
     if conn and conn._ws and conn._event_loop_task and not conn._event_loop_task.done():
@@ -193,13 +136,11 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
 
-    # 2. Cache fallback
     cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
         return cache["models"], MODELS_SOURCE_CACHE
 
-    # 3. Hardcoded fallback
     pipe_log(
         "Using hardcoded fallback model list -- the Gateway has not been reached "
         "yet, so these are examples, not your Gateway's models. They are labelled "

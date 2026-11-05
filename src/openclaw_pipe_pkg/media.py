@@ -5,10 +5,6 @@
 
 
 
-# ---------------------------------------------------------------------------
-# File Server (media delivery)
-# ---------------------------------------------------------------------------
-
 MEDIA_DIR = "/tmp/openclaw-pipe-media"
 MEDIA_BASE_URL = "http://localhost:18791"
 
@@ -19,26 +15,16 @@ _MEDIA_FNAME_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
 
 
 def _looks_like_media_filename(fname: str) -> bool:
-    """Return True only if fname plausibly names a real file (has an
-    extension), so prose using "MEDIA:" as a term ("the MEDIA: fix") keeps
-    its next word as text instead of a broken image link."""
+    """Whether fname has an extension, so prose like "the MEDIA: fix" stays text."""
     return bool(_MEDIA_FNAME_RE.search(fname))
 
 
 def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str, str]:
-    """Feed a new assistant-delta chunk into the MEDIA: buffering state.
+    """Feed a delta; return (text_to_yield_now, new_pending).
 
-    Returns (text_to_yield_now, new_pending), mirroring
-    `_advance_input_prompt_buffer`. A real streaming provider can deliver
-    "MEDIA:filename.png" split across deltas at any point, mid-prefix or
-    mid-filename, and resolving one delta alone drops the directive or
-    truncates its filename. Hold back from the first "MEDIA:" (or a prefix
-    of it that could still complete) until a whitespace char confirms the
-    filename is done.
-
-    A directive in code is text and never held; one after a backtick run
-    that may still open a code span is held until that is decided (ELI-111).
-    `ctx`: the text already shown in this message item.
+    A directive can split across deltas, so hold from "MEDIA:" (or a partial
+    prefix) until whitespace ends the filename, or until an open backtick
+    run is decided (ELI-111). `ctx`: text already shown in this item.
     """
     candidate = pending + delta
     _directives, hold = _media_scan(candidate, ctx, final=False)
@@ -48,12 +34,10 @@ def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str,
 
 
 def _take_media_fname(after_prefix: str) -> tuple[str, str]:
-    """Split the text after a "MEDIA:" prefix into (filename, rest).
+    """Split text after "MEDIA:" into (filename, rest).
 
-    A filename ends at whitespace OR at the next "MEDIA:" directive, so
-    "X.pngMEDIA:Y.png" is two files, not one bogus name (ELI-76). A copy of
-    the same directive glued on with no separator is dropped: nothing emits
-    that on purpose, it is a re-delivered tail.
+    A filename also ends at the next "MEDIA:" (ELI-76). A glued copy of the
+    same directive is a re-delivered tail and is dropped.
     """
     token = after_prefix.split()[0] if after_prefix else ""
     fname = token.split(_MEDIA_TRIGGER, 1)[0]
@@ -67,26 +51,22 @@ def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     return fname, rest
 
 
-# A directive is code-aware, as the ask marker is (ELI-107, ELI-111). Code is
-# a fenced block (CommonMark 4.5) or an inline code span (6.1): a backtick run
-# closed by the next run of the same length within its paragraph. A run with
-# no closer is a literal backtick, which is only known once its paragraph
-# ends. Indented code blocks are not tracked: an indented line in a list is
-# prose.
+# Directives in code stay text (ELI-107, ELI-111): fenced blocks (CommonMark
+# 4.5) and code spans (6.1). An unclosed backtick run is literal, known only
+# when its paragraph ends. Indented code is not tracked (list lines indent).
 _BLOCK_START_RE = re.compile(r"^ {0,3}(#{1,6}(\s|$)|[-+*](\s|$)|\d{1,9}[.)](\s|$))")
 
 
 def _media_code_ranges(text: str, ctx: str = "", final: bool = True):
-    """(ranges, open_at) for `text` as it continues `ctx`: the [start, end)
-    spans of `text` that are code, and the offset in `text` from which that
-    is not decided yet (a backtick run that may still be closed in the open
-    paragraph `text` ends in), else None. `final`: nothing follows `text`."""
+    """(code ranges of `text`, offset where code state is undecided or None).
+
+    `ctx` precedes `text`; `final`: nothing follows `text`."""
     full, base = ctx + text, len(ctx)
     ranges, open_at = [], None
     fence_step = globals().get("_fence_step")
 
     def spans(start, end, last):
-        """Code spans of the paragraph full[start:end]; `last`: it may go on."""
+        """Code spans of full[start:end]; `last`: the paragraph may go on."""
         nonlocal open_at
         i = start
         while i < end:
@@ -151,12 +131,9 @@ def _media_code_ranges(text: str, ctx: str = "", final: bool = True):
 
 
 def _media_scan(text: str, ctx: str = "", final: bool = True):
-    """(directives, hold_at): each complete `MEDIA:<file>` directive of `text`
-    outside code, as (start, end, filename) by `_take_media_fname`, and the
-    offset a stream holds `text` back from (None when nothing): the first
-    occurrence, or prefix of one at the end, whose filename may still be
-    arriving or whose code state is not decided. `ctx`: the text shown
-    before `text` in its message item. `final`: nothing follows `text`."""
+    """(directives as (start, end, filename) outside code, hold offset or None).
+
+    `ctx` precedes `text`; `final`: nothing follows `text`."""
     ranges, open_at = _media_code_ranges(text, ctx, final)
 
     def in_code(i):
@@ -173,8 +150,7 @@ def _media_scan(text: str, ctx: str = "", final: bool = True):
         stripped = after.strip()
         fname, rest = _take_media_fname(stripped)
         end = i + (len(after) - len(after.lstrip())) + len(stripped) - len(rest)
-        # The line break after a directive depends on what follows it, so a
-        # stream holds it until something does (ELI-113).
+        # The line break after it depends on what follows (ELI-113).
         complete = final or bool(text[end:].strip())
         if not complete or (open_at is not None and idx >= open_at
                             and _looks_like_media_filename(fname)):
@@ -192,10 +168,8 @@ def _media_scan(text: str, ctx: str = "", final: bool = True):
 
 
 def _replace_media(text: str, directives, replacement) -> str:
-    """`text` with each directive (from `_media_scan`) replaced by
-    `replacement(filename)`, and the text after it on a line of its own.
-    Nothing else changes: a streamed chunk's own trailing line break is the
-    next chunk's line start (ELI-113)."""
+    """Replace each directive with `replacement(filename)`, text after it on
+    a new line. A chunk's trailing line break is left alone (ELI-113)."""
     out, pos = "", 0
     for start, end, fname in directives:
         rest = text[end:]
@@ -207,20 +181,13 @@ def _replace_media(text: str, directives, replacement) -> str:
 
 
 def _resolve_media(text, base_url=None, ctx=""):
-    """Convert every MEDIA:filename directive in text to embedded media.
-
-    A reply can carry several images, so every directive is converted, not
-    just the first. Prose using "MEDIA:" as a term (no file extension) and a
-    directive quoted in code (ELI-111) stay text. `ctx`: the text shown before `text` in its message
-    item.
-    """
+    """Turn every MEDIA: directive outside code (ELI-111) into an image link."""
     if base_url is None:
         base_url = MEDIA_BASE_URL
     directives, _hold = _media_scan(text, ctx)
     if not directives:
         return text, False
-    # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
-    # A directive that is a URL already is one.
+    # A URL, not base64: base64 breaks OWUI's streaming parser.
     return _replace_media(text, directives,
                           lambda fname: f"![{os.path.basename(fname)}]({fname})" if _is_media_url(fname)
                           else f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
@@ -231,26 +198,21 @@ def _is_media_url(fname: str) -> bool:
 
 
 def _is_gateway_media_name(fname: str) -> bool:
-    """A directive naming a path, not a bare file name or a URL: the Gateway
-    resolves it on its own host and stores the file as an `image` block of
-    the run's message (ELI-328). The Pipe cannot read that path, and the
-    file server never had it."""
+    """A path directive: the Gateway stores that file as an `image` block
+    (ELI-328); the Pipe cannot read the path."""
     return "/" in fname and not _is_media_url(fname)
 
 
 def _event_media_urls(data) -> list[str]:
-    """The `mediaUrls` of an assistant event: on the Gateway's own runtime
-    (DeepSeek, Grok, GPT...) the Gateway takes a reply's `MEDIA:` lines out
-    of its text and sends their files here instead (measured 2026-10-26,
-    ELI-328). claude-cli runs keep the lines in the text."""
+    """An assistant event's `mediaUrls`. The Gateway's own runtime moves
+    `MEDIA:` lines here; claude-cli keeps them in the text (ELI-328)."""
     urls = data.get("mediaUrls") if isinstance(data, dict) else None
     return [u.strip() for u in urls if isinstance(u, str) and u.strip()] if isinstance(urls, list) else []
 
 
 def _take_gateway_media(text: str, ctx: str = "") -> tuple[str, list[str]]:
-    """(`text` without its path `MEDIA:` directives, their paths). The image
-    comes from the run's stored blocks once the run ends (`_gateway_images_text`);
-    the directive line itself is not shown. `ctx`: as for `_media_scan`."""
+    """(`text` without path directives, their paths). The images come later
+    from the run's stored blocks (`_gateway_images_text`)."""
     directives, _hold = _media_scan(text, ctx)
     paths = [d for d in directives if _is_gateway_media_name(d[2])]
     if not paths:
@@ -259,7 +221,7 @@ def _take_gateway_media(text: str, ctx: str = "") -> tuple[str, list[str]]:
 
 
 def _extract_request_bearer(__request__):
-    """Return a Bearer token from the current OWUI request, when available."""
+    """The OWUI request's Bearer token, or None."""
     if not __request__:
         return None
     headers = getattr(__request__, "headers", None)
@@ -286,7 +248,7 @@ def _multipart_body(field_name, file_path, filename, mime):
 
 
 def _upload_owui_file(file_path, base_url, token):
-    """Upload one file to OWUI Files API and return the file object."""
+    """Upload one file to the OWUI Files API; return the file object."""
     if not token:
         raise RuntimeError("missing OWUI bearer token")
     filename = os.path.basename(file_path)
@@ -318,15 +280,10 @@ async def _resolve_media_via_owui(
     __event_emitter__,
     ctx="",
 ):
-    """Upload every MEDIA: file in text to OWUI, in order, and attach each to
-    the current message.
+    """Upload every MEDIA: file to OWUI and attach it to the message.
 
-    A reply can carry several images, so every directive is uploaded, not
-    just the first. If any single directive can't be resolved this way (file missing locally, bad name),
-    bail out entirely with handled=False so the caller's fallback
-    (`_resolve_media`) handles ALL directives uniformly via the external
-    URL instead of leaving a mix of native-upload and unresolved directives
-    in one message.
+    If any one cannot be uploaded, return handled=False so the fallback
+    resolves all of them the same way.
     """
     directives, _hold = _media_scan(text, ctx)
     if not directives:
@@ -339,14 +296,8 @@ async def _resolve_media_via_owui(
     for _start, _end, fname in directives:
         if fname in shown:
             continue
-        # _upload_owui_file uses blocking urllib -- must run off the event loop.
-        # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
-        # calling itself) from *inside* the async handler for the very request
-        # that's driving this pipe run. Calling it directly would block the
-        # single asyncio event loop thread, and OWUI can't service its own
-        # incoming HTTP request while its own loop is blocked waiting on it --
-        # a guaranteed self-deadlock that only resolves via timeout. Running it
-        # in a thread lets the event loop keep serving requests concurrently.
+        # Off the event loop: this blocking call goes to OWUI's own API, which
+        # cannot answer while its loop is blocked (self-deadlock).
         fpath = os.path.join(MEDIA_DIR, fname)
         file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
         if __event_emitter__:
@@ -370,11 +321,9 @@ async def _resolve_media_via_owui(
 
 
 async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None, ctx=""):
-    """Resolve a MEDIA: directive, preferring the native OWUI Files API upload
-    and falling back to the external file-server URL. Shared by the main
-    per-delta resolution site and the end-of-stream final-flush site so both
-    stay in sync (see `_advance_media_buffer` for why callers must only pass
-    in text whose MEDIA:filename is already known-complete).
+    """Resolve MEDIA: directives via OWUI Files, else the file server.
+
+    Pass only text whose filenames are complete (see `_advance_media_buffer`).
     """
     handled = False
     resolved = text
@@ -395,17 +344,15 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
     return resolved, handled
 
 
-# Where the Gateway serves media a reply carries as `image` blocks (an
-# agent's own image tool, e.g. Codex image generation). It needs the Gateway
-# token, which the browser does not have, so the Pipe fetches it (ELI-322).
+# Gateway route for `image` blocks. It needs the Gateway token, which the
+# browser lacks, so the Pipe fetches it (ELI-322).
 _GATEWAY_MEDIA_PREFIX = "/api/chat/media/outgoing/"
 _GATEWAY_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 _SAFE_FNAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _gateway_image_blocks(message) -> list[dict]:
-    """The `image` blocks of a final assistant message that point at the
-    Gateway's media route, in order."""
+    """A message's `image` blocks on the Gateway media route, in order."""
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
         return []
@@ -417,11 +364,11 @@ def _gateway_image_blocks(message) -> list[dict]:
 
 
 def _is_run_assistant_message(message, run_id: str) -> bool:
-    """Whether `message` is one of run `run_id`'s stored assistant messages:
-    the run's own (`runId`), or the one the Gateway appends for the run's
-    media when it cannot add them to the run's own message, keyed
+    """Whether `message` is a stored assistant message of run `run_id`.
+
+    Includes the media message the Gateway appends, keyed
     `<run id>:assistant-media[:n]` with no `runId` (2026.10.10,
-    chat-send-handler appendInjectedAssistantMessageToTranscript)."""
+    appendInjectedAssistantMessageToTranscript)."""
     if not isinstance(message, dict) or message.get("role") != "assistant" or not run_id:
         return False
     meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
@@ -433,10 +380,8 @@ def _is_run_assistant_message(message, run_id: str) -> bool:
 
 
 def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
-    """The Gateway image blocks of one run's assistant messages in
-    `chat.history`, in order. The Gateway stores a run's managed images after
-    its final, in the run's message or in one it appends for them; the live
-    `chat` final carries only the text (measured 2026-10-25, ELI-322)."""
+    """One run's Gateway image blocks in `chat.history`. The live final has
+    only text; images are stored after it (ELI-322)."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list):
         return []
@@ -448,9 +393,7 @@ def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
 
 
 def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
-    """The labels (file names) of the `attachment_error` blocks of one run's
-    assistant messages: a reply's media file the Gateway could not store,
-    e.g. a path that does not exist (seen live: code `file-not-found`)."""
+    """File names from one run's `attachment_error` blocks (e.g. `file-not-found`)."""
     labels = []
     for message in (history or {}).get("messages") or []:
         if not _is_run_assistant_message(message, run_id):
@@ -463,10 +406,8 @@ def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
 
 
 def _unstored_gateway_media(paths, blocks: int, errors: list[str]) -> list[str]:
-    """The names of the path directives in `paths` that have no stored image
-    yet: each one the Gateway reported it could not store (`errors`, by file
-    name), then, while fewer than `blocks` arrived for the rest, the last of
-    those. Empty once every path is accounted for."""
+    """Names in `paths` with no stored image: those in `errors`, then the
+    rest beyond the first `blocks`."""
     names = [os.path.basename(p) for p in paths]
     failed = [n for n in names if n in {os.path.basename(e) for e in errors if e}]
     rest = [n for n in names if n not in failed]
@@ -474,7 +415,7 @@ def _unstored_gateway_media(paths, blocks: int, errors: list[str]) -> list[str]:
 
 
 def _gateway_image_fname(block: dict) -> str:
-    """A unique bare file name for an image block, with its type's extension."""
+    """A unique safe file name for an image block."""
     stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]
     stem = _SAFE_FNAME_RE.sub("-", stem).strip("-.")[:60] or "image"
     ext = mimetypes.guess_extension(block.get("mimeType") or "") or ".png"
@@ -482,7 +423,7 @@ def _gateway_image_fname(block: dict) -> str:
 
 
 def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
-    """GET one media path from the Gateway's HTTP server, with its token."""
+    """GET one media path from the Gateway with its token."""
     host, port, tls = _parse_gateway_url(gateway_url)
     req = urllib.request.Request(
         f"{'https' if tls else 'http'}://{host}:{port}{path}",
@@ -497,12 +438,9 @@ def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
 
 async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None,
                                missing=()) -> str:
-    """Show a final message's Gateway image blocks the way a MEDIA: directive
-    is shown: each image is fetched into the media dir, then resolved by
-    `_resolve_media_text` (Open WebUI's files, else the file server). An
-    image that cannot be fetched is named in the text, never dropped
-    silently, and so is each of `missing`, a file the reply named that the
-    Gateway never stored."""
+    """Fetch Gateway image blocks and show them as MEDIA: directives.
+
+    Failed fetches and `missing` files are named, never dropped silently."""
     lines = [f"_(an image could not be loaded: {name})_" for name in missing]
     for block in blocks:
         fname = _gateway_image_fname(block)
@@ -525,17 +463,9 @@ async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emit
     return resolved
 
 
-# Anchor for finding a file server left behind by a *previous* deploy of this
-# same function (same class of issue as P33/P36/gateway._reap_stale_gateway_
-# connection: OWUI's function loader execs each redeploy into a brand-new
-# module object with no teardown hook on the old one, so a module-level
-# _file_server_started flag alone just resets and a second HTTPServer tries
-# to bind the same port -- silently failing since the old one is still
-# listening, per _start_file_server's `except OSError: pass`). Stashing the
-# server object on `open_webui.socket.main` -- OWUI's own stable module,
-# never reloaded by our function -- lets the next deploy find and shut down
-# the previous one first, so redeploys self-heal without a container
-# restart. Falls back to a no-op when not running inside OWUI (unit tests).
+# OWUI reloads a function into a new module with no teardown, so the old
+# file server keeps the port. It is stashed on `open_webui.socket.main`, which
+# is never reloaded, so the next deploy can shut it down first.
 _STALE_FILE_SERVER_ATTR = "_openclaw_file_server_v1"
 
 
@@ -564,7 +494,7 @@ def _remember_file_server(server) -> None:
 
 
 def _start_file_server(port=18791):
-    """Start a minimal HTTP server for media files. Starts once per process."""
+    """Start the media file server, once per process."""
     global _file_server_started
     if _file_server_started:
         return

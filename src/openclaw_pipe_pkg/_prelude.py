@@ -36,24 +36,14 @@ from cryptography.hazmat.backends import default_backend
 
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 def pipe_log(*args):
     """Log to stdout so it appears in OWUI's backend logs."""
     print(f"[openclaw-pipe] {' '.join(str(a) for a in args)}", flush=True)
 
 
 
-# ---------------------------------------------------------------------------
-# Background tasks
-# ---------------------------------------------------------------------------
-
-# The event loop keeps only a weak reference to a task, so a fire-and-forget
-# asyncio.create_task() can be garbage-collected before it finishes and its
-# work silently never happens. Background work goes through spawn_background,
-# which holds the reference until the task is done.
+# The event loop holds tasks weakly, so a bare create_task() can be collected
+# before it runs. spawn_background keeps a reference until the task is done.
 _BACKGROUND_TASKS: set = set()
 
 

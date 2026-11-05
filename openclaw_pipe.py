@@ -111,24 +111,14 @@ from cryptography.hazmat.backends import default_backend
 
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 def pipe_log(*args):
     """Log to stdout so it appears in OWUI's backend logs."""
     print(f"[openclaw-pipe] {' '.join(str(a) for a in args)}", flush=True)
 
 
 
-# ---------------------------------------------------------------------------
-# Background tasks
-# ---------------------------------------------------------------------------
-
-# The event loop keeps only a weak reference to a task, so a fire-and-forget
-# asyncio.create_task() can be garbage-collected before it finishes and its
-# work silently never happens. Background work goes through spawn_background,
-# which holds the reference until the task is done.
+# The event loop holds tasks weakly, so a bare create_task() can be collected
+# before it runs. spawn_background keeps a reference until the task is done.
 _BACKGROUND_TASKS: set = set()
 
 
@@ -141,13 +131,8 @@ def spawn_background(coro):
 
 # --- identity --------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Device Identity helpers
-# ---------------------------------------------------------------------------
-
 def _generate_device_identity():
-    """Generate a fresh Ed25519 key pair and return a dict with id, publicKey,
-    and privateKey (PEM)."""
+    """New Ed25519 identity: dict with id, publicKey and privateKey (PEM)."""
     pk = ed25519.Ed25519PrivateKey.generate()
     pub = pk.public_key()
     raw = pub.public_bytes(
@@ -165,8 +150,8 @@ def _generate_device_identity():
 
 
 def _sign_challenge(ident, nonce, ts, token_str="", scopes=None):
-    """Sign the WebSocket challenge using the device identity. The Gateway
-    checks the scope list in the signed payload against the scopes requested."""
+    """Sign the WebSocket challenge. The Gateway checks the signed scope list
+    against the scopes requested."""
     parts = [
         "v2", ident["id"], "webchat", "cli", "operator",
         ",".join(GATEWAY_SCOPES if scopes is None else scopes), str(ts), token_str, nonce
@@ -246,41 +231,22 @@ def _write_json_file(path, data):
 
 
 
-# ---------------------------------------------------------------------------
-# Sub-agent child index: the child sessions each chat's session spawned.
-#
-# The Status dialog lists a chat's children, ended ones included (ELI-152).
-# The Gateway has no "children of" read: `sessions.list {spawnedBy}` keeps an
-# ended child for 30 minutes only, and a read without it returns every session
-# (1.35 MB for 422 rows live). So the Pipe records each spawn it sees accepted
-# (`_spawned_child`), and the Status Action keeps each child's last row here,
-# so an ended child is listed from this file and a child the window dropped is
-# looked up by its own key. One file in the bridge state dir, shared by the
-# Pipe and the Action (separate modules in one Open WebUI process), so it
-# survives restarts and redeploys. Each change is a read-modify-write under an
-# flock. Parents untouched for 180 days are dropped, and each keeps its 200
-# newest children. `tasks`: the task each spawn call was given, by child key,
-# which titles the child before its transcript holds the spawn message (on
-# 2026.10 that is written after the spawn returns, ELI-178). `runs`: each
-# spawn's run id and label, by child key. A child spawned with cleanup
-# "delete" has no session once its run is done, so its row comes from its run
-# (`agent.wait`), and so does a failed child's real error (ELI-276, ELI-277).
-# `seeded`: children spawned before this file existed were folded in once,
-# from one full list.
-# ---------------------------------------------------------------------------
+# Sub-agent child index (ELI-152). The Gateway has no "children of" read and
+# `sessions.list {spawnedBy}` drops ended children after 30 min, so the Pipe
+# and Status Action share this flock-guarded file. `tasks` title a child before
+# its transcript has the spawn message (ELI-178). `runs` let a cleanup "delete"
+# child be read via `agent.wait` (ELI-276, ELI-277).
 
 _SUBAGENT_INDEX_NAME = "subagent-children.json"
 _SUBAGENT_INDEX_KEEP_MS = 180 * 86400 * 1000
 _SUBAGENT_INDEX_PER_PARENT = 200
-# What a Subagents row needs of a child session's row.
 _SUBAGENT_SNAPSHOT_KEYS = ("key", "label", "status", "startedAt", "createdAt", "updatedAt", "endedAt",
                            "lastRunError", "spawnedBy", "parentSessionKey", "gone")
 
 
 def _subagent_ended(row) -> bool:
-    """A child session row (or `sessions.changed` push) whose run is over:
-    the row to keep, since a cleanup "delete" removes the session seconds
-    later (ELI-276)."""
+    """Whether a child row's run is over; keep it, as cleanup "delete" removes
+    the session soon after (ELI-276)."""
     return (row or {}).get("status") not in (None, "running", "queued") and row.get("hasActiveRun") is not True
 
 
@@ -341,15 +307,13 @@ def _subagent_tasks(parent) -> dict:
 
 
 def _subagent_runs(parent) -> dict:
-    """{child key: {"runId", "label", "error"}} of `parent`'s spawns: the run
-    each was started with, and that run's own error once read."""
+    """{child key: {"runId", "label", "error"}} of `parent`'s spawns."""
     entry = _subagent_index_read()["parents"].get(parent) or {}
     return dict(entry.get("runs") or {})
 
 
 def _subagent_record(child) -> dict | None:
-    """What the index holds of one child, under whichever parent spawned it:
-    {"parent", "row" (or None), "task", "run"}; None for a child it never saw."""
+    """{"parent", "row", "task", "run"} for one child, or None if unknown."""
     for parent, entry in _subagent_index_read()["parents"].items():
         if child in (entry.get("children") or {}):
             return {"parent": parent, "row": entry["children"][child],
@@ -359,9 +323,7 @@ def _subagent_record(child) -> dict | None:
 
 
 def _subagent_remember(parent, rows=(), keys=(), tasks=None, runs=None) -> None:
-    """Record `parent`'s children: `keys` seen spawned, `rows` as just read,
-    `tasks` {child key: the task its spawn call was given}, `runs` {child
-    key: fields of its run}, merged into what is kept."""
+    """Merge spawned `keys`, read `rows`, `tasks` and `runs` into `parent`'s entry."""
     rows, keys, tasks, runs = list(rows), list(keys), dict(tasks or {}), dict(runs or {})
     if not parent or not (rows or keys or tasks or runs):
         return
@@ -883,25 +845,12 @@ def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
 
 
 # --- thinking --------------------------------------------------------------
-# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
-# and the pipe enforces them against the live session ladder, so the ranks and
-# the clamping rule have to be one implementation, not two that agree today.
-#
-# Deliberately has no imports, no classes, and no module-level names beyond the
-# five below. It is concatenated into the Pipe artifact, where every name in it
-# lands in the same flat namespace as every other fragment: a helper named like
-# one of the pipe's own (a `_state_dir`, say) would silently shadow it
-# depending on fragment order. Filter-only helpers live in `thinking_filter`
-# for exactly that reason.
+# Shared by the Thinking filter and the Pipe so both use one ranking and clamp.
+# No imports or extra names: it lands in the Pipe's flat namespace, where a
+# helper could shadow a Pipe name. Filter-only helpers go in thinking_filter.
 
-# ---------------------------------------------------------------------------
-# Levels
-# ---------------------------------------------------------------------------
-
-# Ranks mirror the gateway's own table (off is genuinely a level, not an
-# absence). Used to order the dropdown and to clamp downward, never upward:
-# asking for less thinking than requested is a safe degradation, asking for
-# more is a surprise on someone's bill.
+# Mirrors the Gateway's table. Clamp only downward: less thinking is safe,
+# more costs money.
 LEVEL_RANKS = {
     "off": 0,
     "minimal": 10,
@@ -914,54 +863,32 @@ LEVEL_RANKS = {
     "ultra": 80,
 }
 
-# The sentinel meaning "do not send the field at all". Distinct from "off",
-# which is an explicit instruction to not think. "default" leaves the agent's
-# own configured level alone; "off" overrides it.
+# Means "send no level": keep the agent's own. "off" is an explicit level.
 UNSET = "default"
 
-# Used until the pipe has run once and written a real ladder cache. Every
-# provider observed supports at least these, so nothing here can be a lie.
+# Used until the Pipe writes a ladder cache. Every known provider has these.
 FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
 
 LADDER_CACHE_NAME = "thinking-ladders.json"
 
-# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
-# are identical (`label: id`). The one divergence is the binary profile, which
-# labels `low` as "on". Mapping it back is the difference between learning a
-# model's real two-level ladder and learning a one-level lie.
+# The Gateway's rejection lists labels, not ids. The binary profile labels
+# `low` as "on".
 LEVEL_LABEL_ALIASES = {"on": "low"}
 
-# The exact anchors of the Gateway's hard validation error, e.g.:
+# Anchors of the Gateway's validation error, all required and in order:
 #   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
-# All three must be present and in order. That is deliberately at least as
-# narrow as matching the whole sentence: it can never fire on genuine assistant
-# text that happens to discuss thinking levels.
 _REJECT_HEAD = 'Thinking level "'
 _REJECT_MID = '" is not supported for '
 _REJECT_TAIL = ". Use one of: "
 
 
 def parse_thinking_rejection(text):
-    """Read the Gateway's own rejection as an authoritative per-model ladder.
+    """Parse the Gateway's level rejection into the model's real ladder.
 
-    This exists because `sessions.describe` cannot be trusted for this. Describe
-    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
-    never sees the catalog's `reasoning: false` and falls through to the generic
-    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
-    whose real ladder is `["off"]`. The send path resolves the same question
-    WITH the catalog and rejects. So the rejection is the only place the truth
-    is stated, and throwing it away is what made this misfire once per turn
-    forever instead of once per model.
-
-    Returns None when `text` is not that rejection. Otherwise a dict:
-    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
-    `levels` may be empty if every listed label is unrecognised -- the caller
-    still learns which model rejected which level, so it must check for None
-    rather than for falsiness.
-
-    Pure string parsing on purpose: this fragment is shared with the Thinking
-    filter, which imports nothing (not even `re`) so that a filter running on
-    every message can never fail on an import it did not need.
+    `sessions.describe` builds its ladder without the model catalog, so it
+    over-reports levels; only the send path's rejection is accurate.
+    Returns None, or `{"level", "model", "levels"}`; `levels` may be empty, so
+    check for None. No `re`, since the filter shares this fragment.
     """
     if not text:
         return None
@@ -979,8 +906,7 @@ def parse_thinking_rejection(text):
     level = text[level_start:mid].strip().lower()
     model = text[mid + len(_REJECT_MID):tail].strip()
     if not level or not model or " " in model:
-        # A model ref never contains a space. Anything that does means the
-        # anchors matched something that merely reads like the rejection.
+        # A model ref has no space, so this is not the real rejection.
         return None
 
     listed = text[tail + len(_REJECT_TAIL):]
@@ -998,22 +924,14 @@ def parse_thinking_rejection(text):
 
 
 def clamp_to_ladder(level, ladder):
-    """Fit a requested level to what a model actually supports.
+    """Fit a level to a model's ladder. Returns (level, note to show or None).
 
-    Returns (resolved_level, note). `note` is None when the request went
-    through untouched, otherwise a short human sentence explaining what
-    changed, which the caller is expected to show rather than swallow.
-
-    Clamping is always downward to the nearest supported rank. If the model
-    supports nothing at or below the request (a ladder of only higher levels,
-    which no observed provider has, but which costs nothing to handle), the
-    lowest supported level is used.
+    Clamps down to the nearest supported rank, else to the lowest one.
     """
     if not level or level == UNSET:
         return None, None
     if not ladder:
-        # No ladder known: pass the request through and let the gateway rule on
-        # it. Silently dropping a level the user explicitly picked is worse.
+        # Unknown ladder: let the Gateway rule rather than drop the user's pick.
         return level, None
     if level in ladder:
         return level, None
@@ -1040,10 +958,6 @@ def clamp_to_ladder(level, ladder):
 # --- media -----------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# File Server (media delivery)
-# ---------------------------------------------------------------------------
-
 MEDIA_DIR = "/tmp/openclaw-pipe-media"
 MEDIA_BASE_URL = "http://localhost:18791"
 
@@ -1054,26 +968,16 @@ _MEDIA_FNAME_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
 
 
 def _looks_like_media_filename(fname: str) -> bool:
-    """Return True only if fname plausibly names a real file (has an
-    extension), so prose using "MEDIA:" as a term ("the MEDIA: fix") keeps
-    its next word as text instead of a broken image link."""
+    """Whether fname has an extension, so prose like "the MEDIA: fix" stays text."""
     return bool(_MEDIA_FNAME_RE.search(fname))
 
 
 def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str, str]:
-    """Feed a new assistant-delta chunk into the MEDIA: buffering state.
+    """Feed a delta; return (text_to_yield_now, new_pending).
 
-    Returns (text_to_yield_now, new_pending), mirroring
-    `_advance_input_prompt_buffer`. A real streaming provider can deliver
-    "MEDIA:filename.png" split across deltas at any point, mid-prefix or
-    mid-filename, and resolving one delta alone drops the directive or
-    truncates its filename. Hold back from the first "MEDIA:" (or a prefix
-    of it that could still complete) until a whitespace char confirms the
-    filename is done.
-
-    A directive in code is text and never held; one after a backtick run
-    that may still open a code span is held until that is decided (ELI-111).
-    `ctx`: the text already shown in this message item.
+    A directive can split across deltas, so hold from "MEDIA:" (or a partial
+    prefix) until whitespace ends the filename, or until an open backtick
+    run is decided (ELI-111). `ctx`: text already shown in this item.
     """
     candidate = pending + delta
     _directives, hold = _media_scan(candidate, ctx, final=False)
@@ -1083,12 +987,10 @@ def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str,
 
 
 def _take_media_fname(after_prefix: str) -> tuple[str, str]:
-    """Split the text after a "MEDIA:" prefix into (filename, rest).
+    """Split text after "MEDIA:" into (filename, rest).
 
-    A filename ends at whitespace OR at the next "MEDIA:" directive, so
-    "X.pngMEDIA:Y.png" is two files, not one bogus name (ELI-76). A copy of
-    the same directive glued on with no separator is dropped: nothing emits
-    that on purpose, it is a re-delivered tail.
+    A filename also ends at the next "MEDIA:" (ELI-76). A glued copy of the
+    same directive is a re-delivered tail and is dropped.
     """
     token = after_prefix.split()[0] if after_prefix else ""
     fname = token.split(_MEDIA_TRIGGER, 1)[0]
@@ -1102,26 +1004,22 @@ def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     return fname, rest
 
 
-# A directive is code-aware, as the ask marker is (ELI-107, ELI-111). Code is
-# a fenced block (CommonMark 4.5) or an inline code span (6.1): a backtick run
-# closed by the next run of the same length within its paragraph. A run with
-# no closer is a literal backtick, which is only known once its paragraph
-# ends. Indented code blocks are not tracked: an indented line in a list is
-# prose.
+# Directives in code stay text (ELI-107, ELI-111): fenced blocks (CommonMark
+# 4.5) and code spans (6.1). An unclosed backtick run is literal, known only
+# when its paragraph ends. Indented code is not tracked (list lines indent).
 _BLOCK_START_RE = re.compile(r"^ {0,3}(#{1,6}(\s|$)|[-+*](\s|$)|\d{1,9}[.)](\s|$))")
 
 
 def _media_code_ranges(text: str, ctx: str = "", final: bool = True):
-    """(ranges, open_at) for `text` as it continues `ctx`: the [start, end)
-    spans of `text` that are code, and the offset in `text` from which that
-    is not decided yet (a backtick run that may still be closed in the open
-    paragraph `text` ends in), else None. `final`: nothing follows `text`."""
+    """(code ranges of `text`, offset where code state is undecided or None).
+
+    `ctx` precedes `text`; `final`: nothing follows `text`."""
     full, base = ctx + text, len(ctx)
     ranges, open_at = [], None
     fence_step = globals().get("_fence_step")
 
     def spans(start, end, last):
-        """Code spans of the paragraph full[start:end]; `last`: it may go on."""
+        """Code spans of full[start:end]; `last`: the paragraph may go on."""
         nonlocal open_at
         i = start
         while i < end:
@@ -1186,12 +1084,9 @@ def _media_code_ranges(text: str, ctx: str = "", final: bool = True):
 
 
 def _media_scan(text: str, ctx: str = "", final: bool = True):
-    """(directives, hold_at): each complete `MEDIA:<file>` directive of `text`
-    outside code, as (start, end, filename) by `_take_media_fname`, and the
-    offset a stream holds `text` back from (None when nothing): the first
-    occurrence, or prefix of one at the end, whose filename may still be
-    arriving or whose code state is not decided. `ctx`: the text shown
-    before `text` in its message item. `final`: nothing follows `text`."""
+    """(directives as (start, end, filename) outside code, hold offset or None).
+
+    `ctx` precedes `text`; `final`: nothing follows `text`."""
     ranges, open_at = _media_code_ranges(text, ctx, final)
 
     def in_code(i):
@@ -1208,8 +1103,7 @@ def _media_scan(text: str, ctx: str = "", final: bool = True):
         stripped = after.strip()
         fname, rest = _take_media_fname(stripped)
         end = i + (len(after) - len(after.lstrip())) + len(stripped) - len(rest)
-        # The line break after a directive depends on what follows it, so a
-        # stream holds it until something does (ELI-113).
+        # The line break after it depends on what follows (ELI-113).
         complete = final or bool(text[end:].strip())
         if not complete or (open_at is not None and idx >= open_at
                             and _looks_like_media_filename(fname)):
@@ -1227,10 +1121,8 @@ def _media_scan(text: str, ctx: str = "", final: bool = True):
 
 
 def _replace_media(text: str, directives, replacement) -> str:
-    """`text` with each directive (from `_media_scan`) replaced by
-    `replacement(filename)`, and the text after it on a line of its own.
-    Nothing else changes: a streamed chunk's own trailing line break is the
-    next chunk's line start (ELI-113)."""
+    """Replace each directive with `replacement(filename)`, text after it on
+    a new line. A chunk's trailing line break is left alone (ELI-113)."""
     out, pos = "", 0
     for start, end, fname in directives:
         rest = text[end:]
@@ -1242,20 +1134,13 @@ def _replace_media(text: str, directives, replacement) -> str:
 
 
 def _resolve_media(text, base_url=None, ctx=""):
-    """Convert every MEDIA:filename directive in text to embedded media.
-
-    A reply can carry several images, so every directive is converted, not
-    just the first. Prose using "MEDIA:" as a term (no file extension) and a
-    directive quoted in code (ELI-111) stay text. `ctx`: the text shown before `text` in its message
-    item.
-    """
+    """Turn every MEDIA: directive outside code (ELI-111) into an image link."""
     if base_url is None:
         base_url = MEDIA_BASE_URL
     directives, _hold = _media_scan(text, ctx)
     if not directives:
         return text, False
-    # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
-    # A directive that is a URL already is one.
+    # A URL, not base64: base64 breaks OWUI's streaming parser.
     return _replace_media(text, directives,
                           lambda fname: f"![{os.path.basename(fname)}]({fname})" if _is_media_url(fname)
                           else f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
@@ -1266,26 +1151,21 @@ def _is_media_url(fname: str) -> bool:
 
 
 def _is_gateway_media_name(fname: str) -> bool:
-    """A directive naming a path, not a bare file name or a URL: the Gateway
-    resolves it on its own host and stores the file as an `image` block of
-    the run's message (ELI-328). The Pipe cannot read that path, and the
-    file server never had it."""
+    """A path directive: the Gateway stores that file as an `image` block
+    (ELI-328); the Pipe cannot read the path."""
     return "/" in fname and not _is_media_url(fname)
 
 
 def _event_media_urls(data) -> list[str]:
-    """The `mediaUrls` of an assistant event: on the Gateway's own runtime
-    (DeepSeek, Grok, GPT...) the Gateway takes a reply's `MEDIA:` lines out
-    of its text and sends their files here instead (measured 2026-10-26,
-    ELI-328). claude-cli runs keep the lines in the text."""
+    """An assistant event's `mediaUrls`. The Gateway's own runtime moves
+    `MEDIA:` lines here; claude-cli keeps them in the text (ELI-328)."""
     urls = data.get("mediaUrls") if isinstance(data, dict) else None
     return [u.strip() for u in urls if isinstance(u, str) and u.strip()] if isinstance(urls, list) else []
 
 
 def _take_gateway_media(text: str, ctx: str = "") -> tuple[str, list[str]]:
-    """(`text` without its path `MEDIA:` directives, their paths). The image
-    comes from the run's stored blocks once the run ends (`_gateway_images_text`);
-    the directive line itself is not shown. `ctx`: as for `_media_scan`."""
+    """(`text` without path directives, their paths). The images come later
+    from the run's stored blocks (`_gateway_images_text`)."""
     directives, _hold = _media_scan(text, ctx)
     paths = [d for d in directives if _is_gateway_media_name(d[2])]
     if not paths:
@@ -1294,7 +1174,7 @@ def _take_gateway_media(text: str, ctx: str = "") -> tuple[str, list[str]]:
 
 
 def _extract_request_bearer(__request__):
-    """Return a Bearer token from the current OWUI request, when available."""
+    """The OWUI request's Bearer token, or None."""
     if not __request__:
         return None
     headers = getattr(__request__, "headers", None)
@@ -1321,7 +1201,7 @@ def _multipart_body(field_name, file_path, filename, mime):
 
 
 def _upload_owui_file(file_path, base_url, token):
-    """Upload one file to OWUI Files API and return the file object."""
+    """Upload one file to the OWUI Files API; return the file object."""
     if not token:
         raise RuntimeError("missing OWUI bearer token")
     filename = os.path.basename(file_path)
@@ -1353,15 +1233,10 @@ async def _resolve_media_via_owui(
     __event_emitter__,
     ctx="",
 ):
-    """Upload every MEDIA: file in text to OWUI, in order, and attach each to
-    the current message.
+    """Upload every MEDIA: file to OWUI and attach it to the message.
 
-    A reply can carry several images, so every directive is uploaded, not
-    just the first. If any single directive can't be resolved this way (file missing locally, bad name),
-    bail out entirely with handled=False so the caller's fallback
-    (`_resolve_media`) handles ALL directives uniformly via the external
-    URL instead of leaving a mix of native-upload and unresolved directives
-    in one message.
+    If any one cannot be uploaded, return handled=False so the fallback
+    resolves all of them the same way.
     """
     directives, _hold = _media_scan(text, ctx)
     if not directives:
@@ -1374,14 +1249,8 @@ async def _resolve_media_via_owui(
     for _start, _end, fname in directives:
         if fname in shown:
             continue
-        # _upload_owui_file uses blocking urllib -- must run off the event loop.
-        # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
-        # calling itself) from *inside* the async handler for the very request
-        # that's driving this pipe run. Calling it directly would block the
-        # single asyncio event loop thread, and OWUI can't service its own
-        # incoming HTTP request while its own loop is blocked waiting on it --
-        # a guaranteed self-deadlock that only resolves via timeout. Running it
-        # in a thread lets the event loop keep serving requests concurrently.
+        # Off the event loop: this blocking call goes to OWUI's own API, which
+        # cannot answer while its loop is blocked (self-deadlock).
         fpath = os.path.join(MEDIA_DIR, fname)
         file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
         if __event_emitter__:
@@ -1405,11 +1274,9 @@ async def _resolve_media_via_owui(
 
 
 async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None, ctx=""):
-    """Resolve a MEDIA: directive, preferring the native OWUI Files API upload
-    and falling back to the external file-server URL. Shared by the main
-    per-delta resolution site and the end-of-stream final-flush site so both
-    stay in sync (see `_advance_media_buffer` for why callers must only pass
-    in text whose MEDIA:filename is already known-complete).
+    """Resolve MEDIA: directives via OWUI Files, else the file server.
+
+    Pass only text whose filenames are complete (see `_advance_media_buffer`).
     """
     handled = False
     resolved = text
@@ -1430,17 +1297,15 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
     return resolved, handled
 
 
-# Where the Gateway serves media a reply carries as `image` blocks (an
-# agent's own image tool, e.g. Codex image generation). It needs the Gateway
-# token, which the browser does not have, so the Pipe fetches it (ELI-322).
+# Gateway route for `image` blocks. It needs the Gateway token, which the
+# browser lacks, so the Pipe fetches it (ELI-322).
 _GATEWAY_MEDIA_PREFIX = "/api/chat/media/outgoing/"
 _GATEWAY_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 _SAFE_FNAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _gateway_image_blocks(message) -> list[dict]:
-    """The `image` blocks of a final assistant message that point at the
-    Gateway's media route, in order."""
+    """A message's `image` blocks on the Gateway media route, in order."""
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
         return []
@@ -1452,11 +1317,11 @@ def _gateway_image_blocks(message) -> list[dict]:
 
 
 def _is_run_assistant_message(message, run_id: str) -> bool:
-    """Whether `message` is one of run `run_id`'s stored assistant messages:
-    the run's own (`runId`), or the one the Gateway appends for the run's
-    media when it cannot add them to the run's own message, keyed
+    """Whether `message` is a stored assistant message of run `run_id`.
+
+    Includes the media message the Gateway appends, keyed
     `<run id>:assistant-media[:n]` with no `runId` (2026.10.10,
-    chat-send-handler appendInjectedAssistantMessageToTranscript)."""
+    appendInjectedAssistantMessageToTranscript)."""
     if not isinstance(message, dict) or message.get("role") != "assistant" or not run_id:
         return False
     meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
@@ -1468,10 +1333,8 @@ def _is_run_assistant_message(message, run_id: str) -> bool:
 
 
 def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
-    """The Gateway image blocks of one run's assistant messages in
-    `chat.history`, in order. The Gateway stores a run's managed images after
-    its final, in the run's message or in one it appends for them; the live
-    `chat` final carries only the text (measured 2026-10-25, ELI-322)."""
+    """One run's Gateway image blocks in `chat.history`. The live final has
+    only text; images are stored after it (ELI-322)."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list):
         return []
@@ -1483,9 +1346,7 @@ def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
 
 
 def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
-    """The labels (file names) of the `attachment_error` blocks of one run's
-    assistant messages: a reply's media file the Gateway could not store,
-    e.g. a path that does not exist (seen live: code `file-not-found`)."""
+    """File names from one run's `attachment_error` blocks (e.g. `file-not-found`)."""
     labels = []
     for message in (history or {}).get("messages") or []:
         if not _is_run_assistant_message(message, run_id):
@@ -1498,10 +1359,8 @@ def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
 
 
 def _unstored_gateway_media(paths, blocks: int, errors: list[str]) -> list[str]:
-    """The names of the path directives in `paths` that have no stored image
-    yet: each one the Gateway reported it could not store (`errors`, by file
-    name), then, while fewer than `blocks` arrived for the rest, the last of
-    those. Empty once every path is accounted for."""
+    """Names in `paths` with no stored image: those in `errors`, then the
+    rest beyond the first `blocks`."""
     names = [os.path.basename(p) for p in paths]
     failed = [n for n in names if n in {os.path.basename(e) for e in errors if e}]
     rest = [n for n in names if n not in failed]
@@ -1509,7 +1368,7 @@ def _unstored_gateway_media(paths, blocks: int, errors: list[str]) -> list[str]:
 
 
 def _gateway_image_fname(block: dict) -> str:
-    """A unique bare file name for an image block, with its type's extension."""
+    """A unique safe file name for an image block."""
     stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]
     stem = _SAFE_FNAME_RE.sub("-", stem).strip("-.")[:60] or "image"
     ext = mimetypes.guess_extension(block.get("mimeType") or "") or ".png"
@@ -1517,7 +1376,7 @@ def _gateway_image_fname(block: dict) -> str:
 
 
 def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
-    """GET one media path from the Gateway's HTTP server, with its token."""
+    """GET one media path from the Gateway with its token."""
     host, port, tls = _parse_gateway_url(gateway_url)
     req = urllib.request.Request(
         f"{'https' if tls else 'http'}://{host}:{port}{path}",
@@ -1532,12 +1391,9 @@ def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
 
 async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None,
                                missing=()) -> str:
-    """Show a final message's Gateway image blocks the way a MEDIA: directive
-    is shown: each image is fetched into the media dir, then resolved by
-    `_resolve_media_text` (Open WebUI's files, else the file server). An
-    image that cannot be fetched is named in the text, never dropped
-    silently, and so is each of `missing`, a file the reply named that the
-    Gateway never stored."""
+    """Fetch Gateway image blocks and show them as MEDIA: directives.
+
+    Failed fetches and `missing` files are named, never dropped silently."""
     lines = [f"_(an image could not be loaded: {name})_" for name in missing]
     for block in blocks:
         fname = _gateway_image_fname(block)
@@ -1560,17 +1416,9 @@ async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emit
     return resolved
 
 
-# Anchor for finding a file server left behind by a *previous* deploy of this
-# same function (same class of issue as P33/P36/gateway._reap_stale_gateway_
-# connection: OWUI's function loader execs each redeploy into a brand-new
-# module object with no teardown hook on the old one, so a module-level
-# _file_server_started flag alone just resets and a second HTTPServer tries
-# to bind the same port -- silently failing since the old one is still
-# listening, per _start_file_server's `except OSError: pass`). Stashing the
-# server object on `open_webui.socket.main` -- OWUI's own stable module,
-# never reloaded by our function -- lets the next deploy find and shut down
-# the previous one first, so redeploys self-heal without a container
-# restart. Falls back to a no-op when not running inside OWUI (unit tests).
+# OWUI reloads a function into a new module with no teardown, so the old
+# file server keeps the port. It is stashed on `open_webui.socket.main`, which
+# is never reloaded, so the next deploy can shut it down first.
 _STALE_FILE_SERVER_ATTR = "_openclaw_file_server_v1"
 
 
@@ -1599,7 +1447,7 @@ def _remember_file_server(server) -> None:
 
 
 def _start_file_server(port=18791):
-    """Start a minimal HTTP server for media files. Starts once per process."""
+    """Start the media file server, once per process."""
     global _file_server_started
     if _file_server_started:
         return
@@ -2037,74 +1885,32 @@ async def _live_output(request, chat_id: str | None, message_id: str | None) -> 
 # --- composer --------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Composer "Status" button (experiment).
+# Composer "Status" button.
 #
-# Open WebUI (0.12) has no hook for adding a button to the composer row:
-# filter chips there only toggle a filter or open its valves. So the button is
-# installed by an `execute` event, the same unsandboxed in-page JS channel the
-# Status dialog already uses. Chat.svelte runs an `execute` event only when
-# its chat_id is the chat the tab shows AND its message_id is already in that
-# tab's history; anything else is silently dropped. The snippet:
+# OWUI 0.12 has no hook for composer buttons, so an `execute` event installs
+# one. Chat.svelte runs it only if its chat_id is the shown chat and its
+# message_id is in that tab's history. The snippet is idempotent and
+# versioned, keeps the button alive with a debounced MutationObserver, shows
+# it only on chats of this Pipe's models, and on click POSTs to the Status
+# Action. It also takes over the toolbar's "OpenClaw Status" button, since
+# OWUI's handler uploads and saves the whole chat (8 s on a 14 MB chat).
+# The button moves out of the chip row when it does not fit, as that row
+# scrolls (OWUI 0.13's Model controls button narrows it on phones).
 #
-#   * is idempotent: it records itself on `window.__openclawComposerBtn` with a
-#     version, so a repeat delivery only refreshes its config, and a newer
-#     version tears the old one down before installing itself;
-#   * keeps the button present with one MutationObserver (debounced), across
-#     re-renders and chat switches (OWUI is a SPA, the composer is rebuilt
-#     freely), and gives up for good if it ever has to re-insert the button
-#     in a tight loop;
-#   * shows the button only on `/c/<id>` pages whose chat model is one of this
-#     Pipe's models (one chat fetch per chat, cached for the page lifetime),
-#     and removes it everywhere else;
-#   * places it right after the "OpenClaw Thinking" filter chip, or at the end
-#     of the composer's chip group when that chip is off; when neither anchor
-#     exists it shows nothing. The chip row scrolls sideways when it is full:
-#     a button that does not fit whole there moves to the end of the left
-#     group (after Integrations), which never scrolls. Open WebUI 0.13 added a
-#     Model controls button on the right, which leaves a 375 px phone's chip
-#     row 25 px narrower. It goes back to the chip row once the window is
-#     wider than when it moved;
-#   * on click POSTs to the Status Action with the same body shape the dialog's
-#     own Compact button uses, so the existing Action flow opens the real
-#     dialog. The body is built from what the page already has: the chat's
-#     model (each delivery names it) and the latest user message on screen,
-#     so a click never downloads the chat;
-#   * takes over the message toolbar's "OpenClaw Status" button the same way
-#     when it knows the chat's model. Open WebUI's own handler uploads every
-#     message of the branch before the Action runs and saves the whole chat
-#     after it returns: on a 14 MB chat over a phone connection that is 8 s
-#     before the dialog shows and a 14 MB upload after (perf/status_open.py).
-#     Unknown model: Open WebUI's handler runs as before;
-#   * never throws into the page: errors become one console warning each and,
-#     for a failed click, a small toast.
-#
-# It is delivered three ways, all cheap and all idempotent:
-#   (a) the Status Action emits it after every status run (one spark click
-#       installs it);
-#   (b) the Pipe emits it at the start of each turn;
-#   (c) the Pipe's composer watcher pushes it to one socket as soon as that
-#       socket opens a chat on one of this Pipe's models (Open WebUI 0.12
-#       records each socket's open chat in SESSION_POOL[sid]["chat_ids"]).
-#
-# (a) and (b) target whatever message the emitter is bound to. (c) targets the
-# chat's latest *user* message on purpose: OWUI's event handler writes back a
-# shallow copy of the targeted message after running the code, and a user
-# message is the one kind that never streams, so the push can never clobber a
-# reply that is streaming into the same tab.
+# Delivered by the Status Action, at each Pipe turn, and by the composer
+# watcher when a socket opens a Pipe chat. The watcher targets the latest
+# *user* message: OWUI writes the targeted message back after running the
+# code, and a user message never streams, so no reply gets clobbered.
 # ---------------------------------------------------------------------------
 
 _COMPOSER_BUTTON_VERSION = "9"
 
-# The Status Action's function id (install_action.py's FUNCTION_ID; the
-# dialog's own JS calls the same fixed id) and the Pipe's default function id.
-# A Pipe installed under another id still works: it adds its own id (from the
-# module name OWUI gives it) and the prefix of every model it serves.
+# Status Action id (install_action.py FUNCTION_ID) and the default Pipe id;
+# a Pipe under another id adds its own prefixes.
 _COMPOSER_ACTION_ID = "openclaw_status_action"
 _COMPOSER_DEFAULT_MODEL_PREFIX = "openclaw_gateway."
 
-# Name of the Thinking filter's chip (install_filter.py registers the filter
-# under this name, and OWUI renders it as the chip icon's alt text). The button
-# goes right after that chip when it is on screen.
+# The Thinking filter chip's alt text (install_filter.py); the button follows it.
 _COMPOSER_THINKING_CHIP_LABEL = "OpenClaw Thinking"
 
 _COMPOSER_BUTTON_JS_TEMPLATE = r"""
@@ -2606,17 +2412,13 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
 
 def _composer_own_function_id():
-    """This artifact's Open WebUI function id, from the module name OWUI's
-    loader gives it (`function_<id>_<32 hex>`, utils/plugin.py), or None
-    outside Open WebUI."""
+    """Function id from the module name `function_<id>_<32 hex>`, or None."""
     m = re.match(r"^function_(.+)_[0-9a-f]{32}$", globals().get("__name__") or "")
     return m.group(1) if m else None
 
 
 def _composer_model_prefixes(model_id=None, own_id=None) -> list:
-    """The model-id prefixes the button treats as OpenClaw chats: the default
-    Pipe id, the Pipe's own function id when known, and the function id of
-    `model_id` (a model this Pipe actually served)."""
+    """Model-id prefixes that count as OpenClaw chats."""
     prefixes = [_COMPOSER_DEFAULT_MODEL_PREFIX]
     extra = []
     if isinstance(own_id, str) and own_id:
@@ -2631,10 +2433,8 @@ def _composer_model_prefixes(model_id=None, own_id=None) -> list:
 
 def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=None,
                                chat_model=None) -> str:
-    """The install snippet with its config embedded as one JSON literal (same
-    no-interpolation rule as action.py's `_json_for_js`: `<` escaped so the
-    payload can never close an enclosing script tag). `chat_model` is the
-    vouched chat's model, carried only with `chat_id`."""
+    """The snippet with its config as one JSON literal, `<` escaped so it
+    cannot close a script tag. `chat_model` is sent only with `chat_id`."""
     config = {
         "version": _COMPOSER_BUTTON_VERSION,
         "actionId": _COMPOSER_ACTION_ID,
@@ -2650,9 +2450,7 @@ def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=
 
 async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=None,
                                 chat_id=None, model_prefixes=None, chat_model=None) -> bool:
-    """Emit the install snippet through an OWUI event emitter. Best effort:
-    returns False instead of raising, because a cosmetic button must never
-    fail the turn or the Action that carries it."""
+    """Emit the snippet; returns False rather than raise, so it never fails a turn."""
     if not __event_emitter__:
         return False
     try:
@@ -4359,53 +4157,18 @@ def question_resolved(payload) -> None:
 
 # --- approvals -------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Plugin approvals
-# ---------------------------------------------------------------------------
-# A plugin's `before_tool_call` hook can answer `requireApproval`: the tool
-# call waits for a person to allow or deny it. The Gateway registers a
-# `plugin.approval.request` and offers it only to a connected client that can
-# show one: scope operator.admin or operator.approvals, and the
-# "plugin-approvals" cap in its connect frame (2026.10.6 dist:
-# server-request-context-*.mjs `canDeliverApprovals`). With no such client the
-# request ends at once and the tool call fails with "Plugin approval
-# unavailable (no approval route)"; a webchat turn has no channel route to
-# fall back on (approval-shared-*.mjs `hasApprovalTurnSourceRoute`).
-#
-# The connection that writes turns holds operator.admin and declares the cap
-# (`_GatewayConnection._connect_caps`), so the Gateway broadcasts it
-# `plugin.approval.requested` {id, request: {title, description, severity,
-# toolName, pluginId, allowedDecisions?, sessionKey, ...}, expiresAtMs}.
-# A request made in an Open WebUI chat is asked in Open WebUI's question card,
-# where the ask_user tool's questions are asked (askuser.py `_ask_agent_card`),
-# and the pick goes back as `plugin.approval.resolve {id, decision}`, decision
-# one of the request's allowedDecisions (allow-once, allow-always, deny).
-# `plugin.approval.resolved` (answered in the Control UI or with /approve,
-# expired, or cancelled by Stop) takes the card off the screen.
-#
-# Only the owner approves, and only for sessions this Pipe copy owns: its own
-# chats (`agent:<AGENT_ID>:openwebui-<user>-<chat>`) and channel threads
-# (`agent:<AGENT_ID>:openwebui:channel:...`), matched by the AGENT_ID valve. A
-# request for any other session (another agent's, another channel's, a
-# sub-agent's) is never answered here, so a second Pipe copy on another agent
-# cannot touch this one's approvals, nor this one theirs.
-# - A guest's chat (a user not in OWNER_USERS) is denied at once with a note in
-#   the reply, as a guest's secret request is cancelled: left pending, it
-#   would wait out the approval's timeout with the guest's reply on
-#   "Thinking", and an approval from the Control UI would run the tool for a
-#   guest.
-# - A channel thread has no question card and is shared by everyone in it, so
-#   it is denied at once too: left pending, the thread would stand still for
-#   the approval's timeout (up to 10 minutes). The agent gets the denial and
-#   says so in the thread, which carries only its own text.
-# - A sub-agent's session gets no card here: its parent's turn already waits
-#   on it, and the Control UI (or the timeout) answers it.
+# Plugin approvals: a `before_tool_call` hook answering `requireApproval`.
+# The Gateway offers `plugin.approval.request` only to a client with
+# operator.admin/approvals scope and the "plugin-approvals" cap
+# (`canDeliverApprovals`); without one, a webchat turn's tool call fails with
+# "no approval route". The owner answers in the ask_user question card.
+# Only sessions this copy owns (by AGENT_ID) are handled. Guest chats and
+# channel threads are denied at once, so the turn does not stall until the
+# timeout (up to 10 min). Sub-agent sessions are left to the Control UI.
 
 PLUGIN_APPROVAL_METHODS = ("plugin.approval.resolve",)
 PLUGIN_APPROVAL_EVENTS = ("plugin.approval.requested", "plugin.approval.resolved")
-# The card's options, in this order, for the decisions a request allows. Deny
-# first: Open WebUI tags the card's first option "Recommended", and that
-# belongs on the fail-closed answer, not on letting the tool run.
+# Deny first: OWUI tags the first option "Recommended".
 PLUGIN_APPROVAL_CHOICES = (("deny", "Deny"), ("allow-once", "Allow once"), ("allow-always", "Always allow"))
 _PLUGIN_APPROVAL_QID = "approval"
 GUEST_APPROVAL_NOTE = "_The agent asked to use `{tool}`. That needs the owner's approval; it was denied here._"
@@ -4415,16 +4178,14 @@ _PLUGIN_APPROVALS: dict = {}
 
 
 def _plugin_approvals_offered(conn) -> bool:
-    """The Gateway offers what an approval needs: its events and the resolve
-    method (hello-ok features)."""
+    """Whether hello-ok lists the approval events and resolve method."""
     methods = getattr(conn, "gateway_methods", None) or ()
     events = getattr(conn, "gateway_events", None) or ()
     return all(m in methods for m in PLUGIN_APPROVAL_METHODS) and all(e in events for e in PLUGIN_APPROVAL_EVENTS)
 
 
 def _plugin_approval_decisions(request: dict) -> list[str]:
-    """The decisions the request allows, deny always among them (the Gateway
-    adds it too: plugin-approval-canonical-decisions-*.mjs)."""
+    """Allowed decisions, deny always first (the Gateway adds deny too)."""
     known = [d for d, _ in PLUGIN_APPROVAL_CHOICES]
     raw = request.get("allowedDecisions") if isinstance(request, dict) else None
     allowed = [d for d in known if isinstance(raw, list) and d in raw] or known
@@ -4432,8 +4193,7 @@ def _plugin_approval_decisions(request: dict) -> list[str]:
 
 
 def _plugin_approval_payload(record) -> dict | None:
-    """Open WebUI's question card for a `plugin.approval.requested` record,
-    or None when it is not one."""
+    """OWUI question card for a `plugin.approval.requested` record, or None."""
     request = record.get("request") if isinstance(record, dict) else None
     if not isinstance(request, dict):
         return None
@@ -4460,8 +4220,7 @@ def _plugin_approval_payload(record) -> dict | None:
 
 
 def _plugin_approval_decision(response, allowed: list[str]) -> str:
-    """The decision the card's answer names; anything else (Cancel, no
-    answer) denies."""
+    """The decision the card's answer names; anything else denies."""
     if isinstance(response, dict) and response.get("status") == "answered":
         answer = (response.get("answers") or {}).get(_PLUGIN_APPROVAL_QID)
         label = str((answer or {}).get("label") or "").strip() if isinstance(answer, dict) else ""
@@ -4472,9 +4231,7 @@ def _plugin_approval_decision(response, allowed: list[str]) -> str:
 
 
 def _plugin_approval_session(conn, key: str) -> tuple | None:
-    """What this Pipe copy makes of a request's session: ("chat", user id,
-    chat id), ("channel",), or None for a session it does not own (another
-    agent's, a sub-agent's, anything else)."""
+    """("chat", user id, chat id), ("channel",), or None if not this copy's."""
     parsed = conn.parse_owui_session_key(key or "")   # matches AGENT_ID
     if parsed:
         return ("chat", *parsed)
@@ -4486,8 +4243,7 @@ def _plugin_approval_session(conn, key: str) -> tuple | None:
 
 
 def plugin_approval_requested(conn, record) -> bool:
-    """`plugin.approval.requested`: ask, or deny, an approval requested in a
-    session this Pipe copy owns. False for anything else."""
+    """Ask or deny an approval in a session this copy owns; False otherwise."""
     if not isinstance(record, dict) or not record.get("id") or record["id"] in _PLUGIN_APPROVALS:
         return False
     if _plugin_approval_payload(record) is None or not _plugin_approvals_offered(conn):
@@ -4500,8 +4256,7 @@ def plugin_approval_requested(conn, record) -> bool:
 
 
 def plugin_approval_resolved(payload) -> None:
-    """`plugin.approval.resolved`: answered elsewhere, expired or cancelled;
-    the card's wait ends."""
+    """Answered elsewhere, expired or cancelled: end the card's wait."""
     task = _PLUGIN_APPROVALS.pop((payload or {}).get("id"), None)
     if task is not None:
         pipe_log(f"  plugin approval: resolved elsewhere ({(payload or {}).get('decision')} by "
@@ -4519,11 +4274,9 @@ async def _resolve_plugin_approval(conn, approval_id: str, decision: str) -> str
 
 
 async def _deny_plugin_approval(conn, record: dict, tool: str, why: str, note: str | None) -> None:
-    """Deny an approval at once, and say so in the reply of the run that asked
-    when `note` is given."""
+    """Deny at once; with `note`, say so in the asking run's reply."""
     approval_id, request = record["id"], record.get("request") or {}
-    # Out of the registry before the request: `plugin.approval.resolved`
-    # follows the answer and would cancel this task before it says so.
+    # Unregister first: `plugin.approval.resolved` would cancel this task.
     if _PLUGIN_APPROVALS.get(approval_id) is asyncio.current_task():
         del _PLUGIN_APPROVALS[approval_id]
     shown = await _resolve_plugin_approval(conn, approval_id, "deny")
@@ -4554,8 +4307,7 @@ async def _answer_plugin_approval(conn, record: dict, kind: str, user_id: str = 
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
     if not message_id:
-        # A card needs the reply it belongs to (askuser.py
-        # `_answer_agent_question`). Left to the Control UI.
+        # A card needs its reply message. Left to the Control UI.
         _PLUGIN_APPROVALS.pop(approval_id, None)
         pipe_log(f"  plugin approval: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
         return
@@ -12025,14 +11777,6 @@ _TURNS = _TurnHooks
 # --- models ----------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Pipe class (Open WebUI entry point)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Dynamic model discovery helpers
-# ---------------------------------------------------------------------------
-
 _FALLBACK_MODELS = [
     {"key": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash", "tags": ["configured", "alias:DeepSeek"]},
     {"key": "openai/gpt-5.5", "name": "gpt-5.5", "tags": ["configured"]},
@@ -12043,16 +11787,9 @@ _FALLBACK_MODELS = [
 
 
 def _friendly_name(model_entry: dict) -> str:
-    """Return a human-friendly name for a model entry.
+    """Display name: catalog name, else alias tag, else last key segment.
 
-    Priority: model name field → alias tag → last segment of key.
-
-    The catalog `name` is preferred because it carries the *version*
-    ("Claude Opus 4.8"), while the alias is a deliberately short handle
-    ("opus") that hides which version you're actually talking to -- the
-    selector then shows two indistinguishable "Opus"/"Sonnet" entries as
-    new versions land. Same complaint as upstream openclaw#111884.
-    Alias remains the fallback for models the gateway returns unnamed.
+    The name carries the version; an alias like "opus" hides it (openclaw#111884).
     """
     name = model_entry.get("name", "")
     if name:
@@ -12066,17 +11803,12 @@ def _friendly_name(model_entry: dict) -> str:
 
 
 def _provider_from_key(key: str) -> str:
-    """Extract the provider/vendor from a model key like 'anthropic/claude-opus-4-8'."""
+    """'anthropic/claude-opus-4-8' -> 'anthropic'."""
     return key.split("/", 1)[0] if "/" in key else ""
 
 
 def _normalize_model_entry(raw: dict) -> dict:
-    """Normalize a raw gateway `models.list` entry into the {key, name, tags}
-    shape used elsewhere in this module (matches _FALLBACK_MODELS).
-
-    The gateway's actual response shape is {id, name, provider, alias, ...} --
-    there is no combined "key" or "tags" field, so this bridges the two.
-    """
+    """Gateway `models.list` entry {id, name, provider, alias, ...} -> {key, name, tags}."""
     provider = raw.get("provider", "")
     model_id = raw.get("id", "")
     key = f"{provider}/{model_id}" if provider and model_id else (model_id or provider)
@@ -12088,14 +11820,9 @@ def _normalize_model_entry(raw: dict) -> dict:
 
 
 def _usable_models(raw_models: list[dict]) -> list[dict]:
-    """Normalize `models.list` entries, dropping the ones the Gateway marks
-    `available: false` (e.g. `unavailableReason: "missing-auth"`).
+    """Normalized entries, minus those marked `available: false` (e.g. missing auth).
 
-    An allowlisted model with no credentials still comes back from
-    `models.list`. Listing it put a selector entry in OWUI that could only
-    fail: `anthropic/claude-haiku-5-5` sat next to the working
-    `claude-cli/claude-haiku-5-5`, and picking it 401'd with "No API key
-    found for provider anthropic". Entries without the field count as usable.
+    The Gateway still lists allowlisted models with no credentials.
     """
     return [
         _normalize_model_entry(m) for m in raw_models
@@ -12103,41 +11830,18 @@ def _usable_models(raw_models: list[dict]) -> list[dict]:
     ]
 
 
-# Wording that points at the agent/session rather than the model. Kept NARROW
-# on purpose -- an earlier version also matched "not found", which misfiled
-# "model 'x/y' not found" as an AGENT_ID problem. Do not re-broaden these; the
-# tests in SessionPatchFailureAttributionTests assert both directions.
+# Keep narrow: "not found" also appears in model errors.
+# SessionPatchFailureAttributionTests assert both directions.
 _AGENT_ERROR_HINTS = ("agent", "session")
 
 
 def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
-    """Describe a failed sessions.patch without misattributing the cause.
+    """Explain a failed sessions.patch: model, AGENT_ID, or unknown.
 
-    The session key embeds AGENT_ID and this patch is the turn's first
-    agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
-    reported as "Model selection error", sending the user to fix
-    DEFAULT_MODEL, which was never the problem.
-
-    Classifying by substring is genuinely ambiguous, so the ordering matters and
-    is deliberate:
-
-    * "model" (or the model key) present -> a MODEL error. Checked FIRST and
-      allowed to win outright, because gateway model errors routinely mention
-      the agent too ("model x/y is not configured for this agent"), whereas an
-      agent error rarely mentions a model. An earlier version of this matched
-      "not found" as an agent hint, which misfiled "model 'x/y' not found" --
-      the exact misattribution this function exists to prevent, just pointed
-      the other way.
-    * otherwise, agent/session wording -> an AGENT error.
-    * otherwise -> say we don't know, and name both valves. Guessing wrong is
-      worse than admitting ambiguity: it sends the user to edit a valve that
-      was correct.
+    This is the first agent-scoped RPC, so a bad AGENT_ID fails here too.
+    Model wording wins first, since model errors often mention the agent.
     """
-    # Transient and transport failures are neither valve's fault, and the retry
-    # comment in pipe() says they are the common ones under load. Classify by
-    # TYPE first: substring matching cannot see them, and str(TimeoutError()) is
-    # "", which rendered as a dangling colon followed by advice to edit two
-    # valves that were both correct.
+    # Transport errors are no valve's fault, and str(TimeoutError()) is "".
     if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
         return (
             "**The Gateway did not respond in time while starting this "
@@ -12177,26 +11881,17 @@ MODELS_SOURCE_LIVE = "live"
 MODELS_SOURCE_CACHE = "cache"
 MODELS_SOURCE_FALLBACK = "fallback"
 
-# Appended to selector entries built from _FALLBACK_MODELS. Display text only --
-# the entry's `id` (the routing key) is untouched, so this cannot affect routing.
+# Display-only suffix for _FALLBACK_MODELS entries; the routing `id` is untouched.
 UNVERIFIED_MODEL_SUFFIX = " -- example, Gateway not reached"
 
 
 async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
-    """Discover models, and report where the list came from.
+    """Return (models, source), source being "live", "cache" or "fallback".
 
-    Returns (models, source), source being "live", "cache" or "fallback".
-
-    Callers need that distinction because the three are not interchangeable to
-    a user. `pipes()` never initiates a connection -- it only reuses one that a
-    previous chat established -- so on a fresh install the live branch is skipped
-    and no cache exists yet, and the selector filled up with five hardcoded
-    models bearing no relationship to the user's Gateway, rendered identically
-    to genuinely discovered ones. Picking one the Gateway doesn't have then
-    failed with a bare "Model selection error", with nothing to suggest the list
-    itself had been fabricated.
+    `pipes()` only reuses an open connection, so a fresh install gets the
+    fallback list, which the selector must label as examples.
     """
-    # 1. Try live gateway (fast path only if already connected)
+    # Live only if a connection is already open.
     global _gateway_connection
     conn = _gateway_connection
     if conn and conn._ws and conn._event_loop_task and not conn._event_loop_task.done():
@@ -12213,13 +11908,11 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
 
-    # 2. Cache fallback
     cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
         return cache["models"], MODELS_SOURCE_CACHE
 
-    # 3. Hardcoded fallback
     pipe_log(
         "Using hardcoded fallback model list -- the Gateway has not been reached "
         "yet, so these are examples, not your Gateway's models. They are labelled "
@@ -12230,60 +11923,25 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
 
 # --- history ---------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
 # What the agent remembers vs what the chat shows (ELI-183).
 #
-# The Pipe sends only the newest user message, and the agent's session is one
-# line of messages. Open WebUI's chat is a tree: Edit sends a new sibling of a
-# user message, Regenerate a new sibling of a reply, and the arrows under a
-# message switch the branch shown. None of that reaches the agent by itself,
-# so its memory and the chat drift apart. A cloned or forked chat is a new chat,
-# so it gets a new session that has never seen the copied messages.
-#
-# Line: for each chat, the message ids the agent was last sent along the
-# branch (`HISTORY_TAIL_MAX` newest), kept in the bridge state dir. Each new
-# request names its user message and its reply (`user_message_id`,
-# `message_id` in Open WebUI's metadata). Walking up from the user message
-# through Open WebUI's `chat_message` rows (parent ids) to the first id on the
-# line says what changed:
-#   - the user message is already on the line: Regenerate. What came after it
-#     on the line is gone from the chat;
-#   - the line's tail after the meeting point is gone and the user message
-#     hangs right under it: Edit, when the replaced user message still exists
-#     as its sibling; deleted messages, when it does not;
-#   - other messages lie between the meeting point and the user message: the
-#     user switched branches.
-# Messages the chat gained without the agent losing any (a reply the agent
-# started, a cron wake) change nothing. Only then does the message carry a
-# short note (`_history_note`), so a normal send never does.
-#
-# Copy: on the first request of a chat Open WebUI marks as a clone or fork
-# (`originalChatId` on the chat) whose session the Gateway does not have, the
-# message carries the copied messages once (`_history_seed`), newest first up
-# to `HISTORY_SEED_MAX_CHARS`.
-#
-# Open WebUI can call the Pipe twice for one reply (ELI-82); the second call
-# must send the same text, so the line keeps the last reply id and what was
-# put before its message.
-#
-# Several models at once (ELI-329): Open WebUI calls the Pipe once per model,
-# together, for the same user message. Each Pipe model's reply gets its own
-# session ("column", see `_owui_session_key`) with its own line, so the replies
-# neither queue behind one another nor take each other for a Regenerate. A
-# column's session has not seen what the others said: when the user goes on
-# from another model's reply, the note carries that reply in full.
-# ---------------------------------------------------------------------------
+# The Pipe sends only the newest user message, but OWUI's chat is a tree
+# (Edit, Regenerate, branch arrows), so the agent's session drifts from it.
+# The "line" stores the message ids last sent per chat. Walking up from the
+# new user message's parents to the line tells regenerate, edit, deleted or
+# branch, and only then a short note (`_history_note`) goes before the message.
+# A clone or fork with no Gateway session gets the copied messages once
+# (`_history_seed`). OWUI may call twice for one reply (ELI-82), so the line
+# keeps the last reply id and its prefix. With several models at once
+# (ELI-329) each Pipe model gets its own session ("column") and line.
 
 HISTORY_TAIL_MAX = 64
-# About 8k tokens. Older copied messages are left out whole; the note says how
-# many.
+# About 8k tokens.
 HISTORY_SEED_MAX_CHARS = 32_000
 HISTORY_QUOTE_CHARS = 60
 HISTORY_LINE_DIR = "history-line"
 HISTORY_LINE_KEEP_S = 180 * 86400
-# Most Pipe models one message can go to side by side.
 MULTI_MODEL_COLUMNS_MAX = 16
-# One reply carried whole into another column's session.
 HISTORY_REPLY_MAX_CHARS = 8_000
 _history_line_pruned = False
 
@@ -12291,17 +11949,15 @@ _DETAILS_BLOCK = re.compile(r"<details\b[^>]*>.*?</details>", re.S | re.I)
 
 
 def _history_line_id(chat_id: str, column: int = 0) -> str:
-    """The name of a session's line file: the chat's id, then `-m<column>`."""
+    """Line file name: the chat id, plus `-m<column>` for columns > 0."""
     return f"{chat_id}-m{column}" if column else chat_id
 
 
 def _pipe_model_column(model, models, model_idx=None) -> tuple[int, int]:
-    """(column, how many Pipe models) of a request: `models` is the list the
-    user picked for the message (Open WebUI's `user_message.models`) and
-    `model` the one this request is for. A model is the Pipe's when it shares
-    `model`'s function id, so models of other providers take no column. The
-    same model picked twice is told apart by `model_idx`, the place of the
-    reply's model in `models`."""
+    """(column, Pipe model count) of a request among `user_message.models`.
+
+    Pipe models share `model`'s function id; `model_idx` tells a model picked twice apart.
+    """
     if not (isinstance(model, str) and "." in model and isinstance(models, list)):
         return 0, 1
     prefix = model.split(".", 1)[0] + "."
@@ -12316,9 +11972,8 @@ def _pipe_model_column(model, models, model_idx=None) -> tuple[int, int]:
 
 
 def _history_column_of(state_dir: str, chat_id: str, ids) -> int | None:
-    """The column whose line holds one of the message `ids`, if any: where a
-    reply the user goes on from was answered. Columns are made in order, so
-    the first one without a line is the last."""
+    """The column whose line holds one of `ids`, or None. Columns are made in
+    order, so stop at the first one without a line."""
     ids = [i for i in ids if i]
     for column in range(MULTI_MODEL_COLUMNS_MAX):
         path = _history_line_path(state_dir, _history_line_id(chat_id, column))
@@ -12331,16 +11986,12 @@ def _history_column_of(state_dir: str, chat_id: str, ids) -> int | None:
 
 
 async def _reply_column(state_dir: str, chat_id: str | None, model, metadata: dict) -> int:
-    """The column (session) this request's reply belongs to. With several Pipe
-    models picked it is the model's place among them. Otherwise the column
-    that holds the message it follows, so going on from the second model's
-    reply continues that model's session; a chat that never had more than one
-    column is always column 0."""
+    """The column (session) for this reply: the model's place when several are
+    picked, else the column holding the message it follows, else 0."""
     um = metadata.get("user_message") if isinstance(metadata.get("user_message"), dict) else {}
     models = um.get("models")
     model_idx = None
     if chat_id and isinstance(models, list) and models.count(model) > 1 and metadata.get("message_id"):
-        # The same model twice: the reply's column in Open WebUI says which.
         try:
             model_idx = await _owui_history_rows(chat_id).model_idx(metadata["message_id"])
         except Exception as ex:
@@ -12368,8 +12019,7 @@ def _history_line_read(state_dir: str, chat_id: str) -> dict:
 
 
 def _history_line_write(state_dir: str, chat_id: str, data: dict) -> None:
-    """Replace the chat's line under its lock (two Open WebUI workers may
-    answer the same chat). Nothing is awaited while the lock is held."""
+    """Replace the line under a lock: two OWUI workers may answer one chat."""
     global _history_line_pruned
     path = _history_line_path(state_dir, chat_id)
     try:
@@ -12391,10 +12041,8 @@ def _history_line_write(state_dir: str, chat_id: str, data: dict) -> None:
 
 
 def _history_line_prune(folder: str, cutoff: float) -> None:
-    """Drop the lines of chats not sent to since `cutoff` (a deleted chat's
-    line goes this way too: Open WebUI tells the Pipe nothing when a chat is
-    deleted). A line's age is its .json file's; its lock goes with it, since
-    a lock file is never written and its own age says nothing."""
+    """Drop lines older than `cutoff`; OWUI never reports chat deletion.
+    Age comes from the .json, since lock files are never written."""
     for name in os.listdir(folder):
         if not name.endswith(".json"):
             continue
@@ -12409,9 +12057,7 @@ def _history_line_prune(folder: str, cutoff: float) -> None:
 
 
 class _OwuiHistoryRows:
-    """The few reads of one chat that the line needs, from Open WebUI's
-    `chat_message` rows (one per message) and one field of the chat row, so
-    the chat itself is never loaded (ELI-115: about 14x its JSON per read)."""
+    """Reads the line needs, by row, never loading the whole chat (ELI-115)."""
 
     def __init__(self, chat_id: str):
         self.chat_id = chat_id
@@ -12436,8 +12082,7 @@ class _OwuiHistoryRows:
         return None if row is None else _coerce_text(row[0])
 
     async def model_idx(self, message_id: str) -> int | None:
-        """The place of a reply's model among the models picked for its
-        message (side by side), kept on the reply in the chat row."""
+        """The reply's `modelIdx` from the chat row."""
         from sqlalchemy import select
         from open_webui.internal.db import get_async_db_context
         from open_webui.models.chats import Chat
@@ -12469,12 +12114,11 @@ class _OwuiHistoryRows:
 
 async def _history_change(tail: list, user_id: str, reply_id: str, rows,
                           user_parent: str | None = None) -> dict:
-    """Compare a new request with the chat's line. Returns {kind, replaced,
-    shown, tail}: `kind` is None (nothing the agent knew is gone),
-    "regenerate", "edit", "deleted" or "branch"; `replaced` the line's ids no
-    longer on the chat's branch, `shown` the ids now between them and the user
-    message; `tail` the new line. `user_parent` stands in for the user
-    message's parent if its row is not there yet."""
+    """Compare a request with the line: {kind, replaced, shown, tail}.
+
+    `kind` is None, "regenerate", "edit", "deleted" or "branch". `user_parent`
+    is used if the user message's row is not written yet.
+    """
     if user_id in tail:
         meet, walked = tail.index(user_id), []
     else:
@@ -12519,8 +12163,7 @@ def _messages(n: int) -> str:
 
 
 async def _shown_in_full(shown: list, rows) -> str:
-    """The messages the chat now shows, whole (each cut at
-    `HISTORY_REPLY_MAX_CHARS`, all of them at `HISTORY_SEED_MAX_CHARS`)."""
+    """The shown messages in full, within the per-reply and total caps."""
     entries, used = [], 0
     for mid in shown:
         role, text, _ = await rows.message(mid)
@@ -12538,8 +12181,7 @@ async def _shown_in_full(shown: list, rows) -> str:
 
 
 async def _shown_from_other_model(shown: list, rows, model_prefix: str | None) -> bool:
-    """Whether the chat now shows a reply of a model that is not the Pipe's:
-    the agent has never seen it."""
+    """Whether a shown reply came from a non-Pipe model."""
     for mid in shown:
         role, _, model_id = await rows.message(mid)
         if role == "assistant" and model_id and model_prefix and not model_id.startswith(model_prefix):
@@ -12548,11 +12190,8 @@ async def _shown_from_other_model(shown: list, rows, model_prefix: str | None) -
 
 
 async def _history_note(change: dict, rows, in_full: bool = False) -> str:
-    """The short note put before the message when the chat no longer shows
-    what the agent remembers (about 50 tokens: counts plus two short quotes).
-    `in_full`: the user went on from a reply written in another session
-    (several models side by side), so a branch switch carries what the chat
-    now shows whole."""
+    """Short note for a history change. `in_full`: a branch note carries the
+    shown messages, since the agent never saw them."""
     kind, replaced, shown = change["kind"], change["replaced"], change["shown"]
     if kind == "regenerate":
         after = f" and the {_messages(len(replaced) - 1)} after it" if len(replaced) > 1 else ""
@@ -12583,9 +12222,7 @@ async def _history_note(change: dict, rows, in_full: bool = False) -> str:
 
 
 def _voice_note(metadata) -> str:
-    """The note put before a message the user spoke into an Open WebUI voice
-    call (`features.voice`): the reply is read aloud, so it must be short
-    spoken sentences with no markup. "" for every other message."""
+    """Note for an OWUI voice call (`features.voice`), else ""."""
     features = metadata.get("features") if isinstance(metadata, dict) else None
     if not (isinstance(features, dict) and features.get("voice") is True):
         return ""
@@ -12596,10 +12233,8 @@ def _voice_note(metadata) -> str:
 
 
 def _history_seed(messages: list, side_by_side: bool = False) -> str:
-    """The copied messages of a cloned chat, for its first message: newest
-    first while they fit in `HISTORY_SEED_MAX_CHARS`, tool-call details left
-    out. Empty when there is nothing to copy. `side_by_side`: the session is
-    a new model column of a chat that went on without it, not a copy."""
+    """Earlier messages for a new session, newest kept first within the cap.
+    `side_by_side`: a new model column rather than a copied chat."""
     entries = []
     for m in messages:
         role = m.get("role")
@@ -12640,9 +12275,7 @@ async def _gateway_has_session(conn, session_key: str) -> bool:
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
                           metadata: dict, messages: list, column: int = 0, model=None) -> str:
-    """What to put before this request's message so the agent's memory matches
-    the chat (see above): "" on a normal send. Updates the session's line
-    (`column`: which of the chat's sessions this reply is in)."""
+    """Prefix that syncs the agent with the chat ("" normally); updates the line."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
@@ -12660,8 +12293,6 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
         if change["kind"]:
             in_full = False
             if change["kind"] == "branch":
-                # The agent has not seen the reply the user went on from when
-                # it was written in another session or by another provider.
                 prefixed = isinstance(model, str) and "." in model
                 in_full = (len(um.get("models") or []) > 1 or await _shown_from_other_model(
                     change["shown"], rows, model.split(".", 1)[0] + "." if prefixed else None))
@@ -12695,62 +12326,36 @@ def _owui_history_rows(chat_id: str):
 
 # --- slash_prompts ---------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Slash commands as Open WebUI Prompts (SYNC_SLASH_COMMANDS valve)
+# Slash commands as Open WebUI Prompts (SYNC_SLASH_COMMANDS valve): OWUI's `/`
+# menu lists Workspace Prompts, so each Gateway command becomes a public prompt.
 #
-# Open WebUI's `/` menu has a hardcoded Commands section, and a Prompts
-# section that lists the Workspace Prompts a user can read. This mirrors the
-# Gateway's slash commands into Prompts, one per command, readable by every
-# user, so typing `/` in a chat offers them.
-#
-# Ownership: a ledger file in the bridge state dir lists the prompts the sync
-# created, by command and prompt id. The sync only ever updates or deletes a
-# prompt in the ledger whose id still matches; a prompt someone made by hand
-# with the same command is left alone and the command skipped. A lost ledger
-# deletes nothing. Each Pipe Function has its own ledger, so a second copy
-# of the Pipe, its sync off, does not delete the first copy's prompts; one
-# lock file for all copies keeps their syncs from running at once. A prompt
-# an admin turned off in the Workspace stays the sync's, and stays off.
-#
-# Cost: the Gateway's `chat.metadata` carries the command list and a
-# revision; asked with `ifRevision` it answers `unchanged: true` and nothing
-# else. A check runs on a page load, at most every SYNC_INTERVAL_MIN after a
-# message (the message path only compares a timestamp), and on the Gateway's
-# `chat.metadata.changed` push. The revision is recorded only after every
-# Open WebUI write succeeded, so a failed write is retried by the next check.
-# Turning the valve off deletes the prompts in the ledger.
-# ---------------------------------------------------------------------------
+# A per-Function ledger records the prompts the sync made; it only touches
+# those, so hand-made prompts and other Pipe copies' prompts are safe. A
+# shared lock file keeps copies from syncing at once. `chat.metadata` with
+# `ifRevision` answers `unchanged: true` cheaply. The revision is saved only
+# after every OWUI write succeeds, so a failure is retried next check.
 
 _SLASH_PROMPTS_LEDGER_NAME = "slash-command-prompts.json"  # before the ledger was per Function
 _SLASH_PROMPTS_LOCK_NAME = "slash-command-prompts.lock"
 _SLASH_PROMPTS_TAG = "openclaw"
 _SLASH_PROMPT_NAME_MAX = 120
-# Open WebUI's prompt editor accepts these in a command; the backend checks nothing.
+# OWUI's prompt editor allows only these; the backend checks nothing.
 _SLASH_PROMPT_CMD_BAD = re.compile(r"[^A-Za-z0-9_-]")
-# A push right after a check is folded into a check this long after it.
 _SLASH_PROMPTS_PUSH_SETTLE_S = 2.0
-# How a Gateway older than 2026.10 refuses `chat.metadata`'s params
-# (2026.9.3: "invalid chat.metadata params: at root: unexpected property
-# 'includeModels'"), or one without the method at all.
+# How a Gateway older than 2026.10 refuses `chat.metadata`'s params.
 _SLASH_PROMPTS_OLD_GATEWAY = re.compile(
     r"unexpected property '(?:includeModels|ifRevision)'|unknown method:? chat\.metadata\b")
-# Once a Gateway refused them, how long `commands.list` is used before
-# `chat.metadata` is tried again (the Gateway may have been upgraded).
+# Retry `chat.metadata` after this long; the Gateway may have been upgraded.
 _SLASH_PROMPTS_LEGACY_RETRY_S = 24 * 3600
 
 _slash_prompts_lock = asyncio.Lock()
 _slash_prompts_state = {
-    # When the last check ran (monotonic), and whether one is queued behind it.
     "checked_at": None,
     "pending": False,
-    # A `_slash_prompts_run` loop is going (between its checks too).
     "running": False,
-    # The settings the last check ran with; a change runs a full sync at once.
     "settings": None,
-    # Whether the ledger is known to be empty (so a disabled sync has nothing to delete).
     "ledger_empty": None,
     "valves": None,
-    # When the Gateway last refused `chat.metadata`'s `ifRevision` (before 2026.10), monotonic.
     "legacy_at": None,
 }
 
@@ -12760,7 +12365,7 @@ def _slash_prompt_excludes(raw) -> set:
 
 
 def _slash_prompts_settings(valves) -> dict:
-    """What the synced prompts depend on besides the Gateway's list."""
+    """Valve settings the synced prompts depend on."""
     return {
         "agent": str(getattr(valves, "AGENT_ID", "") or "main"),
         "prefix": str(getattr(valves, "PROMPT_PREFIX", "") or ""),
@@ -12777,12 +12382,9 @@ def _slash_command_text(cmd: dict) -> str:
 
 
 def _slash_prompt_for(cmd: dict, prefix: str) -> "dict | None":
-    """The prompt for one Gateway command, or None when it cannot be one.
+    """The prompt for one Gateway command, or None.
 
-    Command: the OpenClaw name with characters Open WebUI's editor rejects
-    as `_`, after PROMPT_PREFIX. Name: the command's description. Content: the command as typed, then a
-    `{{arg}}` input for each required argument (Open WebUI asks for those
-    when the prompt is picked); optional arguments are typed after it."""
+    Required arguments become `{{arg}}` inputs, which OWUI asks for on pick."""
     name = str(cmd.get("name") or "").strip()
     if not name:
         return None
@@ -12792,7 +12394,6 @@ def _slash_prompt_for(cmd: dict, prefix: str) -> "dict | None":
         arg_name = _SLASH_PROMPT_CMD_BAD.sub("_", str((arg or {}).get("name") or ""))
         if arg_name and arg.get("required"):
             parts.append("{{" + arg_name + "}}")
-    # The menu shows the name beside the command, cut to its width.
     description = " ".join(str(cmd.get("description") or "").split())
     if len(description) > _SLASH_PROMPT_NAME_MAX:
         description = description[:_SLASH_PROMPT_NAME_MAX - 3].rstrip() + "..."
@@ -12807,9 +12408,7 @@ def _slash_prompt_for(cmd: dict, prefix: str) -> "dict | None":
 
 
 def _slash_prompts_wanted(commands, settings: dict) -> list:
-    """The prompts the Gateway's command list calls for, in its order: text
-    commands only, minus SLASH_COMMANDS_EXCLUDE, one per command (a second
-    command that maps to a taken prompt command is dropped)."""
+    """Prompts for the text commands, minus excludes, first one per prompt command."""
     exclude = set(settings.get("exclude") or ())
     out, seen = [], set()
     for cmd in commands or []:
@@ -12833,14 +12432,10 @@ def _slash_prompt_differs(row: dict, want: dict) -> bool:
 
 
 def _slash_prompts_plan(wanted: list, existing: dict, owned: dict) -> dict:
-    """What to write to make Open WebUI match `wanted`.
+    """Writes that make OWUI match `wanted`: add, update, delete, skip, forget.
 
-    `existing`: Open WebUI's prompts by command, each {"id", "name",
-    "content", "tags"}. `owned`: the ledger, command -> prompt id.
-    Returns lists of `add` (wanted prompts), `update` ((id, wanted)),
-    `delete` ((command, id)), `skip` (commands taken by a prompt the sync
-    does not own) and `forget` (ledger commands whose prompt is gone or was
-    replaced: dropped from the ledger, nothing deleted)."""
+    `skip`: a command held by a prompt the sync does not own. `forget`: a
+    ledger entry whose prompt is gone or replaced (nothing is deleted)."""
     plan = {"add": [], "update": [], "delete": [], "skip": [], "forget": []}
     wanted_cmds = set()
     for want in wanted:
@@ -12870,7 +12465,7 @@ def _slash_prompts_plan(wanted: list, existing: dict, owned: dict) -> dict:
 
 
 def _slash_prompts_owner() -> str:
-    """This Pipe Function, as Open WebUI loads it: `function_<id>`."""
+    """This Pipe Function's module name: `function_<id>`."""
     return _SLASH_PROMPT_CMD_BAD.sub("_", _function_module_prefix(__name__))
 
 
@@ -12882,8 +12477,7 @@ def _slash_prompts_ledger_read() -> dict:
     path = _slash_prompts_ledger_path()
     old = os.path.join(_state_dir(), _SLASH_PROMPTS_LEDGER_NAME)
     if not os.path.exists(path) and os.path.exists(old):
-        # The ledger from before it was per Function: the first copy to sync
-        # takes it, under the lock, so its prompts stay owned.
+        # The old shared ledger: the first copy to sync takes it over.
         try:
             os.replace(old, path)
         except OSError as ex:
@@ -12900,7 +12494,7 @@ def _slash_prompts_ledger_write(ledger: dict) -> bool:
 
 
 class _OwuiPromptStore:
-    """Open WebUI's Prompts table, in process. Only what the sync needs."""
+    """OWUI's Prompts table, in process."""
 
     def __init__(self):
         from open_webui.models.prompts import Prompts, PromptForm
@@ -12909,8 +12503,7 @@ class _OwuiPromptStore:
         self._owner = None
 
     async def owner_id(self) -> "str | None":
-        """The prompts' owner: the first admin. Everyone reads them through
-        the public grant; the owner is who may edit them in the Workspace."""
+        """The first admin, who may edit the prompts; everyone else reads."""
         if self._owner is None:
             from open_webui.models.users import Users
             user = None
@@ -12923,8 +12516,8 @@ class _OwuiPromptStore:
         return self._owner
 
     async def list(self) -> dict:
-        """Every prompt, turned off ones too: `get_prompts` leaves those out,
-        but their command is still taken (it is unique across both)."""
+        """Every prompt, including turned-off ones, which `get_prompts` omits
+        but whose command is still taken."""
         try:
             from open_webui.internal.db import get_async_db_context
             from open_webui.models.prompts import Prompt
@@ -12939,7 +12532,7 @@ class _OwuiPromptStore:
                 for r in rows}
 
     async def find(self, command: str) -> "dict | None":
-        """The prompt with `command`, whoever made it: {"id", "user_id", "meta"}."""
+        """{"id", "user_id", "meta"} of the prompt with `command`, any owner."""
         row = await _owui_call(self._prompts.get_prompt_by_command, command)
         if row is None:
             return None
@@ -12969,10 +12562,8 @@ class _OwuiPromptStore:
 
 
 async def _slash_prompts_apply(store, plan: dict, ledger: dict, save=None) -> bool:
-    """Write `plan` to Open WebUI, recording each add and delete in the
-    ledger file (`save`) as it lands: a prompt added but not recorded, by a
-    restart mid-sync say, would be skipped as someone else's forever after.
-    True when every write succeeded."""
+    """Apply `plan`, saving the ledger after each add or delete, else a restart
+    would leave an unrecorded prompt skipped forever. True if all succeeded."""
     owned = ledger["prompts"]
     save = save or (lambda: None)
     ok = True
@@ -13013,13 +12604,10 @@ async def _slash_prompts_apply(store, plan: dict, ledger: dict, save=None) -> bo
 
 
 async def _slash_prompts_half_added(store, want: dict) -> "str | None":
-    """The id of the prompt a failed add left behind, now recorded and written
-    again; None when there is none.
+    """Id of a prompt a failed add left behind, rewritten; else None.
 
-    Open WebUI commits the prompt row before its read grant and first
-    version, so an add can fail with the row in place. The command had no
-    prompt when the plan was made, and the lock keeps other syncs out, so a
-    row this sync's owner made with this Function's mark is that add's."""
+    OWUI commits the row before its grant and version, so an add can fail
+    with the row in place. Under the lock, a row with our mark is ours."""
     mark = want["meta"]["openclaw"]
     try:
         row = await store.find(want["command"])
@@ -13028,7 +12616,6 @@ async def _slash_prompts_half_added(store, want: dict) -> "str | None":
         theirs = (row.get("meta") or {}).get("openclaw") or {}
         if (theirs.get("command"), theirs.get("function")) != (mark["command"], mark["function"]):
             return None
-        # Writing it again sets the grant and the version the add did not.
         if not await store.update(row["id"], want):
             return None
     except Exception as ex:
@@ -13044,13 +12631,10 @@ def _slash_prompts_legacy() -> bool:
 
 
 async def _slash_prompts_fetch(conn, agent_id: str, revision) -> "tuple[list | None, str | None]":
-    """The Gateway's commands and their revision; (None, revision) when the
-    revision is unchanged.
+    """(commands, revision), or (None, revision) when unchanged.
 
-    A Gateway older than 2026.10 takes neither `includeModels` nor
-    `ifRevision`: there the full list comes from `commands.list` and the
-    revision is its hash, so an unchanged list still writes nothing. Any
-    other refusal (a wrong AGENT_ID, say) is an error, not an older Gateway."""
+    Before 2026.10, falls back to `commands.list` with its hash as revision.
+    Other refusals (a wrong AGENT_ID) stay errors."""
     if not _slash_prompts_legacy():
         params = {"agentId": agent_id, "includeModels": False}
         if revision:
@@ -13079,11 +12663,8 @@ async def _slash_prompts_fetch(conn, agent_id: str, revision) -> "tuple[list | N
 
 
 async def _slash_prompts_sync(valves, conn_getter, store=None) -> str:
-    """One check. Returns what it did, for the log and the tests: "busy",
-    "unchanged", "synced", "partial", "removed", "off" or "error".
-
-    A "busy" check leaves `pending` set, so the run that holds the lock, or
-    `_slash_prompts_run` after its settle delay, checks again."""
+    """One check: "busy", "unchanged", "synced", "partial", "removed", "off"
+    or "error". "busy" sets `pending` so the lock holder checks again."""
     if _slash_prompts_lock.locked():
         _slash_prompts_state["pending"] = True
         return "busy"
@@ -13099,7 +12680,7 @@ async def _slash_prompts_sync(valves, conn_getter, store=None) -> str:
                 try:
                     fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
-                    # Another Open WebUI worker, or another copy of the Pipe, is syncing.
+                    # Another OWUI worker or Pipe copy is syncing.
                     _slash_prompts_state["pending"] = True
                     return "busy"
             # A trigger from here on is not covered by this check.
@@ -13153,12 +12734,10 @@ async def _slash_prompts_sync_locked(valves, conn_getter, store) -> str:
         return "error"
     wanted = _slash_prompts_wanted(commands, settings)
     plan = _slash_prompts_plan(wanted, existing, dict(ledger["prompts"]))
-    # Not a complete sync until the end: a restart mid-way runs it in full again.
     ledger["revision"] = None
     ok = await _slash_prompts_apply(store, plan, ledger, lambda: _slash_prompts_ledger_write(ledger))
     ledger["settings"] = settings
-    # Only a complete sync records the revision; otherwise the next check
-    # runs in full and retries what failed.
+    # Only a complete sync records the revision, so failures get retried.
     ledger["revision"] = new_revision if ok else None
     _slash_prompts_ledger_write(ledger)
     for cmd in plan["skip"]:
@@ -13171,9 +12750,7 @@ async def _slash_prompts_sync_locked(valves, conn_getter, store) -> str:
 
 
 async def _slash_prompts_run(valves_getter) -> None:
-    """A check, and one more if a trigger arrived while it ran or another
-    worker held the lock. One per process: a trigger meanwhile only sets
-    `pending`."""
+    """Check, repeating while `pending` is set. One loop per process."""
     state = _slash_prompts_state
     state["running"] = True
     try:
@@ -13201,9 +12778,7 @@ def _slash_prompts_inside_owui() -> bool:
 
 
 def _ensure_slash_prompts(valves_getter, force: bool = False) -> None:
-    """Start a check when one is due. Cheap enough for every message: it
-    compares settings and a timestamp, and any Gateway or Open WebUI call
-    runs in the background. `force`: a page load or a Gateway push."""
+    """Start a check when due; cheap per message. `force`: page load or push."""
     try:
         _ensure_slash_prompts_now(valves_getter, force)
     except Exception as ex:
@@ -13216,7 +12791,7 @@ def _ensure_slash_prompts_now(valves_getter, force: bool) -> None:
     valves = valves_getter()
     enabled = bool(getattr(valves, "SYNC_SLASH_COMMANDS", False))
     if enabled:
-        # Known again once a check runs: another worker's sync may fill the ledger.
+        # Another worker's sync may fill the ledger.
         state["ledger_empty"] = None
     elif state["ledger_empty"]:
         return
@@ -13233,7 +12808,7 @@ def _ensure_slash_prompts_now(valves_getter, force: bool) -> None:
         return
     if not _slash_prompts_inside_owui():
         return
-    state["running"] = True  # before the task starts, so a second trigger cannot start another
+    state["running"] = True  # set before the task starts, so no second loop
     try:
         spawn_background(_slash_prompts_run(valves_getter))
     except BaseException:
@@ -13242,7 +12817,7 @@ def _ensure_slash_prompts_now(valves_getter, force: bool) -> None:
 
 
 def _slash_prompts_on_metadata_changed(payload: dict) -> None:
-    """The Gateway's `chat.metadata.changed`: its commands may have changed."""
+    """Handle `chat.metadata.changed`: commands may have changed."""
     if (payload or {}).get("commandsChanged") is False:
         return
     getter = _slash_prompts_state["valves"]

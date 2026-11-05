@@ -70,25 +70,12 @@ level in Valves: under Model controls next to the model's name (Open WebUI
 
 
 # --- thinking --------------------------------------------------------------
-# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
-# and the pipe enforces them against the live session ladder, so the ranks and
-# the clamping rule have to be one implementation, not two that agree today.
-#
-# Deliberately has no imports, no classes, and no module-level names beyond the
-# five below. It is concatenated into the Pipe artifact, where every name in it
-# lands in the same flat namespace as every other fragment: a helper named like
-# one of the pipe's own (a `_state_dir`, say) would silently shadow it
-# depending on fragment order. Filter-only helpers live in `thinking_filter`
-# for exactly that reason.
+# Shared by the Thinking filter and the Pipe so both use one ranking and clamp.
+# No imports or extra names: it lands in the Pipe's flat namespace, where a
+# helper could shadow a Pipe name. Filter-only helpers go in thinking_filter.
 
-# ---------------------------------------------------------------------------
-# Levels
-# ---------------------------------------------------------------------------
-
-# Ranks mirror the gateway's own table (off is genuinely a level, not an
-# absence). Used to order the dropdown and to clamp downward, never upward:
-# asking for less thinking than requested is a safe degradation, asking for
-# more is a surprise on someone's bill.
+# Mirrors the Gateway's table. Clamp only downward: less thinking is safe,
+# more costs money.
 LEVEL_RANKS = {
     "off": 0,
     "minimal": 10,
@@ -101,54 +88,32 @@ LEVEL_RANKS = {
     "ultra": 80,
 }
 
-# The sentinel meaning "do not send the field at all". Distinct from "off",
-# which is an explicit instruction to not think. "default" leaves the agent's
-# own configured level alone; "off" overrides it.
+# Means "send no level": keep the agent's own. "off" is an explicit level.
 UNSET = "default"
 
-# Used until the pipe has run once and written a real ladder cache. Every
-# provider observed supports at least these, so nothing here can be a lie.
+# Used until the Pipe writes a ladder cache. Every known provider has these.
 FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
 
 LADDER_CACHE_NAME = "thinking-ladders.json"
 
-# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
-# are identical (`label: id`). The one divergence is the binary profile, which
-# labels `low` as "on". Mapping it back is the difference between learning a
-# model's real two-level ladder and learning a one-level lie.
+# The Gateway's rejection lists labels, not ids. The binary profile labels
+# `low` as "on".
 LEVEL_LABEL_ALIASES = {"on": "low"}
 
-# The exact anchors of the Gateway's hard validation error, e.g.:
+# Anchors of the Gateway's validation error, all required and in order:
 #   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
-# All three must be present and in order. That is deliberately at least as
-# narrow as matching the whole sentence: it can never fire on genuine assistant
-# text that happens to discuss thinking levels.
 _REJECT_HEAD = 'Thinking level "'
 _REJECT_MID = '" is not supported for '
 _REJECT_TAIL = ". Use one of: "
 
 
 def parse_thinking_rejection(text):
-    """Read the Gateway's own rejection as an authoritative per-model ladder.
+    """Parse the Gateway's level rejection into the model's real ladder.
 
-    This exists because `sessions.describe` cannot be trusted for this. Describe
-    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
-    never sees the catalog's `reasoning: false` and falls through to the generic
-    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
-    whose real ladder is `["off"]`. The send path resolves the same question
-    WITH the catalog and rejects. So the rejection is the only place the truth
-    is stated, and throwing it away is what made this misfire once per turn
-    forever instead of once per model.
-
-    Returns None when `text` is not that rejection. Otherwise a dict:
-    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
-    `levels` may be empty if every listed label is unrecognised -- the caller
-    still learns which model rejected which level, so it must check for None
-    rather than for falsiness.
-
-    Pure string parsing on purpose: this fragment is shared with the Thinking
-    filter, which imports nothing (not even `re`) so that a filter running on
-    every message can never fail on an import it did not need.
+    `sessions.describe` builds its ladder without the model catalog, so it
+    over-reports levels; only the send path's rejection is accurate.
+    Returns None, or `{"level", "model", "levels"}`; `levels` may be empty, so
+    check for None. No `re`, since the filter shares this fragment.
     """
     if not text:
         return None
@@ -166,8 +131,7 @@ def parse_thinking_rejection(text):
     level = text[level_start:mid].strip().lower()
     model = text[mid + len(_REJECT_MID):tail].strip()
     if not level or not model or " " in model:
-        # A model ref never contains a space. Anything that does means the
-        # anchors matched something that merely reads like the rejection.
+        # A model ref has no space, so this is not the real rejection.
         return None
 
     listed = text[tail + len(_REJECT_TAIL):]
@@ -185,22 +149,14 @@ def parse_thinking_rejection(text):
 
 
 def clamp_to_ladder(level, ladder):
-    """Fit a requested level to what a model actually supports.
+    """Fit a level to a model's ladder. Returns (level, note to show or None).
 
-    Returns (resolved_level, note). `note` is None when the request went
-    through untouched, otherwise a short human sentence explaining what
-    changed, which the caller is expected to show rather than swallow.
-
-    Clamping is always downward to the nearest supported rank. If the model
-    supports nothing at or below the request (a ladder of only higher levels,
-    which no observed provider has, but which costs nothing to handle), the
-    lowest supported level is used.
+    Clamps down to the nearest supported rank, else to the lowest one.
     """
     if not level or level == UNSET:
         return None, None
     if not ladder:
-        # No ladder known: pass the request through and let the gateway rule on
-        # it. Silently dropping a level the user explicitly picked is worse.
+        # Unknown ladder: let the Gateway rule rather than drop the user's pick.
         return level, None
     if level in ladder:
         return level, None
@@ -225,15 +181,9 @@ def clamp_to_ladder(level, ladder):
 
 
 # --- thinking_filter -------------------------------------------------------
-# The Filter class and its pydantic surface. Split from `thinking` so the Pipe
-# can reuse the ranks and the clamp without also inheriting a Filter class it
-# must not expose.
-#
-# pydantic is the only non-stdlib import here, and Open WebUI ships it. This
-# deliberately does NOT reuse the pipe's _prelude, which pulls in websockets and
-# cryptography: a filter runs on every message, and one that cannot import takes
-# the whole chat down with it. A transport dependency is not worth that risk for
-# a control that only writes one dict key.
+# The Filter class, split from `thinking` so the Pipe does not expose a Filter.
+# Does not use the Pipe's _prelude (websockets, cryptography): a filter that
+# fails to import takes the whole chat down. pydantic ships with Open WebUI.
 
 import json
 import os
@@ -242,28 +192,15 @@ from typing import Optional
 from pydantic import BaseModel, Field, create_model
 
 
-# ---------------------------------------------------------------------------
-# Reading the ladder cache
-# ---------------------------------------------------------------------------
-
 def _state_dir():
-    """Same default and env override as the pipe, without importing it.
-
-    Read-only here, so unlike the pipe this never creates or falls back to a
-    writable directory: a missing directory just means no cache yet.
-    """
+    """The Pipe's state dir, read-only: a missing dir means no cache yet."""
     return os.environ.get("OPENCLAW_BRIDGE_STATE_DIR") or "/data/openclaw-bridge"
 
 
 def _read_ladder_cache(path=None):
-    """Return the level ids the pipe has actually seen a gateway offer.
+    """Level ids the Pipe cached (gateway.py writes {"levels": [...], "updated": ts}).
 
-    The cache is written by the pipe (see gateway.py) as::
-
-        {"levels": ["off", "minimal", ...], "updated": 1786784049}
-
-    Anything unreadable, malformed, or empty falls back rather than raising:
-    a broken cache must degrade to a shorter dropdown, never to a broken chat.
+    Returns None on any bad cache, never raises.
     """
     path = path or os.path.join(_state_dir(), LADDER_CACHE_NAME)
     try:
@@ -281,25 +218,17 @@ def _read_ladder_cache(path=None):
 
 
 def available_levels(path=None):
-    """The dropdown contents: UNSET first, then real levels ordered by rank.
+    """Dropdown: UNSET, then the union of all models' levels by rank.
 
-    This is the union across the models the gateway knows about, not the ladder
-    of the currently selected model. Open WebUI builds a valve dropdown once,
-    from the class, so it cannot vary per message. The pipe closes that gap by
-    clamping against the live session ladder at send time and saying so.
+    OWUI builds the dropdown once per class, so the Pipe clamps per model.
     """
     levels = _read_ladder_cache(path) or FALLBACK_LEVELS
     ordered = sorted(set(levels), key=lambda lv: (LEVEL_RANKS[lv], lv))
     return [UNSET] + ordered
 
 
-# ---------------------------------------------------------------------------
-# Filter
-# ---------------------------------------------------------------------------
-
-# Black stroke on purpose: Open WebUI renders this via <img src=...> and applies
-# `dark:invert-[80%]` to any `data:image/svg` icon, so currentColor never
-# resolves and a themed stroke shows up invisible in one of the two themes.
+# Black stroke: OWUI shows it via <img> with `dark:invert-[80%]`, so
+# currentColor never resolves.
 ICON = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20"
@@ -310,12 +239,7 @@ ICON = (
 
 
 def _build_user_valves(levels):
-    """Build the UserValves model with the dropdown baked in.
-
-    A pydantic Literal is fixed when the class is defined, so the choices have
-    to be known at import time. create_model is what lets the list come from
-    the gateway's real ladders instead of being hardcoded here.
-    """
+    """UserValves with the level dropdown, built at import from the cache."""
     return create_model(
         "UserValves",
         level=(
@@ -354,23 +278,15 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Open WebUI caches the Filter *instance*, not the module, so `toggle`
-        # and `icon` have to be instance attributes. Set at class level they are
-        # invisible to get_filter_items_from_module() and the row silently never
-        # renders, which reads exactly like the filter not being installed.
+        # Must be instance attributes: OWUI's get_filter_items_from_module()
+        # does not see class-level ones and the toggle never renders.
         self.toggle = True
         self.icon = ICON
 
     def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """Write the chosen level into the field the pipe reads.
+        """Write the level into body["reasoning_effort"], the key Advanced Params also sets.
 
-        `body["reasoning_effort"]` is the single source of truth. Open WebUI's
-        Advanced Params control writes the same key, so the two controls move
-        one value instead of racing over two.
-
-        Reached only when the toggle is on: Open WebUI does not run a toggled
-        filter's inlet otherwise. So an untouched chat behaves exactly as if
-        this filter were not installed.
+        OWUI runs this only while the toggle is on.
         """
         if not isinstance(body, dict):
             return body
@@ -381,8 +297,6 @@ class Filter:
             level = user_valves.get("level")
 
         if not level or level == UNSET:
-            # Nothing chosen. Leave whatever Advanced Params set, including
-            # leaving the key absent, so the pipe omits it downstream.
             return body
 
         if body.get("reasoning_effort") and not self.valves.override_advanced_params:
