@@ -22,7 +22,7 @@ Set [`GATEWAY_URL`](../configuration.md#gateway_url) (installer: `GATEWAY_URL` o
 
 It is resolved by the Open WebUI backend, which is not necessarily the same network as your browser, nor as the machine you run the installer on. The default, `localhost:18789`, only works when the Gateway runs on the same host as the Open WebUI backend.
 
-If the Pipe can't reach that address, a chat shows an `**Error:**` line instead of a reply, and the model picker shows a built-in example list ("Gateway not reached") instead of your models. Check `GATEWAY_URL` and `GATEWAY_TOKEN`, and that the Gateway accepts connections on that address from the Open WebUI host.
+If the Pipe can't reach that address, a chat shows an error sentence (with the Gateway's text under **Technical details**) instead of a reply, and the model picker shows a built-in example list ("Gateway not reached") instead of your models. Check `GATEWAY_URL` and `GATEWAY_TOKEN`, and that the Gateway accepts connections on that address from the Open WebUI host.
 
 ### Open WebUI in a container, Gateway on the host
 

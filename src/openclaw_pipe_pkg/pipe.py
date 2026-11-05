@@ -1214,6 +1214,7 @@ class _PipeTurn:
                 patch_err,
                 model_override=self.model_override,
                 agent_id=self.pipe.valves.AGENT_ID,
+                user_text=self.text,
             )
             self.ended = True
             return
@@ -1511,14 +1512,14 @@ class _PipeTurn:
             except asyncio.TimeoutError:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
-                yield "**Timeout:** Gateway did not respond to chat.send"
+                yield _plain_error(ERROR_TIMEOUT, "Gateway did not respond to chat.send", self.text)
                 self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             except Exception as e:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
-                yield f"**Error sending message:** {e}"
+                yield _plain_error(ERROR_SEND, f"Error sending message: {e}", self.text)
                 self.end_waiting_replies_unsent()
                 self.ended = True
                 return
@@ -2063,7 +2064,7 @@ class _PipeTurn:
             self.done = True
             pipe_log("  lifecycle end -> done")
         elif err:
-            self.error_shown = f"\n\n**Error:** {err}"
+            self.error_shown = "\n\n" + _plain_error(ERROR_RUN, err, self.text)
             self.record_visible_chunk(self.error_shown)
             yield self.error_shown
             self.done = True
@@ -2085,7 +2086,7 @@ class _PipeTurn:
         if (run_error and not self.error_shown
                 and _thinking_rejection_retry_body(
                     self.body, run_error, self.resolved_thinking) is None):
-            self.error_shown = f"\n\n**Error:** {run_error}"
+            self.error_shown = "\n\n" + _plain_error(ERROR_RUN, run_error, self.text)
             self.record_visible_chunk(self.error_shown)
             yield self.error_shown
 
@@ -2649,7 +2650,7 @@ class _PipeTurn:
         if turn_owner(row, self.owner_notice_before) == "pipe":
             return ("end", TURN_CUT_OFF_NOTE)
         if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
-            return ("end", f"**Error:** {row['lastRunError']}")
+            return ("end", _plain_error(ERROR_RUN, row["lastRunError"], self.text))
         return ("end", None)
 
     async def own_run_usage(self) -> dict | None:
@@ -2709,7 +2710,7 @@ class _PipeTurn:
             return "**Stopped.**"
         if status in ("failed", "timeout"):
             err = row.get("lastRunError")
-            return f"**Error:** {err}" if err else "**Failed:** the run did not complete."
+            return _plain_error(ERROR_RUN if err else ERROR_UNFINISHED, err, self.text)
         return await self.recover_from_transcript() or ""
 
     def record_visible_chunk(self, chunk: str):

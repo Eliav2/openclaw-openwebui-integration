@@ -63,7 +63,15 @@ def _usable_models(raw_models: list[dict]) -> list[dict]:
 _AGENT_ERROR_HINTS = ("agent", "session")
 
 
-def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
+# The raw side of the start timeout: for whoever runs the Gateway.
+_START_TIMEOUT_ADVICE = (
+    "The Gateway did not respond in time while starting this conversation. "
+    "This is usually transient -- send the message again. If it keeps "
+    "happening, check that the Gateway is healthy and reachable from Open WebUI."
+)
+
+
+def _explain_session_patch_failure(err, *, model_override, agent_id, user_text="") -> str:
     """Explain a failed sessions.patch: model, AGENT_ID, or unknown.
 
     This is the first agent-scoped RPC, so a bad AGENT_ID fails here too.
@@ -71,12 +79,7 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     """
     # Transport errors are no valve's fault, and str(TimeoutError()) is "".
     if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
-        return (
-            "**The Gateway did not respond in time while starting this "
-            "conversation.** This is usually transient -- send the message "
-            "again. If it keeps happening, check that the Gateway is healthy "
-            "and reachable from Open WebUI."
-        )
+        return _plain_error(ERROR_TIMEOUT, _START_TIMEOUT_ADVICE, user_text)
 
     detail = str(err).strip() or repr(err)
     low = detail.lower()

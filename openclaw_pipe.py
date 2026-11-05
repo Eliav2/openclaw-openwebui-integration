@@ -8281,6 +8281,85 @@ async def _list_all_sessions(conn, *, timeout: float = 30, **filters) -> dict:
             return {"sessions": rows, "totalCount": total if total is not None else len(rows)}
 
 
+# --- errors ----------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# What the user sees when a run or a send fails (S13)
+#
+# The Gateway's error string is a developer's line ("prepared reply dispatch
+# runtime owner was not published for main"), the same for every user. The user
+# gets one plain sentence in the language of their own message, and the raw
+# text stays one click away in a collapsed block for whoever debugs it.
+# ---------------------------------------------------------------------------
+
+ERROR_SEND = "send"              # chat.send was refused or failed
+ERROR_RUN = "run"                # the run ended in an error
+ERROR_TIMEOUT = "timeout"        # the Gateway did not answer in time
+ERROR_UNFINISHED = "unfinished"  # the run ended without a reply or a reason
+ERROR_DETAILS = "details"        # the summary of the collapsed raw text
+
+LANG_EN = "en"
+LANG_HE = "he"
+
+# The Hebrew block of Unicode: its letters and points.
+_HEBREW_FIRST, _HEBREW_LAST = "֐", "׿"
+_URL_RE = re.compile(r"https?://\S+")
+_BACKTICKS_RE = re.compile(r"`+")
+# A code fence is at least this many backticks.
+_MIN_FENCE = 3
+
+_ERROR_TEXT = {
+    LANG_EN: {
+        ERROR_SEND: "**Your message couldn't be sent.** Please try sending it again.",
+        ERROR_RUN: "**Something went wrong while answering.** Please try again.",
+        ERROR_TIMEOUT: ("**The assistant took too long to respond.** This is usually "
+                        "temporary: please send your message again."),
+        ERROR_UNFINISHED: "**The reply didn't finish.** Please send your message again.",
+        ERROR_DETAILS: "Technical details",
+    },
+    LANG_HE: {
+        ERROR_SEND: "**לא הצלחתי לשלוח את ההודעה.** אפשר לנסות לשלוח אותה שוב.",
+        ERROR_RUN: "**משהו השתבש בזמן שעניתי.** אפשר לנסות שוב.",
+        ERROR_TIMEOUT: ("**לא קיבלתי תשובה בזמן.** זה בדרך כלל חולף, "
+                        "אפשר לשלוח את ההודעה שוב."),
+        ERROR_UNFINISHED: "**התשובה לא הסתיימה.** אפשר לשלוח את ההודעה שוב.",
+        ERROR_DETAILS: "פרטים טכניים",
+    },
+}
+
+
+def _message_language(text) -> str:
+    """`LANG_HE` when more words of `text` have Hebrew letters than Latin ones
+    (links left out), else `LANG_EN`: the script of the message picks the
+    language, no setting. Words, not letters, so one long foreign name in a
+    Hebrew sentence does not outweigh it."""
+    hebrew = latin = 0
+    for word in _URL_RE.sub("", str(text or "")).split():
+        if any(_HEBREW_FIRST <= c <= _HEBREW_LAST for c in word):
+            hebrew += 1
+        elif any(c.isascii() and c.isalpha() for c in word):
+            latin += 1
+    return LANG_HE if hebrew > latin else LANG_EN
+
+
+def _fenced(raw: str) -> str:
+    """`raw` as a code block that no backticks inside it can close."""
+    longest = max((len(m) for m in _BACKTICKS_RE.findall(raw)), default=0)
+    fence = "`" * max(_MIN_FENCE, longest + 1)
+    return f"{fence}\n{raw}\n{fence}"
+
+
+def _plain_error(kind: str, raw, user_text="") -> str:
+    """The sentence for an error of `kind`, in the language of `user_text`,
+    followed by `raw` (the Gateway's own text) in a collapsed block."""
+    text = _ERROR_TEXT[_message_language(user_text)]
+    raw = str(raw or "").strip()
+    if not raw:
+        return text[kind]
+    return (f"{text[kind]}\n\n<details>\n<summary>{text[ERROR_DETAILS]}</summary>\n\n"
+            f"{_fenced(raw)}\n\n</details>")
+
+
 # --- writer ----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -9330,7 +9409,8 @@ class _TurnWriter:
             note = TURN_CUT_OFF_NOTE
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             if not (row["lastRunError"].strip() == EMPTY_RESPONSE_ERROR and await self._run_is_inter_session()):
-                note = f"**Error:** {row['lastRunError']}"
+                request = self.request or (await self._run_request())[0]
+                note = _plain_error(ERROR_RUN, row["lastRunError"], request)
         if note is None and await self._ask_question():
             return
         if not self._showable():
@@ -11405,7 +11485,15 @@ def _usable_models(raw_models: list[dict]) -> list[dict]:
 _AGENT_ERROR_HINTS = ("agent", "session")
 
 
-def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
+# The raw side of the start timeout: for whoever runs the Gateway.
+_START_TIMEOUT_ADVICE = (
+    "The Gateway did not respond in time while starting this conversation. "
+    "This is usually transient -- send the message again. If it keeps "
+    "happening, check that the Gateway is healthy and reachable from Open WebUI."
+)
+
+
+def _explain_session_patch_failure(err, *, model_override, agent_id, user_text="") -> str:
     """Explain a failed sessions.patch: model, AGENT_ID, or unknown.
 
     This is the first agent-scoped RPC, so a bad AGENT_ID fails here too.
@@ -11413,12 +11501,7 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     """
     # Transport errors are no valve's fault, and str(TimeoutError()) is "".
     if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
-        return (
-            "**The Gateway did not respond in time while starting this "
-            "conversation.** This is usually transient -- send the message "
-            "again. If it keeps happening, check that the Gateway is healthy "
-            "and reachable from Open WebUI."
-        )
+        return _plain_error(ERROR_TIMEOUT, _START_TIMEOUT_ADVICE, user_text)
 
     detail = str(err).strip() or repr(err)
     low = detail.lower()
@@ -14203,6 +14286,7 @@ class _PipeTurn:
                 patch_err,
                 model_override=self.model_override,
                 agent_id=self.pipe.valves.AGENT_ID,
+                user_text=self.text,
             )
             self.ended = True
             return
@@ -14500,14 +14584,14 @@ class _PipeTurn:
             except asyncio.TimeoutError:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
-                yield "**Timeout:** Gateway did not respond to chat.send"
+                yield _plain_error(ERROR_TIMEOUT, "Gateway did not respond to chat.send", self.text)
                 self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             except Exception as e:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
-                yield f"**Error sending message:** {e}"
+                yield _plain_error(ERROR_SEND, f"Error sending message: {e}", self.text)
                 self.end_waiting_replies_unsent()
                 self.ended = True
                 return
@@ -15052,7 +15136,7 @@ class _PipeTurn:
             self.done = True
             pipe_log("  lifecycle end -> done")
         elif err:
-            self.error_shown = f"\n\n**Error:** {err}"
+            self.error_shown = "\n\n" + _plain_error(ERROR_RUN, err, self.text)
             self.record_visible_chunk(self.error_shown)
             yield self.error_shown
             self.done = True
@@ -15074,7 +15158,7 @@ class _PipeTurn:
         if (run_error and not self.error_shown
                 and _thinking_rejection_retry_body(
                     self.body, run_error, self.resolved_thinking) is None):
-            self.error_shown = f"\n\n**Error:** {run_error}"
+            self.error_shown = "\n\n" + _plain_error(ERROR_RUN, run_error, self.text)
             self.record_visible_chunk(self.error_shown)
             yield self.error_shown
 
@@ -15638,7 +15722,7 @@ class _PipeTurn:
         if turn_owner(row, self.owner_notice_before) == "pipe":
             return ("end", TURN_CUT_OFF_NOTE)
         if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
-            return ("end", f"**Error:** {row['lastRunError']}")
+            return ("end", _plain_error(ERROR_RUN, row["lastRunError"], self.text))
         return ("end", None)
 
     async def own_run_usage(self) -> dict | None:
@@ -15698,7 +15782,7 @@ class _PipeTurn:
             return "**Stopped.**"
         if status in ("failed", "timeout"):
             err = row.get("lastRunError")
-            return f"**Error:** {err}" if err else "**Failed:** the run did not complete."
+            return _plain_error(ERROR_RUN if err else ERROR_UNFINISHED, err, self.text)
         return await self.recover_from_transcript() or ""
 
     def record_visible_chunk(self, chunk: str):

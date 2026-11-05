@@ -36,6 +36,9 @@ import websockets  # noqa: E402  (after the stubs)
 
 import openclaw_pipe  # noqa: E402
 import openclaw_status_action  # noqa: E402
+
+RUN_ERROR_SENTENCE = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_EN][openclaw_pipe.ERROR_RUN]
+HEBREW_ASK = "מתי יוצאת הרכבת הבאה לקיוטו"
 from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
@@ -2325,8 +2328,8 @@ class NoDroppedMessagesTests(_TurnCase):
             "sessionKey": self.SK, "runId": run_id, "state": "error",
             "errorMessage": message}}
 
-    async def _reply_text(self, events):
-        gen = self._reply("these /model are fine", "m1")
+    async def _reply_text(self, events, text="these /model are fine"):
+        gen = self._reply(text, "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
         for ev in events:
@@ -2340,7 +2343,8 @@ class NoDroppedMessagesTests(_TurnCase):
         """ELI-139: a run the Gateway refused before it started (a "/model" directive in the text)
         shows the error, not "(This turn produced no reply text.)"."""
         out = await self._reply_text([self._chat_error("run-1", self._NOT_ALLOWED)])
-        self.assertIn(f"**Error:** {self._NOT_ALLOWED}", out)
+        self.assertIn(RUN_ERROR_SENTENCE, out)
+        self.assertIn(f"```\n{self._NOT_ALLOWED}\n```", out)
         self.assertNotIn("no reply text", out)
 
     def _spawn_card_events(self, run_id):
@@ -2380,8 +2384,29 @@ class NoDroppedMessagesTests(_TurnCase):
                 "data": {"phase": "error", "error": "provider overloaded"}}},
             self._chat_error("run-1", "provider overloaded"),
         ])
-        self.assertEqual(out.count("**Error:**"), 1)
-        self.assertIn("**Error:** provider overloaded", out)
+        self.assertEqual(out.count(RUN_ERROR_SENTENCE), 1)
+        self.assertIn("```\nprovider overloaded\n```", out)
+
+    async def test_a_run_error_is_a_plain_sentence_in_the_language_of_the_message(self):
+        """S13: Ortal saw `**Error:** Error: prepared reply dispatch runtime owner was not
+        published for main` for a question in Hebrew."""
+        raw = "Error: prepared reply dispatch runtime owner was not published for main"
+        out = await self._reply_text([self._chat_error("run-1", raw)], text=HEBREW_ASK)
+        he = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_HE]
+        self.assertIn(he[openclaw_pipe.ERROR_RUN], out)
+        self.assertNotIn("**Error:**", out)
+        head, details = out.split("<details>")
+        self.assertNotIn("dispatch runtime", head)
+        self.assertIn(f"<summary>{he[openclaw_pipe.ERROR_DETAILS]}</summary>", details)
+        self.assertIn(f"```\n{raw}\n```", details)
+
+    async def test_a_send_failure_is_a_plain_sentence_with_the_raw_error_collapsed(self):
+        self.send_fails = RuntimeError("attachment image-2.png: image exceeds size limit")
+        out = "".join([c async for c in self._reply(HEBREW_ASK, "m1") if isinstance(c, str)])
+        he = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_HE]
+        self.assertTrue(out.startswith(he[openclaw_pipe.ERROR_SEND]), out)
+        self.assertNotIn("**Error sending message:**", out)
+        self.assertIn("exceeds size limit", out.split("<details>")[1])
 
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost during a gap, so a gap wakes every waiter."""
@@ -6682,6 +6707,18 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
                 self.assertNotIn("Model selection error", msg)
                 self.assertIn("again", msg.lower())
 
+    def test_the_start_timeout_is_plain_in_the_users_language_with_the_advice_collapsed(self):
+        """S13: the 11-03 timeout text, English, for a question in Hebrew."""
+        msg = _explain_session_patch_failure(
+            asyncio.TimeoutError(), model_override=None, agent_id="main", user_text=HEBREW_ASK)
+        he = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_HE]
+        self.assertTrue(msg.startswith(he[openclaw_pipe.ERROR_TIMEOUT]), msg)
+        self.assertIn("check that the Gateway is healthy", msg.split("<details>")[1])
+        english = _explain_session_patch_failure(
+            asyncio.TimeoutError(), model_override=None, agent_id="main", user_text="when is the next train")
+        self.assertTrue(english.startswith(
+            openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_EN][openclaw_pipe.ERROR_TIMEOUT]))
+
     def test_dropdown_reads_the_cache_the_pipe_actually_writes(self):
         """get_model_options is a classmethod and read `_state_dir()` with no argument, missing a
         custom STATE_DIR cache."""
@@ -7418,9 +7455,9 @@ class SettledTailTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_failed_run_that_showed_nothing(self):
         self.assertEqual(await self._turn().settled_tail({"status": "failed", "lastRunError": "quota"}),
-                         "**Error:** quota")
+                         openclaw_pipe._plain_error(openclaw_pipe.ERROR_RUN, "quota", "hi"))
         self.assertEqual(await self._turn().settled_tail({"status": "timeout"}),
-                         "**Failed:** the run did not complete.")
+                         "**The reply didn't finish.** Please send your message again.")
 
     async def test_a_run_that_showed_text_owes_nothing_more(self):
         self.assertEqual(await self._turn(text_yielded=True).settled_tail({"status": "failed"}), "")
@@ -9229,8 +9266,20 @@ class TurnWriterEndTests(_TurnWriterCase):
         w = await self.opened_writer()
         await w.end({"status": "failed", "lastRunError": "429 rate limited", "hasActiveRun": False})
         self.assertIs(self.m()["done"], True)
-        self.assertIn("429 rate limited", self.m()["content"])
+        self.assertIn(RUN_ERROR_SENTENCE, self.m()["content"])
+        self.assertIn("```\n429 rate limited\n```", self.m()["content"])
+        self.assertNotIn("**Error:**", self.m()["content"])
         self.assertNotIn("chat.send", [m for m, _ in self.sent])
+
+    async def test_the_writers_error_follows_the_language_of_the_request_it_answers(self):
+        for m in self.history["messages"]:
+            if m.get("idempotencyKey") == f"{self.RUN}:user":
+                m["content"] = [{"type": "text", "text": HEBREW_ASK}]
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "lastRunError": "429 rate limited", "hasActiveRun": False})
+        he = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_HE]
+        self.assertIn(he[openclaw_pipe.ERROR_RUN], self.m()["content"])
+        self.assertIn("429 rate limited", self.m()["content"].split("<details>")[1])
 
     EMPTY = "CLI backend returned an empty response."
 
@@ -9257,13 +9306,13 @@ class TurnWriterEndTests(_TurnWriterCase):
         self._user_turn_from(None)
         w = await self.opened_writer()
         await w.end({"status": "failed", "lastRunError": self.EMPTY, "hasActiveRun": False})
-        self.assertIn(self.EMPTY, self.m()["content"])
+        self.assertIn(self.EMPTY, self.m()["content"].split("<details>")[1])
 
     async def test_another_error_on_an_inter_session_turn_is_still_shown(self):
         self._user_turn_from({"kind": "inter_session", "sourceTool": "sessions_send"})
         w = await self.opened_writer()
         await w.end({"status": "failed", "lastRunError": "429 rate limited", "hasActiveRun": False})
-        self.assertIn("429 rate limited", self.m()["content"])
+        self.assertIn("429 rate limited", self.m()["content"].split("<details>")[1])
 
     async def test_a_running_row_keeps_the_message_open_for_the_recovery(self):
         w = await self.opened_writer()
@@ -12450,13 +12499,15 @@ class InlineOwnerRuleTests(_TurnCase):
     async def test_a_real_error_is_shown_inline(self):
         out = await self._turn(self._lifecycle_error("429 rate limited"))
         self.assert_not_handed_over()
-        self.assertIn("**Error:** 429 rate limited", out)
+        self.assertIn(RUN_ERROR_SENTENCE, out)
+        self.assertIn("```\n429 rate limited\n```", out)
 
     async def test_a_cli_exit_1_is_not_an_outside_kill(self):
         """`process exited with code 1` is the CLI failing, not an outside kill."""
         out = await self._turn(self._lifecycle_error("Claude Code process exited with code 1"))
         self.assert_not_handed_over()
-        self.assertIn("**Error:** Claude Code process exited with code 1", out)
+        self.assertIn(RUN_ERROR_SENTENCE, out)
+        self.assertIn("```\nClaude Code process exited with code 1\n```", out)
 
     async def test_the_handover_carries_the_thinking_level(self):
         """The writer's resume runs at the user's thinking level (ELI-85)."""
@@ -13318,7 +13369,8 @@ class ApiCallerOwnerRuleTests(_TurnCase):
                  lastRunError="restart recovery gave up")
         out = await asyncio.wait_for(task, 5)
         self.assertIn("Reading them.", out)
-        self.assertIn("**Error:** restart recovery gave up", out)
+        self.assertIn(RUN_ERROR_SENTENCE, out)
+        self.assertIn("```\nrestart recovery gave up\n```", out)
         self.assertEqual(self.sent, ["hello"])
 
 
