@@ -134,7 +134,7 @@ Order (decided): the AST check with cut 1, then 5, 6 and 9, with the other prose
 | 7 | Drop the 2026.9.3 paths | −150 / −400 | medium | waits for ELI-356 (minimum OpenClaw 2026.10.10, ~2026-11-22..26) |
 | 8 | Drop the branches steering makes unreachable on 2026.10.10 | −300 to −600 / −1,000 | medium | waits for ELI-356 |
 | 9 | One "wait on transcript/row/session change" helper; one row-read helper | - | - | closed: measured at about −10 lines. Only 3 of 5 first-event waits fit one helper, and the row read repeats 3 times, one line each. Not worth a gated change |
-| 10 | Split `_PipeTurn` and `Action._run_status` into smaller steps, dropping repeated branches | −500 to −1,000 | medium-high | - |
+| 10 | Split `_PipeTurn` and `Action._run_status` into smaller steps | - | - | closed: measured. Only about 50 repeated lines across `pipe.py` and `action.py`; splitting into steps adds signatures and state passing, so lines go up. A readability refactor only if Eliav asks |
 | 11 | Merge duplicate unit tests (shared fixtures, parametrize) | −2,000 to −4,000 | low (no assert lost) | - |
 | 12 | Scripts used by hand only | - | - | closed: `social_preview.py` and `record_live.py` stay |
 | 13 | Drop the ELI-205 shield (`_uncancellable`) | - | - | closed: the wedge is fixed in 0.12.4, but the shield also makes a write that a Stop interrupts finish instead of rolling back, so removing it changes behaviour |
