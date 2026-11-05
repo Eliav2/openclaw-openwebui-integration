@@ -26,7 +26,9 @@ Replies:
   then waits for the file `go-TOKEN`. There it takes the message in and answers it as
   `E2E_CLI_STEERED: <its text>`, then each one injected meanwhile the same way (Eliav's chat
   c9dc45f0, test 2). After each answer it takes the next message the Gateway injects (noted
-  `injected TOKEN: <count>`), until the file `done-TOKEN` says none is coming.
+  `injected TOKEN: <count>`), until the file `done-TOKEN` says none is coming. It answers a
+  message it took in once the file `say-TOKEN` or `done-TOKEN` exists, as a model answers
+  after the Gateway recorded the message.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * anything else -> `E2E_CLI_REPLY`.
@@ -290,6 +292,10 @@ while True:
             each = injected[taken]
             taken += 1
             take_in(each)
+            # A model answers well after the Gateway recorded the message it
+            # took in; the file `say-TOKEN` (or `done-TOKEN`) stands for that.
+            while not (os.path.exists(os.path.join(DIR, f"say-{token}")) or os.path.exists(done)):
+                time.sleep(0.2)
             answer = f"E2E_CLI_STEERED: {text_of(each)}"
             say(answer)
             lifecycle("completed", each.get("uuid"))

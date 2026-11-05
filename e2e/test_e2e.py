@@ -844,7 +844,7 @@ def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token)
     chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
     assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
     word = f"two{uuid.uuid4().hex[:8]}"
-    go, done = os.path.join(logs, f"go-{word}"), os.path.join(logs, f"done-{word}")
+    go, done, say = (os.path.join(logs, f"{f}-{word}") for f in ("go", "done", "say"))
     page = _Page(token)
     page.join(chat_id)
     held = _post_turn(token, chat_id, f"E2E_CLI_LATE_STEER {word}", model=CLI_MODEL)
@@ -866,9 +866,34 @@ def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token)
         _until("Claude Code past both sends, at its next boundary", lambda: logged(f"boundary {word}"),
                timeout_s=60, every_s=0.2)
         open(go, "w").close()
-        # The Gateway hands Claude Code the milk message once it took the
-        # tomatoes one in, as live: after the tomatoes answer, in the same run.
+
+        def working():
+            # The line after the one it waited under (its request opened with
+            # its own "Thinking...").
+            with page.cond:
+                lines = [(e.get("data") or {}).get("data") or {} for _t, e in page.events
+                         if e.get("message_id") == tomato and (e.get("data") or {}).get("type") == "status"]
+            waited = [n for n, line in enumerate(lines) if STEER_PENDING in (line.get("description") or "")]
+            return bool(waited) and {"description": "Thinking...", "done": False} in lines[waited[0] + 1:]
+        # W5's re-QA on 5246fcb: the tomatoes reply (its request cancelled by
+        # the milk's Send now) stayed blank, with no status, until the run
+        # ended. Once its message is in, it reads as working ...
+        try:
+            _until("the tomatoes reply reading as working", working, timeout_s=60, every_s=0.2)
+        except pytest.fail.Exception:
+            pytest.fail(f"the tomatoes reply never read as working:\n{page.summary(tomato)}")
+        open(say, "w").close()
+        # ... and its answer is live under it while the run still works. The
+        # Gateway hands Claude Code the milk message once it took the tomatoes
+        # one in, as live: after the tomatoes answer, in the same run.
         _until("the milk message in the turn", lambda: logged(f"injected {word}: 2"), timeout_s=60, every_s=0.2)
+        try:
+            _until("the tomatoes answer live under its message", lambda: f"tomatoes-{word}" in _output_text(
+                page.streamed(tomato)), timeout_s=60, every_s=0.2)
+        except pytest.fail.Exception:
+            pytest.fail(f"the tomatoes answer is not live under its message:\n{page.summary(tomato)}\n"
+                        f"{page.summary(held)}")
+        assert f"tomatoes-{word}" not in _output_text(page.streamed(held)), "nor in the first reply"
         open(done, "w").close()
         _until("all three replies done", lambda: all(
             _chat_messages(token, chat_id)[r].get("done") for r in (held, tomato, milk)))
@@ -880,6 +905,7 @@ def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token)
     finally:
         open(go, "w").close()
         open(done, "w").close()
+        open(say, "w").close()
         page.close()
     msgs = _chat_messages(token, chat_id)
     shown = {r: msgs[r].get("content", "") for r in (held, tomato, milk)}
@@ -889,6 +915,7 @@ def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token)
         assert shown[reply].count("E2E_CLI_STEERED:") == 1 and own in shown[reply], shown
     os.remove(go)
     os.remove(done)
+    os.remove(say)
 
 
 def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):

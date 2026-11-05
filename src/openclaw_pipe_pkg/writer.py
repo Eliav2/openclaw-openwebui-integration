@@ -825,6 +825,13 @@ class _TurnWriter:
         # one event is a `chat` final with no message, and the answer is
         # that run's, which the last message steered into it shows.
         self.steered_message = False
+        # The run M's message was steered into, whose events M shows from the
+        # commit (`steered_in`): its images are that run's, as for a live
+        # steered reply (`finish_final_images`), not looked up as M's own.
+        self.steered_into: str | None = None
+        # A later run of the session works (`_turn_next_run`): M's end leaves
+        # the chat's active state to that run's reply.
+        self.newer_run = False
         self.sent_output: list = []     # the `output` open tabs hold
         self.sent_text = ""              # and its text
         # A handover owes M one write: Open WebUI's end-of-stream save of the
@@ -930,6 +937,21 @@ class _TurnWriter:
         # The DB says so once the request's own save is in (ELI-115).
         self.handover_owed = True
         await self._stream()
+
+    async def working(self) -> None:
+        """M's message went into the running run: M reads like any reply whose
+        run works until its answer, and its end replaces the line."""
+        if self.opened and not self.closed:
+            line = {"description": "Thinking...", "done": False}
+            emit = await self._emitter()
+            await emit({"type": "status", "data": line})
+            # Saved too: a tab that loads the chat now reads the status from the
+            # message, where the line M waited with is the last one.
+            from open_webui.models.chats import Chats
+            async with self.conn._chat_write_lock(self.chat_id):
+                saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+                await _owui_upsert_message(self.chat_id, self.message_id, {
+                    "statusHistory": [*(saved.get("statusHistory") or []), line]})
 
     def _showable(self) -> bool:
         """Condition B: a tool call start, or text that is not a silent
@@ -1594,7 +1616,8 @@ class _TurnWriter:
                                                              "output": output}})
             for line in status:
                 await emit({"type": "status", "data": line})
-            await emit({"type": "chat:active", "data": {"active": False}})
+            if not self.newer_run:
+                await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")
             pipe_log(f"  turn writer: finalized {self.message_id[:8]}... ({len(text)} chars, "
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
@@ -1606,7 +1629,10 @@ class _TurnWriter:
         into M, as the inline reply reads them (`finish_final_images`): the
         Gateway attaches a run's images to its stored message after the
         run's final, so a run that made or named some is read again on each
-        transcript change until they are there (ELI-328)."""
+        transcript change until they are there (ELI-328). Not for a message
+        steered into another run, as for a live steered reply."""
+        if self.steered_into:
+            return [], []
         for _s, _e, fname in _media_scan(self.renderer.text)[0]:
             if _is_gateway_media_name(fname):
                 self.gateway_media.add(fname)
@@ -1774,6 +1800,11 @@ class _TurnWriter:
         the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
         spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
+        if self.steered_into and self.runs == [self.run_id] and spans[0] is not None:
+            # M streamed the run its message went into from the commit on, and
+            # what streamed may be a later message's answer (both taken in at
+            # one boundary): its own span decides, also when it is empty.
+            return _history_renderer(spans[0])
         if any(s is None for s in spans):
             pipe_log(f"  turn writer: the transcript does not show {self.message_id[:8]}...'s "
                      f"{len(self.runs)} run(s) closed; keeping what streamed")
@@ -2007,6 +2038,10 @@ class _RunPump:
         # message steered in later can take it over (`_GatewayConnection._steer`).
         self.started = False
         self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
+        # The id of the run its writer shows, which a later message was steered
+        # into, once it ended cleanly: the next run's first event settles it
+        # (`_turn_next_run`).
+        self.ended_clean: str | None = None
 
 
 def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -2270,6 +2305,28 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
             pump.queue.put_nowait(("settled", row))
 
 
+def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
+    """An event of a run of the session, so every other run before it is over
+    (a session runs one at a time). The writers of a run a message was steered
+    into, which ended cleanly, end here from the transcript: when a message
+    sent to be steered missed the run and the Gateway ran it after (its
+    follow-up policy), the session's idle comes with no push (2026.10.10: that
+    run's last push is its `phase: end`, still `hasActiveRun: true`, and a run
+    drained from the follow-up queue has no `phase: start` either). As after
+    a clean own final (ELI-215), no row is waited for. A terminal event starts
+    no run: a steered message's own lone final can come after the run's end."""
+    if _is_terminal_event(payload):
+        return
+    sess, run_id = payload.get("sessionKey"), payload.get("runId")
+    for (s, run), pump in list(conn._turn_pumps.items()):
+        if s == sess and pump.ended_clean and pump.ended_clean != run_id:
+            pump.ended_clean = None
+            if pump.writer is not None:
+                pump.writer.newer_run = True
+            pipe_log(f"  next run {str(run_id)[:24]}... started: run {run[:24]}... ends from the transcript")
+            pump.queue.put_nowait(("settled", None))
+
+
 async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
                                pump: _RunPump) -> None:
     """Rule E needs a recovery run's own `:user` turn, and a 2026.10 Gateway
@@ -2375,6 +2432,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
+            if kind == _PUMP_STEERED_IN:
+                # M's message was steered into run `item["run"]`: its events come
+                # here from now on, after what the reply before showed (`_steer`).
+                if writer is not None:
+                    writer.steered_into = item.get("run")
+                    writer.renderer.seed(item.get("run_text"))
+                    await writer.working()
+                    pipe_log(f"  turn writer: {writer.message_id[:8]}... shows run "
+                             f"{str(item.get('run'))[:24]}... from its message's commit")
+                continue
             if kind == "steered":
                 # A later message was steered into this run: M ends with what
                 # it streamed, and the rest goes to that message's reply,
@@ -3567,6 +3634,7 @@ class _TurnHooks:
     after_hello = staticmethod(_turn_after_hello)
     resync = staticmethod(_turn_resync)
     settled = staticmethod(_turn_settled)
+    next_run = staticmethod(_turn_next_run)
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)
