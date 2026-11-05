@@ -6720,12 +6720,13 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     if (o.time) top.appendChild(o.time);
     el.appendChild(top);
     (o.meta || []).filter(Boolean).forEach(function(text) {
+      // Wraps, never cut: on a phone the owner ("by another chat of yours")
+      // would not fit beside the time.
       const meta = document.createElement('div');
       meta.dataset.openclawMeta = '1';
-      meta.className = 'text-xs text-gray-500 dark:text-gray-400 mt-0.5';
+      meta.className = 'text-xs text-gray-500 dark:text-gray-400 mt-0.5 break-words';
       meta.textContent = text;
-      meta.title = text;
-      el.appendChild(oneLine(meta));
+      el.appendChild(meta);
     });
     if (o.preview) {
       const preview = document.createElement('div');
