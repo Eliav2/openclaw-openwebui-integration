@@ -327,16 +327,22 @@ def gateway_release() -> tuple:
     return tuple(int(n) for n in m.groups()) if m else (0, 0, 0)
 
 
-def add_chat_automation(session_key: str) -> str:
-    """A daily automation that runs in this chat (ELI-163), next due
-    tomorrow morning; its id, to remove it after the scene."""
+# Another chat of the same user, as the owner of an automation that runs in
+# this one: its row says "by another chat of yours", the longest owner text.
+OTHER_CHAT_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def add_chat_automation(session_key: str, *, name: str = "Morning forecast chart",
+                        expr: str = "0 7 * * *", message: str = "Morning chart for the forecast app",
+                        owner_key: str | None = None) -> str:
+    """A daily automation that runs in this chat (ELI-163), made in this chat
+    unless `owner_key` says another; its id, to remove it after the scene."""
     job = gateway_call("cron.add", {
-        "name": "Morning forecast chart", "agentId": "main",
-        "schedule": {"kind": "cron", "expr": "0 7 * * *", "tz": "UTC"},
+        "name": name, "agentId": "main",
+        "schedule": {"kind": "cron", "expr": expr, "tz": "UTC"},
         "sessionTarget": f"session:{session_key}",
-        "owner": {"agentId": "main", "sessionKey": session_key},
-        "payload": {"kind": "agentTurn", "message": "Morning chart for the forecast app",
-                    "model": AUTOMATION_MODEL},
+        "owner": {"agentId": "main", "sessionKey": owner_key or session_key},
+        "payload": {"kind": "agentTurn", "message": message, "model": AUTOMATION_MODEL},
         "delivery": {"mode": "none"}})
     return job.get("id") or job.get("job", {}).get("id")
 
@@ -841,13 +847,18 @@ class Scenes:
         source held back (the sample rate limits), every other section
         already filled; #2 Background unfolded with the four imports, the
         failed check before them (ELI-232: a command without a title), the
-        other sections opened; #3 Scheduled with the chat's automation."""
+        other sections opened; #3 Scheduled with two automations, one made in
+        another chat (the longest owner text, wrapped on a phone)."""
         new_chat(page)
         chat = send(page, "Import the station data for all four regions.")
         wait_js(page, last_text_has("All four imports are running"), "the reply")
         set_title(self.token, chat, "Station data import")
         me = api("GET", "/api/v1/auths/", token=self.token)
-        job = add_chat_automation(f"agent:main:openwebui-{me['id']}-{chat}")
+        key = f"agent:main:openwebui-{me['id']}-{chat}"
+        jobs = [add_chat_automation(key),
+                add_chat_automation(key, name="Weekly station summary", expr="0 8 * * 1",
+                                    message="Summarise the week's station data",
+                                    owner_key=f"agent:main:openwebui-{me['id']}-{OTHER_CHAT_ID}")]
         root = STATUS_ROOT
         try:
             with open(USAGE_DELAY_FILE, "w", encoding="utf-8") as fh:
@@ -872,9 +883,9 @@ class Scenes:
             open_fold(page, "subagents")
             open_fold(page, "agents")
             wait_js(page, f"""() => {{ const t = document.querySelector('{root}').innerText;
-              return /background \\(5\\)/i.test(t) && /scheduled \\(1\\)/i.test(t) && /Morning forecast chart/.test(t)
+              return /background \\(5\\)/i.test(t) && /scheduled \\(2\\)/i.test(t) && /Morning forecast chart/.test(t) && /by another chat of yours/.test(t)
                 && /no sub-agents/i.test(t) && /no such region/.test(t); }}""",
-                    "Background with the imports, Scheduled with the automation, every section open", 30_000)
+                    "Background with the imports, Scheduled with both automations, every section open", 30_000)
             print("  background: " + json.dumps(page.locator("#openclaw-status-section-background").inner_text()[:600]),
                   flush=True)
             # Opening the last section scrolled the dialog down; back to Background.
@@ -886,7 +897,8 @@ class Scenes:
             self.s.shot(page, "status-dialog-scheduled", selector="#openclaw-status-section-scheduled")
             page.keyboard.press("Escape")
         finally:
-            gateway_call("cron.remove", {"id": job})
+            for job in jobs:
+                gateway_call("cron.remove", {"id": job})
         self.background_chat = chat
 
     def background_scrolled(self, page: Page) -> None:
