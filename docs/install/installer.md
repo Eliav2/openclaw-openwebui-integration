@@ -139,7 +139,7 @@ Supported Open WebUI and OpenClaw versions: [Versions](../versions.md).
 10. Run an end-to-end smoke test through `/api/chat/completions`: it asks the agent to reply with a fixed word. If the reply says **pairing required** and the local `openclaw` CLI is available, it approves the matching pending pairing request and tries again.
 11. Run a route smoke test: it picks one discovered (non-default) model and asks the agent which model it is running on, to prove that picking a model in Open WebUI reaches the agent.
 
-The command exits 0 only when both smoke tests pass. The smoke tests are two real messages to your agent, in throwaway chats.
+The command exits 0 only when both smoke tests pass. The smoke tests are two real messages to your agent. They create no chat in Open WebUI: each runs in a Gateway session of its own (`install-smoke-<UTC date>` and `install-route-smoke-<UTC date>`), which every later run that day reuses.
 
 Step 4 is why re-running this is safe: the function is never deleted and recreated, so `DEVICE_IDENTITY` survives and you never re-approve the device.
 

@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +51,18 @@ from rich.prompt import Prompt
 
 FUNCTION_ID = "openclaw_gateway"
 DEFAULT_MODEL_ID = f"{FUNCTION_ID}.default"
+# The Gateway session each smoke test runs in. Open WebUI drops a `metadata` field from the
+# request and answers 404 to a top-level `chat_id` that names no chat, but passes a top-level
+# `session_id` on to the Pipe, which uses it as its session when there is no chat id. Without
+# one the Pipe starts a new session on every deploy. One id per smoke and UTC day reuses a
+# session within the day and keeps it from growing for good: every turn of a session resends
+# its whole history, so a session that never ended would cost more with each deploy.
+SMOKE_SESSION_PREFIX = "install-smoke"
+ROUTE_SMOKE_SESSION_PREFIX = "install-route-smoke"
+
+
+def smoke_session_id(prefix: str, now: datetime | None = None) -> str:
+    return f"{prefix}-{(now or datetime.now(timezone.utc)).strftime('%Y-%m-%d')}"
 ROOT = Path(__file__).resolve().parent
 PIPE_FILE = ROOT / "openclaw_pipe.py"
 LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
@@ -821,10 +834,7 @@ def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
                 }
             ],
             "stream": False,
-            "metadata": {
-                "chat_id": f"install-smoke-{int(time.time())}",
-                "user_id": "install-smoke",
-            },
+            "session_id": smoke_session_id(SMOKE_SESSION_PREFIX),
         },
         timeout=90,
     )
@@ -884,10 +894,7 @@ def route_smoke_test(client: OwuiClient) -> bool:
                 }
             ],
             "stream": False,
-            "metadata": {
-                "chat_id": f"install-route-smoke-{int(time.time())}",
-                "user_id": "install-route-smoke",
-            },
+            "session_id": smoke_session_id(ROUTE_SMOKE_SESSION_PREFIX),
         },
         timeout=120,
     )

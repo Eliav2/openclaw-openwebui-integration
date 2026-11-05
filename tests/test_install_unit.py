@@ -254,5 +254,76 @@ class InstallerCoreTests(unittest.TestCase):
         self.assertFalse(inst.function_status(owui, self.filter))
 
 
+class _OwuiChatCompletions:
+    """Open WebUI's /api/chat/completions as measured on 0.13.0: a `metadata` field in the
+    request is dropped, a top-level `chat_id` must name a chat row (404 otherwise), and a
+    top-level `session_id` reaches the Pipe as metadata.session_id, which the Pipe uses
+    as its session when there is no chat id. A request with neither gets a random one."""
+
+    def __init__(self):
+        self.bodies = []
+        self.sessions = []
+
+    def request(self, method, path, body=None, timeout=30):
+        if path == "/api/v1/models":
+            return 200, {"data": [{"id": f"{inst.FUNCTION_ID}.default"}, {"id": f"{inst.FUNCTION_ID}.other"}]}
+        self.bodies.append(body)
+        if body.get("chat_id"):
+            return 404, {"detail": "not found"}
+        self.sessions.append(body.get("session_id") or f"owui-random-{len(self.sessions)}")
+        return 200, {"choices": [{"message": {"content": "OK_CONFIG_TEST other"}}]}
+
+
+class SmokeSessionTests(unittest.TestCase):
+    """The smokes name their Gateway session in the field Open WebUI passes on, so a deploy
+    reuses one session per smoke instead of starting a new Opus session each time."""
+
+    def run_smokes(self, runs=2):
+        from datetime import datetime, timezone
+        from unittest import mock
+        owui = _OwuiChatCompletions()
+        with mock.patch.object(inst, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 5, 12, 0, tzinfo=timezone.utc)
+            for _ in range(runs):
+                self.assertTrue(inst.smoke_test(owui))
+                self.assertTrue(inst.route_smoke_test(owui))
+        return owui
+
+    def test_repeated_deploys_reuse_one_session_per_smoke(self):
+        owui = self.run_smokes()
+        smoke, route = owui.sessions[0::2], owui.sessions[1::2]
+        self.assertEqual(len(set(smoke)), 1, smoke)
+        self.assertEqual(len(set(route)), 1, route)
+
+    def test_a_new_utc_day_starts_a_new_session(self):
+        from datetime import datetime, timezone
+        from unittest import mock
+        day = lambda d, h: datetime(2026, 11, d, h, 30, tzinfo=timezone.utc)  # noqa: E731
+        with mock.patch.object(inst, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = day(5, 23)
+            late = _OwuiChatCompletions()
+            inst.smoke_test(late)
+            clock.now.return_value = day(6, 0)
+            early = _OwuiChatCompletions()
+            inst.smoke_test(early)
+        self.assertEqual(late.sessions, ["install-smoke-2026-11-05"])
+        self.assertEqual(early.sessions, ["install-smoke-2026-11-06"])
+
+    def test_the_session_id_uses_the_utc_date_not_the_local_one(self):
+        from datetime import datetime, timedelta, timezone
+        tz = timezone(timedelta(hours=14))
+        self.assertEqual(inst.smoke_session_id("p", datetime(2026, 11, 6, 1, 0, tzinfo=tz).astimezone(timezone.utc)), "p-2026-11-05")
+
+    def test_the_two_smokes_do_not_share_a_session(self):
+        owui = self.run_smokes(runs=1)
+        self.assertEqual(len(set(owui.sessions)), 2, owui.sessions)
+
+    def test_no_request_carries_the_field_open_webui_drops(self):
+        owui = self.run_smokes(runs=1)
+        for body in owui.bodies:
+            self.assertNotIn("metadata", body)
+            self.assertNotIn("chat_id", body)
+
+
 if __name__ == "__main__":
     unittest.main()
