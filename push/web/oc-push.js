@@ -204,10 +204,15 @@
     return null;
   }
 
-  async function loadMutes() {
-    const v = (await valves("")) || {};
-    mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
-    hasDevices = parse(v.subscriptions, "[]").length > 0;
+  // Open WebUI navigates a few times while it starts (each runs chatPage): they
+  // share the one read on its way instead of each asking the server.
+  let loadingMutes = null;
+  function loadMutes() {
+    return loadingMutes ||= valves("").then((v) => {
+      v ||= {};
+      mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
+      hasDevices = parse(v.subscriptions, "[]").length > 0;
+    }).finally(() => { loadingMutes = null; });
   }
 
   async function loadFolders() {
@@ -735,14 +740,25 @@
   }
 
   const watch = new MutationObserver(() => {
-    if (errorPage()) { watch.disconnect(); recover(); } else if (appUp()) { watch.disconnect(); session.drop(RELOADED); }
+    if (errorPage()) { watch.disconnect(); recover(); } else if (appUp()) {
+      watch.disconnect();
+      session.drop(RELOADED);
+      session.drop(VERSION_RELOADED);
+    }
   });
   watch.observe(document.documentElement, { childList: true, subtree: true });
   recover();
   addEventListener("online", recover);
   navigator.connection?.addEventListener?.("change", recover);
+  // The kept app turned out to be another Open WebUI version: reload once onto the
+  // server's own (the service worker dropped what it kept). Its own guard, cleared
+  // the same way, so a version reload and an error-page reload never block each other.
+  const VERSION_RELOADED = "ocReloadedForVersion";
   navigator.serviceWorker?.addEventListener("message", (e) => {
-    if (e.data?.type === NEW_VERSION) location.reload();
+    if (e.data?.type !== NEW_VERSION || session.get(VERSION_RELOADED)) return;
+    session.set(VERSION_RELOADED, "1");
+    location.reload();
   });
   navigator.serviceWorker?.startMessages?.();
+  navigator.serviceWorker?.controller?.postMessage({ type: "oc-version-check" });
 })();

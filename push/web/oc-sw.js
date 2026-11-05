@@ -290,6 +290,13 @@ self.addEventListener("message", (e) => {
     if (typeof answered === CALLABLE) answered();
     return;
   }
+  if (m.type === VERSION_CHECK) {
+    // The page asks once it runs: told to reload if the kept app it got is not
+    // this server's version (the answer can come before the page can hear it).
+    const stale = staleApp.get(e.source.id);
+    if (stale) e.waitUntil(stale.then((yes) => yes && e.source.postMessage({ type: NEW_VERSION })));
+    return;
+  }
   if (m.type !== PAGE_ACT) return;
   e.waitUntil(act(m.action, m.data || {}, m.reply).then((result) =>
     e.source.postMessage({ type: "oc-push-action", action: m.action, result })));
@@ -356,6 +363,7 @@ const NEW_VERSION = "oc-new-version";   // to the page: reload, the app it runs 
 const HTTP_OK = 200, HTTP_SERVER_ERROR = 500;
 const HASH_HEX = 16, HEX = 16, BYTE_DIGITS = 2;
 const SAME_ORIGIN = "basic", GET = "GET", NAVIGATE = "navigate", NO_STORE = "no-store", MANUAL = "manual";
+const OPAQUE_REDIRECT = "opaqueredirect";
 const never = new Promise(() => {});
 const after = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -435,33 +443,56 @@ async function savedFirst(e, req, cacheName, key, onFresh, keep = keepable) {
   return (await cache.match(key)) || (await net) || Response.error();
 }
 
-const bootVersion = new Map();   // page (client id) -> the /api/version answer its load got
+const bootVersion = new Map();   // page (client id) -> its load's /api/version answer (a promise)
+const staleApp = new Map();      // page (client id) -> whether the kept app it got is another version
+const VERSION_CHECK = "oc-version-check";   // from the page: was my app the server's version?
 const JSON_TYPE = { "content-type": "application/json" };
 
-// A page load. The kept app is used only once this Open WebUI says it is the
-// version the app came with (a newer Open WebUI drops every cache and loads its
-// own); a page answer that comes first is used as it is (a redirect to a login,
-// a new page). With no network the kept app opens at once; with a network that
-// says nothing for LIE_FI_MS, too, and the page is told to reload if the version
-// that comes later is another one.
+// A page load. The kept app opens at once when it was kept with its version, and
+// this Open WebUI's /api/version is asked alongside it. Another version (a newer
+// Open WebUI): every cache goes and the page is told to reload, once (oc-push.js),
+// onto the server's own app. A redirect instead of a version (an expired
+// Cloudflare Access session): the kept page goes, and the reload gets the login.
+// Kept without a version (an older worker kept it): the kept app is used only
+// once the version matches, as before; with no network, at once; with a network
+// that says nothing for LIE_FI_MS, too, and told to reload as above.
 async function navigate(e, req) {
   const net = again(req).catch(() => null);
+  let redirected = false;
   const asked = again(VERSION_PATH, { cache: NO_STORE, redirect: MANUAL })
-    .then((r) => (r.ok ? r.text() : null), () => null);
+    .then((r) => {
+      redirected = r.type === OPAQUE_REDIRECT;
+      return r.ok ? r.text() : null;
+    }, () => null);
   const cache = await caches.open(SHELL);
   const saved = await cache.match(PAGE_KEY);
   const kept = await (await cache.match(VERSION_KEY))?.text();
   const other = (v) => v !== null && v !== kept;
   const version = asked.then(async (v) => {
     if (other(v)) await dropCaches(() => true);
+    // A login instead of a version: the kept page is not opened again.
+    else if (redirected) await cache.delete(PAGE_KEY);
     return v;
   });
-  // The page's own first /api/version read gets this answer: it is this load's.
+  // The page's own first /api/version read gets this load's answer: no second round trip.
   bootVersion.clear();
-  asked.then((v) => v !== null && bootVersion.set(e.resultingClientId, v));
+  bootVersion.set(e.resultingClientId, asked);
   // A copy taken as the answer comes, before the page reads its body.
   e.waitUntil(keepPage(net.then((res) => res && res.clone()), version));
   if (!saved) return (await net) || Response.error();
+  if (kept !== undefined) {
+    // The kept app is that version, so its own /api/version read gets that at once:
+    // Open WebUI waits for it while it starts, and the server's answer is only for
+    // the check here (a silent network leaves the app running, the check pending).
+    bootVersion.set(e.resultingClientId, Promise.resolve(kept));
+    const stale = version.then((v) => other(v) || redirected);
+    staleApp.clear();
+    staleApp.set(e.resultingClientId, stale);
+    e.waitUntil(stale.then(async (yes) => {
+      if (yes) (await self.clients.get(e.resultingClientId))?.postMessage({ type: NEW_VERSION });
+    }));
+    return saved;
+  }
   const first = await Promise.race([
     net.then((res) => (down(res) ? never : { res })),
     version.then((v) => (v === null ? never : { v })),
@@ -471,6 +502,8 @@ async function navigate(e, req) {
   if (first.res) return first.res;
   if (first.v !== undefined && first.v !== kept) return (await net) || Response.error();
   if (first.silent) {
+    // Nothing heard: the page's /api/version goes the usual way (the kept copy, as any read).
+    bootVersion.delete(e.resultingClientId);
     e.waitUntil(version.then(async (v) => {
       if (other(v)) (await self.clients.get(e.resultingClientId))?.postMessage({ type: NEW_VERSION });
     }));
@@ -562,9 +595,10 @@ self.addEventListener("fetch", (e) => {
       e.respondWith(savedFirst(e, req, apiCache, req.url, async (_res, cache) => trim(cache, API_MAX), keepableImage));
     }
   } else if (path === VERSION_PATH && bootVersion.has(e.clientId)) {
-    const v = bootVersion.get(e.clientId);
+    const asked = bootVersion.get(e.clientId);
     bootVersion.delete(e.clientId);
-    e.respondWith(new Response(v, { headers: JSON_TYPE }));
+    e.respondWith(asked.then((v) => (v === null ? freshFirst(e, req, SHELL, req.url, LIE_FI_MS)
+      : new Response(v, { headers: JSON_TYPE }))));
   } else {
     const fresh = FRESH_READS.some((r) => r.test(path));
     if (!fresh && !SHELL_READS.some((r) => r.test(path))) return;
