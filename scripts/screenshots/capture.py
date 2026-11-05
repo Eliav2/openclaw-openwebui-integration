@@ -295,17 +295,18 @@ def upload_media(name: str, data: bytes) -> None:
 AUTOMATION_MODEL = "openai/gpt-5.5"
 
 
-def schedule_wake(session_key: str, message: str, in_s: float) -> str:
-    """Add a one-shot cron wake into the session; its job's id."""
+def schedule_wake(session_key: str, message: str, in_s: float, model: str = "") -> str:
+    """Add a one-shot cron wake into the session; its job's id. The E2E suite
+    calls it too, on a stack whose only model has a key: no model named."""
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     # agentId: from OpenClaw 2026.10.10 a job needs its agent named when the
     # Gateway has more than one (main, title-gen). model: and it needs a
     # stored account or a key in provider config for the model it runs, which
-    # the stack's anthropic fake has not (its other fakes do).
+    # the screenshots stack's anthropic fake has not (its other fakes do).
     params = {"name": "nightly-build-check", "agentId": "main", "schedule": {"kind": "at", "at": at},
               "sessionTarget": f"session:{session_key}",
-              "payload": {"kind": "agentTurn", "message": message, "model": AUTOMATION_MODEL},
+              "payload": {"kind": "agentTurn", "message": message, **({"model": model} if model else {})},
               "delivery": {"mode": "none"}, "deleteAfterRun": True}
     job = gateway_call("cron.add", params)
     return (job.get("job") or job).get("id")
@@ -981,7 +982,7 @@ class Scenes:
                 "the first reply")
         set_title(self.token, chat, "Overnight build check")
         me = api("GET", "/api/v1/auths/", token=self.token)
-        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Nightly build check for the forecast app", 5)
+        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Nightly build check for the forecast app", 5, AUTOMATION_MODEL)
         # The tab stays open on the chat: the cron reply has to arrive in it
         # live, with no reload (agent turns, "open tabs update live").
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('nothing needs you today'); }}",
@@ -998,7 +999,7 @@ class Scenes:
         set_title(self.token, chat, "Morning forecast chart")
         upload_media("hourly-forecast.png", forecast_chart_png())
         me = api("GET", "/api/v1/auths/", token=self.token)
-        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Morning chart for the forecast app", 5)
+        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Morning chart for the forecast app", 5, AUTOMATION_MODEL)
         wait_api(self.token, chat, "bike out this morning")
         page.goto(f"{BASE}/c/{chat}")
         wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
