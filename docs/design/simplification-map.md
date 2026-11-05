@@ -121,7 +121,7 @@ Yes, for now. Stock users install in two ways that read the committed files:
 
 ## Proposed cuts, ranked
 
-Order: zero-risk and big first, then removals that need a version decision, then restructuring.
+Order (decided): the AST check with cut 1, then 5, 6 and 9, with the other prose cuts interleaved between code cuts. 7 and 8 wait for ELI-356.
 
 | # | Cut | Est. lines | Risk | Needs |
 |---:|---|---:|---|---|
@@ -129,19 +129,22 @@ Order: zero-risk and big first, then removals that need a version decision, then
 | 2 | Prose diet in `pipe.py`, `action.py`, `askuser.py` | −800 | none | - |
 | 3 | Prose diet in the other src modules | −400 | none | - |
 | 4 | Prose diet in tests, a file at a time (AST-identical outside docstrings) | −2,000 | none | - |
-| 5 | Delete `owui_internals_diff.py`, `probe_cancelled_owui_write.py`, `_parse_channel_session_key` | −290 | low | - |
-| 6 | Drop the ELI-230 tab probe and the ELI-195 dialog hold (fixed in Open WebUI 0.12.4) | −180 src / −400 tests | low | Minimum Open WebUI 0.12.4 (Eliav) |
-| 7 | Drop the 2026.9.3 paths | −150 / −400 | medium | Minimum OpenClaw 2026.10.x (Eliav) |
-| 8 | Drop the branches steering makes unreachable on 2026.10.10 | −300 to −600 / −1,000 | medium | Minimum OpenClaw 2026.10.10 (Eliav) |
+| 5 | Delete `owui_internals_diff.py`, `probe_cancelled_owui_write.py`, `migrate_stale_chat_models.py` (+ test, docs), `_parse_channel_session_key` | −560 | low | decided |
+| 6 | Drop the ELI-230 tab probe and the ELI-195 dialog hold (fixed in Open WebUI 0.12.4) | −180 src / −400 tests | low | decided: minimum Open WebUI 0.12.4 |
+| 7 | Drop the 2026.9.3 paths | −150 / −400 | medium | waits for ELI-356 (minimum OpenClaw 2026.10.10, ~2026-11-22..26) |
+| 8 | Drop the branches steering makes unreachable on 2026.10.10 | −300 to −600 / −1,000 | medium | waits for ELI-356 |
 | 9 | One "wait on transcript/row/session change" helper; one row-read helper | −200 to −300 | medium | - |
 | 10 | Split `_PipeTurn` and `Action._run_status` into smaller steps, dropping repeated branches | −500 to −1,000 | medium-high | - |
 | 11 | Merge duplicate unit tests (shared fixtures, parametrize) | −2,000 to −4,000 | low (no assert lost) | - |
-| 12 | Scripts used by hand only (section 6, last three) | −674 | low | Eliav |
+| 12 | Scripts used by hand only | - | - | closed: `social_preview.py` and `record_live.py` stay |
 
 Each PR reports src/tests/scripts lines before and after, runs the unit suite and the e2e shards, then goes to the manager's live gate. It lists any test deleted (code gone) or merged (true duplicate). It rebases the magic baseline with `--update` when baselined lines go away. It doesn't touch `push/` or the web-push function (W1).
 
-## Open questions
+## Decisions (2026-11-05)
 
-1. **For Eliav:** raise the minimums to Open WebUI 0.12.4 and OpenClaw 2026.10.10 (cuts 6–8)?
-2. **For Eliav:** keep `social_preview.py`, `record_live.py`, `migrate_stale_chat_models.py`?
-3. **For the manager:** the prose diet changes thousands of lines with no code change. Gate on the AST proof plus CI, or still the live gate each time?
+1. **Open WebUI minimum: 0.12.4, now (Eliav).** Cut 6 goes ahead. The PR also records the new minimum in [Versions](../versions.md) and the release notes.
+2. **OpenClaw minimum: unchanged for now (Eliav).** The pre-10.10 and pre-steering paths stay, so cuts 7 and 8 wait. The minimum moves to 2026.10.10 around 2026-11-22..26 ([ELI-356](https://linear.app/eliavb/issue/ELI-356)).
+3. **Scripts (Eliav):** `migrate_stale_chat_models.py` goes, with its test and its docs mention (in cut 5). `social_preview.py` and `record_live.py` stay. Cut 12 is closed.
+4. **Gate for prose-only PRs (manager):** they skip the live gate when a CI check proves it. The check compares the AST with docstrings and comments stripped, for `src/` and the built bundles, between base and head, and fails on any difference. A PR labelled `prose-only` must pass it; a PR that does not pass it gets the live gate as usual.
+5. **Prose rule (manager):** keep a comment that explains a non-obvious why (an upstream bug with its link, an ordering constraint). Drop retold incident stories and comments that restate the code. Keep every upstream issue link, since cuts 7 and 8 need them.
+6. **Order and reporting (manager):** real code cuts go in early, interleaved with the prose PRs: the AST check with cut 1, then 5, then 6, then 9. Every report gives `src/` as code lines (without comments and docstrings) and as total lines, before and after.
