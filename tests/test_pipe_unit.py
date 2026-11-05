@@ -111,6 +111,7 @@ from openclaw_pipe import (
     _relative_time,
     _remember_gateway_connection,
     _resolve_media,
+    _resolve_media_text,
     _resolve_media_via_owui,
     _session_active_from_signals,
     _strip_input_marker_line,
@@ -4792,6 +4793,50 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, text)
 
 
+class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
+    """With ENABLE_FILE_SERVER off nothing serves a fallback link, so a file
+    that cannot be uploaded is an error in the reply, not an image that
+    never loads."""
+
+    def test_a_bare_filename_is_an_error_when_the_file_server_is_off(self):
+        result, handled = _resolve_media(
+            "see\nMEDIA:pic.png\nend", base_url="https://example.com", file_server=False)
+        self.assertTrue(handled)
+        self.assertEqual(result, "see\n_(a file could not be uploaded: pic.png)_\nend")
+        self.assertNotIn("](", result)
+
+    def test_a_url_directive_needs_no_file_server(self):
+        result, handled = _resolve_media(
+            "MEDIA:https://example.com/a.png", base_url="https://x", file_server=False)
+        self.assertTrue(handled)
+        self.assertEqual(result, "![a.png](https://example.com/a.png)")
+
+    async def _resolve(self, text, **valves):
+        v = Pipe.Valves(**valves)
+        with mock.patch("openclaw_pipe._upload_owui_file", side_effect=OSError("upload refused")), \
+             mock.patch("os.path.isfile", return_value=True):
+            return await _resolve_media_text(text, valves=v)
+
+    async def test_a_failed_upload_with_the_file_server_off_is_an_error(self):
+        result, handled = await self._resolve(
+            "here MEDIA:chart.png now", ENABLE_FILE_SERVER=False, FILE_SERVER_BASE_URL="https://x")
+        self.assertTrue(handled)
+        self.assertEqual(result, "here _(a file could not be uploaded: chart.png)_\nnow")
+        self.assertNotIn("https://x", result)
+
+    async def test_a_failed_upload_with_the_file_server_on_still_links_to_it(self):
+        result, handled = await self._resolve(
+            "MEDIA:chart.png", ENABLE_FILE_SERVER=True, FILE_SERVER_BASE_URL="https://x")
+        self.assertTrue(handled)
+        self.assertEqual(result, "![chart.png](https://x/chart.png)")
+
+    async def test_owui_files_off_and_file_server_off_is_an_error_too(self):
+        result, handled = await self._resolve(
+            "MEDIA:chart.png", ENABLE_FILE_SERVER=False, USE_OWUI_FILES=False)
+        self.assertTrue(handled)
+        self.assertEqual(result, "_(a file could not be uploaded: chart.png)_")
+
+
 class MediaBufferTests(unittest.TestCase):
     """A stream can split "MEDIA:filename.png" anywhere; _advance_media_buffer holds back until
     trailing whitespace shows the name is whole."""
@@ -6469,6 +6514,26 @@ class ConnectRejectionMessageTests(unittest.TestCase):
     def test_unrecognized_errors_pass_through_verbatim(self):
         self.assertEqual(_explain_connect_rejection("some novel failure"),
                          "some novel failure")
+
+
+class FileServerValveOffOnLoadTests(unittest.TestCase):
+    """A deploy that turns ENABLE_FILE_SERVER off must close the port an
+    earlier load left open: the first model list after the load does it."""
+
+    def _pipes(self, enabled):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Pipe()
+            p.valves.STATE_DIR = tmp
+            p.valves.ENABLE_FILE_SERVER = enabled
+            with mock.patch("openclaw_pipe._stop_file_server") as stop:
+                asyncio.run(p.pipes())
+            return stop
+
+    def test_the_model_list_closes_the_file_server_when_the_valve_is_off(self):
+        self._pipes(False).assert_called_once_with()
+
+    def test_the_model_list_leaves_it_alone_when_the_valve_is_on(self):
+        self._pipes(True).assert_not_called()
 
 
 class UnverifiedModelListTests(unittest.TestCase):

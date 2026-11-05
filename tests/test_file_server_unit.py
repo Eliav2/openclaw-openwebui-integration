@@ -116,6 +116,28 @@ class StaleFileServerReapTests(unittest.TestCase):
         self.assertEqual(err.exception.code, 400)
         self.assertFalse(target.exists(), "the upload followed the symlink out of the directory")
 
+    def test_a_server_left_by_an_earlier_load_is_closed_when_the_file_server_is_off(self):
+        fs._start_file_server(port=0)
+        server = getattr(self.stub_owui_socket_main, fs._STALE_FILE_SERVER_ATTR)
+        port = server.server_address[1]
+        self.assertTrue(self._wait_up(port), "server never came up")
+
+        # The next load runs with ENABLE_FILE_SERVER off and starts nothing itself.
+        fs._start_file_server.__globals__["_file_server_started"] = False
+        fs._stop_file_server()
+
+        self.assertEqual(server.socket.fileno(), -1, "the port is still open")
+        self.assertFalse(self._wait_up(port))
+        self.assertIsNone(getattr(self.stub_owui_socket_main, fs._STALE_FILE_SERVER_ATTR))
+        fs._stop_file_server()   # nothing left: a no-op, not a second reap
+
+    def test_turning_the_file_server_back_on_starts_it_again(self):
+        fs._start_file_server(port=0)
+        fs._stop_file_server()
+        fs._start_file_server(port=0)
+        server = getattr(self.stub_owui_socket_main, fs._STALE_FILE_SERVER_ATTR)
+        self.assertTrue(self._wait_up(server.server_address[1]), "no server after switching back on")
+
     def test_reap_is_noop_outside_owui(self):
         for name in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
             sys.modules.pop(name, None)

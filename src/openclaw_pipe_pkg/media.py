@@ -180,17 +180,27 @@ def _replace_media(text: str, directives, replacement) -> str:
     return out + text[pos:]
 
 
-def _resolve_media(text, base_url=None, ctx=""):
-    """Turn every MEDIA: directive outside code (ELI-111) into an image link."""
+def _resolve_media(text, base_url=None, ctx="", file_server=True):
+    """Turn every MEDIA: directive outside code (ELI-111) into an image link.
+
+    A bare filename links to the file server at `base_url`. With the file
+    server off (`file_server` False) nothing serves that link, so the line
+    becomes a plain error instead of an image that never loads; a URL
+    directive needs no server and stays an image either way."""
     if base_url is None:
         base_url = MEDIA_BASE_URL
     directives, _hold = _media_scan(text, ctx)
     if not directives:
         return text, False
-    # A URL, not base64: base64 breaks OWUI's streaming parser.
-    return _replace_media(text, directives,
-                          lambda fname: f"![{os.path.basename(fname)}]({fname})" if _is_media_url(fname)
-                          else f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
+
+    def shown(fname):
+        if _is_media_url(fname):
+            return f"![{os.path.basename(fname)}]({fname})"
+        if file_server:
+            # A URL, not base64: base64 breaks OWUI's streaming parser.
+            return f"![{fname}]({base_url.rstrip('/')}/{fname})"
+        return f"_(a file could not be uploaded: {fname})_"
+    return _replace_media(text, directives, shown), True
 
 
 def _is_media_url(fname: str) -> bool:
@@ -340,7 +350,10 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
         except Exception as ex:
             pipe_log(f"  OWUI file upload failed; falling back: {ex}")
     if not handled:
-        resolved, handled = _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx)
+        resolved, handled = _resolve_media(
+            text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=valves.ENABLE_FILE_SERVER)
+        if handled and not valves.ENABLE_FILE_SERVER and resolved != text:
+            pipe_log("  MEDIA: file not uploaded to OWUI and the file server is off; the reply says so")
     return resolved, handled
 
 
@@ -480,9 +493,20 @@ def _reap_stale_file_server() -> None:
     try:
         stale.shutdown()
         stale.server_close()
+        setattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, None)
         pipe_log("  reaped stale file server from a previous deploy")
     except Exception as ex:
         pipe_log(f"  failed to reap stale file server (non-fatal): {ex}")
+
+
+def _stop_file_server() -> None:
+    """ENABLE_FILE_SERVER is off: close the port a server of this load or of
+    an earlier deploy still holds. Only starting a server reaps the old one,
+    and with the valve off none starts, so a deploy that turned it off would
+    leave the port open until Open WebUI restarted."""
+    global _file_server_started
+    _reap_stale_file_server()
+    _file_server_started = False
 
 
 def _remember_file_server(server) -> None:
