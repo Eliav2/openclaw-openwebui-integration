@@ -46,7 +46,7 @@ Failures name the thing that fixes them. When the cause is genuinely ambiguous, 
 
 When a message can't be sent, the Gateway doesn't answer, or a run ends in an error, the chat shows one plain sentence in the language of your own message (Hebrew or English, no setting) and says to try again. The Gateway's own error text is kept under a collapsed **Technical details** block below it, so the sentences quoted in the table below are what to look for there.
 
-<img src="./img/error-message-light.png" alt="An error in the chat: the agent named in AGENT_ID does not exist on the Gateway" width="320">
+<img src="./img/error-message-light.png" alt="An error in the chat: one plain sentence saying the message could not be sent, with a collapsed Technical details line below it" width="320">
 
 | The chat shows | What to do |
 |---|---|

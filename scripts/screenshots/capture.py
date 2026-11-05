@@ -1149,12 +1149,13 @@ class Scenes:
                     text_selector=".chat-assistant >> nth=0")
 
     def error_message(self, page: Page) -> None:
-        """An actionable error: AGENT_ID names an agent the Gateway lacks."""
+        """A failed send: AGENT_ID names an agent the Gateway lacks. The chat shows
+        one plain sentence, the Gateway's own text collapsed under it."""
         old = pipe_valves(self.token, AGENT_ID="research")
         try:
             new_chat(page)
             chat = send(page, "Can you check the staging logs?")
-            wait_js(page, last_text_has('"research"'), "the error reply")
+            wait_js(page, last_text_has("couldn't be sent", "Technical details"), "the error reply")
             set_title(self.token, chat, "Staging logs")
             self.s.shot(page, "error-message")
         finally:
