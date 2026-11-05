@@ -14,7 +14,9 @@ Images inside an HTML comment, a code span or a fenced block do not count, so
 the PR template's own hints never pass it.
 
 The label `no-visual-change` skips the check, for a change to one of those
-files that nothing on screen shows (a refactor, a log line).
+files that nothing on screen shows (a refactor, a log line). So does
+`prose-only`: the Prose only check (scripts/prose_only.py) then proves the
+code unchanged.
 
     python3 scripts/pr_media.py --event "$GITHUB_EVENT_PATH" --files changed.txt
 
@@ -29,6 +31,7 @@ import re
 import sys
 
 SKIP_LABEL = "no-visual-change"
+PROSE_ONLY_LABEL = "prose-only"
 MAX_LISTED_FILES = 5   # the files a failing message names before "..."
 
 # Sources of what users see in the browser: the Status dialog and the
@@ -102,7 +105,7 @@ def branch_links(body: str | None) -> list:
 
 def check(paths, body: str | None, labels) -> str | None:
     """None when the PR passes, else why it does not."""
-    if SKIP_LABEL in labels:
+    if SKIP_LABEL in labels or PROSE_ONLY_LABEL in labels:
         return None
     touched = visual_files(paths)
     if not touched or has_image(body):
@@ -137,7 +140,8 @@ def main(argv=None) -> int:
         print(f"::error title=No Before and After images::{why.splitlines()[0]}")
         print(why)
         return 1
-    print("ok: " + ("label " + SKIP_LABEL if SKIP_LABEL in labels
+    skip = next((lb for lb in (SKIP_LABEL, PROSE_ONLY_LABEL) if lb in labels), None)
+    print("ok: " + ("label " + skip if skip
                     else "has an image" if visual_files(paths) else "no visual files changed"))
     return 0
 
