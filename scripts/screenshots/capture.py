@@ -435,6 +435,16 @@ ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section
   .filter(s => s.style.fontSize === '10px').map(s => s.textContent)"""
 FIRST_ASSISTANT = "document.querySelector('.chat-assistant')"
 REBUILD_SAYS = "Rebuilding the cache from the forecast API."
+REBUILD_DONE = "The cache is rebuilt"
+# From OpenClaw 2026.10.10 the Gateway steers a message sent while a run works
+# into that run: the run ends its reply at the next step and the scripted
+# model answers the new message, so the rebuild's closing line is never said
+# and the new message shows the Pipe's pending note, not "Queued". Before it,
+# the message waits and the rebuild finishes first (writer.py
+# STEER_PENDING_STATUS; the E2E suite's _steers).
+STEER_RELEASE = (2026, 10, 10)
+STEER_PENDING = "it reads it at its next step"
+QUEUED_NOTE = "Queued"
 
 
 def opened_card_clip(message_js: str) -> str:
@@ -580,6 +590,7 @@ class Scenes:
         self.spawn_chat: str | None = None
         self.background_chat: str | None = None
         self.long_chat: str | None = None
+        self.steers = gateway_release() >= STEER_RELEASE
 
     def hero(self, page: Page) -> None:
         """#1 hero-tool-cards mid-run, then #5 tool-card-expanded once done."""
@@ -1214,14 +1225,21 @@ class Scenes:
         page.locator("#send-message-button").click()
         return chat
 
+    def _rebuild_ends_with(self) -> str:
+        """What the rebuild's own reply says once it is over: its closing line,
+        or, when the Gateway steered the new message into the run, the line
+        before its tool (the run goes on under the new message)."""
+        return REBUILD_SAYS if self.steers else REBUILD_DONE
+
     def _both_answered(self, page: Page) -> None:
         """The rebuild ran to its end in its own reply (nothing aborted it,
         and it did not move to the next reply), then the new message got
         its own answer."""
-        wait_js(page, """() => { const a = [...document.querySelectorAll('.chat-assistant')];
-                 return a.length >= 2 && a[0].innerText.includes('The cache is rebuilt')
+        wait_js(page, f"""() => {{ const a = [...document.querySelectorAll('.chat-assistant')];
+                 return a.length >= 2 && a[0].innerText.includes({json.dumps(self._rebuild_ends_with())})
+                   && !a[0].querySelector('[role=button] .shimmer')
                    && a[a.length - 1].innerText.includes("It's on main")
-                   && !a[a.length - 1].innerText.includes('The cache is rebuilt'); }""",
+                   && !a[a.length - 1].innerText.includes({json.dumps(REBUILD_DONE)}); }}""",
                 "the rebuild finished in its own reply, and the new message's own answer")
         wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
                 "the answer finished", 60_000)
@@ -1239,9 +1257,9 @@ class Scenes:
                              key=lambda m: m.get("timestamp") or 0)
             last = [(m.get("done"), (m.get("content") or "")[-60:]) for m in replies]
             if (len(replies) >= TWO_REPLIES and all(m.get("done") is True for m in replies)
-                    and "The cache is rebuilt" in (replies[0].get("content") or "")
+                    and self._rebuild_ends_with() in (replies[0].get("content") or "")
                     and "It's on main" in (replies[-1].get("content") or "")
-                    and "The cache is rebuilt" not in (replies[-1].get("content") or "")):
+                    and REBUILD_DONE not in (replies[-1].get("content") or "")):
                 return
             time.sleep(1)
         raise RuntimeError(f"stored replies of {chat_id} do not match the page: {last}")
@@ -1256,9 +1274,9 @@ class Scenes:
         wait_js(page, f"""() => [...document.querySelectorAll('.user-message')]
                    .some(m => m.innerText.includes('Which branch is this on?'))
                  && !document.querySelector('button path[d="{SEND_NOW_ICON}"]')
-                 && !document.body.innerText.includes('The cache is rebuilt')
+                 && !document.body.innerText.includes({json.dumps(REBUILD_DONE)})
                  && {FIRST_ASSISTANT}.querySelectorAll('[role=button] .shimmer').length >= 1
-                 && [...document.querySelectorAll('.chat-assistant')].pop().innerText.includes('Queued')""",
+                 && [...document.querySelectorAll('.chat-assistant')].pop().innerText.includes({json.dumps(STEER_PENDING if self.steers else QUEUED_NOTE)})""",
                 "the new message in the chat while the rebuild's card still runs", 30_000)
         park_mouse(page)
         self.s.shot(page, "message-sent-mid-run")
@@ -1510,7 +1528,7 @@ def main(argv=None) -> int:
             # Makes its own chat; thinking-level needs the filter it attaches.
             shooter.run("thinking-toggle", scenes.thinking, page, needed_by=("thinking-level",))
             shooter.run("question-card", scenes.question, page)
-            if gateway_release() >= (2026, 10, 10):
+            if scenes.steers:
                 shooter.run("secret-request", scenes.secret_request, page)
             shooter.run("plugin-approval", scenes.plugin_approval, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
