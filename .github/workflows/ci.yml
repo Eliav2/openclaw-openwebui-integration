@@ -51,6 +51,9 @@ jobs:
           for f in gateway-plugins/*/*.json e2e/agent-tool/*.json; do python3 -m json.tool "$f" >/dev/null && echo "ok $f"; done
           node --test gateway-plugins/*/*.test.js
 
+      - name: Push service worker (node --test)
+        run: node --test push/web/*.test.js
+
   test:
     name: Unit (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
