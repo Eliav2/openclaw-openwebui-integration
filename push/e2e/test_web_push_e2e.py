@@ -207,7 +207,7 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     (d,) = seen_for(page, a_chat)
     assert d["shown"] and d["payload"]["source"] == "api"
     assert d["payload"] == {"v": 2, "kind": "chat.finished", "source": "api", "chat_id": a_chat,
-                            "message_id": a_msg, "title": "Chat A", "url": f"/c/{a_chat}", "fn": "web_push"}
+                            "message_id": a_msg, "title": "Chat A", "url": f"/c/{a_chat}", "fn": "web_push", "actions": ["reply", "mute"]}
     notes = page.evaluate(NOTES)   # the worker posts its decision once the notification is shown
     assert any(n["tag"] == f"chat-{a_chat}" and n["url"] == f"/c/{a_chat}" for n in notes), notes
     assert not any(s in json.dumps(notes) for s in SECRETS)
@@ -530,3 +530,48 @@ def test_opening_a_chat_clears_its_notifications(owui, browser):
     assert read(page, chats["Z"]) == []
     page.evaluate("() => delete document.visibilityState")
     other()
+
+
+def unread(token, chat_id):
+    """The sidebar's blue dot (Open WebUI 0.13): the chat changed after it was last read."""
+    (c,) = [c for c in api("/api/v1/chats/?page=1", token=token) if c["id"] == chat_id]
+    return c.get("last_read_at") is None or c["updated_at"] > c["last_read_at"]
+
+
+def test_mark_as_read_from_the_notification(owui, browser):
+    ctx, page = browser
+    token = owui
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    api("/api/v1/functions/id/web_push/valves/update",
+        {**api("/api/v1/functions/id/web_push/valves", token=token), "NOTIFICATION_ACTIONS": "reply,read"}, token)
+    try:
+        other = behind(ctx, page)
+        r_chat, r_msg = new_chat(token, "stub", "Chat R")
+        reply(token, "stub", r_chat, r_msg)
+        (d,) = seen_for(page, r_chat)
+        assert d["shown"] and d["payload"]["actions"] == ["reply", "read"]
+        wait_done(token, r_chat, r_msg)
+        # Unread, as a reply that came while you were away (here it may share the chat's creation second).
+        api(f"/api/v1/chats/{r_chat}/unread", {}, token)
+        assert unread(token, r_chat)
+        # Mark as read: the dot goes, through Open WebUI's own read event, without opening the chat.
+        data = {"chat_id": r_chat, "url": f"/c/{r_chat}", "fn": "web_push"}
+        assert act(page, "read", data) == "read"
+        assert not unread(token, r_chat)
+        assert "/c/" not in page.url
+        # Signed out (no session cookie): not marked, the chat opens instead, which reads it.
+        api(f"/api/v1/chats/{r_chat}/unread", {}, token)
+        assert unread(token, r_chat)
+        cookies = ctx.cookies(BASE)
+        ctx.clear_cookies(name="token")
+        try:
+            page.evaluate("(m) => navigator.serviceWorker.controller.postMessage(m)",
+                          {"type": "oc-push-act", "action": "read", "data": data})
+            page.wait_for_url(f"**/c/{r_chat}", timeout=WAIT_MS)
+        finally:
+            ctx.add_cookies([c for c in cookies if c["name"] == "token"])
+        other()
+    finally:
+        api("/api/v1/functions/id/web_push/valves/update",
+            {**api("/api/v1/functions/id/web_push/valves", token=token), "NOTIFICATION_ACTIONS": "reply,mute"}, token)

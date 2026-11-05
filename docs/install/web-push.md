@@ -43,12 +43,13 @@ Its valves:
 
 | Valve | Default | What it does |
 |---|---|---|
-| `VAPID_PRIVATE_KEY_FILE` | `$DATA_DIR/web-push/vapid_private.pem` (`/app/backend/data/web-push/vapid_private.pem` in the image) | The private key, as the container sees it. |
-| `VAPID_SUBJECT` | Open WebUI's `WEBUI_URL` | A `mailto:` or `https:` contact for the push services. Apple rejects pushes without a real one. |
-| `TTL_SECONDS` | `3600` | How long a push service keeps a notification for a device that is offline. |
-| `URGENCY` | `normal` | RFC 8030 urgency: `very-low`, `low`, `normal` or `high`. |
-| `PIPE_MODEL_PREFIXES` | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
-| `PREVIEW_CHARS` | `0` (off) | Up to this many characters of the reply, as plain text, in the notification. Read the [privacy note](#preview) first. |
+| [`VAPID_PRIVATE_KEY_FILE`](../configuration.md#vapid_private_key_file) | `$DATA_DIR/web-push/vapid_private.pem` (`/app/backend/data/web-push/vapid_private.pem` in the image) | The private key, as the container sees it. |
+| [`VAPID_SUBJECT`](../configuration.md#vapid_subject) | Open WebUI's `WEBUI_URL` | A `mailto:` or `https:` contact for the push services. Apple rejects pushes without a real one. |
+| [`TTL_SECONDS`](../configuration.md#ttl_seconds) | `3600` | How long a push service keeps a notification for a device that is offline. |
+| [`URGENCY`](../configuration.md#urgency) | `normal` | RFC 8030 urgency: `very-low`, `low`, `normal` or `high`. |
+| [`PIPE_MODEL_PREFIXES`](../configuration.md#pipe_model_prefixes) | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
+| [`PREVIEW_CHARS`](../configuration.md#preview_chars) | `0` (off) | Up to this many characters of the reply, as plain text, in the notification. Read the [privacy note](#preview) first. |
+| [`NOTIFICATION_ACTIONS`](../configuration.md#notification_actions) | `reply,mute` | The notification's buttons, in order, from `reply`, `read`, `mute`; see [Buttons](#buttons). |
 
 Its user valves are written by the page script and the service worker, not by hand: `subscriptions` (one entry per device) and `mutes` (muted chats).
 
@@ -102,7 +103,7 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 - **Title, and the reply only with the preview.** The push carries the chat's title, its id, the link and the function's id. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function forwards only the [preview](#preview), and only when it is on.
 - **Opened means read.** When a chat is on screen on a device, opened in any way (the notification, the sidebar, a link, the app coming back to the front on it), that device closes the chat's notification. Other devices keep theirs until the chat is opened there.
 - **Tap to open.** A tap on the notification focuses an open Open WebUI window and opens the chat, or opens a new one. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
-- **Reply and Mute 8 h.** Below the text, see [Buttons](#buttons).
+- **Buttons.** Reply and Mute 8 h by default, or Mark as read; see [Buttons](#buttons).
 - **A new service worker** takes over by itself: on the next page load, and when an app left open comes back to the front. Nothing to clear or reinstall.
 - **After an Open WebUI update.** Open WebUI removes every service worker when it updates. The next time you open it on a device, it registers again with a new subscription, which replaces the old one. Replies that finish before that are not notified on that device.
 - **Another user on the same device.** When someone else signs in on a device, the page script drops the old subscription and makes a new one for them. Signing out alone does not: the device keeps getting the previous user's notifications until someone signs in again, or until notifications are turned off for the site.
@@ -118,16 +119,17 @@ INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3
 
 ### Preview
 
-With `PREVIEW_CHARS` above 0 the notification shows the start of the reply instead of "New reply": plain text, tool and status blocks, images and files left out, a code block as "[code]", cut on a word. Expanded, Android shows the whole preview. A push holds about 4 KB, so a long preview is shortened to fit.
+With [`PREVIEW_CHARS`](../configuration.md#preview_chars) above 0 the notification shows the start of the reply instead of "New reply": plain text, tool and status blocks, images and files left out, a code block as "[code]", cut on a word. Expanded, Android shows the whole preview. A push holds about 4 KB, so a long preview is shortened to fit.
 
 Privacy: the text is on the lock screen and in the notification shade of every device you enabled, where anyone holding the phone can read it. It passes through the browser's push service (Google, Apple or Mozilla) encrypted end to end (`aes128gcm`); the push service cannot read it. Android can hide notification text on the lock screen: Settings > Notifications > "Sensitive notifications" off. That is why the preview is off by default.
 
 ### Buttons
 
-Android Chrome shows two buttons under a notification (`Notification.maxActions` is 2), and adds a third of its own:
+Android Chrome shows two buttons under a notification (`Notification.maxActions` is 2), and adds a third of its own. The function's [`NOTIFICATION_ACTIONS`](../configuration.md#notification_actions) valve picks them, in order (default `reply,mute`; `reply,read` swaps Mute for Mark as read):
 
-- **Reply** opens a text field in the notification. What you type is sent to the chat as your message, and the agent answers as if you had typed it in the app. It is sent the way Open WebUI 0.13.0's chat page sends a message (one `/api/chat/completions` with the new message under the chat's last one), with the session cookie of your sign-in. While the chat's reply is still running, the message reaches it like one sent from another tab: the OpenClaw Pipe steers it into the run, or queues it until the run ends (see [Messages sent while the agent works](../features/reliability.md#messages-sent-while-the-agent-works)). If it cannot be sent (signed out, Access session expired, offline, an Open WebUI that answers differently), the chat opens with your text in the message box and a line saying it was not sent. It depends on Open WebUI 0.13.0's chat API; with another version, check that a reply from the notification appears in the chat.
-- **Mute 8 h**: no notifications from this chat for 8 hours, on any of your devices (see below).
+- **Reply** (`reply`) opens a text field in the notification. What you type is sent to the chat as your message, and the agent answers as if you had typed it in the app. It is sent the way Open WebUI 0.13.0's chat page sends a message (one `/api/chat/completions` with the new message under the chat's last one), with the session cookie of your sign-in. While the chat's reply is still running, the message reaches it like one sent from another tab: the OpenClaw Pipe steers it into the run, or queues it until the run ends (see [Messages sent while the agent works](../features/reliability.md#messages-sent-while-the-agent-works)). If it cannot be sent (signed out, Access session expired, offline, an Open WebUI that answers differently), the chat opens with your text in the message box and a line saying it was not sent. It depends on Open WebUI 0.13.0's chat API; with another version, check that a reply from the notification appears in the chat.
+- **Mute 8 h** (`mute`): no notifications from this chat for 8 hours, on any of your devices (see below).
+- **Mark as read** (`read`): the chat's unread dot in Open WebUI's sidebar goes, on every device, without opening the chat. Open WebUI 0.13.0 keeps that dot on the server (the chat's `last_read_at`) and sets it for one chat only through its Socket.IO event `events:chat` `{type: "last_read_at"}`, the one its chat page sends when you open a chat. The service worker gets your session's token from `GET /api/v1/auths/` (the session cookie), sends that event over a WebSocket to `/ws/socket.io`, waits for Open WebUI's answer and closes; the token is not kept. If it cannot (signed out, offline), the chat opens instead, which reads it.
 - **Unsubscribe** is Chrome's own: it turns notifications off for the whole site on that device. To turn them on again, allow notifications for the site in Chrome's site settings and open Open WebUI.
 
 Other browsers show the buttons differently or not at all; a browser without a text field opens the chat with the message box focused. iOS shows no buttons: a tap opens the chat.

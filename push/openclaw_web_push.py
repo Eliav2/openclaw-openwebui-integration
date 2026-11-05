@@ -2,7 +2,7 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.3.0
+version: 0.4.0
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
@@ -33,6 +33,11 @@ MAX_TITLE_CHARS = 120
 PUSH_REQUEST_TIMEOUT_S = 10
 # The push service says the subscription is gone (RFC 8030 section 7.3): drop it.
 GONE_STATUSES = (404, 410)
+# The notification's buttons the service worker knows (push/web/oc-sw.js):
+# reply in the shade, mark the chat read, mute it for 8 hours.
+KNOWN_ACTIONS = ("reply", "read", "mute")
+# Mute writes this function's user valves, so it needs the function's id.
+NEEDS_FUNCTION_ID = ("mute",)
 DEFAULT_KEY_FILE = os.path.join(os.environ.get("DATA_DIR", "/app/backend/data"), "web-push", "vapid_private.pem")
 
 
@@ -67,7 +72,16 @@ def snippet(text: str, limit: int) -> str:
     return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:") + "…"
 
 
-def build_payload(event: dict, preview_chars: int = 0, fn: str = "") -> dict:
+def parse_actions(raw: str) -> list:
+    """NOTIFICATION_ACTIONS as a list: known names, in order, each once."""
+    out = []
+    for name in (x.strip() for x in str(raw or "").split(",")):
+        if name in KNOWN_ACTIONS and name not in out:
+            out.append(name)
+    return out
+
+
+def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: list | None = None) -> dict:
     """What the device gets: the chat's title and where to open it, the id of
     this function (the service worker's Mute writes its user valves), and, only
     with `preview_chars`, the start of the reply. `data.message` holds the whole
@@ -80,6 +94,10 @@ def build_payload(event: dict, preview_chars: int = 0, fn: str = "") -> dict:
                "url": f"/c/{chat_id}" if chat_id else "/"}
     if fn:
         payload["fn"] = fn
+    names = parse_actions(Event.Valves.model_fields["NOTIFICATION_ACTIONS"].default) if actions is None else actions
+    names = [a for a in names if fn or a not in NEEDS_FUNCTION_ID]
+    if chat_id and names:
+        payload["actions"] = names
     if preview_chars > 0:
         body = snippet(data.get("message") or "", preview_chars)
         if body:
@@ -185,6 +203,11 @@ class Event:
             description="Comma list of model id prefixes whose replies come from the OpenClaw Pipe "
                         "(its function id plus a dot). For these, only the Pipe's own "
                         "'chat.finished' is sent. Turn on the Pipe's PUBLISH_CHAT_FINISHED.")
+        NOTIFICATION_ACTIONS: str = Field(
+            default="reply,mute",
+            description="The notification's buttons, in order: reply (a text field in the "
+                        "notification, sent as your message), read (marks the chat read), mute "
+                        "(this chat, 8 hours). Android Chrome shows the first two; iOS shows none.")
         PREVIEW_CHARS: int = Field(
             default=0, ge=0, le=2000,
             description="Show the start of the reply (plain text, at most this many characters) "
@@ -235,7 +258,8 @@ class Event:
         if key is None:
             return
         subject = await self._subject()
-        body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid))
+        body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
+                                            parse_actions(self.valves.NOTIFICATION_ACTIONS)))
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject)
         if gone:
