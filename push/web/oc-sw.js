@@ -180,6 +180,8 @@ async function openChat(url) {
 // Mute and Mark as read get this long, token fetch and socket included; past it
 // the chat opens instead. Chrome lets a notification click open or focus a
 // window for about 10 s, so the fallback must start well inside that.
+// openChat focuses first (that needs the allowance); its wait for the page's
+// answer and navigate() after it do not.
 const ACTION_DEADLINE_MS = 6000;
 
 // What a tap does. `action`: "" (the notification), "reply" or "mute".
