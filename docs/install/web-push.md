@@ -140,15 +140,17 @@ On a device with notifications on, the ⋯ menu of a chat in Open WebUI's sideba
 
 ### Mute a chat
 
-In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯, when you have one) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. The bell shows only once a device of yours is enabled.
+In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯, when you have one) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. A mute that ends on another day names the day ("Muted until Sat 09:05"). The same menu opens from **Mute notifications** in the chat's ⋯ menu in the sidebar, after Mark as read; when the chat is muted that item says until when. The bell and the item show only once a device of yours is enabled.
 
 A mute is kept on the server, in the function's `mutes` user valve, so it applies to every device of yours, iPhone included: the function checks it before it encrypts anything, and sends nothing for a muted chat. It is per user: muting a shared chat mutes it only for you.
 
 ### Mute a folder
 
-In a chat that is in a folder, the bell's menu has a second part for that folder: **Mute folder for 1 hour**, **for 8 hours**, **always**, or **Unmute folder**. A folder's mute covers the chats in it and in every folder inside it, so a folder for tests or automated chats can stay quiet while you keep your own chats. The bell of a chat muted through its folder says so, for example "Muted (folder QA)"; when the mute comes from a folder above, the menu names it and unmutes that one.
+In a chat that is in a folder, the bell's menu has a second part for that folder: **Mute folder for 1 hour**, **for 8 hours**, **always**, or **Unmute folder**. A folder's own ⋯ menu, in the sidebar and on the folder's page, has **Mute folder** after Open WebUI's "Mark all as read" (or "Muted …" when it is muted), which opens the same choices for that folder. A folder's mute covers the chats in it and in every folder inside it, so a folder for tests or automated chats can stay quiet while you keep your own chats. The bell of a chat muted through its folder says so, for example "Muted (folder QA)"; when the mute comes from a folder above, the menu names it and unmutes that one.
 
 Folder mutes are kept like chat mutes, in the `folder_mutes` user valve (`{folder id: until}`). Only while one is in effect does the function read the chat's folder and your folders before it sends.
+
+The ⋯ menu items are added the same way as [Mark as read](#mark-a-chat-read-from-the-chat-list): to Open WebUI 0.13.0's menus, found by their structure and the "Mark as unread" or "Mark all as read" icon. A menu drawn differently gets nothing, and the console says once which menu it did not recognise (except on a folder's page, where its ⋯ cannot be told from the page's other menus, such as the icon picker: there it is only left alone); Open WebUI's own items are never changed, and ours come back if Open WebUI redraws the menu while it is open.
 
 The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two devices changing them in the same instant can lose one change; change it again.
 

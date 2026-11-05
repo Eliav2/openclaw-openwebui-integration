@@ -22,10 +22,10 @@
   },
   "push/web/oc-push.js": {
     "no-magic-numbers": {
-      "count": 8
+      "count": 6
     },
     "no-restricted-syntax": {
-      "count": 9
+      "count": 7
     }
   },
   "scripts/owui_live_fold.ts": {

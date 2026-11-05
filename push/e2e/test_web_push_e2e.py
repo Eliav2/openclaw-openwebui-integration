@@ -704,3 +704,227 @@ def test_mark_as_read_from_the_chat_menu(owui, browser):
     assert len([l for l in logs if "chat menu" in l]) == 1, logs
     page.evaluate("() => document.querySelectorAll('#not-owui, #not-owui-2, #bad-label, #fake-item').forEach(e => e.remove())")
     page.set_viewport_size({"width": 390, "height": 844})
+
+
+def native_menu(page, trigger_js, arg):
+    """Open one of Open WebUI's own ⋯ menus, pressed as a pointer does; returns the menu."""
+    # Every menu before it is closed (ours close Open WebUI's when they act).
+    page.wait_for_function("() => !document.querySelector('[role=menu]')", timeout=WAIT_MS)
+    page.evaluate("""([find, arg]) => { const b = (new Function('arg', 'return ' + find))(arg);
+        for (const t of ['pointerdown', 'pointerup']) b.dispatchEvent(new PointerEvent(t, {bubbles: true}));
+        b.click(); }""", [trigger_js, arg])
+    menu = page.locator("[role=menu]").first
+    menu.wait_for(timeout=WAIT_MS)
+    return menu
+
+
+def shot(page, name):
+    """A still for the PR (E2E_SHOTS=<dir>), taken before the check so an old build gives its own."""
+    if os.environ.get("E2E_SHOTS"):
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], name + ".png"))
+
+
+def close_menus(page):
+    """Escape, sent where Open WebUI's menus listen (focus is not in a menu opened by dispatched events),
+    then a press outside, as a user closes one, while a menu is still open."""
+    page.wait_for_function("""() => { if (!document.querySelector('[role=menu]')) return true;
+        document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+        for (const t of ['pointerdown', 'pointerup']) document.body.dispatchEvent(new PointerEvent(t, {bubbles: true}));
+        return false; }""", timeout=WAIT_MS, polling=MENU_DRAWN_WAIT_MS)
+
+
+FOLDER_ROW_TRIGGER = "document.getElementById('folder-' + arg + '-button').querySelector('button[aria-haspopup]')"
+CHAT_TRIGGER = """(() => { let box = document.querySelector('a[href="/c/' + arg + '"]'), b = null;
+    while (box && !(b = box.querySelector('button[aria-haspopup]'))) box = box.parentElement; return b; })()"""
+ITEMS = "(m) => [...m.querySelectorAll('.app-dropdown-menu > button[role=menuitem]')].map(b => b.textContent.trim())"
+
+
+def test_mute_from_open_webuis_own_menus(owui, browser):
+    """G: Mute in a chat's ⋯ and a folder's ⋯ (sidebar and folder page), with the DOM contract;
+    H3: a folder's name is isolated in the menu's sentences."""
+    ctx, page = browser
+    token = owui
+    page.bring_to_front()
+    page.set_viewport_size({"width": 1280, "height": 844})
+    name = "מסמכים חשובים של הבית והמשפחה " + uuid.uuid4().hex[:4]   # long, right to left
+    folder = api("/api/v1/folders/", {"name": name}, token)["id"]
+    g_chat, _ = new_chat(token, "stub", "Chat G")
+    api(f"/api/v1/chats/{g_chat}/folder", {"folder_id": folder}, token)
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    if page.locator("#sidebar-open-button").is_visible():
+        page.locator("#sidebar-open-button").click()
+    row = page.locator(f"#folder-{folder}-button")
+    if not row.is_visible():
+        page.get_by_text("Folders", exact=True).first.click()
+    row.wait_for(timeout=WAIT_MS)
+    try:
+        # The folder's ⋯ in the sidebar: "Mute folder" right after "Mark all as read", native items untouched.
+        menu = native_menu(page, FOLDER_ROW_TRIGGER, folder)
+        shot(page, "web-push-g-folder-menu")
+        item = menu.get_by_role("menuitem", name="Mute folder")
+        item.wait_for(timeout=WAIT_MS)
+        items = menu.evaluate(ITEMS)
+        assert items.index("Mute folder") == items.index("Mark all as read") + 1, items
+        assert [i for i in items if i != "Mute folder"] == ["New Chat", "Create Folder", "Mark all as read", "Edit", "Export", "Delete"], items
+        assert item.evaluate("(b) => b.className === b.previousElementSibling.className")
+        # Open WebUI redraws the menu while it is open: ours comes back.
+        menu.evaluate("(m) => m.querySelectorAll('[data-oc-push-item]').forEach(e => e.remove())")
+        menu.get_by_role("menuitem", name="Mute folder").wait_for(timeout=WAIT_MS)
+        menu.get_by_role("menuitem", name="Mute folder").click()
+        mm = page.locator("#oc-push-mute-menu")
+        mm.wait_for(timeout=WAIT_MS)
+        # Ours closes Open WebUI's menu, as its own items do, and the focus is on the first choice.
+        page.wait_for_function("() => !document.querySelector('[role=menu]:not(#oc-push-mute-menu)')", timeout=WAIT_MS)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        assert page.evaluate("() => document.activeElement === document.querySelector('#oc-push-mute-menu [role=menuitem]')")
+        # H3: the folder's name is isolated in the sentence.
+        assert mm.locator("bdi").first.inner_text() == name
+        shot(page, "web-push-g-folder-mute-menu")
+        mm.get_by_role("menuitem", name="Mute folder always").click()
+        page.wait_for_function(f"() => window.ocPushMuted?.id === {json.dumps(folder)}", timeout=WAIT_MS)
+        assert json.loads(valves(token)["folder_mutes"]) == {folder: 0}
+        # Muted: the item says so the next time.
+        menu = native_menu(page, FOLDER_ROW_TRIGGER, folder)
+        menu.get_by_role("menuitem", name="Muted").wait_for(timeout=WAIT_MS)
+        close_menus(page)
+
+        # The folder's own page: its ⋯ gets the item too.
+        page.locator(f'a[href="/folders/{folder}"]').click()
+        page.wait_for_function(f"() => location.pathname === '/folders/{folder}'", timeout=WAIT_MS)   # in the app, no load
+        page_trigger = ("[...document.querySelectorAll('button[aria-haspopup]')].find(b => !b.closest('#sidebar') "
+                        "&& !b.closest('#message-input-container') && b.getAttribute('aria-label') === 'Folder options')")
+        page.wait_for_function(f"() => !!({page_trigger})", timeout=WAIT_MS)
+        menu = native_menu(page, page_trigger, None)
+        menu.get_by_role("menuitem", name="Muted").wait_for(timeout=WAIT_MS)
+        close_menus(page)
+
+        # The chat's ⋯ in the sidebar: "Mute notifications" after Mark as read; it opens the mute menu with the folder.
+        page.goto(BASE + "/")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        if not page.locator(f'a[href="/c/{g_chat}"]').is_visible():
+            row.locator("button[aria-expanded]").first.click()
+        page.locator(f'a[href="/c/{g_chat}"]').wait_for(timeout=WAIT_MS)
+        menu = native_menu(page, CHAT_TRIGGER, g_chat)
+        shot(page, "web-push-g-chat-menu")
+        item = menu.locator("[data-oc-push-item=mute]")
+        item.wait_for(timeout=WAIT_MS)
+        items = menu.evaluate(ITEMS)
+        assert items.index("Mark as read") == items.index("Mark as unread") + 1, items
+        assert items[items.index("Mark as read") + 1] == item.inner_text().strip(), items
+        assert item.inner_text().strip().startswith("Muted"), "the chat is in a muted folder"
+        item.click()
+        mm.wait_for(timeout=WAIT_MS)
+        page.wait_for_function("() => !document.querySelector('[role=menu]:not(#oc-push-mute-menu)')", timeout=WAIT_MS)
+        assert "This chat" in mm.inner_text() and mm.locator("bdi").count() >= 1
+        mm.get_by_role("menuitem", name="Mute for 1 hour").click()
+        page.wait_for_function(f"() => window.ocPushMuted?.id === {json.dumps(g_chat)}", timeout=WAIT_MS)
+        assert abs(json.loads(valves(token)["mutes"])[g_chat] - (time.time() + 3600)) < 60
+        # Moved to another folder: the chat's menu offers the new folder, not the one it was in.
+        second = api("/api/v1/folders/", {"name": "Second " + uuid.uuid4().hex[:4]}, token)
+        api(f"/api/v1/chats/{g_chat}/folder", {"folder_id": second["id"]}, token)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        if not page.locator(f'a[href="/c/{g_chat}"]').count():   # the sidebar redrew it into the new folder
+            page.locator(f'#folder-{second["id"]}-button button[aria-expanded]').first.click()
+            page.locator(f'a[href="/c/{g_chat}"]').wait_for(timeout=WAIT_MS)
+        menu = native_menu(page, CHAT_TRIGGER, g_chat)
+        menu.locator("[data-oc-push-item=mute]").click()
+        mm.wait_for(timeout=WAIT_MS)
+        assert second["name"] in mm.inner_text() and name not in mm.inner_text(), mm.inner_text()
+        close_menus(page)
+
+        # Fail safe: a folder ⋯ whose menu is not Open WebUI 0.13's gets nothing, one console line.
+        logs = []
+        page.on("console", lambda m: logs.append(m.text))
+        page.evaluate("""() => { const row = document.createElement('div'); row.id = 'folder-fake-button';
+            row.innerHTML = '<button aria-haspopup="true">⋯</button>'; document.body.appendChild(row);
+            for (const id of ['bad-folder', 'bad-folder-2']) {
+              row.querySelector('button').dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+              const m = document.createElement('div'); m.setAttribute('role', 'menu'); m.id = id;
+              m.innerHTML = '<button role="menuitem">Something</button>'; document.body.appendChild(m);
+            } }""")
+        page.wait_for_function("() => window.ocPushFolderMenuContract === 'missing'", timeout=WAIT_MS)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
+        assert page.locator("#bad-folder [role=menuitem], #bad-folder-2 [role=menuitem]").count() == 2
+        assert len([l for l in logs if "folder menu" in l]) == 1, logs
+        page.evaluate("() => document.querySelectorAll('#bad-folder, #bad-folder-2, #folder-fake-button').forEach(e => e.remove())")
+    finally:
+        api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "mutes": "{}", "folder_mutes": "{}"}, token)
+        page.set_viewport_size({"width": 390, "height": 844})
+
+def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
+    """H2: an Open WebUI toast over the bell's menu does not take its taps; H4: on a phone the menu keeps
+    a gutter at both edges; H5: a mute that ends on another day says which day."""
+    ctx, page = browser
+    token = owui
+    page.bring_to_front()
+    page.set_viewport_size({"width": 1280, "height": 844})
+    g_chat, _ = new_chat(token, "stub", "Chat H")
+    # A long folder name makes the menu's items long (W5's phone menu was flush with the left edge then).
+    long_folder = api("/api/v1/folders/", {"name": "תיקייה עם שם ארוך מאוד של פרויקט הבית " + uuid.uuid4().hex[:4]}, token)["id"]
+    api(f"/api/v1/chats/{g_chat}/folder", {"folder_id": long_folder}, token)
+    mm = page.locator("#oc-push-mute-menu")
+    broken = []   # all three are checked, so a run names each one that breaks
+    try:
+        # H2: a toast of Open WebUI over the menu does not take its taps (the menu is in the top layer).
+        page.goto(f"{BASE}/c/{g_chat}")
+        bell = page.locator("#oc-push-bell")
+        bell.wait_for(timeout=WAIT_MS)
+        bell.evaluate("(b) => b.click()")
+        mm.wait_for(timeout=WAIT_MS)
+        # Added after the menu, so only the top layer keeps the menu above it.
+        page.evaluate("""() => { const t = document.createElement('div'); t.id = 'fake-toast';
+            t.style.cssText = 'position:fixed;inset:0 0 auto 0;height:60vh;z-index:2147483647;background:#f008';
+            document.body.appendChild(t); }""")
+        shot(page, "web-push-h2-toast")
+        if not mm.evaluate("""(m) => { const i = m.querySelector('[role=menuitem]'); const r = i.getBoundingClientRect();
+            return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === i; }"""):
+            broken.append("H2: the toast covers the menu")
+        close_menus(page)
+        page.evaluate("() => document.getElementById('fake-toast').remove()")
+        # Escape closes it, and the next press on the bell opens it again.
+        bell.click()
+        mm.wait_for(timeout=WAIT_MS)
+        page.keyboard.press("Escape")
+        mm.wait_for(state="detached", timeout=WAIT_MS)
+        bell.click()
+        try:
+            mm.wait_for(timeout=MENU_DRAWN_WAIT_MS * 4)
+            close_menus(page)
+        except Exception:  # noqa: BLE001 - listed below
+            broken.append("Escape: the next bell press did not open the menu")
+
+        # H5: a mute that ends on another day says which day.
+        later = int(time.time()) + 2 * 86400
+        api("/api/v1/functions/id/web_push/valves/user/update",
+            {**valves(token), "mutes": json.dumps({g_chat: later}), "folder_mutes": "{}"}, token)
+        page.goto(f"{BASE}/c/{g_chat}")
+        page.wait_for_function("() => (document.getElementById('oc-push-bell')?.title || '').startsWith('Muted until')", timeout=WAIT_MS)
+        day = page.evaluate("(t) => new Date(t * 1000).toLocaleString([], {weekday: 'short'})", later)
+        title = page.locator("#oc-push-bell").get_attribute("title")
+        if day not in title:
+            broken.append(f"H5: no day ({day}) in {title!r}")
+
+        # H4: on a phone the menu keeps a gutter at both edges.
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto(f"{BASE}/c/{g_chat}")
+        bell.wait_for(timeout=WAIT_MS)
+        bell.click()
+        box = mm.bounding_box()
+        shot(page, "web-push-h4-h5-phone")
+        if not (box["x"] >= 8 and box["x"] + box["width"] <= 390 - 8):
+            broken.append(f"H4: no gutter, menu at {box}")
+        close_menus(page)
+        # A short window (a phone on its side): the menu stays inside it and scrolls.
+        page.set_viewport_size({"width": 390, "height": 260})
+        bell.click()
+        box = mm.bounding_box()
+        if not (box["y"] >= 8 and box["y"] + box["height"] <= 260 - 8):
+            broken.append(f"short window: menu out of it, at {box}")
+        close_menus(page)
+        assert not broken, broken
+    finally:
+        api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "mutes": "{}", "folder_mutes": "{}"}, token)
+        page.set_viewport_size({"width": 390, "height": 844})
