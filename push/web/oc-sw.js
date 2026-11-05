@@ -125,7 +125,8 @@ async function markRead(chatId) {
       const done = (f, v) => { clearTimeout(timer); f(v); };
       ws.onerror = () => done(fail, new Error("socket error"));
       ws.onclose = () => done(fail, new Error("socket closed"));
-      ws.onmessage = ({ data }) => {
+      ws.onmessage = ({ data }) => { try { onFrame(String(data)); } catch (e) { done(fail, e); } };
+      const onFrame = (data) => {
         if (data === EIO.PING) return ws.send(EIO.PONG);
         if (data.startsWith(SIO.CONNECT_ERROR)) return done(fail, new Error("socket refused"));
         if (data.startsWith(SIO.CONNECT)) {
@@ -140,7 +141,8 @@ async function markRead(chatId) {
       };
     });
   } finally {
-    ws.onclose = null;
+    // Every path ends here (answered, refused, error, closed, timed out): no socket is left open.
+    ws.onclose = ws.onerror = ws.onmessage = null;
     ws.close();
   }
 }
