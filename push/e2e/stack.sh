@@ -49,7 +49,7 @@ rm -rf "$run/worker/web"; mv "$run/web" "$run/worker/web"   # a second `up` on t
 cat > "$run/worker/wrangler.jsonc" <<JSON
 { "name": "web-push-e2e", "main": "src/index.js", "compatibility_date": "2025-10-01",
   "rules": [{ "type": "Text", "globs": ["**/oc-sw.js", "**/oc-push.js"], "fallthrough": true }],
-  "vars": { "VAPID_PUBLIC_KEY": "$(cat "$run/keys/public.b64")", "FUNCTION_ID": "web_push" } }
+  "vars": { "VAPID_PUBLIC_KEY": "$(cat "$run/keys/public.b64")", "FUNCTION_ID": "web_push", "OFFLINE": "${E2E_OFFLINE:-1}" } }
 JSON
 : > "$run/wrangler.log"
 systemd-run --user --unit "$name-wrangler" --working-directory "$run/worker" --setenv=PATH="$PATH" \

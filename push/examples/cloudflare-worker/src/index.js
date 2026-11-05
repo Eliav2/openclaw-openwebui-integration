@@ -7,13 +7,16 @@
 import SW from "../../../web/oc-sw.js";
 import PAGE from "../../../web/oc-push.js";
 
+const OFFLINE_ON = "1", OFFLINE_OFF = "0";
 const JS = { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" };
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     if (url.pathname === "/oc-sw.js") {
-      return new Response(SW, { headers: { ...JS, "service-worker-allowed": "/" } });
+      // OFFLINE = "1" turns on offline open (docs/install/web-push.md); unset, it is off.
+      const sw = SW.replaceAll("__OC_OFFLINE__", env.OFFLINE === OFFLINE_ON ? OFFLINE_ON : OFFLINE_OFF);
+      return new Response(sw, { headers: { ...JS, "service-worker-allowed": "/" } });
     }
     if (url.pathname !== "/static/loader.js") return fetch(req);
     const res = await fetch(req);

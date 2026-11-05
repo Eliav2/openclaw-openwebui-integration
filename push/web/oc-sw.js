@@ -1,8 +1,12 @@
 // oc-sw.js: the Web Push service worker for Open WebUI (docs/install/web-push.md).
-// Serve it at /oc-sw.js. Push only: there is no fetch handler, so it never
-// caches or intercepts a request.
+// Serve it at /oc-sw.js. With offline open on (the proxy sets OFFLINE, see
+// below) it also keeps the app and the chats read last, so Open WebUI opens
+// on a slow network or none; with it off it never caches or intercepts a request.
 self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener("activate", (e) => e.waitUntil((async () => {
+  if (!OFFLINE) await dropCaches(() => true);   // turned off: nothing of it stays on the device
+  await self.clients.claim();
+})()));
 
 // iOS and iPadOS: every push must show a notification (userVisibleOnly), or
 // WebKit revokes the subscription.
@@ -266,5 +270,140 @@ self.addEventListener("pushsubscriptionchange", (e) => {
   const options = e.oldSubscription?.options;
   if (options?.applicationServerKey) {
     e.waitUntil(self.registration.pushManager.subscribe(options));
+  }
+});
+
+
+// --- Offline open (ELI-352) -------------------------------------------------
+// The proxy replaces __OC_OFFLINE__ with its OFFLINE setting ("1" = on); served
+// as a plain file it stays off.
+const OFFLINE_SETTING = "__OC_OFFLINE__", ON = "1";
+const OFFLINE = OFFLINE_SETTING === ON;
+const SHELL = "oc-shell-v1";          // the app: its page, its hashed files, /static
+const API_PREFIX = "oc-api-";         // + a hash of the user's token: one user's reads
+const OURS = (name) => name === SHELL || name.startsWith(API_PREFIX);
+const NAV_TIMEOUT_MS = 3000;          // a page load waits this long for the network
+const READ_TIMEOUT_MS = 4000;         // an API read too
+const SHELL_MAX = 400;                // entries kept, the oldest go first
+const API_MAX = 300;
+const PAGE_KEY = "/";                 // Open WebUI is one page for every route
+const IMMUTABLE = "/_app/immutable/";
+const FRESH_FIRST = ["/static/", "/assets/", "/_app/version.json", "/manifest.json"];
+// The reads Open WebUI needs to draw the app, the chat list and an opened chat.
+const READS = [
+  /^\/api\/config$/, /^\/api\/version$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
+  /^\/api\/v1\/users\/user\/settings$/, /^\/api\/v1\/configs\/banners$/, /^\/api\/v1\/folders\/$/,
+  /^\/api\/v1\/chats\/$/, /^\/api\/v1\/chats\/pinned$/, /^\/api\/v1\/chats\/all\/tags$/,
+  /^\/api\/v1\/chats\/[\w-]+$/, /^\/api\/v1\/chats\/[\w-]+\/tags$/,
+];
+const HTTP_OK = 200, HTTP_SERVER_ERROR = 500;
+const HASH_HEX = 16, HEX = 16, BYTE_DIGITS = 2;
+const SAME_ORIGIN = "basic", GET = "GET", NAVIGATE = "navigate";
+
+// Only a clean answer is kept: never a redirect (an expired Cloudflare Access
+// session answers with one), an error or another site's answer.
+const keepable = (res) => res && res.status === HTTP_OK && res.type === SAME_ORIGIN && !res.redirected;
+// The network gave nothing usable: no answer, or the server (or the tunnel in
+// front of it) is down.
+const down = (res) => !res || res.status >= HTTP_SERVER_ERROR;
+
+async function dropCaches(which) {
+  for (const name of await caches.keys()) if (OURS(name) && which(name)) await caches.delete(name);
+}
+
+async function trim(cache, max) {
+  const keys = await cache.keys();
+  for (const k of keys.slice(0, Math.max(0, keys.length - max))) await cache.delete(k);
+}
+
+// The network within `ms`, else the cached copy; the network answer, when it
+// comes, still refreshes the cache (`isIt` can refuse an answer that is not the
+// thing being kept).
+async function freshFirst(e, req, cacheName, key, ms, onFresh, isIt) {
+  const cache = await caches.open(cacheName);
+  const net = fetch(req).then(async (res) => {
+    if (keepable(res) && (!isIt || await isIt(res.clone()))) {
+      await cache.put(key, res.clone());
+      if (onFresh) await onFresh(res.clone(), cache);
+    }
+    return res;
+  }, () => null);
+  e.waitUntil(net);
+  const timer = new Promise((r) => setTimeout(() => r(undefined), ms));
+  const first = await Promise.race([net, timer]);
+  if (first !== undefined && !down(first)) return first;
+  const saved = await cache.match(key);
+  if (saved) return saved;
+  const res = await net;
+  return res || Response.error();
+}
+
+// A new page means a new Open WebUI build: its hashed files are new too, so the
+// old ones go.
+async function pruneShell(page, cache) {
+  const html = await page.text();
+  const used = new Set(html.match(/\/_app\/immutable\/[^"'\s)]+/g) || []);
+  if (!used.size) return;
+  const keys = await cache.keys();
+  const stamp = await cache.match("/_oc/page-files");
+  const before = stamp ? await stamp.text() : "";
+  const now = [...used].sort().join("\n");
+  if (before && before !== now) {
+    for (const k of keys) {
+      const path = new URL(k.url).pathname;
+      if (path.startsWith(IMMUTABLE) && !used.has(path)) await cache.delete(k);
+    }
+  }
+  await cache.put("/_oc/page-files", new Response(now));
+  await trim(cache, SHELL_MAX);
+}
+
+// Open WebUI's page loads its hashed files; a login page (Cloudflare Access) or
+// an error page does not, and is never kept as the app.
+const isAppPage = async (res) => (await res.text()).includes(IMMUTABLE);
+
+async function cacheFirst(e, req) {
+  const cache = await caches.open(SHELL);
+  const saved = await cache.match(req);
+  if (saved) return saved;
+  const res = await fetch(req);
+  if (keepable(res)) e.waitUntil(cache.put(req, res.clone()));
+  return res;
+}
+
+// One user's reads in one cache, named by a hash of their token: a sign-out or
+// another user on this device starts a new one, and the others are deleted.
+let apiCache = "";
+async function apiCacheFor(auth) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(auth));
+  const name = API_PREFIX + [...new Uint8Array(digest)].map((b) => b.toString(HEX).padStart(BYTE_DIGITS, "0")).join("").slice(0, HASH_HEX);
+  if (name !== apiCache) {
+    apiCache = name;
+    await dropCaches((n) => n.startsWith(API_PREFIX) && n !== name);
+  }
+  return name;
+}
+
+self.addEventListener("fetch", (e) => {
+  if (!OFFLINE) return;
+  const req = e.request;
+  if (req.method !== GET) return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  const path = url.pathname;
+  if (req.mode === NAVIGATE) {
+    e.respondWith(freshFirst(e, req, SHELL, PAGE_KEY, NAV_TIMEOUT_MS, pruneShell, isAppPage));
+  } else if (path.startsWith(IMMUTABLE)) {
+    e.respondWith(cacheFirst(e, req));
+  } else if (FRESH_FIRST.some((p) => path.startsWith(p))) {
+    e.respondWith(freshFirst(e, req, SHELL, req, NAV_TIMEOUT_MS));
+  } else if (READS.some((r) => r.test(path))) {
+    const auth = req.headers.get("authorization");
+    if (!auth) {
+      e.respondWith(freshFirst(e, req, SHELL, req, READ_TIMEOUT_MS));   // public: /api/config, /api/version
+      return;
+    }
+    e.respondWith(apiCacheFor(auth).then((name) => freshFirst(e, req, name, req.url, READ_TIMEOUT_MS,
+      async (_res, cache) => trim(cache, API_MAX))));
   }
 });
