@@ -406,13 +406,15 @@ out.fetches = fetches;
 console.log(JSON.stringify(out));
 """
 
-_SCHED_TITLES_JS = _FAKE_DOM_JS + r"""
+_SCHED_META_JS = _FAKE_DOM_JS + r"""
 global.localStorage = { getItem: () => 'tok' };
 global.fetch = () => new Promise(() => {});
 run(input.open);
 input.fills.forEach(run);
 const section = document.getElementById('openclaw-status-section-scheduled');
-console.log(JSON.stringify(section.walk().map((e) => e.title).filter(Boolean)));
+console.log(JSON.stringify(section.querySelectorAll('[data-openclaw-meta]').map((e) => ({
+  text: e.textContent, className: e.className, whiteSpace: e.style.whiteSpace || '',
+  textOverflow: e.style.textOverflow || '' }))));
 """
 
 # A follow request that never reaches the Action (Open WebUI down).
@@ -471,14 +473,22 @@ class PageTests(unittest.TestCase):
                 self.assertFalse(any("(0)" in t for t in seen["before"]), seen["before"])
                 self.assertTrue(any(note in t for t in seen["before"]), seen["before"])
 
-    def test_a_meta_line_shows_whole_on_hover(self):
-        error = "Last run failed: " + "x" * 300
-        row = action._scheduled_rows([{**_job("broken"), "nextRunAtMs": NOW + H}], KEY, USER)
+    def test_a_meta_line_wraps_and_is_never_cut(self):
+        # On a phone, "by another chat of yours" does not fit beside the time.
+        other = "agent:main:openwebui-" + USER + "-00000000-0000-4000-8000-000000000001"
+        row = action._scheduled_rows([{**_job("weekly", owner={"agentId": "main", "sessionKey": other}),
+                                       "nextRunAtMs": NOW + H}], KEY, USER)
         row["rows"][0].update(status="failed", error="x" * 300, failedInARow=1)
         fill = action._render_scheduled_fill_js({"source": "pipe", "fetchedAt": NOW, "error": None,
                                                  "revision": 4, **row})
-        seen = run_page(_SCHED_TITLES_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY), "fills": [fill]})
-        self.assertIn(error, seen)
+        metas = run_page(_SCHED_META_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY), "fills": [fill]},
+                         tz="UTC")
+        self.assertTrue(any(m["text"].endswith("by another chat of yours") for m in metas), metas)
+        self.assertIn("Last run failed: " + "x" * 300, [m["text"] for m in metas])
+        for m in metas:
+            self.assertNotEqual(m["whiteSpace"], "nowrap", m)
+            self.assertNotEqual(m["textOverflow"], "ellipsis", m)
+            self.assertIn("break-words", m["className"], m)
 
     def test_a_follow_request_that_never_arrives_marks_the_rows_out_of_date(self):
         row = action._scheduled_rows([{**_job("nightly"), "nextRunAtMs": NOW + H}], KEY, USER)

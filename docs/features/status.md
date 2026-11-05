@@ -92,7 +92,7 @@ It counts the background agents the reply started and stays until the reply ends
 
 ## Scheduled
 
-<img src="../img/status-dialog-scheduled-light.png" alt="The Scheduled section: a daily automation for this chat, counting down to its next run, with the time, who made it, how often it runs and the first line of its message" width="320">
+<img src="../img/status-dialog-scheduled-light.png" alt="The Scheduled section on a phone: two automations for this chat, one made in another chat, each counting down to its next run, with the time and who made it (wrapped, never cut), how often it runs and the first line of its message" width="320">
 
 The Scheduled section lists the automations (OpenClaw cron jobs) that run in this chat, read-only, the running one first, then by when each runs next. A row has:
 
