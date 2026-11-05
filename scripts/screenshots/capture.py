@@ -436,7 +436,6 @@ ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section
 FIRST_ASSISTANT = "document.querySelector('.chat-assistant')"
 REBUILD_SAYS = "Rebuilding the cache from the forecast API."
 REBUILD_DONE = "The cache is rebuilt"
-GOAL_SET = "Goal set"
 GOAL_ANSWER = "Next is the staging deploy script"
 # From OpenClaw 2026.10.10 the Gateway steers a message sent while a run works
 # into that run: the run ends its reply at the next step and the scripted
@@ -1100,9 +1099,12 @@ class Scenes:
         new_chat(page)
         chat = send(page, "Keep at it until the hourly view is on staging.")
         wait_js(page, last_text_has("Goal set"), "the reply that sets the goal")
-        # Not before it is over: a message sent into the running turn is steered
-        # into it and its reply has no status rows of its own.
-        wait_js(page, reply_done_js(reply_with(GOAL_SET)), "the goal's reply finished", 60_000)
+        # The goal keeps the session going, and a message sent while it does is
+        # held behind the loop for minutes (steered into a follow-up turn it
+        # cannot join). Stop ends the running turn and the queued ones; the goal
+        # stays active, and the next message is an ordinary turn.
+        page.locator('button[aria-label="Stop"]').click()
+        wait_js(page, "() => !document.querySelector('button[aria-label=\"Stop\"]')", "the goal's turn stopped")
         send(page, "Start with the build.")
         answer = reply_with(GOAL_ANSWER)
         wait_js(page, reply_done_js(answer), "the reply that answers, finished")
