@@ -6,7 +6,9 @@ stubbed.
 
 Run: python3 -m pytest -q tests/test_file_server_unit.py
 """
+import os
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -109,10 +111,49 @@ class StaleFileServerReapTests(unittest.TestCase):
         # serve_forever loop stopped, or the port would still be held.
         self.assertEqual(first_server.socket.fileno(), -1)
 
+    def test_an_upload_is_written_and_a_bad_name_refused(self):
+        fs._start_file_server(port=0)
+        port = getattr(self.stub_owui_socket_main, fs._STALE_FILE_SERVER_ATTR).server_address[1]
+        self.assertTrue(self._wait_up(port), "server never came up")
+        name = f"unit-upload-{os.getpid()}.txt"
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/{name}", data=b"hi", method="PUT")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            self.assertEqual(resp.read(), f"ok:{name}".encode())
+        written = Path("/tmp/openclaw-pipe-media", name)
+        self.addCleanup(written.unlink)
+        self.assertEqual(written.read_bytes(), b"hi")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/..", data=b"hi", method="PUT")
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(err.exception.code, 400)
+
     def test_reap_is_noop_outside_owui(self):
         for name in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
             sys.modules.pop(name, None)
         fs._reap_stale_file_server()  # must not raise
+
+
+class UploadDestTests(unittest.TestCase):
+    """An upload's file name resolves to a file directly inside the upload
+    directory, or the upload is refused."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.outside = tempfile.mkdtemp()
+
+    def test_a_plain_name_lands_in_the_directory(self):
+        self.assertEqual(fs._upload_dest(self.dir, "/shot.png?x=1"),
+                         os.path.join(os.path.realpath(self.dir), "shot.png"))
+
+    def test_names_that_leave_the_directory_are_refused(self):
+        for raw in ("", "/", "..", "/../x", "a/b", "."):
+            with self.subTest(raw=raw):
+                self.assertIsNone(fs._upload_dest(self.dir, raw))
+
+    def test_a_symlink_out_of_the_directory_is_refused(self):
+        os.symlink(os.path.join(self.outside, "target"), os.path.join(self.dir, "link"))
+        self.assertIsNone(fs._upload_dest(self.dir, "/link"))
+        self.assertFalse(os.path.exists(os.path.join(self.outside, "target")))
 
 
 if __name__ == "__main__":
