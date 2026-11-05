@@ -1183,7 +1183,7 @@ class Scenes:
             new_chat(page)
             chat = send(page, "Help me plan the hourly view release.")
             wait_js(page, last_text_has("What's left"), "the first reply")
-                send(page, "What should go in the release notes?")
+            send(page, "What should go in the release notes?")
             wait_js(page, last_text_has("Lead with the hourly strip"), "the second reply")
             deadline = time.time() + 120
             while "Hourly view release plan" not in chat_title(self.token, chat):
