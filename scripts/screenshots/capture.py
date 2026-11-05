@@ -309,7 +309,7 @@ def gateway_call(method: str, params: dict) -> dict:
     out = subprocess.run(["openclaw", "gateway", "call", method, "--json", "--params", json.dumps(params)],
                          capture_output=True, text=True, timeout=90)
     if out.returncode:
-        raise RuntimeError(f"{method} failed: {out.stderr[-1500:]}")
+        raise RuntimeError(f"{method} failed: {out.stderr[-1500:]}{out.stdout[-1500:]}")
     return json.loads(out.stdout[out.stdout.find("{"):])
 
 
