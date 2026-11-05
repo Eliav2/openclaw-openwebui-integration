@@ -1,9 +1,5 @@
-"""A Gateway that has just started refuses runs while it inspects and
-prepares the agent's database (OpenClaw 2026.10.5+): the run request is sent
-again, same key, after the wait the refusal names, and never shown as a reply.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_startup_refusal_unit.py
-"""
+"""A just-started Gateway (2026.10.5+) refuses runs while preparing its database:
+the request is resent with the same key after the named wait."""
 import asyncio
 import json
 import unittest
@@ -116,8 +112,8 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("startup inspection", str(caught.exception))
 
     async def test_a_refused_response_frame_keeps_its_error_shape(self):
-        """The `res` frame's error shape reaches the caller, not only its
-        message: the retry reads `retryable`, `retryAfterMs` and details.code."""
+        """The caller gets the `res` frame's error shape: the retry reads
+        `retryable`, `retryAfterMs` and details.code."""
         conn = ocp._GatewayConnection(lambda: None)
         fut = asyncio.get_running_loop().create_future()
         conn._pending_reqs["7"] = fut
@@ -141,7 +137,7 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_transcript_subscription_refused_while_preparing_is_renewed(self):
         """A renewal refused after a restart would leave the session without
-        tool events until the next reconnect (the key stays recorded)."""
+        tool events until the next reconnect."""
         conn = ocp._GatewayConnection(lambda: None)
         fake = FakeConn([refusal(), {}])
         conn.send_request = fake.send_request

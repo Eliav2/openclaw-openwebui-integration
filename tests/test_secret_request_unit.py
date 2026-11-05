@@ -1,9 +1,5 @@
-"""ELI-96: a secret the agent requests (`secrets` action=request, a Gateway
-store-bound question) is asked in the chat's masked input dialog, and the
-typed value goes only to `question.resolve`.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_secret_request_unit.py
-"""
+"""ELI-96: a requested secret is asked in a masked input dialog; the value goes only
+to `question.resolve`."""
 import asyncio
 import json
 import os
@@ -96,7 +92,7 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         seen = ocp.secret_request_seen(conn, rec)
         task = ocp._SECRET_REQUESTS.get(rec["id"])
         if task is not None:
-            await asyncio.wait_for(task, 2)   # bounds the test only
+            await asyncio.wait_for(task, 2)
         return seen
 
     def assertValueNowhere(self, *places):
@@ -130,8 +126,7 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
                                                            "resolvedBy": "openwebui"})])
 
     async def test_a_gateway_without_the_question_protocol_leaves_it_to_the_control_ui(self):
-        """No `question.resolve` or question events in hello-ok: the Pipe
-        could not answer it, so it is not asked."""
+        """No `question.resolve` in hello-ok: the Pipe cannot answer, so it does not ask."""
         for methods, events in ((frozenset(), QUESTION_EVENTS), (QUESTION_METHODS, frozenset()),
                                 (frozenset(), frozenset())):
             with self.subTest(methods=sorted(methods), events=sorted(events)):
@@ -140,8 +135,7 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((turn.asked, conn.sent), ([], []))
 
     async def test_any_release_line_that_offers_the_protocol_asks_it(self):
-        """The gate is what the Gateway offers, not its version number:
-        2026.10.5 has the store-bound question as 2026.10.10 does."""
+        """Gated on what the Gateway offers, not its version: 2026.10.5 has it."""
         for version in ("2026.10.5", "2026.9.3", "2026.10.10-beta.1"):
             with self.subTest(version=version):
                 ocp._SECRET_REQUESTS.clear()
@@ -150,10 +144,8 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(conn.sent[0][0], "question.resolve")
 
     async def test_a_chat_of_a_user_not_in_owner_users_is_not_asked(self):
-        """The store is the owner's: a guest's chat must not write into it,
-        and the request is cancelled at once rather than left answerable in
-        the Control UI for a run the guest reads (ELI-229). The reply of the
-        run that asked says it needs the owner."""
+        """The store is the owner's: a guest's request is cancelled at once
+        (ELI-229) and the reply says it needs the owner."""
         conn, turn = FakeConn(), FakeTurn(VALUE)
         with mock.patch.object(ocp, "_sender_is_owner", mock.AsyncMock(return_value=False)):
             self.assertTrue(await self._ask(conn, turn))
@@ -170,18 +162,14 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("q-1", ocp._SECRET_REQUESTS)
 
     async def test_the_cancel_still_says_so_when_the_gateway_reports_it_resolved_first(self):
-        """The Gateway answers `question.resolve` and broadcasts
-        `question.resolved` back to back, so both frames can reach the receive
-        loop in one step: the event handler runs before the task awaiting the
-        answer resumes. Its note still has to reach the reply, or a fast run
-        finishes without it (the guest-secret E2E, PR 241 CI attempt 1)."""
+        """`question.resolved` can land before the resolve's answer; the note must
+        still reach the reply (guest-secret E2E, PR 241)."""
         class RacingConn(FakeConn):
             async def send_request(self, method, params, timeout=10):
                 self.sent.append((method, json.loads(json.dumps(params))))
                 answer = asyncio.get_running_loop().create_future()
                 answer.set_result({"status": "cancelled"})
-                # The receive loop delivers the response, then handles the
-                # event in the same step, before this task resumes.
+                # The event lands before this task resumes.
                 ocp.secret_request_resolved({"id": params["id"], "status": "cancelled"})
                 await asyncio.sleep(0)
                 return await answer
@@ -211,8 +199,8 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.sent, [])
 
     async def test_no_tab_on_the_chat_leaves_it_to_expire(self):
-        """No reply streams the run and no tab views the chat: nothing is sent,
-        and the Gateway's expiry tells the agent no credential arrived."""
+        """No reply streams and no tab views the chat: nothing is sent, and the
+        Gateway's expiry answers the agent."""
         conn = FakeConn()
         with mock.patch.object(ocp, "_call_on_chat_tab", mock.AsyncMock(return_value=None)) as tab:
             await self._ask(conn, None)
@@ -238,11 +226,8 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RetiredConnectionTests(unittest.IsolatedAsyncioTestCase):
-    """A deploy retires the previous load's connection but keeps it open while
-    it streams a run. The Gateway sends every connected client its own copy of
-    `question.requested`, so a retired connection that still handled it asked
-    the same question a second time (ELI-341): after a guest secret request was
-    cancelled, the second cancel failed with a GatewayError."""
+    """ELI-341: a retired connection still streaming a run also got
+    `question.requested` and asked a second time. Only the live one asks."""
 
     async def play(self, conn, frames):
         frames = list(frames)
@@ -269,9 +254,8 @@ class RetiredConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gone.call_args_list, [])
 
     async def test_a_retired_connection_still_hands_over_a_resolved_question(self):
-        """A question asked before a deploy is held by the previous load's
-        module, which only the retired connection reaches: it must still hear
-        that the question was answered elsewhere, cancelled or expired."""
+        """The retired connection still hears that a pre-deploy question was
+        resolved, cancelled or expired."""
         resolved = {"type": "event", "event": "question.resolved",
                     "payload": {"id": "q-1", "status": "cancelled"}}
         seen, gone = mock.Mock(), mock.Mock()
@@ -293,8 +277,7 @@ class RetiredConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NoteItemTests(unittest.TestCase):
-    """A note item (ELI-229) through `_TurnRenderer`, the one renderer the
-    live reply and a turn writer share."""
+    """A note item (ELI-229) through `_TurnRenderer`, shared by the live reply and a turn writer."""
 
     def note(self, text="note one", nid="msg_note_secret_q-1"):
         return {"sessionKey": KEY, "runId": "run-1", "stream": ocp.PIPE_NOTE_STREAM,
@@ -324,9 +307,8 @@ class NoteItemTests(unittest.TestCase):
         self.assertEqual([i["content"][0]["text"] for i in r.output], ["note two"])
 
     def test_a_rebuild_from_the_transcript_keeps_the_note_in_place(self):
-        """The turn writer rebuilds a reply from the transcript at its end;
-        the note is in no transcript, so it is put back after the item it
-        followed (ELI-229: the cancel note vanished from the saved reply)."""
+        """The note is in no transcript, so a turn writer's rebuild puts it
+        back after the item it followed (ELI-229)."""
         call = {"type": "function_call", "id": "call_1"}
         result = {"type": "function_call_output", "id": "fco_call_1"}
         streamed = ocp._TurnRenderer()

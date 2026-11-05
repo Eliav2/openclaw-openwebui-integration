@@ -1,14 +1,6 @@
-"""Cron wake turns on both OpenClaw lines (ELI-211).
-
-9.3 records a wake's prompt as a user turn starting `[cron:<jobId> <name>]`
-with no provenance, and runs the wake under the session's id (ELI-103).
-10.2+ records it with the cron provenance and no header; `chat.history`
-returns it as role "assistant" (GH #24), and the wake runs under its own run
-id with its own `cli-assistant:<runId>` closing. The 10.5 fixture is the live
-gate's cron-wake chat.
-
-Run: python3 -m pytest -q tests/test_wake_turns_unit.py
-"""
+"""Cron wake turns (ELI-211). 9.3: a `[cron:<jobId> <name>]` user turn under the
+session's id (ELI-103). 10.2+: cron provenance, role "assistant" (GH #24), its own
+run id and `cli-assistant:<runId>` closing. Fixture: the live gate's wake chat."""
 import json
 import os
 import unittest
@@ -47,8 +39,8 @@ class WakeTurns105Tests(unittest.TestCase):
         self.assertIsNone(ocp.wake_turn_of_run(msgs, WAKE_105["job"], 1792366183000))
 
     def test_the_105_wake_run_renders_its_reply_only(self):
-        """The wake's run is its closing's id, and its span holds the reply
-        and its tool calls, not the prompt."""
+        """The wake's run is its closing's id; its span holds the reply and
+        tool calls, not the prompt."""
         hist = {"messages": ocp._transcript_roles(FX105["messages"])}
         span = ocp._history_span_messages(hist, FX105["lastRunId"])
         rendered = ocp._history_renderer(span)

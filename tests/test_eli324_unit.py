@@ -1,15 +1,8 @@
 """ELI-324: a reply the agent sends with its `message` tool is shown once.
 
-An agent that answers an inter-session send (or any agent turn) with
-`message(action=send, final=true)` leaves three assistant messages in the
-Gateway's transcript: the send's delivery mirror (`<runId>:message-tool:...`),
-whatever text the model wrote after it (here "Delivered."), and, because the
-send was the run's final reply, one more record with the sent text again. The
-rebuilt reply was "<sent>\\n\\nDelivered.<sent>". The fixture is that run as
-2026.10.5 returned it from `chat.history` (a QA chat, haiku 5.5).
-
-Run: python3 -m pytest -q tests/test_eli324_unit.py
-"""
+`message(action=send, final=true)` leaves the delivery mirror
+(`<runId>:message-tool:...`), any later text, and the sent text again. Fixture:
+2026.10.5 `chat.history`."""
 import copy
 import json
 import os
@@ -52,15 +45,13 @@ class MessageToolRepeatTests(unittest.TestCase):
         self.assertEqual(r.output[0]["name"], "message")
 
     def test_a_run_that_says_nothing_after_the_send_shows_the_sent_text_once(self):
-        """The model's own text is dropped (it ended silent): the record of the
-        send is the only message after the mirror."""
+        """The model's own text is dropped (it ended silent)."""
         silent = [m for m in FX["messages"] if not _says(m, "Delivered.")]
         self.assertEqual(len(silent), len(FX["messages"]) - 1)
         self.assertEqual(_render(silent).text, SENT)
 
     def test_the_same_text_twice_without_a_send_is_kept(self):
-        """Only a text the `message` tool delivered is a repeat: an agent that
-        really says the same thing twice says it twice."""
+        """Only text the `message` tool delivered counts as a repeat."""
         msgs = copy.deepcopy(FX["messages"])
         mirror = next(m for m in msgs if m.get("model") == "delivery-mirror")
         mirror["idempotencyKey"] = mirror["__openclaw"]["idempotencyKey"] = f"{RUN}:not-a-send:1"

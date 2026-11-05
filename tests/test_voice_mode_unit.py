@@ -1,10 +1,5 @@
-"""Voice mode (ELI-335): Open WebUI marks a message typed by speaking into a voice
-call with `features.voice`. The reply will be read aloud, so the agent gets a
-short note before that message: short spoken sentences in the user's language,
-no markup. A normal message carries nothing.
-
-Run: python3 -m pytest -q tests/test_voice_mode_unit.py
-"""
+"""Voice mode (ELI-335): a message with `features.voice` gets a note asking for short
+spoken sentences in the user's language, no markup."""
 import unittest
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)

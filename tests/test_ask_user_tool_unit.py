@@ -1,10 +1,5 @@
-"""ELI-216: a question from the agent's ask_user tool (a Gateway question,
-`question.requested`) is asked in Open WebUI's question card, on a tab that
-has loaded the chat, and the answer goes to `question.resolve`. With no such
-tab it stays pending until one opens the chat.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_ask_user_tool_unit.py
-"""
+"""ELI-216: an ask_user question (`question.requested`) is asked in the question
+card on a tab with the chat loaded; the answer goes to `question.resolve`."""
 import asyncio
 import json
 import unittest
@@ -23,8 +18,7 @@ KEY = "agent:main:openwebui-user-1-chat-1"
 
 
 def record(qid="ask_1", status="pending", questions=None):
-    """What OpenClaw 2026.10.5 broadcasts for an ask_user call (the tool's
-    normalized questions: header cut to 12, isOther always true)."""
+    """What 2026.10.5 broadcasts for ask_user (header cut to 12, isOther true)."""
     return {"id": qid, "status": status, "sessionKey": KEY, "runId": "run-1",
             "expiresAtMs": int((ocp.time.time() + 900) * 1000),
             "questions": questions or [{
@@ -63,14 +57,13 @@ class FakeTurn:
         self.__event_emitter__ = None
 
         async def event_call(payload):
-            # What Open WebUI answers for a call on a socket that is gone.
+            # Open WebUI's answer for a socket that is gone.
             return {"error": "Client session disconnected."}
         self.__event_call__ = event_call
 
 
 class Tabs:
-    """Open WebUI's sockets: SESSION_POOL, and a card on each socket that
-    answers when the test says so."""
+    """Open WebUI's SESSION_POOL and a card per socket that answers on cue."""
 
     def __init__(self, test, pool=None):
         self.pool = pool if pool is not None else {}
@@ -138,7 +131,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
     async def finished(self, rec_id="ask_1"):
         task = asked().get(rec_id)
         if task is not None:
-            await asyncio.wait_for(task, 2)   # bounds the test only
+            await asyncio.wait_for(task, 2)
 
     async def test_the_card_shows_on_the_reply_tab_and_its_answer_resolves_the_question(self):
         conn, tabs = FakeConn(), Tabs(self)
@@ -160,8 +153,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tabs.removed_from("sid-own"))
 
     async def test_asked_with_no_tab_open_it_waits_and_shows_when_a_tab_opens_the_chat(self):
-        """The user asks, closes the tab (or the phone sleeps), comes back later:
-        the question is still there to answer."""
+        """A question survives the tab closing until the user comes back."""
         conn, tabs = FakeConn(), Tabs(self)
         self.ask(conn, turn=FakeTurn("sid-gone"))
         for _ in range(20):
@@ -175,8 +167,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["Postgres"]}})
 
     async def test_a_tab_that_has_not_loaded_the_chat_gets_no_card(self):
-        """Open WebUI cancels a card at once on a tab still loading the chat:
-        that must not read as the user's Cancel."""
+        """A card cancelled by a tab still loading is not the user's Cancel."""
         conn, tabs = FakeConn(), Tabs(self)
         tabs.open("sid-loading")
         self.ask(conn, turn=FakeTurn("sid-gone"))
@@ -212,8 +203,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
                                                            "resolvedBy": "openwebui"})])
 
     async def test_a_cancel_from_a_tab_that_left_the_chat_is_not_the_users(self):
-        """The tab switched to another chat: Open WebUI cancels the card
-        there. The question stays, for the next tab that shows the chat."""
+        """Switching chats cancels the card there; the question stays."""
         conn, tabs = FakeConn(), Tabs(self)
         tabs.open("sid-own")
         self.ask(conn, turn=FakeTurn())
@@ -251,8 +241,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
                          {"answers": {"name": ["gamma"], "toppings": ["Cheese", "Olives"]}})
 
     async def test_a_run_no_reply_streams_asks_in_the_turn_writers_reply(self):
-        """A run the agent started: the card belongs to the reply the turn
-        writer streams it into."""
+        """In an agent-started run the card belongs to the writer's reply."""
         conn, tabs = FakeConn(), Tabs(self)
         conn._turn_writers[("chat-1", "msg-w")] = mock.Mock(
             chat_id="chat-1", session_key=KEY, message_id="msg-w", closed=False)

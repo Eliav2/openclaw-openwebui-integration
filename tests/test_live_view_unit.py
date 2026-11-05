@@ -1,8 +1,5 @@
-"""Live view of the agent's browser (LIVE_VIEW_URL): a reply that uses a browser
-tool gets the configured page as an embed, once, for the users it is set for.
-
-Run: python3 -m pytest -q tests/test_live_view_unit.py
-"""
+"""Live view (LIVE_VIEW_URL): a reply using a browser tool embeds the page once,
+for the users it is set for."""
 import json
 import types
 import unittest
@@ -42,9 +39,8 @@ class LiveViewUrlTests(unittest.TestCase):
                 self.assertIsNone(live_view_url(tool, args))
 
     def test_only_a_real_browser_launch_shows_the_card(self):
-        # 248 of 269 live-view cards on one deployment over a week had no browser behind them.
-        # The default matched "playwright"/"chromium" anywhere in any tool's arguments: a file being
-        # written, a message, a heredoc body, a grep. A card means the agent starts or drives a browser.
+        # Most cards had no browser behind them: a browser word anywhere in the
+        # arguments matched. A card needs a browser launch or drive.
         launches = (
             ("browser", {"action": "open", "url": "https://x"}),
             ("exec", {"command": "openclaw browser --json open https://example.org"}),
@@ -114,7 +110,7 @@ class LiveViewUrlTests(unittest.TestCase):
     def test_only_the_command_argument_is_judged(self):
         # a launch quoted in another argument of a command tool is still not a launch
         self.assertIsNone(live_view_url("exec", json.dumps({"command": "ls", "note": "chromium --headless"})))
-        # and an argument string that is no JSON object leaves only the tool's name
+        # an argument string that is no JSON object leaves only the tool's name
         self.assertIsNone(live_view_url("exec", "chromium --headless"))
         self.assertIsNotNone(live_view_url("browser", "not json"))
 
@@ -130,8 +126,7 @@ class LiveViewUrlTests(unittest.TestCase):
                 self.assertIsNone(live_view_url("exec", json.dumps({"command": cmd}), LIVE_VIEW_TOOLS=valve))
 
     def test_the_default_on_real_tool_calls(self):
-        # ELI-248: on the claude-cli runtime the agent drives its browser with exec
-        # running `openclaw browser <verb>`; no tool is called "browser" there
+        # ELI-248: claude-cli drives the browser with exec `openclaw browser <verb>`
         browser_use = (
             ("exec", {"command": "B=/opt/openclaw/bin/openclaw; $B browser --json open https://en.wikipedia.org/wiki/Octopus 2>&1 | tail -20"}),
             ("exec", {"command": "B=x; sleep 15; for i in 1 2; do $B browser press PageDown; done"}),

@@ -1,10 +1,5 @@
-"""The run-state probe files the thinking ladder it reads from describe once per
-turn, not on every call. A queued message probes every 1.5 s for up to 30
-minutes, and filing reads and writes the ladder cache file on the event loop
-(review on #3).
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_ladder_probe_unit.py
-"""
+"""The run-state probe files the thinking ladder once per turn, not on every 1.5 s
+call, since filing does file I/O on the event loop (review on #3)."""
 import tempfile
 import types
 import unittest

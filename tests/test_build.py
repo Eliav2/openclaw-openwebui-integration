@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Guards for the bundle build: no drift, and the two hard OWUI constraints.
-
-Run: python3 -m pytest -q tests/test_build.py
-"""
+"""Guards for the bundle build: no drift, and the hard OWUI constraints."""
 import ast
 import builtins
 import re
@@ -18,9 +15,7 @@ BUILT = ROOT / "openclaw_pipe.py"
 ACTION_BUILT = ROOT / "openclaw_status_action.py"
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
 
-# Verbatim copy of open_webui.utils.plugin.extract_frontmatter (0.11.0).
-# Reimplemented rather than imported because OWUI is not a test dependency --
-# the artifacts have to satisfy OWUI's parser, not ours.
+# Copy of open_webui.utils.plugin.extract_frontmatter (0.11.0); OWUI is not a test dependency.
 _FRONTMATTER_RE = re.compile(r"^\s*([a-z_]+):\s*(.*)\s*$", re.IGNORECASE)
 
 
@@ -39,10 +34,8 @@ def extract_frontmatter(content: str) -> dict:
     return frontmatter
 
 
-# Keys OWUI reads off a distributed function. `requirements` is the load-bearing
-# one: OWUI pip-installs it on first load, so omitting it means every user on a
-# stock image hits ModuleNotFoundError for websockets/cryptography instead of a
-# working function. All of these silently parsed to {} before this was guarded.
+# Keys OWUI reads off a function. Without `requirements` OWUI does not
+# pip-install websockets/cryptography and the function fails to load.
 REQUIRED_FRONTMATTER_KEYS = (
     "title", "author", "version", "license",
     "requirements", "required_open_webui_version", "description",
@@ -60,8 +53,8 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"drift detected:\n{r.stdout}\n{r.stderr}")
 
     def test_frontmatter_is_first(self):
-        """OWUI reads the function title/requirements from the leading docstring;
-        it must be the first statement (no bundler boilerplate above it)."""
+        """OWUI reads title and requirements from the leading docstring, which
+        must be the first statement."""
         tree = ast.parse(BUILT.read_text())
         self.assertTrue(tree.body, "empty module")
         first = tree.body[0]
@@ -70,12 +63,7 @@ class BuildTests(unittest.TestCase):
         self.assertIn("OpenClaw Gateway Pipe", first.value.value)
 
     def test_owui_parses_frontmatter_metadata(self):
-        """OWUI must extract real metadata from the artifact, not an empty dict.
-
-        Prose alone parses to {}: OWUI's regex only picks up `key: value` lines.
-        Without `requirements`, OWUI never auto-installs websockets/cryptography
-        and a stock deployment fails to load the function at all.
-        """
+        """OWUI must extract real metadata (`key: value` lines), not {}."""
         fm = extract_frontmatter(BUILT.read_text())
         self.assertTrue(fm, "OWUI would parse an empty frontmatter dict")
         for key in REQUIRED_FRONTMATTER_KEYS:
@@ -84,8 +72,7 @@ class BuildTests(unittest.TestCase):
             self.assertIn(mod, fm["requirements"])
 
     def test_pipe_class_is_top_level(self):
-        """OWUI introspects a top-level `Pipe` class; it must not be buried
-        inside a loader/module wrapper."""
+        """OWUI introspects a top-level `Pipe` class."""
         tree = ast.parse(BUILT.read_text())
         names = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
         self.assertIn("Pipe", names)
@@ -95,9 +82,7 @@ class BuildTests(unittest.TestCase):
 
 
 class StatusActionBuildTests(unittest.TestCase):
-    """openclaw_status_action.py -- the companion Action Function. Same
-    guards as BuildTests, adapted to the Action's own OWUI constraints
-    (top-level `Action` class rather than `Pipe`)."""
+    """The companion Action Function: BuildTests' guards with a top-level `Action` class."""
 
     def test_no_drift(self):
         r = subprocess.run(
@@ -115,7 +100,7 @@ class StatusActionBuildTests(unittest.TestCase):
         self.assertIn("OpenClaw Status Action", first.value.value)
 
     def test_owui_parses_frontmatter_metadata(self):
-        """Same contract as the Pipe -- see BuildTests for why this matters."""
+        """Same contract as the Pipe."""
         fm = extract_frontmatter(ACTION_BUILT.read_text())
         self.assertTrue(fm, "OWUI would parse an empty frontmatter dict")
         for key in REQUIRED_FRONTMATTER_KEYS:
@@ -132,10 +117,8 @@ class StatusActionBuildTests(unittest.TestCase):
         compile(ACTION_BUILT.read_text(), str(ACTION_BUILT), "exec")
 
     def test_carries_no_turn_writer(self):
-        """ELI-149: the Action writes no turns, so it ships none of writer.py:
-        no definition from it and no reference to one. A reference left in a
-        shared fragment would be a NameError the first time that path ran in
-        the Action's own connection (CI's ruff F821 lints the built file too)."""
+        """ELI-149: the Action ships nothing of writer.py; a leftover reference
+        would be a NameError at run time."""
         writer = ast.parse((PKG / "writer.py").read_text())
         names = set()
         for node in writer.body:
@@ -145,7 +128,7 @@ class StatusActionBuildTests(unittest.TestCase):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 names |= {t.id for t in targets if isinstance(t, ast.Name)}
         self.assertIn("_TurnWriter", names)
-        # The one name both share: gateway.py's hook, which writer.py sets.
+        # gateway.py's hook, which writer.py sets.
         names.discard("_TURNS")
         action = ast.parse(ACTION_BUILT.read_text())
         defined = {n.name for n in action.body
@@ -157,23 +140,16 @@ class StatusActionBuildTests(unittest.TestCase):
         self.assertEqual([ast.unparse(n.value) for n in hooks], ["None"])
 
     def test_does_not_reuse_pipe_stale_conn_write_path(self):
-        """The Action fragment must never call _remember_gateway_connection
-        or assign the module-level `_gateway_connection` singleton itself
-        -- both are the Pipe's own redeploy-reaping bookkeeping, and the
-        Action must only ever READ _STALE_CONN_ATTR, never write it (see
-        action.py's module docstring for the collision this avoids)."""
+        """The Action must not touch the Pipe's redeploy bookkeeping:
+        _remember_gateway_connection, `_gateway_connection`, _STALE_CONN_ATTR."""
         action_src = (PKG / "action.py").read_text()
         self.assertNotIn("_remember_gateway_connection(", action_src)
         self.assertNotIn("_get_gateway_connection(", action_src)
 
     def test_shares_gateway_fragment_verbatim_with_pipe(self):
-        """The Action and Pipe artifacts must bundle byte-identical
-        gateway.py content -- this is what "reuse, don't duplicate" means
-        here: one fragment file, two build targets."""
+        """The Action and the Pipe bundle the same gateway.py content."""
         gateway_src = (PKG / "gateway.py").read_text()
-        # Both artifacts strip the fragment banner before inlining; compare
-        # the post-strip body so this test is agnostic to how build.py
-        # formats the surrounding per-fragment header.
+        # Compare after the fragment banner is stripped.
         body = build_mod._strip_fragment_banner(gateway_src)
         self.assertIn(body.rstrip("\n"), BUILT.read_text())
         self.assertIn(body.rstrip("\n"), ACTION_BUILT.read_text())
@@ -184,13 +160,8 @@ if __name__ == "__main__":
 
 
 class _Scope:
-    """One lexical scope for the name-resolution check below.
-
-    `parent` is already the correct *lookup* parent: a function's or
-    comprehension's scope points past any enclosing class body, mirroring the
-    real Python rule that a class's own namespace is invisible to nested
-    functions (only to the class body's own statements).
-    """
+    """One lexical scope. `parent` is the lookup parent, which skips an
+    enclosing class body as Python does."""
 
     __slots__ = ("bindings", "parent")
 
@@ -215,12 +186,8 @@ def _nearest_non_class_scope(stack, class_scopes):
 
 
 class _ScopedNameCollector:
-    """Walks a module's AST building one scope per function/class/
-    comprehension, and records every `Name` load against the scope it was
-    lexically found in. Resolution (`_Scope.resolves`) happens afterwards,
-    once every scope's bindings are complete -- a local binding in one
-    function must never appear to define a name used, unresolved, in another.
-    """
+    """Builds one scope per function, class and comprehension and records each
+    `Name` load. Resolution runs after all bindings are known."""
 
     def __init__(self, module_scope):
         self.class_scopes = set()
@@ -261,7 +228,6 @@ class _ScopedNameCollector:
         for child in ast.iter_child_nodes(node):
             self.visit(child)
 
-    # -- name-introducing leaves --------------------------------------------
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Load):
@@ -278,15 +244,11 @@ class _ScopedNameCollector:
             self.bind(alias.asname or alias.name)
 
     def visit_Global(self, node):
-        # A declaration, not a binding: the accompanying assignment (handled
-        # via visit_Name -> bind, which checks global_names) is what actually
-        # lands the name in module scope.
+        # A declaration; the assignment binds the name in module scope.
         self.global_names.update(node.names)
 
     def visit_Nonlocal(self, node):
-        # Also just a declaration. Python requires the name to already exist
-        # in an enclosing function scope, which the normal scope chain finds
-        # without treating this statement as a binding site itself.
+        # A declaration; the enclosing scope already binds the name.
         pass
 
     def visit_ExceptHandler(self, node):
@@ -294,7 +256,6 @@ class _ScopedNameCollector:
             self.bind(node.name)
         self.generic_visit(node)
 
-    # -- scope-introducing nodes ---------------------------------------------
 
     def _visit_arg_annotations(self, args):
         for a in (list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
@@ -353,9 +314,8 @@ class _ScopedNameCollector:
         self.stack.pop()
 
     def _enter_comprehension(self, node, visit_contents):
-        # The outermost iterable is evaluated in the enclosing scope; the
-        # comprehension itself (targets, later clauses, element) is its own
-        # scope and, like a function, skips over an enclosing class body.
+        # The outermost iterable runs in the enclosing scope; the rest is the
+        # comprehension's own scope.
         self.visit(node.generators[0].iter)
         parent = _nearest_non_class_scope(self.stack, self.class_scopes)
         scope = _Scope(parent)
@@ -381,18 +341,8 @@ class _ScopedNameCollector:
 
 
 class ArtifactNameResolutionTests(unittest.TestCase):
-    """Every artifact must define every module-level name its fragments use.
-
-    An artifact is a concatenation of a chosen subset of fragments, so taking a
-    fragment without taking what that fragment references produces a file that
-    imports fine and raises NameError only when the affected line finally runs.
-    That is the worst possible time to find out, and neither the build nor a
-    smoke import will catch it: this test does the resolving statically.
-
-    Caught in review: adding a ladder-cache helper to `gateway` made the status
-    Action reference LEVEL_RANKS, which lives in `thinking`, which the Action
-    did not bundle.
-    """
+    """Every artifact must define every module-level name its fragments use, or
+    it raises NameError only when that line runs (e.g. LEVEL_RANKS in the Action)."""
 
     ARTIFACTS = [build_mod.PIPE, build_mod.ACTION, build_mod.FILTER]
 
@@ -421,8 +371,7 @@ class ArtifactNameResolutionTests(unittest.TestCase):
                     f"(module_order={artifact.module_order}): {missing}")
 
     def test_the_check_can_actually_fail(self):
-        # A test that cannot fail is indistinguishable from one that passes for
-        # the right reason, so prove the detector on a file that IS broken.
+        # Prove the detector on a broken file.
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
             fh.write("def f():\n    return SOME_MISSING_CONSTANT\n")
@@ -433,10 +382,7 @@ class ArtifactNameResolutionTests(unittest.TestCase):
             broken.unlink()
 
     def test_a_same_named_local_does_not_mask_an_unresolved_global(self):
-        # Regression for a real gap: aggregating every scope's bindings into
-        # one file-wide bag let a local `token = ...` in one function make
-        # `token` look resolved everywhere, hiding a genuinely undefined
-        # global `token` read by a different function.
+        # A local binding in one function must not resolve a global read in another.
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
             fh.write(

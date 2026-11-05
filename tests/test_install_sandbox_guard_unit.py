@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
-"""ELI-221: an installer run from a sandbox shell must not deploy to the host's
-Open WebUI by accident.
-
-A sandbox (e2e-local's run.sh) sets E2E_ROOT and runs inside its own network
-namespace, where localhost:8080 is the sandbox's Open WebUI. The same command
-typed in the host shell with E2E_ROOT still exported reaches the live Open
-WebUI on the host instead. The installers refuse that unless --live is given.
-A plain shell (no E2E_ROOT) is unchanged.
-
-The CLI runs as a real subprocess against a recording HTTP server standing in
-for the target Open WebUI, so "refused" means no request reached it.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_install_sandbox_guard_unit.py
-"""
+"""ELI-221: an installer run with E2E_ROOT set but outside the sandbox namespace
+refuses to deploy to the host's Open WebUI unless --live is given. "Refused"
+means no request reached the recording server."""
 import http.server
 import os
 import subprocess
@@ -90,8 +79,7 @@ class InstallerSandboxGuardTests(unittest.TestCase):
 
 
 class SandboxNetnsTests(unittest.TestCase):
-    """Inside the sandbox's own network namespace localhost is the sandbox, so
-    the wrapper's deploys (run.sh: E2E_ROOT set) go through untouched."""
+    """Inside the sandbox namespace localhost is the sandbox, so run.sh's deploys go through."""
 
     def setUp(self):
         sys.path.insert(0, str(ROOT))

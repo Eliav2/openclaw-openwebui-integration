@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the Thinking filter (ELI-85).
-
-Runs against the BUILT artifact, not the fragment, because the artifact is what
-Open WebUI actually loads. A fragment that passes and an artifact that does not
-is the failure mode a build step invites, so the build is part of the test.
-
-    python3 -m pytest tests/test_thinking_unit.py
-"""
+"""Unit tests for the Thinking filter (ELI-85), on the built artifact Open WebUI loads."""
 
 import importlib.util
 import json
@@ -21,14 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT = ROOT / "openclaw_thinking_filter.py"
 
-# Precondition, checked before anything else: this suite exercises the real
-# pydantic surface (create_model, then model_json_schema on what it built), so
-# a stubbed or missing pydantic makes every assertion below meaningless. A
-# sibling suite's stub used to shadow the real library here; conftest.py now
-# imports it first, and this guard says so out loud if that ever stops working.
-# On CI the dependency is installed, so a miss there is a real breakage and has
-# to fail: a suite that quietly skips itself is indistinguishable from one that
-# passes.
+# This suite needs the real pydantic (create_model, model_json_schema);
+# conftest.py imports it first. On CI a miss must fail, not skip.
 try:
     from pydantic import create_model as _require_real_pydantic  # noqa: F401
 except ImportError as exc:  # pragma: no cover - environment guard
@@ -40,13 +27,8 @@ except ImportError as exc:  # pragma: no cover - environment guard
 
 
 def load(state_dir=None):
-    """Import the built artifact fresh, with STATE_DIR pointed wherever we want.
-
-    Reimported per case because the dropdown is baked into UserValves at import
-    time: testing that from one cached import would only ever exercise the
-    first state dir. `available_levels()` reads the variable live, so it stays
-    set; each test restores it (`_StateDirCase`).
-    """
+    """Import the built artifact fresh with STATE_DIR set (the dropdown is baked in
+    at import). Tests restore it (`_StateDirCase`)."""
     if state_dir is None:
         os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
     else:
@@ -81,9 +63,7 @@ class BuildTests(unittest.TestCase):
                          "run: python3 build.py --all\n" + (proc.stdout or proc.stderr)[:400])
 
     def test_open_webui_frontmatter(self):
-        # OWUI reads function metadata ONLY from `key: value` lines in the
-        # leading docstring. Prose parses to {} in silence, so assert with
-        # OWUI's own shape.
+        # OWUI reads metadata only from `key: value` lines in the docstring.
         head = ARTIFACT.read_text()[:4000]
         doc = head.split('"""')[1] if '"""' in head else ""
         meta = {}
@@ -155,9 +135,7 @@ class ClampTests(_StateDirCase):
 
 
 class RejectionTests(_StateDirCase):
-    """The parser lives in the shared fragment, so the filter artifact
-    carries it too. Asserting it here proves the fragment stays import-free:
-    the filter imports nothing beyond pydantic."""
+    """The parser lives in the shared fragment; the filter imports nothing beyond pydantic."""
 
     def test_the_real_wording_yields_level_model_and_ladder(self):
         self.assertEqual(
@@ -180,8 +158,7 @@ class RejectionTests(_StateDirCase):
                            ' Use one of: off, off.')["levels"], ["off"])
 
     def test_an_all_unknown_ladder_is_still_a_rejection(self):
-        # The caller still learns WHICH model rejected WHICH level, so it
-        # tests for None, not for falsiness.
+        # It still says which model rejected which level: test for None.
         parsed = self.mod.parse_thinking_rejection(
             'Thinking level "max" is not supported for x/y. Use one of: turbo.')
         self.assertIsNotNone(parsed)
@@ -191,8 +168,7 @@ class RejectionTests(_StateDirCase):
         for text in (
             "Let me think about supported levels here.",
             "high is not supported in this context, unrelated to models.",
-            # The anchors are there but the "model" is prose: a model ref
-            # never contains a space.
+            # A model ref never contains a space.
             'Thinking level "high" is not supported for some models. Use one of: off.',
             'Thinking level "high" is not supported for x/y.',   # no ladder clause
             'is not supported for x/y. Use one of: off.',        # no head

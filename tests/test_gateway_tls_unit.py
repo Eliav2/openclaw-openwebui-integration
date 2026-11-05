@@ -1,9 +1,5 @@
-"""A Gateway behind a TLS proxy (`tailscale serve`, a reverse proxy) is reached
-with GATEWAY_URL=wss://host. The scheme used to be parsed and thrown away, so the
-Pipe dialled plaintext ws:// on port 18789 whatever was typed.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_gateway_tls_unit.py
-"""
+"""A Gateway behind a TLS proxy is reached with GATEWAY_URL=wss://host; the scheme
+used to be dropped, dialling ws:// on 18789."""
 import asyncio
 import json
 import os

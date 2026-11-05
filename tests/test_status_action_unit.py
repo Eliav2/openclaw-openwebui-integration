@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""Focused unit tests for the companion Action Function (openclaw_status_action.py).
-
-Mirrors test_pipe_unit.py's dependency-stubbing pattern so this runs without
-a real OWUI/pydantic/websockets/cryptography environment.
-"""
+"""Unit tests for the companion Action Function (openclaw_status_action.py),
+with stubbed dependencies as in test_pipe_unit.py."""
 
 import asyncio
 import datetime
@@ -40,9 +37,7 @@ from openclaw_status_action import (  # noqa: E402
 
 
 def _emitted_codes(emitted, event_type="execute"):
-    """The dialog's own execute codes. Excludes the composer Status button
-    snippet every run also delivers (covered by test_composer_unit.py), so
-    these tests keep counting only what the dialog itself renders."""
+    """The dialog's own execute codes, without the composer snippet."""
     return [
         e["data"]["code"] for e in emitted
         if e["type"] == event_type and "__openclawComposerBtn" not in e["data"]["code"]
@@ -50,11 +45,7 @@ def _emitted_codes(emitted, event_type="execute"):
 
 
 class RenderJsTests(unittest.TestCase):
-    """The JSON-blob substitution (_json_for_js, used by every _render_*_js
-    function here) is the one place untrusted-ish gateway text (e.g. a goal
-    description) flows into JS source -- these guard the safety property
-    described in action.py's module comment, exercised through each of the
-    four render entry points that use it."""
+    """_json_for_js carries Gateway text into JS; guard it in every renderer."""
 
     def test_open_js_embeds_identity_and_no_placeholder_left(self):
         js = _render_modal_open_js({"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y"})
@@ -64,9 +55,7 @@ class RenderJsTests(unittest.TestCase):
         self.assertTrue(js.strip().endswith("})();"))
 
     def test_adversarial_strings_stay_inside_the_json_blob(self):
-        """Quotes, backslashes, and a fake </script> tag must not be able to
-        terminate the JS string/close the <script> the execute event runs
-        inside -- json.dumps is what guarantees this."""
+        """Quotes, backslashes and </script> must not end the string or script."""
         nasty = 'a"b\\c</script><img src=x onerror=alert(1)>\nline2'
         js = _render_context_fill_js({
             "provider": nasty, "model": "", "context": None, "goal": None,
@@ -79,21 +68,15 @@ class RenderJsTests(unittest.TestCase):
         self.assertNotIn("</script>", js.replace("<\\/script>", ""))
 
     def test_traffic_light_colours_are_inline_not_tailwind_classes(self):
-        """'bg-rose-500' rendered as an invisible bar: OWUI's Tailwind build
-        ships only the utilities its own source uses. The colours are
-        inline styles (DialogSectionTests checks the values)."""
+        """OWUI ships only the Tailwind classes it uses: colours are inline styles."""
         js = _render_modal_open_js({"chatId": None, "messageId": None, "sessionId": None, "owuiModel": None})
         executable = "\n".join(l for l in js.splitlines() if not l.strip().startswith("//"))
         for leftover in ("bg-rose", "bg-amber", "bg-emerald", "text-rose"):
             self.assertNotIn(leftover, executable)
 
 
-# A page just big enough for the Status dialog's own JS: elements with
-# children, ids, dataset, `[data-*]` lookups, and a clock and timers the test
-# drives by hand. Reads {"open": js, "fills": [js, ...], "steps": [...]} on
-# stdin and prints what each step saw.
-# A page just big enough to run the dialog's JS under bun or node: the
-# elements, ids, data-* selectors and timers it uses.
+# A page just big enough to run the dialog's JS under bun or node. Reads
+# {"open": js, "fills": [js, ...], "steps": [...]} on stdin.
 _FAKE_DOM_JS = r"""
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 let now = input.now;
@@ -210,8 +193,7 @@ FULL_IDENTITY = {"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiMode
 
 
 class DialogSectionTests(unittest.TestCase):
-    """The Status dialog's Context, Rate Limits and error fills, run on a
-    fake page: what a reader sees, not what the JS source contains."""
+    """The Context, Rate Limits and error fills, run on a fake page."""
 
     def _page(self, fills, identity=FULL_IDENTITY, click=False, tz="UTC"):
         payload = {"now": 1, "open": _render_modal_open_js(identity), "fills": fills, "click": click}
@@ -322,10 +304,8 @@ class DialogSectionTests(unittest.TestCase):
 
 
 class DrawerToolCardsStayOpenTests(unittest.TestCase):
-    """ELI-133 (ELI-110 screenshots, run 38636471099): while a sub-agent
-    runs, the drawer refills every 2.5 s, and each refill rebuilt every card
-    closed, so a card the user opened snapped shut. A card keeps its open or
-    closed state across refills, keyed by its tool call id."""
+    """ELI-133 (seen in ELI-110 shots): a drawer refill closed every card. A card keeps its
+    open state across refills, keyed by its tool call id."""
 
     TASK = {"id": "t1", "title": "Child", "status": "running", "childSessionKey": "agent:main:subagent:c",
             "startedAt": 1, "endedAt": None, "progressSummary": None, "terminalSummary": None, "error": None}
@@ -359,8 +339,7 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
         self.assertEqual(seen[3], [["read", False], ["exec", False]])
 
     def test_the_state_follows_the_call_not_its_position(self):
-        """When an older step drops out of the read, the open card is still
-        the same call, now one place up."""
+        """An open card stays open when an older step drops out of the read."""
         a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
         seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "exec"},
                            {"fill": self._fill([b, c])}])
@@ -369,8 +348,7 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
 
 class DrawerRunShowsEachResultOnceTests(unittest.TestCase):
     """ELI-128: a tool's output shows once, in its card. In OpenClaw's own
-    shape (any runtime but claude-cli) the result is a `toolResult` message
-    of its own; it is never a turn of the run."""
+    shape the result is a separate `toolResult` message, never a turn."""
 
     def test_the_gateways_own_shape(self):
         items = _drawer_run_items([
@@ -399,9 +377,7 @@ class DrawerRunShowsEachResultOnceTests(unittest.TestCase):
 
 
 class ElapsedTickTests(unittest.TestCase):
-    """ELI-120: a running sub-agent's elapsed time counts up while the Status
-    dialog stays open, instead of freezing at whatever it was when the
-    dialog opened ("1s" for a child spawned a moment earlier)."""
+    """ELI-120: a running sub-agent's time counts up while the dialog is open."""
 
     NOW = 1_783_790_100_000
 
@@ -440,11 +416,8 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
         fake_conn = mock.AsyncMock()
         fake_conn.endpoint_moved = mock.Mock(return_value=False)
         fake_module = types.SimpleNamespace(_openclaw_gateway_connection_v1=fake_conn)
-        # `import open_webui.socket.main` requires the parent packages to
-        # also resolve via sys.modules -- patching only the leaf module
-        # isn't enough, the import statement fails on the (unstubbed)
-        # `open_webui` top-level package first and silently falls through
-        # to the fallback path, which is not what this test means to check.
+        # `import open_webui.socket.main` needs the parent packages stubbed
+        # too, or it silently takes the fallback path.
         stub_modules = {
             "open_webui": types.ModuleType("open_webui"),
             "open_webui.socket": types.ModuleType("open_webui.socket"),
@@ -466,12 +439,11 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(conn, fake_conn)
         self.assertEqual(source, "action-own")
         fake_conn.ensure_connected.assert_awaited_once()
-        mod._action_fallback_connection = None  # reset for other tests
+        mod._action_fallback_connection = None
 
 
 class _RecordingOwuiModule(types.ModuleType):
-    """An Open WebUI module that records every name read from it. Nothing is
-    stashed on it (`_openclaw_*`): no Pipe connection is in the process."""
+    """An Open WebUI module recording every name read, with no Pipe stashed."""
 
     def __init__(self, name, touched):
         super().__init__(name)
@@ -487,10 +459,8 @@ class _RecordingOwuiModule(types.ModuleType):
 
 
 class _ScriptedSocket:
-    """A Gateway socket that plays a list of frames. A request is answered at
-    once (from `answers`, by method); `None` in the script drops the socket.
-    When the script of the last socket is done, `on_end` runs and the
-    connection stops."""
+    """A Gateway socket that plays a list of frames. Requests are answered
+    from `answers`; `None` drops the socket; `on_end` runs after the last."""
 
     def __init__(self, conn, frames, answers, sent, on_end=None):
         self.conn, self.frames, self.answers, self.sent = conn, list(frames), answers, sent
@@ -515,10 +485,8 @@ class _ScriptedSocket:
 
 
 class ActionOwnConnectionWritesNothingTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-149: the Action's fallback connection is the only place the Action
-    runs gateway.py's receive loop. Fed every kind of frame a Gateway sends it,
-    with no Pipe connection in the process, it raises nothing and writes
-    nothing: no turn, no chat.send, no Open WebUI write."""
+    """ELI-149: the fallback connection's receive loop, fed every frame kind
+    without a Pipe, raises and writes nothing."""
 
     USER = "00000000-0000-4000-8000-0000000000a1"
     CHAT = "0abe9bde-9b86-4ef3-8a46-a3a98ed9410a"
@@ -616,14 +584,13 @@ class ActionOwnConnectionWritesNothingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t.exception() for t in tasks if t.exception()], [])
         self.assertEqual([line for line in logs
                           if "error" in line.lower() or "failed" in line.lower()], [])
-        # Each path was reached: both hellos, the frame gap, the restart, the
-        # settle's subscription.
+        # Each path was reached.
         self.assertEqual(sent.count("sessions.subscribe"), 2)
         self.assertIn("sessions.messages.subscribe", sent)
         for reached in ("frame seq gap", "WS disconnected", "Gateway restarted"):
             self.assertTrue(any(reached in line for line in logs), (reached, logs))
         self.assertEqual(sorted(set(sent) - self.READ_ONLY), [])
-        # Only this function's own stash was looked up: no Open WebUI API.
+        # No Open WebUI API was looked up.
         self.assertEqual([t for t in touched if not (
             t[0] == "open_webui.socket.main" and t[1].startswith("_openclaw_"))], [])
         self.assertEqual(dict(getattr(conn, "_turn_pumps", {})), {})
@@ -632,9 +599,7 @@ class ActionOwnConnectionWritesNothingTests(unittest.IsolatedAsyncioTestCase):
 
 class SessionKeyTests(unittest.TestCase):
     def test_matches_pipe_format(self):
-        """Must stay byte-identical to gateway.py's _owui_session_key (same
-        fragment, shared by both artifacts) so a session the Pipe created is
-        the same session this Action looks up."""
+        """Matches gateway.py's _owui_session_key: Pipe and Action share sessions."""
         self.assertEqual(
             _owui_session_key("main", "user-1", "chat-1"),
             "agent:main:openwebui-user-1-chat-1",
@@ -653,10 +618,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted[0]["data"]["type"], "error")
 
     async def test_success_fills_every_section_independently(self):
-        """Open happens before any network call; each section then emits
-        its own separate execute fill as its own source resolves -- not one
-        combined event. Exercises context+goal, rate-limit windows, and a
-        nonzero subagent count all end to end."""
+        """The open precedes any network call; each section fills on its own."""
         action = Action()
         emitted = []
         parent = "agent:main:openwebui-user-1-chat-1"
@@ -677,8 +639,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     {"label": "5h", "usedPercent": 72, "resetAt": 1783790000000},
                 ]}]}
             if method == "sessions.list":
-                # The open reads every session (ELI-152); a refill follows
-                # the chat's current children.
+                # The open reads every session (ELI-152); a refill follows the current children.
                 if "spawnedBy" in params:
                     self.assertEqual(params["spawnedBy"], parent)
                 return {"sessions": [
@@ -699,9 +660,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
         async def fake_get_connection(_valves_getter):
-            # By the time the connection is fetched, the open (loading
-            # skeletons) must already have been emitted -- proves open
-            # happens before any network call, not just before return.
+            # The open was emitted before the connection was fetched.
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "execute")
             self.assertIn("'openclaw-status-section-' + s[0]", emitted[0]["data"]["code"])
@@ -715,11 +674,10 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 __user__={"id": "user-1"}, __event_emitter__=emitter,
             ), fake_conn)
 
-        # Two children are running, so the dialog stays open to follow them.
         self.assertEqual(result, "following")
         codes = _emitted_codes(emitted)
-        # open + 5 independent fills; the Subagents re-read that starts the
-        # follow (ELI-127) found the same rows, so it is not sent (ELI-268)
+        # open + 5 fills; the follow's re-read (ELI-127) found the same rows,
+        # so it is not sent (ELI-268)
         self.assertEqual(len(codes), 6)
 
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
@@ -731,7 +689,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1783790000000", limits_code)
 
         subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
-        # Every child of this chat, the ended one included; another chat's not.
+        # Every child of this chat, ended included; not another chat's.
         self.assertEqual(subagents_code.count('"status": "running"') + subagents_code.count('"status": "queued"'), 2)
         self.assertIn('"status": "completed"', subagents_code)
         self.assertNotIn("agent:main:subagent:d", subagents_code)
@@ -768,10 +726,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     if "getElementById('openclaw-status-section-context')" in c)
 
     async def test_a_row_with_no_totals_yet_shows_the_last_runs_usage(self):
-        """ELI-223: OpenClaw 2026.10.10 writes no totals to a session's row
-        after its first run (only after the second), so the dialog had no
-        context numbers and no Compact button. They come from the newest
-        assistant message's usage then, as the reply's usage line does."""
+        """ELI-223: 2026.10.10 writes no totals to a session row after its
+        first run, so they come from the newest assistant message's usage."""
         history = {"messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "older", "usage": {"input": 3, "output": 1}},
@@ -790,9 +746,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"usedTokens": "34k"', code)
 
     async def test_connect_failure_errors_the_gateway_sections_only(self):
-        """Each section the Gateway fills says it could not connect, in its
-        own place; In-process agents reads Open WebUI's copy of the chat and
-        still fills."""
+        """Gateway sections say they could not connect; In-process agents still fills."""
         action = Action()
         emitted = []
         emitter = RecordingEmitter(emitted)
@@ -812,9 +766,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("getElementById('openclaw-status-section-agents')" in c for c in codes))
 
     async def test_per_section_rpc_failure_only_errors_that_section(self):
-        """A failure fetching one section's data (here: the child sessions) must
-        not prevent the other two, independently-loading sections from
-        rendering their own real data."""
+        """One section's failure must not stop the others from rendering."""
         action = Action()
         emitted = []
         emitter = RecordingEmitter(emitted)
@@ -847,9 +799,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
-    """Since OpenClaw 2026.9.1 usage.status has no `anthropic` entry on a
-    Claude-CLI-only setup; the Rate Limits section falls back to the
-    companion plugin's claudeCliUsage.status."""
+    """Since 2026.9.1 usage.status has no `anthropic` entry on a claude-cli
+    only setup; Rate Limits falls back to claudeCliUsage.status."""
 
     async def _run(self, usage_status, cli_usage, provider="anthropic"):
         emitted = []
@@ -943,12 +894,7 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompactTests(unittest.IsolatedAsyncioTestCase):
-    """The dialog's Compact button fetches back to this same Action with a
-    synthetic mode="compact" marker (see triggerCompact() in
-    _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and
-    the poll-for-completion flow (chat.send + sessions.describe polling,
-    not the Pipe's full event-consumer loop -- see action.py's
-    _run_compact docstring for why)."""
+    """The Compact button's mode="compact": the dispatch and the completion poll."""
 
     COMPACT_BODY = {"mode": "compact", "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
                      "model": "openclaw_gateway.anthropic/claude-sonnet-5"}
@@ -974,7 +920,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
         fake_conn = mock.Mock()
         fake_conn.active_run_id_for_session = mock.Mock(return_value="some-active-run")
-        fake_conn.send_request = mock.AsyncMock()  # must never be called
+        fake_conn.send_request = mock.AsyncMock()
 
         with action_gateway(fake_conn):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
@@ -1000,10 +946,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
                 return {"runId": "compact-run-1"}
             if method == "sessions.describe":
                 describe_calls["n"] += 1
-                # Still running on the first poll, done on the second --
-                # exercises the loop actually looping, not just the
-                # single-iteration happy path. Calls after that (the
-                # _run_status refresh's own sessions.describe) report done.
+                # Running on the first poll, done after, so the loop loops.
                 status = "running" if describe_calls["n"] == 1 else "done"
                 return {"session": {"status": status, "modelProvider": "anthropic",
                                      "model": "claude-sonnet-5"}}
@@ -1033,7 +976,6 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         codes = _emitted_codes(emitted)
         self.assertIn("Compacting", codes[0])
         self.assertIn("openclaw-status-sections", codes[1])  # skeleton reset, not full re-open
-        # The refresh must reach all three sections again, not just Context.
         self.assertTrue(any("getElementById('openclaw-status-section-context')" in c for c in codes))
         self.assertTrue(any("getElementById('openclaw-status-section-limits')" in c for c in codes))
         self.assertTrue(any("getElementById('openclaw-status-section-subagents')" in c for c in codes))
@@ -1043,8 +985,8 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     sent_keys: list
 
     def _reply(self, params, text):
-        """The compact run's turn and reply as `chat.history` shows them
-        (2026.9.3): both carry the chat.send's idempotency key."""
+        """The compact run's turn and reply in `chat.history` (2026.9.3), both
+        with the chat.send's idempotency key."""
         key = self.sent_keys[-1]
         return [{"role": "user", "content": "/compact", "idempotencyKey": f"{key}:user"},
                 {"role": "assistant", "content": [{"type": "text", "text": text}],
@@ -1054,8 +996,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.sent_keys = []
 
     async def test_a_refused_compaction_shows_the_gateways_reason(self):
-        """ELI-209: the /compact run ends "done" whether or not it
-        compacted; a refusal must show in the dialog, not read as done."""
+        """ELI-209: /compact ends "done" even when refused; the dialog shows why."""
         action = Action()
         emitted = []
 
@@ -1098,15 +1039,14 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
             if method == "chat.send":
                 return {"runId": "compact-run-1"}
             if method == "sessions.describe":
-                return {"session": {"status": "running"}}  # never finishes
+                return {"session": {"status": "running"}}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.Mock()
         fake_conn.active_run_id_for_session = mock.Mock(return_value=None)
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        # Simulate 180s+ elapsing without a real wait: each asyncio.sleep
-        # call jumps the fake clock forward past the deadline immediately.
+        # Each asyncio.sleep jumps the fake clock past the 180 s deadline.
         clock = {"t": 0.0}
 
         def fake_time():
@@ -1172,9 +1112,8 @@ class CompactReplyTests(unittest.TestCase):
 
 
 class DrawerRunItemsTests(unittest.TestCase):
-    """The drawer's run (ELI-155): chat.history read the way the chat's own
-    rebuild reads it (`_history_renderer`), as text, user turns and a card
-    per tool call with its result."""
+    """The drawer's run (ELI-155): chat.history read as the chat's rebuild
+    reads it (`_history_renderer`)."""
 
     @staticmethod
     def _tools(items):
@@ -1217,9 +1156,8 @@ class DrawerRunItemsTests(unittest.TestCase):
         self.assertTrue(items[0]["result"].endswith("boom"))
 
     def test_a_result_shows_its_output_not_the_raw_envelope(self):
-        """ELI-125: a tool_result's content can be a list of blocks or the
-        agent-tool envelope {content, details}. A card shows the output, the
-        chat tool cards' rule (ELI-121)."""
+        """ELI-125: a tool_result's content can be a block list or the
+        {content, details} envelope; the card shows the output (ELI-121)."""
         results = {
             "text blocks": ([{"type": "text", "text": "a1b2 Fix the cache"}, {"type": "text", "text": "c3d4 Docs"}],
                             "a1b2 Fix the cache\nc3d4 Docs"),
@@ -1240,9 +1178,8 @@ class DrawerRunItemsTests(unittest.TestCase):
                 self.assertEqual(items[0]["result"], shown)
 
     def test_the_gateways_own_tool_shape(self):
-        """Outside claude-cli imports, chat.history keeps OpenClaw's own shape
-        (seen in the screenshots stack, 2026-10-14): a `toolCall` block in the
-        assistant message and the result as a `toolResult` message."""
+        """Outside claude-cli imports, chat.history keeps OpenClaw's shape: a
+        `toolCall` block and a `toolResult` message."""
         from openclaw_status_action import TOOL_ERROR_MARK
         items = _drawer_run_items([
             {"role": "user", "content": "Price out Fly.io."},
@@ -1261,9 +1198,8 @@ class DrawerRunItemsTests(unittest.TestCase):
         self.assertIn("README.md", tools[0]["args"])
 
     def test_a_running_claude_cli_child_has_no_tool_calls_yet(self):
-        """Measured against the real Gateway (2026-07-30, again 2026-10-16 on
-        2026.9.3): while a claude-cli child runs, chat.history holds only the
-        messages it was sent; its run reaches the transcript when it ends."""
+        """While a claude-cli child runs, chat.history holds only the messages
+        it was sent (measured on 2026.9.3)."""
         items = _drawer_run_items([
             {"role": "user", "content": "[Subagent Context] You are running as a subagent.\n[Subagent Task]\nDo X."},
             {"role": "user", "content": "[Inter-session message] status?"},
@@ -1271,9 +1207,8 @@ class DrawerRunItemsTests(unittest.TestCase):
         self.assertEqual(items, [{"kind": "user", "text": "[Inter-session message] status?"}])
 
     def test_the_drawer_and_the_chat_rebuild_read_the_same_calls(self):
-        """One transcript parser (ELI-147): the drawer's cards are the ones
-        the chat's rebuild makes, in both shapes. A recorded DeepSeek run (the
-        Gateway's own runtime) and a claude-cli run with a failed call."""
+        """One transcript parser (ELI-147): the drawer's cards match the
+        chat's rebuild, in both shapes."""
         from openclaw_status_action import _history_renderer
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "test_fixture_native_history.json")
         with open(path) as f:
@@ -1299,10 +1234,8 @@ async def _subscribe_nothing(_key):
 
 
 async def _open_dialog(opening, conn):
-    """Run a status dialog Action until it returns, or until it holds open
-    to follow listed sub-agents that never change (ELI-127); then stop it,
-    as Open WebUI does when the request goes away. Returns the Action's
-    result, or "following"."""
+    """Run a status Action until it returns or follows unchanging sub-agents
+    (ELI-127), then stop it. Returns its result or "following"."""
     import asyncio
     followed = asyncio.Event()
 
@@ -1363,9 +1296,8 @@ const button = (label) => section().walk().find((e) => e.tagName === 'BUTTON' &&
 
 
 class SubagentFoldTapTests(unittest.TestCase):
-    """A tap on the folded Subagents section asks the Action for its rows. A
-    request that fails (a dropped phone connection, a proxy's error page) says
-    so in the section with a Retry, instead of a skeleton that never ends."""
+    """A failed Subagents fetch says so in the section with a Retry, instead
+    of a skeleton that never ends."""
 
     PENDING = {"tasks": [{"id": "agent:main:subagent:k1", "title": "Child", "status": "completed",
                           "startedAt": 1, "endedAt": 2}],
@@ -1392,11 +1324,8 @@ class SubagentFoldTapTests(unittest.TestCase):
 
 
 class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
-    """The Subagents section's rows fetch back to this same Action with a
-    synthetic mode="subagent-detail" marker (see openSubagentDrawer() in
-    _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and the
-    hold-the-request-open poll loop (same shape as CompactTests exercises
-    for _run_compact, polling the child session)."""
+    """The rows post mode="subagent-detail" back to this Action: the Python
+    dispatch and the poll loop on the child session."""
 
     CHILD = "agent:main:subagent:child-sess-1"
     DETAIL_BODY = {"mode": "subagent-detail", "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
@@ -1420,8 +1349,8 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("taskId", _emitted_codes(emitted)[0])
 
     async def test_one_request_opens_and_fills_the_drawer_once(self):
-        """Opened from here (no `opened`): the drawer, then one fill of its
-        header and run. The page asks again while the child runs (ELI-155)."""
+        """Opened here: the drawer, then one fill. The page asks again while
+        the child runs (ELI-155)."""
         action = Action()
         emitted = []
         emitter = RecordingEmitter(emitted)
@@ -1448,7 +1377,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(get_calls["n"], 1)
         codes = _emitted_codes(emitted)
-        self.assertIn("openDrawer", codes[0])  # initial open
+        self.assertIn("openDrawer", codes[0])
         fills = [c for c in codes if "S.fillDrawer(DATA)" in c]
         self.assertEqual(len(fills), 1)
         self.assertIn('"model": "claude-sonnet-5"', fills[0])
@@ -1461,10 +1390,8 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_the_header_task_on_a_history_that_shows_it_bare(self):
-        """OpenClaw 2026.10.5's chat.history shows the spawn message as the
-        bare task, with nothing marking it as the spawn: the header had no
-        task. sessions.preview still has it as the model got it; the bare
-        message is then the header's, not a turn of the run."""
+        """2026.10.5's chat.history shows the spawn message as the bare task.
+        The task comes from sessions.preview, and that message is not a turn."""
         action = Action()
         emitted = []
         task = "E2E_SLOW:20 E2E_CHILDTASK"
@@ -1497,13 +1424,8 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
-    """A real OWUI toolbar click on an old sub-agent-finished message (written
-    by bridge versions before ELI-100; read-only shim `_SUBAGENT_TASK_ID_MARKER_RE`)
-    is mode-less (OWUI itself never sends "mode") but carries a hidden
-    `<!-- openclaw:taskId=... -->` marker in body["content"]. Deliberately
-    no separate Action/button for this -- the
-    existing default click handler detects the marker and redirects into
-    the same subagent-detail drawer instead of the general status dialog."""
+    """A pre-ELI-100 message's `<!-- openclaw:taskId=... -->` marker
+    (`_SUBAGENT_TASK_ID_MARKER_RE`) opens the subagent-detail drawer."""
 
     async def test_marker_in_content_routes_to_subagent_detail(self):
         action = Action()
@@ -1543,9 +1465,7 @@ class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
         detail_m.assert_not_awaited()
 
     async def test_explicit_mode_still_takes_priority_over_marker_sniffing(self):
-        """A synthetic mode="compact"/"subagent-detail" click (the dialog's
-        own in-page buttons) must never be reinterpreted by content
-        sniffing, even if its body coincidentally carries old marker text."""
+        """A synthetic mode click is never reinterpreted by content sniffing."""
         action = Action()
         body = {"mode": "compact", "chat_id": "chat-1",
                 "content": "<!-- openclaw:taskId=task-1 -->"}
@@ -1557,12 +1477,8 @@ class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-140 (2026-10-15): the footer's "Updated HH:MM:SS" came from the
-    Open WebUI server's clock (`time.strftime`), while the rate-limit resets
-    beside it are formatted in the browser. With the container on UTC and
-    the reader in Asia/Jerusalem, "Updated" was 3 hours off. The dialog's
-    own fill, rendered in the reader's timezone, must show the reader's
-    time."""
+    """ELI-140: "Updated HH:MM:SS" came from the server's clock (UTC) while
+    the resets beside it use the browser's. It must show the reader's time."""
 
     FETCHED = 1792054800  # 2026-10-15 09:00:00 UTC, 12:00:00 in Jerusalem
 
@@ -1605,11 +1521,8 @@ process.stdout.write(JSON.stringify(f ? f.textContent : null));
 
 
 class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-141 (2026-10-15): the Status dialog links to this session in
-    the OpenClaw Control UI, and the sub-agent drawer to the child's. The
-    route is the Control UI's short-id form, `/chat/<agent>/<hex of the key's
-    trailing UUID>`, which its `sessions.resolve {shortId}` maps back to the
-    key (checked on 9.3)."""
+    """ELI-141: Control UI links for the session and child, via
+    `/chat/<agent>/<hex of the key's trailing UUID>`."""
 
     BASE = "https://claw.example.com/"
     CHAT = "56b98d09-f3b7-4e4f-b2bb-688ce63bfa53"

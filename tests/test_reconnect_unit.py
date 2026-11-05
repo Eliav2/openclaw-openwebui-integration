@@ -1,9 +1,5 @@
-"""ELI-176: a turn that needs the Gateway connection while the event loop
-waits out a reconnect backoff takes the loop's attempt, made at once, instead
-of connecting a socket of its own that nothing reads.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_reconnect_unit.py
-"""
+"""ELI-176: a turn during a reconnect backoff takes the loop's attempt at once
+rather than opening a socket nothing reads."""
 import asyncio
 import types
 import unittest
@@ -48,7 +44,7 @@ class ReconnectHandoffTests(_Reconnecting, unittest.IsolatedAsyncioTestCase):
 
     async def test_a_turn_during_a_backoff_takes_the_loops_attempt_at_once(self):
         await self._backing_off()
-        await asyncio.wait_for(self.conn.ensure_connected(), 2)   # bounds the test only
+        await asyncio.wait_for(self.conn.ensure_connected(), 2)
         self.assertEqual(self.connects, [self.conn._event_loop_task], "one connect, by the loop")
         self.assertIsNotNone(self.conn._ws)
 
@@ -83,9 +79,8 @@ def refused():
 
 
 class GatewayDownTests(_Reconnecting, unittest.IsolatedAsyncioTestCase):
-    """A Gateway that is down or restarting refuses the connection until its
-    new process listens. A turn that finds the socket reconnecting waits
-    through those refusals instead of answering with one."""
+    """A turn that finds the socket reconnecting waits through refusals from a
+    restarting Gateway instead of failing on one."""
 
     def setUp(self):
         super().setUp()

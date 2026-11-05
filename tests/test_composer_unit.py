@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for the composer Status button (src/openclaw_pipe_pkg/composer.py).
-
-Covers both built artifacts that carry it: the Pipe (turn-start delivery and
-the composer watcher) and the Status Action (delivery on every run), plus a
-syntax and idempotence check of the JS snippet under node when node exists.
-
-Same dependency-stubbing pattern as test_pipe_unit.py, so this runs without a
-real OWUI/websockets/cryptography environment.
-"""
+"""Unit tests for the composer Status button (src/openclaw_pipe_pkg/composer.py)
+in the Pipe and the Status Action."""
 
 import asyncio
 import copy
@@ -69,8 +62,7 @@ def _history(*rows, current=None):
 
 
 def _rows(history, reads=None):
-    """`message(id)` for `_composer_chat_head`: the (role, parent_id, model_id)
-    of a `chat_message` row, read one at a time."""
+    """`message(id)` for `_composer_chat_head`: a row's (role, parent_id, model_id)."""
     async def message(mid):
         if reads is not None:
             reads.append(mid)
@@ -133,11 +125,8 @@ class SnippetRenderTests(unittest.TestCase):
 
 
 class StatusLabelWidthTests(unittest.TestCase):
-    """ELI-123: at phone width (390 px) the composer row has no room for the
-    "Status" text next to the model selector, so the chip row's overflow cut
-    it to "Statı". Below `sm` the button is icon-only, like Open WebUI's own
-    composer chips, and keeps its accessible name; from `sm` up the label
-    shows. Both classes exist in Open WebUI 0.12's shipped CSS."""
+    """ELI-123: at 390 px the "Status" label was cut off. Below `sm` the button
+    is icon-only with its accessible name."""
 
     def test_label_is_hidden_below_sm_and_the_button_keeps_its_name(self):
         code = _render_composer_button_js()
@@ -145,10 +134,7 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn("b.setAttribute('aria-label', 'OpenClaw status');", code)
 
     def test_a_button_cut_off_by_the_chip_row_moves_to_the_left_group(self):
-        """Open WebUI 0.13's Model controls button leaves a 375 px chip row too
-        narrow for the Thinking chip and the button: the button moves after
-        Integrations (the left group, which never scrolls) up to that width,
-        and back to the chip row once the window is wider."""
+        """With 0.13's Model controls, a 375 px chip row is too narrow: move after Integrations."""
         code = _render_composer_button_js()
         self.assertIn("if (state.narrowAt && window.innerWidth <= state.narrowAt) return leftSlot(c);", code)
         self.assertIn("state.narrowAt = window.innerWidth;", code)
@@ -156,10 +142,8 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn("window.removeEventListener('resize', onResize);", code)
 
     def test_a_cut_off_button_moves_at_once_and_a_narrower_chip_row_is_checked_again(self):
-        """The move happens in the same task as the check, not on the next
-        debounced ensure(), so a clipped button is never left on screen; and a
-        ResizeObserver on the chip row catches it narrowing without a childList
-        change (the model's name filling in)."""
+        """The move happens in the same task as the check, and a ResizeObserver
+        catches the chip row narrowing without a childList change."""
         code = _render_composer_button_js()
         fits = code[code.index("function checkFits(btn)"):code.index("function onResize()")]
         self.assertIn("if (s) s.parent.appendChild(btn);", fits)
@@ -168,9 +152,7 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn("if (state.resizeObserver) state.resizeObserver.disconnect();", code)
 
     def test_a_resize_checks_the_fit_and_its_moves_do_not_count_as_a_fight(self):
-        """Narrowing a window where the button fitted checks it again; widening
-        past where it stopped fitting clears the insert count, so dragging the
-        width does not reach LOOP_LIMIT and remove the button until reload."""
+        """Dragging the width back and forth must not reach LOOP_LIMIT and remove the button."""
         code = _render_composer_button_js()
         on = code[code.index("function onResize()"):code.index("function removeAll()")]
         self.assertIn("if (state.narrowAt && window.innerWidth > state.narrowAt) {", on)
@@ -181,13 +163,10 @@ class StatusLabelWidthTests(unittest.TestCase):
 
 
 class ClawNameTests(unittest.TestCase):
-    """ELI-202: the composer chip, its tooltip and the dialog read "Claw", and
-    the chip and the toolbar button show the same icon. ELI-231: that icon is a
-    crab claw, not ELI-202's paw. The names the page scripts find the buttons by
-    stay: the composer chip's aria-label and the Action's title, which Open
-    WebUI makes the toolbar button's aria-label."""
+    """ELI-202: chip, tooltip and dialog read "Claw" with one icon; ELI-231
+    made it a crab claw. The aria-labels page scripts find buttons by stay."""
 
-    # ELI-202's paw: four toe pads (elliptical arcs) over a pad
+    # ELI-202's paw: four toe pads over a pad
     PAW_TOE = "M11 6a1.5 2 0 1 1-3 0"
 
     def test_the_buttons_and_the_dialog_say_claw_with_a_crab_claw(self):
@@ -235,9 +214,7 @@ class EmitHelperTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatHeadTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-115: the watcher reads a chat's head, never the chat. Open WebUI
-    builds the whole chat in Python, about 14x its JSON, for every read of it,
-    and a tab's every join or reconnect made one."""
+    """ELI-115: the watcher reads a chat's head, never the whole chat (~14x its JSON)."""
 
     async def head(self, history, reads=None):
         return await _composer_chat_head("alice", history["currentId"], _rows(history, reads))
@@ -362,8 +339,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         return _config_of(events[-1]["data"]["code"])
 
     async def test_vouches_only_for_openclaw_chats(self):
-        # The Action is global: its spark also shows under other models'
-        # replies, and a dotted id like llama3.2 must not become a prefix.
+        # The Action is global: a dotted id like llama3.2 must not become a prefix.
         cfg = await self._status_cfg("openclaw_gateway.default")
         self.assertEqual(cfg["chatId"], "c1")
         cfg = await self._status_cfg("llama3.2:1b")
@@ -417,7 +393,6 @@ class _TestWatcher(_ComposerWatcher):
         self.pool = pool
         self.chats = chats
         self.sent = []
-        # Per-call ack results; the tab acks by default.
         self.acks = list(acks or [])
 
     def _session_pool_batches(self):
@@ -449,7 +424,7 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         w = _TestWatcher(pool, self.chats)
         self.assertEqual(await w.tick(now=100.0), 0)  # first sighting: settle
         self.assertEqual(await w.tick(now=102.0), 1)
-        self.assertEqual(await w.tick(now=104.0), 0)  # handled already
+        self.assertEqual(await w.tick(now=104.0), 0)
         self.assertEqual(len(w.sent), 1)
         sid, payload = w.sent[0]
         self.assertEqual(sid, "sidA")
@@ -468,10 +443,7 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(openclaw_pipe._COMPOSER_WATCH_INTERVAL_S * 2, 1.0)
 
     async def test_the_push_installs_the_stop_send_now_intent_hook(self):
-        """ELI-100 case 8, live gate 2026-10-13: a tab that opens a chat after
-        its agent turn started never got the intent hook (the writer installs
-        it only when it opens M), so Stop on an agent turn read as "unknown"
-        and did not abort it. Every tab that opens an OpenClaw chat gets it."""
+        """ELI-100 case 8: every OpenClaw chat tab gets the intent hook, so Stop aborts."""
         pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
         w = _TestWatcher(pool, self.chats)
         await w.tick(now=100.0)
@@ -486,7 +458,7 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     async def test_no_ack_retries_then_gives_up(self):
-        # The tab drops the event (no ack) while it has not loaded the chat yet.
+        # No ack while the tab has not loaded the chat.
         pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
         w = _TestWatcher(pool, self.chats, acks=[False, False, False, False])
         await w.tick(now=0.0)
@@ -551,8 +523,7 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(w.sent, [])
 
     async def test_a_tab_that_acks_the_push_is_ready_for_an_ask_user_card(self):
-        """The ack says the tab shows the chat, so an ask_user card waiting
-        for a tab can go there (ELI-216); leaving the chat takes it back."""
+        """The ack says the tab shows the chat, so an ask_user card can go there (ELI-216)."""
         openclaw_pipe._READY_CHAT_TABS.clear()
         self.addCleanup(openclaw_pipe._READY_CHAT_TABS.clear)
         pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
@@ -658,9 +629,7 @@ class EnsureWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stale.cancelled())
 
     async def test_a_second_pipe_copy_keeps_the_first_copys_watcher(self):
-        # Each copy of the Pipe is its own OWUI function, loaded as its own
-        # module with its own watcher: starting one must cancel only an
-        # earlier load of the same function, never the other copy's watcher.
+        # Each Pipe copy has its own watcher; a start cancels only its own earlier load.
         fake_owui(self, SESSION_POOL={})
         with mock.patch.object(openclaw_pipe, "_composer_own_function_id",
                                return_value="openclaw_gateway"):
@@ -681,12 +650,8 @@ class EnsureWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_ensure_composer_watcher(lambda: valves))
 
 
-# Runs the snippet the way OWUI 0.12's Chat.svelte does
-# (`new Function('return (async () => { ' + code + ' })()')`) against a minimal
-# fake DOM with no composer in it. The real DOM placement is validated live
-# (see the PR); this proves the snippet parses inside that wrapper, installs
-# one observer, treats a repeat delivery as a config refresh, never throws
-# without a composer, and fetches a chat at most once.
+# Runs the snippet as OWUI 0.12's Chat.svelte does (`new Function(...)`) on a
+# fake DOM with no composer.
 _NODE_HARNESS = r"""
 const code = require('fs').readFileSync(process.argv[2], 'utf8');
 const chatModels = JSON.parse(process.argv[3]);
@@ -741,8 +706,7 @@ async function run(c) { return new Function('return (async () => { ' + c + ' })(
 """
 
 
-# A composer with the slot the button goes in and a button already on
-# screen, of `input.version`: what `ensure()` leaves there.
+# A composer with the button's slot and a button of `input.version` in it.
 _NODE_SLOT_HARNESS = r"""
 const code = require('fs').readFileSync(process.argv[2], 'utf8');
 const oldVersion = process.argv[3];
@@ -795,9 +759,8 @@ globalThis.fetch = function () { return Promise.reject(new Error('no fetch expec
 """
 
 
-# The composer row with boxes: [left group with Integrations] [chip row > chip
-# group]. ResizeObserver records its callback, so a test can narrow the chip
-# row and fire it the way the browser would.
+# The composer row: [left group with Integrations] [chip row > chip group].
+# ResizeObserver records its callback so a test can fire it.
 _NODE_FIT_HARNESS = r"""
 const code = require('fs').readFileSync(process.argv[2], 'utf8');
 globalThis.window = globalThis;
@@ -900,8 +863,7 @@ class SnippetUnderNodeTests(unittest.TestCase):
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
     def test_a_button_of_an_older_version_is_replaced(self):
-        # A page that already shows an older button (the clipped label of
-        # ELI-123) gets the new one, once.
+        # An older button (the clipped label of ELI-123) is replaced, once.
         self.assertEqual(self._slot("2"), {"oldKept": False, "versions": [_COMPOSER_BUTTON_VERSION]})
 
     def test_a_chip_row_that_narrows_without_a_dom_change_moves_the_button_left(self):
@@ -939,8 +901,7 @@ class SnippetUnderNodeTests(unittest.TestCase):
 
 
 class ChatModelDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    """Each delivery that vouches for a chat also names the chat's model, so a
-    click builds the Action's body without downloading the chat."""
+    """Each delivery names the chat's model, so a click needs no chat download."""
 
     def test_rendered_with_the_vouch_only(self):
         cfg = _config_of(_render_composer_button_js(chat_id="c9", chat_model="openclaw_gateway.x"))
@@ -970,9 +931,8 @@ class ChatModelDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg["chatModel"], "openclaw_gateway.default")
 
 
-# A chat page with one user and one assistant message, the composer button and
-# the assistant's toolbar "OpenClaw Status" button. Clicks each and records the
-# requests the page made and whether Open WebUI's own handler still ran.
+# A chat page with the composer button and the toolbar "OpenClaw Status"
+# button. Records each click's requests and whether Open WebUI's handler ran.
 _NODE_CLICK_HARNESS = r"""
 const code = require('fs').readFileSync(process.argv[2], 'utf8');
 const which = process.argv[3];
@@ -1055,9 +1015,7 @@ function click(target) {
 
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class ClickWithoutTheChatTests(unittest.TestCase):
-    """Opening the dialog sends a small body whatever the chat's size: no
-    download of the chat (composer button), no upload of its messages and no
-    whole-chat save after (Open WebUI's toolbar handler)."""
+    """Opening the dialog sends a small body: no chat download, upload or save."""
 
     def _click(self, which, avatar_model="", **cfg):
         paths = []
@@ -1089,8 +1047,7 @@ class ClickWithoutTheChatTests(unittest.TestCase):
         }])
 
     def test_the_toolbar_takes_the_model_from_the_messages_own_avatar(self):
-        """A chat the page script was not delivered for yet (a chat switched
-        to in a tab that has the script): the message shows its model."""
+        """A chat the script was not delivered for yet: the message shows its model."""
         out = self._click("toolbar", avatar_model="openclaw_gateway.default", session_id="sock1")
         self.assertEqual(out["owuiHandled"], 0)
         self.assertEqual(out["requests"][0]["body"]["model"], "openclaw_gateway.default")

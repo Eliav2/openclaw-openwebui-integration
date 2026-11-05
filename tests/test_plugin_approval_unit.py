@@ -1,11 +1,5 @@
-"""A plugin approval (a tool call a plugin's `before_tool_call` hook holds
-with `requireApproval`) is asked in Open WebUI's question card, and the pick
-goes to `plugin.approval.resolve`. The Gateway offers the request only to a
-connection that declares the "plugin-approvals" cap; without one the tool call
-failed at once with "Plugin approval unavailable (no approval route)".
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_plugin_approval_unit.py
-"""
+"""A plugin approval (`requireApproval`) is asked in the question card and goes to
+`plugin.approval.resolve`, on a "plugin-approvals" cap connection."""
 import asyncio
 import types
 import unittest
@@ -52,8 +46,8 @@ class ApprovalConn(FakeConn):
         return types.SimpleNamespace(AGENT_ID=self.agent_id)
 
     def parse_owui_session_key(self, key):
-        """KEY is the fixture chat of this Pipe copy's agent; any other key
-        goes through the real parser, which matches on AGENT_ID."""
+        """KEY is this Pipe copy's fixture chat; other keys use the real
+        parser (matches on AGENT_ID)."""
         if key == KEY:
             return ("user-1", "chat-1") if self.agent_id == "main" else None
         return ocp._GatewayConnection.parse_owui_session_key(self, key)
@@ -81,8 +75,7 @@ class ConnectCapsTests(unittest.TestCase):
         return module._GatewayConnection._connect_caps(conn)
 
     def test_the_pipes_connection_says_it_shows_plugin_approvals(self):
-        """canDeliverApprovals (server-request-context-*.mjs): operator.admin
-        and the "plugin-approvals" cap make a client an approval route."""
+        """canDeliverApprovals: operator.admin plus the "plugin-approvals" cap."""
         self.assertIn("plugin-approvals", self.caps(ocp))
         self.assertIn("tool-events", self.caps(ocp))
 
@@ -90,8 +83,7 @@ class ConnectCapsTests(unittest.TestCase):
         self.assertEqual(self.caps(ocp, scopes=ocp.RESTRICTED_SCOPES), ["tool-events"])
 
     def test_a_connection_that_writes_no_turns_does_not(self):
-        """The Status Action's connection asks nothing: as an approval route
-        it would only make an approval wait out its timeout."""
+        """The Status Action asks nothing; as a route it would only time out."""
         self.assertEqual(self.caps(ocp, writes_turns=False), ["tool-events"])
         self.assertEqual(self.caps(oca), ["tool-events"])
 
@@ -117,7 +109,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def finished(self, aid="plugin:1"):
         task = approvals().get(aid)
         if task is not None:
-            await asyncio.wait_for(task, 2)   # bounds the test only
+            await asyncio.wait_for(task, 2)
 
     async def test_the_card_names_the_action_and_allow_once_resolves_it(self):
         conn, tabs = ApprovalConn(), Tabs(self)
@@ -160,8 +152,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.sent, [("plugin.approval.resolve", {"id": "plugin:1", "decision": "deny"})])
 
     async def test_resolved_elsewhere_takes_the_card_away_and_sends_nothing(self):
-        """Answered in the Control UI, expired, or cancelled by Stop: the
-        Gateway broadcasts `plugin.approval.resolved`."""
+        """Answered elsewhere, expired or cancelled by Stop: `plugin.approval.resolved`."""
         conn, tabs = ApprovalConn(), Tabs(self)
         tabs.open("sid-own")
         self.ask(conn, turn=FakeTurn())
@@ -185,8 +176,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         approvals()["plugin:1"].cancel()
 
     async def test_an_answer_too_late_for_an_expired_approval_is_harmless(self):
-        """The Gateway has dropped the approval: resolve fails, and the Pipe
-        logs it and goes on."""
+        """A dropped approval: resolve fails, the Pipe logs it and goes on."""
         conn, tabs = ApprovalConn(), Tabs(self)
 
         async def expired(method, params, timeout=10):
@@ -197,7 +187,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         await tabs.card_on("sid-own")
         task = approvals()["plugin:1"]
         tabs.answer("sid-own", picked("Allow once"))
-        await asyncio.wait_for(task, 2)     # no exception out of the task
+        await asyncio.wait_for(task, 2)
         self.assertIsNone(task.exception())
         self.assertEqual(approvals(), {})
 
@@ -210,9 +200,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.sent, [("plugin.approval.resolve", {"id": "plugin:1", "decision": "deny"})])
 
     async def test_only_this_pipe_copys_sessions_are_ever_touched(self):
-        """A second Pipe copy (another AGENT_ID) sees the same broadcast. It
-        resolves and denies nothing for this agent's sessions, and this one
-        nothing for its: no card, no resolve, no note."""
+        """Two Pipe copies (AGENT_IDs) each act only on their own sessions."""
         mine = f"agent:main:openwebui-{U}-{C}"
         theirs = f"agent:other:openwebui-{U}-{C}"
         for conn_agent, key in (

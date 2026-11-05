@@ -1,11 +1,5 @@
-"""Open WebUI's multi-model chat (ELI-329): one message sent to several models
-makes Open WebUI call the Pipe once per model, at the same time, for the same
-chat and the same user message. Each Pipe model's reply runs in its own
-OpenClaw session, so the replies do not queue behind one another, do not
-overwrite each other's model, and do not take each other for a Regenerate.
-
-Run: python3 -m pytest -q tests/test_multi_model_unit.py
-"""
+"""Open WebUI's multi-model chat (ELI-329): each model's reply runs in its own
+session, so replies do not queue, mix models, or look like a Regenerate."""
 import asyncio
 import tempfile
 import unittest
@@ -32,8 +26,8 @@ def _key(column=0):
 
 
 class MultiModelBase(unittest.IsolatedAsyncioTestCase):
-    """The Pipe's real request path against a fake Gateway that records every
-    `sessions.patch` and `chat.send`, with the chat's rows in `self.tree`."""
+    """The Pipe's request path on a fake Gateway recording `sessions.patch` and
+    `chat.send`; the chat's rows are in `self.tree`."""
 
     async def asyncSetUp(self):
         self.conn = _GatewayConnection(lambda: None)
@@ -77,8 +71,7 @@ class MultiModelBase(unittest.IsolatedAsyncioTestCase):
         self.tree[reply_id] = (role, parent, text, model)
 
     async def call(self, model, models, user, reply, text, parent=None, extra_meta=None):
-        """One Open WebUI call to the Pipe, answered with 'ok from <reply>'.
-        Returns once the reply finished."""
+        """One Pipe call, answered 'ok from <reply>'; returns when it ends."""
         body = {"model": model, "messages": [{"role": "user", "content": text}]}
         meta = {"chat_id": CHAT, "user_id": USER, "message_id": reply, "user_message_id": user,
                 "user_message": {"id": user, "parentId": parent, "models": models}, **(extra_meta or {})}
@@ -128,8 +121,7 @@ class PipeAndPipeModelsTests(MultiModelBase):
             (_key(0), "anthropic/claude-haiku-5-5"), (_key(1), "anthropic/claude-opus-5-5")]))
 
     async def test_both_models_are_sent_before_either_reply_ends(self):
-        """The replies run side by side: the second model's message reaches the
-        Gateway while the first is still running, not after it ends."""
+        """The second model's message reaches the Gateway while the first runs."""
         self.message("u1", "user", None, "pick one")
         models = [HAIKU, OPUS]
         bodies = {HAIKU: "a1", OPUS: "b1"}
@@ -148,7 +140,6 @@ class PipeAndPipeModelsTests(MultiModelBase):
             if len(self.sends) == 2:
                 break
             await asyncio.sleep(0.005)
-        # Neither reply has ended, and both messages are already at the Gateway.
         self.assertEqual(len(self.sends), 2, "the second model waited for the first to end")
         self.assertEqual({s["session"] for s in self.sends}, {_key(0), _key(1)})
         for _, first in gens:

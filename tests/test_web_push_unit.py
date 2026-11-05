@@ -1,9 +1,5 @@
-"""The Web Push event function (push/openclaw_web_push.py).
-
-What it sends (title and link, never the reply), which events it sends for
-(an OpenClaw model's only from the Pipe), and a real encrypted send to a
-local push service, in its own interpreter (tests/web_push_roundtrip.py).
-"""
+"""The Web Push function (push/openclaw_web_push.py): title and link only, OpenClaw
+events only from the Pipe, and a real encrypted send (tests/web_push_roundtrip.py)."""
 import importlib.util
 import json
 import os
@@ -33,8 +29,7 @@ def finished(source="openclaw-pipe", model="openclaw_gateway.main", **data):
 
 class PayloadTests(unittest.TestCase):
     def test_the_payload_never_contains_the_reply(self):
-        """Open WebUI 0.13.0's and the Pipe's chat.finished carry the whole
-        reply in data.message; the device gets the title and link only."""
+        """chat.finished carries the whole reply; the device gets only title and link."""
         body = web_push.encode_payload(web_push.build_payload(finished()))
         self.assertNotIn("SECRET-REPLY-TEXT", body)
         self.assertEqual(json.loads(body), {"v": 2, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
@@ -64,8 +59,7 @@ class WhichEventsTests(unittest.TestCase):
         self.assertTrue(web_push.should_send(finished(), PIPE))
 
     def test_open_webuis_chat_finished_for_an_openclaw_model_is_skipped(self):
-        """It fires when the request ends, which for a handed-over reply is
-        before the reply does; the Pipe publishes that reply itself."""
+        """For a handed-over reply the request ends first; the Pipe publishes that reply itself."""
         self.assertFalse(web_push.should_send(finished(source="api"), PIPE))
 
     def test_open_webuis_chat_finished_for_another_model_is_sent(self):

@@ -1,9 +1,5 @@
-"""Owner users (OWNER_USERS valve): a user not on the list reaches the Gateway
-over a second connection without operator.admin, so the Gateway does not
-treat that user's turns as the owner's and withholds owner-only tools.
-
-Run: python3 -m pytest -q tests/test_owner_users_unit.py
-"""
+"""OWNER_USERS: other users reach the Gateway over a connection without
+operator.admin, so their turns are not the owner's."""
 import ast
 import asyncio
 import hashlib
@@ -23,8 +19,7 @@ from openclaw_pipe import Pipe, GATEWAY_SCOPES, _sign_challenge
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESTRICTED = ["operator.read", "operator.write"]
-# Every request that starts, steers or ends a run. Sent on the admin
-# connection, such a request makes the turn the owner's.
+# Requests that start, steer or end a run: on admin they make the turn the owner's.
 RUN_METHODS = {"chat.send", "chat.abort", "sessions.patch"}
 
 
@@ -49,8 +44,7 @@ class OwnerUsersValveTests(unittest.TestCase):
 
 
 class SignedScopesTests(unittest.TestCase):
-    """The Gateway checks the scope list inside the signed device payload, so
-    a connection must sign exactly the scopes it requests."""
+    """A connection signs exactly the scopes it requests."""
 
     IDENT = {"id": "dev-1", "publicKey": "pub", "privateKey": "pem"}
 
@@ -77,9 +71,7 @@ class SignedScopesTests(unittest.TestCase):
 
 
 class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
-    """A run request sent on the admin connection for a non-owner chat would
-    make that turn the owner's. Every such request goes through
-    `_run_request`, which picks the connection; none is sent anywhere else."""
+    """Every run request goes through `_run_request`, which picks the connection."""
 
     RUN_NAMES = {"RUN_SEND", "RUN_ABORT", "RUN_PATCH"}
 
@@ -102,8 +94,7 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
         self.assertEqual(len(defined), 3)
 
     def test_run_constants_are_only_passed_to_the_router(self):
-        """Every use of RUN_SEND/RUN_ABORT/RUN_PATCH is an argument of a
-        `_run_request(...)` call (or the router's own comparison)."""
+        """Every RUN_SEND/RUN_ABORT/RUN_PATCH use is a `_run_request(...)` argument."""
         offenders = []
         for name, tree in self._trees():
             ok = set()
@@ -119,9 +110,7 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
         self.assertEqual(offenders, [], "run requests that bypass _run_request")
 
     def test_every_run_request_call_site_is_routed(self):
-        """The places that start, steer or end a run: the 11 in PHASE-B-PLAN.md
-        the writer's question-card answer (#21), and a channel thread's
-        follow-up turn."""
+        """The 11 call sites in PHASE-B-PLAN.md, the card answer (#21), channel follow-ups."""
         calls = [f"{name}:{n.lineno}" for name, tree in self._trees() for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_run_request"]
         self.assertEqual(len(calls), 13, calls)
@@ -129,9 +118,7 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
 
 
 # ── What reaches the Gateway, byte for byte ─────────────────────────────────
-# One harness for the code before and after OWNER_USERS: a fixed identity, a
-# signer that hashes the payload, a socket that records every frame. The
-# frames recorded on f7faa5f are `test_fixture_owner_users_empty_valve.json`
+# Frames from f7faa5f: `test_fixture_owner_users_empty_valve.json`
 # (`python3 -c "import test_owner_users_unit as t; t.print_frames()"` there).
 
 FIXED_IDENT = {"id": "dev-fixed", "publicKey": "pub-fixed", "privateKey": "pem-fixed"}
@@ -162,8 +149,7 @@ class _FakeWS:
 
 
 def capture_frames(make_conn, send, owner_users=""):
-    """[(label, frame)] of a connect, a chat.send, a sessions.patch and an
-    abort, with `send(conn, method, params)` doing the sending."""
+    """[(label, frame)] of a connect, chat.send, sessions.patch and abort."""
     async def run():
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "identity.json"), "w") as fh:
@@ -190,8 +176,7 @@ def capture_frames(make_conn, send, owner_users=""):
 
 
 def print_frames(path="test_fixture_owner_users_empty_valve.json"):
-    """Run on the code before OWNER_USERS to record the fixture (the pipe logs
-    to stdout, so the frames go to a file)."""
+    """Records the fixture on the pre-OWNER_USERS code (to a file)."""
     frames = capture_frames(openclaw_pipe._GatewayConnection,
                             lambda conn, m, p: conn.send_request(m, p))
     with open(path, "w") as fh:
@@ -269,8 +254,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.restricted.send_request.assert_awaited_once()
 
     async def test_a_guest_resume_abort_and_patch_are_restricted(self):
-        """The writer's resume (`writer.py`), Stop and the model override
-        carry the chat's session key; a guest chat's never leave on main."""
+        """Resume, Stop and the model override never send a guest chat's key on main."""
         c = self.conn(self.OWNER)
         k = self.key(self.GUEST)
         await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND,
@@ -281,10 +265,8 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.restricted.send_request.await_count, 3)
 
     async def test_a_guest_send_leaves_out_the_admin_only_fields(self):
-        """The Gateway refuses a chat.send carrying system provenance or
-        originating route fields from a connection without operator.admin
-        ("system provenance fields require admin scope"). An owner's send keeps
-        them as they are; a guest's goes without them."""
+        """Without operator.admin the Gateway refuses provenance and route fields
+        ("system provenance fields require admin scope"): a guest's send drops them."""
         k_owner, k_guest = self.key(self.OWNER), self.key(self.GUEST)
         c = self.conn(self.OWNER)
         owner_params = openclaw_pipe._owui_chat_send_params(k_owner, "hi", "i1", "chat-1", self.OWNER)
@@ -302,10 +284,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("systemProvenanceReceipt", guest_params)  # caller's dict untouched
 
     async def test_a_guest_send_carries_the_metadata_block_in_its_text(self):
-        """The Gateway hands the agent `receipt + "\\n\\n" + message`
-        (chat-send-handler, messageForAgent). A guest's send puts the same
-        block in the message text the same way, so the agent sees the same
-        prompt; it stays labelled untrusted, and names the guest."""
+        """A guest's send prepends the receipt block (messageForAgent), naming the guest."""
         k = self.key(self.GUEST)
         c = self.conn(self.OWNER)
         params = openclaw_pipe._owui_chat_send_params(k, "hi there", "i2", "chat-2", self.GUEST)
@@ -318,8 +297,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block, {"chat_id": "chat-2", "source": "openwebui", "user_id": self.GUEST})
 
     async def test_a_guest_command_is_sent_as_typed(self):
-        """The Gateway reads a command from the raw message; a block in front
-        of "/stop" would turn it into a prompt."""
+        """A block in front of "/stop" would turn the command into a prompt."""
         k = self.key(self.GUEST)
         c = self.conn(self.OWNER)
         params = openclaw_pipe._owui_chat_send_params(k, "/stop", "i3", "chat-2", self.GUEST)
@@ -329,8 +307,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("systemProvenanceReceipt", sent)
 
     async def test_a_guest_send_without_a_block_is_unchanged(self):
-        """A send the pipe makes without chat metadata (a resume, the title)
-        gets none added."""
+        """A send without chat metadata (resume, title) gets none added."""
         k = self.key(self.GUEST)
         c = self.conn(self.OWNER)
         params = {"sessionKey": k, "message": "continue", "idempotencyKey": "msg-x-resume"}
@@ -344,16 +321,14 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.restricted.send_request.assert_awaited_once()
 
     async def test_an_explicit_owner_flag_decides(self):
-        """The title run's session is not the chat's; the caller passes the
-        chat's owner status."""
+        """The title run's session is not the chat's; the caller passes owner status."""
         c = self.conn(self.OWNER)
         await self.send(c, "agent:title-gen:title-gen-abc", owner=False)
         await self.send(c, "agent:title-gen:title-gen-abc", owner=True)
         self.assertEqual((c.send_request.await_count, self.restricted.send_request.await_count), (1, 1))
 
     async def test_the_status_actions_connection_reads_the_pipes_valves(self):
-        """The Status Action's own connection has no OWNER_USERS valve: the
-        Pipe function's saved valves decide, and an unreadable one fails closed."""
+        """The Action uses the Pipe's saved valves; unreadable fails closed."""
         c = self.conn(None)
         c._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
         fns = types.SimpleNamespace(
@@ -373,10 +348,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuestQuestionCardAnswerTests(test_pipe_unit.WriterQuestionCardTests):
-    """The writer's question card (ELI-107 option 1, #21) sends the user's
-    answer as a new run of the reply. For a chat whose user is not on
-    OWNER_USERS that run goes over the restricted connection, as the guest's
-    own message does; on the admin connection it would be the owner's turn."""
+    """A guest's card answer (ELI-107 option 1, #21) runs on the restricted connection."""
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -414,11 +386,8 @@ for _name in [n for n in dir(test_pipe_unit.WriterQuestionCardTests)
 
 
 class GuestAnswerFromTheTranscriptTests(test_pipe_unit.HandoverRewriteTests):
-    """A guest's turns are stored behind the conversation metadata block
-    (`_non_owner_send_params`), the answer to a question included. After an
-    Open WebUI restart, and in the ELI-94 reconcile (`_transcript_view`), the
-    writer rebuilds an answered question's card from that stored answer; the
-    card shows what the user answered, not the block."""
+    """A guest's rebuilt answer card (after a restart, or ELI-94's `_transcript_view`)
+    shows the answer, not the metadata block."""
 
     BLOCK = ('Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "c", '
              '"source": "openwebui",\n  "user_id": "u"\n}\n```\n\n')

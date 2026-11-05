@@ -1,10 +1,5 @@
-"""What the agent remembers vs what the chat shows (ELI-183): Edit,
-Regenerate, a branch switch and deleted messages each put a short note before
-the message; a cloned chat's first message carries the copied messages once;
-a normal send carries nothing.
-
-Run: python3 -m pytest -q tests/test_history_unit.py
-"""
+"""What the agent remembers vs what the chat shows (ELI-183): Edit, Regenerate,
+branch switches and deletes add a note; a clone carries its copy once."""
 import asyncio
 import copy
 import tempfile
@@ -21,8 +16,7 @@ import openclaw_pipe as ocp  # noqa: E402
 from openclaw_pipe import Pipe, _GatewayConnection  # noqa: E402
 
 
-# Looked up when called, so on a build without the feature each test fails on
-# its own instead of the whole file failing to import.
+# Looked up when called, so a build without the feature fails per test.
 def _history_change(*a, **k):
     return ocp._history_change(*a, **k)
 
@@ -128,8 +122,7 @@ class HistoryChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(change["tail"], ["u1", "a1", "u2b", "a2b", "u3", "a3"])
 
     async def test_messages_the_agent_added_itself_change_nothing(self):
-        # A cron wake's reply under the last answer: the chat gained a message,
-        # the agent lost none.
+        # A cron wake's reply: the chat gained a message, the agent lost none.
         tree = _chain("u1", "a1")
         tree["wake"] = ("assistant", "a1", "a reply the agent started")
         tree["u2"] = ("user", "wake", "thanks")
@@ -282,9 +275,8 @@ class HistoryPrefixTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HistoryLineFilesTests(unittest.IsolatedAsyncioTestCase):
-    """STATE_DIR/history-line/ holds one small file per chat: a line is at
-    most HISTORY_TAIL_MAX ids, a copy's messages stay only until the next
-    send, and lines not sent to for HISTORY_LINE_KEEP_S are dropped."""
+    """STATE_DIR/history-line/ holds one small file per chat, capped at
+    HISTORY_TAIL_MAX ids and dropped after HISTORY_LINE_KEEP_S unused."""
 
     def test_old_lines_are_dropped_with_their_locks_and_recent_ones_kept(self):
         import os
@@ -295,7 +287,7 @@ class HistoryLineFilesTests(unittest.IsolatedAsyncioTestCase):
             open(p, "w").close()
         long_ago = time.time() - ocp.HISTORY_LINE_KEEP_S - 60
         os.utime(old, (long_ago, long_ago))
-        # A lock file is created once and never written: its age is no signal.
+        # A lock file is never written, so its age is no signal.
         os.utime(new + ".lock", (long_ago, long_ago))
         ocp._history_line_prune(folder, time.time() - ocp.HISTORY_LINE_KEEP_S)
         self.assertEqual(sorted(os.listdir(folder)), ["new.json", "new.json.lock"])

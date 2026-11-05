@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""The README and docs/ stay true to the repo: every relative link and anchor
-resolves, every image exists and fits its budget, the versions they state are
-the ones CI pins, and the wording rules hold (no em dash, no internal terms)."""
+"""The README and docs/ stay true to the repo: links, anchors, images and budgets,
+CI-pinned versions, and wording rules (no em dash, no internal terms)."""
 
 import re
 import unittest
@@ -29,8 +28,8 @@ HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.M)
 
 MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
 IMG_TAG = re.compile(r'<img\b(?:[^>"]|"[^"]*")*>')
-# A README feature tile: a demo GIF in a <picture>, its still poster the <img>, in a table cell
-# that sets the width, so the <img> fills the cell (width="100%").
+# A README feature tile: a demo GIF in a <picture> with a poster <img> that fills
+# its table cell (width="100%").
 PICTURE = re.compile(r"<picture>(.*?)</picture>", re.S)
 PHONE_WIDTH = 320      # a phone shot, as the README shows it
 WIDE_MAX = 800
@@ -53,10 +52,8 @@ def image_size(path: Path) -> tuple:
 
 
 def image_width_limit(size: tuple, gif: bool = False) -> tuple:
-    """(kind, largest display width). Shots are 2x captures, so none shows above half its
-    pixel width: a strip (3x wider than tall) at half, a phone shot at PHONE_WIDTH, a wide
-    (desktop) shot at half, capped at WIDE_MAX. A demo GIF is encoded at 1x, so it shows
-    at most at its own width, capped at WIDE_MAX."""
+    """(kind, largest display width). 2x shots show at most at half width (a
+    phone shot at PHONE_WIDTH); a 1x GIF at its own width; all capped at WIDE_MAX."""
     w, h = size
     if gif:
         return "demo", min(w, WIDE_MAX)
@@ -68,7 +65,7 @@ def image_width_limit(size: tuple, gif: bool = False) -> tuple:
 
 
 def markdown_files() -> list:
-    """README and every docs page; not the site's build output and cache under docs/.vitepress."""
+    """README and every docs page, not docs/.vitepress output."""
     return [ROOT / "README.md"] + sorted(p for p in (ROOT / "docs").rglob("*.md") if ".vitepress" not in p.parts)
 
 
@@ -131,8 +128,7 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual(broken, [])
 
     def test_every_link_into_the_docs_site_names_a_page_and_heading(self):
-        """The README links to the site, not to docs/: each link must still name a page that
-        exists and a heading on it, so a renamed page or section breaks here, not for a reader."""
+        """Each README link to the site must name an existing page and heading."""
         broken = []
         for md in markdown_files():
             for target in links(md):
@@ -161,7 +157,7 @@ class DocsLinkTests(unittest.TestCase):
                 path = target.partition("#")[0]
                 if path.endswith((".png", ".jpg", ".webp", ".gif")):
                     used.add((md.parent / path).resolve())
-        # media.json is the record of what each file shows (MediaFreshTests), not an image.
+        # media.json is the media record (MediaFreshTests), not an image.
         images = sorted(p for p in IMG.iterdir() if p.is_file() and p.name != "media.json")
         demos = sorted(p for p in DEMOS.iterdir() if p.suffix == ".gif")
         videos = sorted(p for p in DEMOS.iterdir() if p.suffix in (".mp4", ".webm"))
@@ -171,7 +167,7 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual([p.name for p in demos if p.stat().st_size > DEMO_BUDGET], [])
         self.assertEqual([p.name for p in videos if p.stat().st_size > VIDEO_BUDGET], [])
         self.assertLessEqual(sum(p.stat().st_size for p in videos), VIDEOS_TOTAL_BUDGET)
-        # The site plays a demo's video in place of its GIF: both formats, next to a GIF a page shows.
+        # The site plays a demo's video in place of its GIF, so both exist.
         stems = {p.stem for p in videos}
         self.assertEqual(sorted(f"{s}: {ext}" for s in stems for ext in ("gif", "mp4", "webm")
                                 if not (DEMOS / f"{s}.{ext}").exists()), [])
@@ -180,8 +176,8 @@ class DocsLinkTests(unittest.TestCase):
                          "images in docs/img that no page uses")
 
     def test_every_image_has_a_width_within_its_kind(self):
-        """github.com shows an image without a width at the full content column, so a phone
-        shot fills the page on desktop. Every local image is an <img> with a width."""
+        """Every local image is an <img> with a width, or a phone shot fills
+        the page on github.com desktop."""
         bad = []
         for md in markdown_files():
             text = re.sub(r"`[^`\n]*`", "", FENCE.sub("", md.read_text()))
@@ -231,9 +227,8 @@ class DocsLinkTests(unittest.TestCase):
 
 
 class HiddenExamplesTests(unittest.TestCase):
-    """docs/examples/ describes our own setup, not the Pipe: each page is reachable only
-    through a link in the section it illustrates, and listed nowhere (sidebar, home page,
-    search, llms.txt)."""
+    """docs/examples/ shows our own setup: each page is linked only from the
+    section it illustrates and listed nowhere (sidebar, home, search, llms.txt)."""
 
     def setUp(self):
         self.pages = sorted((ROOT / "docs" / "examples").glob("*.md"))
@@ -257,8 +252,8 @@ class HiddenExamplesTests(unittest.TestCase):
 
 
 class SocialCardTests(unittest.TestCase):
-    """Every docs page carries Open Graph and Twitter tags for the card a shared link shows
-    (docs/.vitepress/config.mts): the repository's social preview, served from the site root."""
+    """Every docs page carries Open Graph and Twitter tags pointing at the
+    social preview (docs/.vitepress/config.mts)."""
 
     def setUp(self):
         self.config = (ROOT / "docs" / ".vitepress" / "config.mts").read_text()
@@ -319,10 +314,8 @@ class VersionsTests(unittest.TestCase):
                 self.assertIn(self.openclaw, self._row(path, "OpenClaw Gateway"))
 
     def test_functions_require_the_minimum_open_webui(self):
-        """Open WebUI refuses to install a function whose
-        `required_open_webui_version` is above its own version, so the field
-        must be the documented minimum: lower lets a release the Pipe breaks
-        on install it (spinning tool cards, missing agent replies)."""
+        """`required_open_webui_version` must be the documented minimum: higher is
+        refused, lower lets a broken release install it."""
         minimums = {self._row(path, "Open WebUI").split("|")[2].strip()
                     for path in (ROOT / "docs" / "versions.md",)}
         self.assertEqual(len(minimums), 1, f"versions.md states no single minimum: {minimums}")
@@ -338,10 +331,8 @@ class VersionsTests(unittest.TestCase):
 
 
 class MediaFreshTests(unittest.TestCase):
-    """Every screenshot and recording was made on the UI as it is now
-    (scripts/media.py, docs/img/media.json): a change to the composer's Claw
-    button, the Status icon or dialog, or the pinned Open WebUI fails here
-    until the files that show it are recorded again."""
+    """Screenshots and recordings match the current UI (scripts/media.py,
+    docs/img/media.json); a UI change fails until they are re-recorded."""
 
     def setUp(self):
         import importlib.util

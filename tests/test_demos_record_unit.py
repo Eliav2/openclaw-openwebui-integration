@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""scripts/demos/record.py: a demo's length is the script's, not the runner's speed. While a
-step waits on the stack, a frame held on screen is cut to WAIT_HELD_MAX (nothing moved), and a
-wait with `show_ms` plays faster to fit it; typing and pauses keep their real timing."""
+"""scripts/demos/record.py: a demo's length is the script's, not the runner's speed.
+Held frames are cut to WAIT_HELD_MAX, a `show_ms` wait plays faster to fit."""
 
 import sys
 import types

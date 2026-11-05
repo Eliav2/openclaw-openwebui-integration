@@ -1,11 +1,5 @@
-"""ELI-318: a tool result that carries a page where the user takes over from
-the agent (CONTROL_LINK_PATTERN, e.g. a browser takeover's link) adds a
-"Take control" link to the reply, as a note of its own, right after the call's
-card: in the reply's text, which Open WebUI's own page renders, so it opens
-as a page of its own and not inside a sandboxed embed.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_control_link_unit.py
-"""
+"""ELI-318: a tool result with a takeover page (CONTROL_LINK_PATTERN) adds a "Take
+control" link note after its card, in the reply text, not a sandboxed embed."""
 import types
 import unittest
 

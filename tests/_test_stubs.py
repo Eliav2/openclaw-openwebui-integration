@@ -1,7 +1,5 @@
-"""Stand-ins for the third-party modules Open WebUI provides at runtime
-(websockets, cryptography, pydantic), so the unit suites import the built
-artifacts on a bare machine. Each one is installed only when that name is not
-imported yet; conftest.py imports the real pydantic first (it says why)."""
+"""Stand-ins for websockets, cryptography and pydantic, installed only when not
+imported yet, so the suites run on a bare machine (see conftest.py)."""
 
 import sys
 import types
