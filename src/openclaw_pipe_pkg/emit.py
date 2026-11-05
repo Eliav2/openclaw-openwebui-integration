@@ -4,7 +4,6 @@
 # ------------------------------------------------------------------
 
 
-
 async def _emit_status(__event_emitter__, description, *, done=False):
     """Send an OWUI status event when the current pipe call supports events."""
     if not __event_emitter__:
@@ -14,16 +13,14 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     )
 
 
-# Claude Code's in-process sub-agent tool, and what its card's result says for
-# one started in the background: its report comes later, and the run stays
-# open until it is in (ELI-163).
+# Claude Code's sub-agent tool; a background one keeps the run open until its
+# report is in (ELI-163).
 _AGENT_TOOL_NAME = "Agent"
 _AGENT_LAUNCHED_PREFIX = "Async agent launched"
 
 
 def _is_agent_tool(name) -> bool:
-    """Claude Code calls it `Agent`; in any case, as the Gateway lowercases
-    the names of some tools. OpenClaw has no tool of its own by that name."""
+    """Claude Code's `Agent`, in any case: the Gateway lowercases some tool names."""
     return (name or "").strip().lower() == _AGENT_TOOL_NAME.lower()
 
 
@@ -37,14 +34,11 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
-# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
-# are, so they must be plain ids.
+# Live view ids go into the URL as they are.
 _LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
-# Words a shell command can start with that are not the command: loop and
-# condition keywords, and wrappers that run what follows. An assignment
-# (`FOO=1 cmd`) is skipped the same way.
+# Words before the real command: keywords, wrappers. `FOO=1 cmd` is skipped too.
 _SHELL_LEAD_WORDS = frozenset({"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(",
                                "time", "env", "nohup", "setsid", "sudo", "exec"})
 _SHELL_WRAPPER_WITH_ARG = frozenset({"timeout"})   # `timeout 60 cmd`: one more word to skip
@@ -71,11 +65,8 @@ def _command_position(segment: str) -> str:
 
 
 def _command_segments(command: str) -> list[str]:
-    """The commands a shell line runs, each from its command word on: a line is
-    split at `;` `&&` `||` `|` a lone `&`, newlines, `$(` and backticks, outside
-    quotes. Quoted text is emptied and heredoc bodies are dropped, so a browser
-    word in a string, a grep pattern or a script being written is not a
-    command."""
+    """The commands a shell line runs, each from its command word on. Quoted
+    text and heredoc bodies are dropped, so a browser word in a string is no command."""
     segments: list[str] = []
     cur: list[str] = []
     pending: list[tuple[str, bool]] = []   # heredocs whose bodies start after this line
@@ -141,8 +132,7 @@ def _command_segments(command: str) -> list[str]:
 
 
 def _tool_command(args_str) -> str:
-    """The `command` argument of a tool call given as a JSON object; "" when
-    there is none."""
+    """The `command` argument of a JSON tool call, else ""."""
     try:
         args = json.loads(args_str or "")
     except (TypeError, ValueError):
@@ -152,15 +142,9 @@ def _tool_command(args_str) -> str:
 
 
 def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
-    """The embed URL for a reply whose tool call really starts or drives a
-    browser, or None. None when the valve is off, the user is not in
-    LIVE_VIEW_USERS, the call does not match LIVE_VIEW_TOOLS, or the URL would
-    not be an http(s) URL: Open WebUI renders any other embed string as HTML.
-
-    LIVE_VIEW_TOOLS is searched in the tool's name and in each command of the
-    call's `command` argument, from its command word on. Nothing else about the
-    call is read: a file being written, a message or a query that names a
-    browser is no browser use."""
+    """The live view embed URL for a call that really drives a browser, or None.
+    Only the tool name and the commands are matched, and only an http(s) URL is
+    returned: Open WebUI renders any other embed string as HTML."""
     template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
     if not template or not re.match(r"^https?://", template, re.I):
         return None
@@ -243,12 +227,8 @@ def _relative_time(reset_at_ms) -> str | None:
 
 
 def _window_reset_line(w: dict) -> str | None:
-    """Full detail line for one rate-limit window, only when it has a known
-    reset time -- e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
-    without a `resetAt` (e.g. Gemini's Pro/Flash aren't time-windows), since
-    there'd be nothing new to say beyond what the thin combined line already
-    shows.
-    """
+    """Detail line for one rate-limit window with a known reset time, e.g.
+    '⏱ 5h 18% left (resets in 22m)'."""
     bit = _window_bit(w)
     rel = _relative_time(w.get("resetAt"))
     if not bit or not rel:
@@ -258,34 +238,13 @@ def _window_reset_line(w: dict) -> str | None:
 
 async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
                                     run_usage: dict | None = None) -> list[str]:
-    """Best-effort final status lines: context window fill (combined with the
-    provider's primary/nearest-term rate-limit window on the same line, kept
-    deliberately thin -- no reset time), one full detail line per rate-limit
-    window that has a known reset time (e.g. both '5h' and 'Week' for
-    Anthropic/OpenAI), and the active session goal (if any) on its own line.
-    Returned as separate short lines (rather than one combined line) because
-    OWUI's status UI hard-clamps every line to a single row (`line-clamp-1`,
-    no way to disable per-event) -- one line per fact keeps each row inside
-    that clamp instead of getting cut off mid-number.
+    """Best-effort final status lines: context fill with the primary window,
+    a reset line per window, and the goal. One fact per line, since OWUI clamps
+    each status row to one line; the thin line goes last since OWUI shows only
+    the last one. Errors are swallowed so the reply is never affected.
 
-    OWUI shows only the *last* emitted status line by default (the rest
-    only appear once the user expands that message's status history), so
-    the thin context+primary-window line is placed last on purpose. Goal and
-    the per-window reset-time detail lines still show up immediately on
-    expand.
-
-    Both RPCs are read-only and already used elsewhere by the pipe
-    (`sessions.describe`) or are simple/cheap (`usage.status`); any failure
-    here must not affect the actual reply, so every error is swallowed and
-    just omits that line. They're fetched concurrently (not one after the
-    other) so this adds at most one round trip's worth of latency, not two,
-    to the moment the status line settles after the reply text is done.
-
-    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
-    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
-    session's first totals to its row just after the run ends, so a new
-    chat's first reply found none there, and every later reply read the run
-    before it (ELI-177). The window (`contextTokens`) still comes from the row.
+    `run_usage`: the run's own usage gives the context fill, since OpenClaw
+    2026.10 writes a first reply's totals to the row only after the run (ELI-177).
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -324,10 +283,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
                     primary_bit = f"⏱ {bits[0]}"
                 elif p.get("summary"):
                     primary_bit = f"⏱ {p['summary']}"
-                # A full "(resets in ...)" line per window that actually has
-                # a known reset time -- including the same window already
-                # folded into `primary_bit`, since that one stays thin (no
-                # reset time) on purpose.
+                # The primary window gets its reset line here too.
                 reset_lines = [
                     line for line in (_window_reset_line(w) for w in windows) if line
                 ]
@@ -341,13 +297,9 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
 
 async def _emit_message_snapshot(__event_emitter__, content):
-    """Write `content` to the reply's stored message with a `replace` event.
-
-    Open WebUI 0.12 writes it even while the message is `done: false` (the
-    message upsert has no done guard), and its end-of-reply save then sets
-    `content` from `output`, over it. So it shows when a reply never reaches
-    that save, and to a chat read that spans it (`_live_output`). Probed on
-    0.12.0 (ELI-160 slice 8).
+    """Write `content` to the stored reply with a `replace` event. Open WebUI
+    0.12 writes it even while `done: false`, and its end-of-reply save
+    overwrites it (ELI-160 slice 8).
     """
     if not __event_emitter__ or not content:
         return
@@ -357,17 +309,9 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
 
 async def _live_output(request, chat_id: str | None, message_id: str | None) -> list | None:
-    """Open WebUI's live copy of a streaming reply's `output`: the text and
-    tool cards a chat read shows while the reply streams. None when there is
-    none (no request, a chat that is not saved, the reply not streaming).
-
-    Open WebUI 0.12's chat read (`GET /api/v1/chats/{id}`) takes the saved
-    message, then, a few awaits later, lays this copy over it. The saved
-    message has no `output` until Open WebUI's end-of-reply save, which then
-    drops the copy: a read whose two halves span that save gets the message
-    as saved before it, and nothing live over it (ELI-267). Open WebUI
-    refreshes the copy after each line of the reply it reads, so at the end
-    of the Pipe's stream it holds the whole reply."""
+    """Open WebUI's live copy of a streaming reply's `output`, or None.
+    A chat read spanning the end-of-reply save gets neither copy nor output
+    (ELI-267); at the end of the Pipe's stream the copy holds the whole reply."""
     if request is None or not chat_id or not message_id:
         return None
     try:

@@ -3,34 +3,20 @@
 # Source of truth: src/openclaw_pipe_pkg/<module>.py + build.py
 # ------------------------------------------------------------------
 #
-# Pipe only (the Action artifact does not include this fragment). Uses the
-# snippet helpers from composer.py.
+# Pipe only (the Action artifact does not include this fragment).
 
 
 # ---------------------------------------------------------------------------
 # (c) Composer watcher: push the snippet when a tab opens an OpenClaw chat.
 #
-# Open WebUI 0.12 tabs emit `events:chat` join/leave, and the server keeps the
-# joined ids in SESSION_POOL[sid]["chat_ids"] (socket/main.py). There is no
-# hook on the join itself, so this polls the pool. For each (sid, chat) pair,
-# after a short settle delay, it reads the chat's head (`_composer_chat_head`:
-# its owner and its branch's newest messages, never the whole chat), checks
-# that the socket's own user owns it and that it is on one of this Pipe's
-# models, and sends the snippet to that one socket (`to=sid`, never the user
-# room) targeting the chat's latest user message.
-#
-# It is sent with `sio.call`, not `emit`: Chat.svelte acks an `execute` event
-# only after actually running it, and drops it (no ack) while the tab has not
-# loaded that chat's history yet. No ack means a retry a few seconds later, up
-# to _COMPOSER_WATCH_ATTEMPTS times. Leaving and re-joining a chat re-arms the
-# pair. The watcher idles while this Pipe function is disabled and stops when
-# it is deleted. Every failure is logged once and swallowed: on an Open WebUI
-# without `chat_ids` the loop simply finds nothing.
+# Open WebUI 0.12 has no hook on a tab's `events:chat` join, so this polls
+# SESSION_POOL[sid]["chat_ids"] (socket/main.py). It sends with `sio.call` to
+# that one socket: Chat.svelte acks `execute` only after running it and drops
+# it (no ack) until the chat's history is loaded, so no ack means retry.
 # ---------------------------------------------------------------------------
 
-# Until the snippet lands, a toolbar Status click takes Open WebUI's slow path
-# (it uploads the chat's messages and saves the whole chat), so a newly opened
-# chat gets it within a second. A poll reads SESSION_POOL, in memory.
+# Until the snippet lands, a Status click takes Open WebUI's slow path (it saves
+# the whole chat), so poll fast. SESSION_POOL is in memory.
 _COMPOSER_WATCH_INTERVAL_S = 0.5
 _COMPOSER_WATCH_SETTLE_S = 0.5
 _COMPOSER_WATCH_ACK_TIMEOUT_S = 4.0
@@ -38,11 +24,8 @@ _COMPOSER_WATCH_RETRY_S = 3.0
 _COMPOSER_WATCH_ATTEMPTS = 3
 _COMPOSER_WATCH_LIVENESS_S = 30.0
 
-# Stashed on `open_webui.socket.main` (OWUI's own stable module, see
-# `_STALE_CONN_ATTR` in gateway.py for why) so a redeploy can cancel the
-# previous deploy's watcher task instead of leaving two running. One slot per
-# Pipe function (`_composer_watch_slot`): a second copy of the Pipe runs its
-# own watcher and must not cancel the first copy's.
+# Kept on `open_webui.socket.main` (see `_STALE_CONN_ATTR` in gateway.py) so a
+# redeploy can cancel the old watcher. One slot per Pipe function id.
 _COMPOSER_WATCH_ATTR = "_openclaw_composer_watcher_v1"
 
 
@@ -54,11 +37,8 @@ _composer_watcher_task = None
 
 
 async def _composer_chat_head(user_id, current_id, message) -> dict:
-    """What a push needs of a chat: {"user_id", "message_id", "model"}.
-    `message(id)` reads one message as (role, parent_id, model_id), or None.
-    `message_id` is the snippet's targetMessageId(): the latest user message
-    on the current branch, else the current message. `model` is the newest
-    assistant message's on the branch, the model the chat replies with."""
+    """{"user_id", "message_id", "model"} of a chat: `message_id` is the snippet's
+    targetMessageId(), `model` the newest assistant message's."""
     target, model, message_id = None, None, current_id
     for _ in range(500):
         if not message_id:
@@ -102,10 +82,8 @@ class _ComposerWatcher:
 
     @staticmethod
     async def _chat_head(chat_id):
-        """`_composer_chat_head` of a chat, from Open WebUI's DB: the chat
-        row's owner and current message id, then one `chat_message` row per
-        step up the branch. Open WebUI builds a whole chat in Python, about
-        14x its JSON, for every read of the chat itself (ELI-115)."""
+        """`_composer_chat_head` from the DB, one `chat_message` row per step.
+        Reading the chat itself builds it all in Python, about 14x its JSON (ELI-115)."""
         from sqlalchemy import select
         from open_webui.internal.db import get_async_db_context
         from open_webui.models.chats import Chat
@@ -216,9 +194,8 @@ class _ComposerWatcher:
         message_id = head["message_id"]
         if not message_id:
             return "skip"
-        # The Stop / Send now intent hook and the auto-send hook ride along: a
-        # tab that opens the chat after a turn writer started must still
-        # answer its cancel query (ELI-100 case 8) and send what it queues.
+        # The intent and auto-send hooks ride along: a tab opened after a turn
+        # writer started must still answer its cancel query (ELI-100 case 8).
         code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id,
                                              chat_model=model))
@@ -250,7 +227,6 @@ class _ComposerWatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
-                # Logged once per distinct failure, not every interval.
                 if str(ex) != last_error:
                     last_error = str(ex)
                     pipe_log(f"[composer] watcher tick failed: {ex}")
@@ -261,10 +237,8 @@ _composer_known_prefixes = [_COMPOSER_DEFAULT_MODEL_PREFIX]
 
 
 def _composer_note_model(model_id=None) -> list:
-    """Remember the Pipe's own function id and the prefix of a model it
-    actually served, so the button also recognises chats when the Pipe is
-    installed under a non-default id. Returns the known prefixes. Pipe only:
-    in the Action artifact the module name is the Action's id."""
+    """Remember the Pipe's function id and served model prefixes, so chats are
+    recognised under a non-default id. Returns the known prefixes."""
     for p in _composer_model_prefixes(model_id, own_id=_composer_own_function_id()):
         if p not in _composer_known_prefixes:
             _composer_known_prefixes.append(p)
@@ -272,9 +246,8 @@ def _composer_note_model(model_id=None) -> list:
 
 
 def _ensure_composer_watcher(valves_getter):
-    """Start the watcher once per deploy, inside Open WebUI only. Cancels a
-    previous deploy's watcher found on the stable socket module. Returns the
-    running task, or None when not inside OWUI, disabled, or on failure."""
+    """Start the watcher once per deploy inside Open WebUI, cancelling a
+    previous deploy's. Returns the task, or None."""
     global _composer_watcher_task
     try:
         if not bool(getattr(valves_getter(), "COMPOSER_STATUS_BUTTON", True)):

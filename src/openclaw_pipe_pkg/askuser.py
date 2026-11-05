@@ -4,7 +4,6 @@
 # ------------------------------------------------------------------
 
 
-
 _USER_INPUT_TRIGGER_PREFIXES = ("Codex needs input:", "OpenClaw needs input:")
 
 
@@ -15,16 +14,9 @@ def _is_user_input_prompt(text: str) -> bool:
 
 
 def _could_be_user_input_prefix(normalized_text: str) -> bool:
-    """Return True while `normalized_text` (already left-stripped) is still
-    ambiguous: either a strict prefix of one of the trigger phrases (so more
-    streamed text could still complete it), or already a full match.
-
-    Used to decide whether to keep withholding assistant-delta text instead
-    of yielding it immediately -- real token-by-token streaming (e.g. Claude)
-    delivers the trigger phrase a few characters at a time, so checking each
-    raw delta in isolation (as `_is_user_input_prompt` does) never matches.
-    Only once the buffered text diverges from every trigger prefix do we know
-    for sure this message isn't a needs-input prompt.
+    """True while `normalized_text` could still become (or is) a trigger phrase.
+    Streaming delivers the phrase a few characters at a time, so a single delta
+    never matches alone.
     """
     if not normalized_text:
         return True
@@ -34,16 +26,15 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
-# CommonMark 4.5: a fence is 3+ backticks or tildes indented up to 3 spaces;
-# a backtick fence's info string has no backtick; only a run of the same
-# character, at least as long and followed by nothing but spaces, closes it.
+# CommonMark 4.5: a fence is 3+ backticks or tildes, indented up to 3 spaces;
+# only an equal-or-longer run of the same character closes it.
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 
 def _fence_of(state) -> str:
-    """A fence state as the open fence's run ("" when none). `True` is an
-    open backtick fence of unknown length (older callers passed a bool)."""
+    """A fence state as the open fence's run ("" when none). `True` is a
+    backtick fence of unknown length (older callers passed a bool)."""
     if state is True:
         return "```"
     return state or ""
@@ -63,8 +54,7 @@ def _fence_step(line: str, fence: str) -> str:
 
 
 def _fence_open_after(text: str, in_fence=False) -> str:
-    """The fenced code block open at the end of `text` (its fence run, "" when
-    none), when `in_fence` was open where `text` starts. Truthy when open."""
+    """The fence run open at the end of `text` ("" when none)."""
     fence = _fence_of(in_fence)
     for line in (text or "").split("\n"):
         fence = _fence_step(line, fence)
@@ -73,15 +63,8 @@ def _fence_open_after(text: str, in_fence=False) -> str:
 
 def _marker_line_index(text: str, in_fence=False):
     """Index of the first line that opens a needs-input block, else None.
-
-    The marker only counts at the start of a line, but it does NOT have to be
-    the start of the message: a reply usually explains itself first and asks at
-    the end. Every line is checked, not only the text after the last newline,
-    because a provider can deliver the whole reply as one cumulative chunk with
-    the marker mid-string.
-
+    Every line is checked: a provider can deliver the whole reply as one chunk.
     A line inside a fenced code block is a quote, not a prompt (ELI-107).
-    `in_fence`: a fence is open where `text` starts.
     """
     start, fence = 0, _fence_of(in_fence)
     while True:
@@ -97,25 +80,13 @@ def _marker_line_index(text: str, in_fence=False):
 
 def _advance_input_prompt_buffer(pending: str, delta: str,
                                  in_fence=False, at_line_start=True) -> tuple[str, str]:
-    """Feed a new assistant-delta chunk into the needs-input buffering state.
+    """Feed an assistant delta into the needs-input buffer; returns
+    `(text_to_yield_now, new_pending)`. A trigger counts only at a line start,
+    and deltas need not split at lines, so after divergence only the text after
+    the last newline is held again.
 
-    Returns `(text_to_yield_now, new_pending)`. `pending` is text already
-    withheld because it might still become a needs-input trigger.
-
-    A trigger is only meaningful as the start of a line, so once the
-    combined text (`pending + delta`) diverges from every trigger prefix,
-    only the text after the LAST newline is worth re-examining as a fresh
-    candidate -- a real streaming delta doesn't necessarily break exactly at
-    a line boundary (e.g. a single chunk can contain the tail of one
-    paragraph, the blank-line separator, *and* the start of the next one),
-    so checking `delta.endswith("\\n")` at the yield site isn't enough on
-    its own.
-
-    `in_fence`: a fenced code block is open where `pending + delta` starts
-    (the shown text left it open); nothing in a fence is held (ELI-107).
-    `at_line_start`: the shown text ends at the start of a line. When it
-    does not, the first line of `delta` continues a line and opens no
-    prompt, wherever the deltas happen to split (ELI-147).
+    `in_fence`: nothing in a fence is held (ELI-107). `at_line_start`: when
+    False, the first line of `delta` opens no prompt (ELI-147).
     """
     candidate = pending + delta
     if not (pending or at_line_start):
@@ -128,8 +99,7 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
         return head + flush, held
     if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
-    # A complete marker may sit mid-candidate when the whole reply arrives at
-    # once. Flush what precedes it and hold from the marker onward.
+    # The whole reply may arrive at once: flush up to the marker, hold the rest.
     marker_at = _marker_line_index(candidate, in_fence)
     if marker_at is not None:
         return candidate[:marker_at], candidate[marker_at:]
@@ -143,18 +113,9 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
 
 def _strip_input_marker_line(text: str) -> str:
-    """Remove a leading needs-input marker ("OpenClaw needs input:" /
-    "Codex needs input:") and keep the prompt after it. The one place a
-    prompt is split from its marker: the card, the modal and the text
-    fallback all read the prompt through it.
-
-    A needs-input prompt is normally intercepted into a modal and never
-    rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
-    that ended before the modal could fire -- can still reach a raw ``yield``
-    with the marker intact, leaking the literal directive line into the chat.
-    The marker is only ever meaningful at the start, so drop exactly the
-    marker and keep the rest (the actual question), including a question
-    written on the marker line itself (ELI-151).
+    """Drop a leading needs-input marker and keep the prompt after it, including
+    a question on the marker line (ELI-151). Card, modal and text fallback all
+    split the prompt here, so no fallback leaks the raw directive.
     """
     if not text:
         return text
@@ -170,10 +131,8 @@ def _strip_input_marker_line(text: str) -> str:
 
 
 def _strip_needs_input_lines(text: str) -> str:
-    """Drop every needs-input directive (and the blank lines after a lone
-    one) that is outside a fenced code block: the question it opens stays as
-    readable text, a question on the marker line included (ELI-151), and a
-    quoted block in a fence stays as written (ELI-107)."""
+    """Drop every needs-input directive outside a fence, keeping its question
+    (ELI-151); a fenced quote stays as written (ELI-107)."""
     if not text:
         return text
     out, fence, skip_blank = [], "", False
@@ -192,14 +151,8 @@ def _strip_needs_input_lines(text: str) -> str:
 
 
 def _truncate_at_repeated_marker(text: str) -> str:
-    """Keep only the FIRST needs-input block.
-
-    An agent that emits the marker block twice (seen live: the second copy glued
-    straight onto the last option, "3. Park itOpenClaw needs input: ...") turned
-    a 3-option question into a 6-button dialog, one of whose labels was the raw
-    internal directive. The agent misbehaved, but the pipe owns what the user
-    sees, so it should not render that. Everything from a second marker onward
-    is a repeat, not part of the prompt.
+    """Keep only the first needs-input block: an agent once glued a second
+    copy onto the last option, doubling the dialog's buttons.
     """
     if not text:
         return text
@@ -219,11 +172,7 @@ def _truncate_at_repeated_marker(text: str) -> str:
 
 
 def _dedupe_options(options):
-    """Drop repeated option labels, keeping first-seen order.
-
-    Belt and braces behind _truncate_at_repeated_marker: a dialog that offers
-    the same answer twice is always wrong, whatever produced it.
-    """
+    """Drop repeated option labels, keeping first-seen order."""
     seen, out = set(), []
     for opt in options:
         key = opt.strip().lower()
@@ -234,24 +183,22 @@ def _dedupe_options(options):
 
 
 def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
-    """Return [(index_str, label), ...] for a numbered option list, in prompt
-    order, or [] if there are none. Matches lines like "1. foo" / "2) bar"."""
+    """[(index_str, label), ...] for lines like "1. foo" / "2) bar", else []."""
     pattern = re.compile(r"(?m)^\s*(\d+)[.)]\s+(.+)$")
     return [(m.group(1), m.group(2).strip()) for m in pattern.finditer(prompt_text or "")]
 
 
 # What the Ask User block shows for a secret's answer.
 SECRET_ANSWER_SHOWN = "•••• (secret entered)"
-# What the agent gets once when the secret's dialog got no answer: the reply
-# tells the user not to type it into the chat, so no answer will come there.
+# Sent once when the secret's dialog got no answer: the reply tells the user
+# not to type it into the chat.
 SECRET_NOT_RECEIVED_FOR_AGENT = (
     "[Open WebUI] No answer: the masked dialog for the secret you asked for was not "
     "answered, so nothing was received. Do not ask for it in the chat, which stores "
     "what the user types. Use masked credential entry, or ask again when the user "
     "has this chat open."
 )
-# What the agent gets when the user cancels the secret's dialog (ELI-189),
-# and what the Ask User block shows for it.
+# Sent when the user cancels the secret's dialog (ELI-189); also shown in the block.
 SECRET_CANCELLED_FOR_AGENT = (
     "[Open WebUI] Cancelled: the user closed the masked dialog for the secret you "
     "asked for without entering it, so nothing was received. Do not ask for it in "
@@ -268,11 +215,10 @@ _MULTI_MARKERS = (
 
 
 def _parse_text_prompt(prompt_text: str) -> dict:
-    """The fields of a text needs-input prompt: `title`, `message`, `secret`,
-    `confirm` (a yes/no question), `options` (the numbered list) and `multi`
-    (a multi-select marker, stripped from the title and message)."""
+    """`title`, `message`, `secret`, `confirm`, `options` and `multi` of a
+    text needs-input prompt."""
     prompt_text = _truncate_at_repeated_marker(prompt_text or "")
-    # The marker goes as in the text fallback: a question on its line stays (ELI-151).
+    # A question on the marker line stays (ELI-151).
     lines = [line.strip() for line in _strip_input_marker_line(prompt_text).splitlines()]
     lines = [line for line in lines if line]
 
@@ -291,8 +237,7 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         title = title or "OpenClaw needs input"
         message = message or "Please answer so the run can continue."
 
-    # Yes/no only when the prompt clearly reads as binary: a free-text question
-    # turned into yes/no loses the real answer. A numbered list is a choice.
+    # Yes/no only when clearly binary: free text turned into yes/no loses the answer.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
     yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)", "כן/לא", "כן / לא", "نعم/لا", "نعم / لا")
     confirm_verbs = (
@@ -301,11 +246,9 @@ def _parse_text_prompt(prompt_text: str) -> dict:
     )
     # "؟" is the Arabic question mark.
     ends_question = message.rstrip().endswith(("?", "؟")) or title.rstrip().endswith(("?", "؟"))
-    # A secret unless it is clearly a choice (an explicit yes/no marker, or two
-    # or more numbered options) and nothing asks for the value itself: a
-    # choice that merely mentions a password keeps its answers (ELI-196), but
-    # a key typed into the card's Other field would land in the chat. Kept
-    # specific on purpose: a bare "key" matches innocent words ("monkey").
+    # A secret unless it is clearly a choice and nothing asks for the value: a
+    # choice that merely mentions a password keeps its answers (ELI-196). Kept
+    # specific: a bare "key" matches "monkey".
     mentions_secret = any(
         marker in text_lower for marker in ("secret", "password", "api key", "token"))
     asks_for_value = "may show your reply" in text_lower or bool(re.search(
@@ -334,9 +277,8 @@ def _is_secret_prompt(prompt_text: str) -> bool:
 
 
 def _secret_not_received_text(prompt_text: str) -> str:
-    """A secret nobody entered in its dialog, as the text that ends the
-    reply. Never the agent's own question: that asks for the value, and an
-    answer typed into the chat is stored in it."""
+    """The reply's closing text for a secret nobody entered. Never the agent's
+    question: an answer typed into the chat is stored there."""
     title = _parse_text_prompt(prompt_text)["title"]
     return (f"**{title}**: not received. A secret is entered only in its masked dialog, "
             "never in the chat, which keeps what you type. To enter it, open this chat "
@@ -354,17 +296,15 @@ def _masked_input_payload(title: str, message: str, placeholder: str = "Type you
 
 
 def _secret_input_payload(prompt_text: str) -> dict:
-    """OWUI's masked input dialog for a prompt asking for a secret: the card
-    has no masked field."""
+    """OWUI's masked input dialog for a secret: the card has no masked field."""
     fields = _parse_text_prompt(prompt_text)
     return _masked_input_payload(fields["title"], fields["message"])
 
 
 _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
 
-# OWUI clamps a request:user_input event call to 60..240s and, when it times
-# out, removes the card itself. We ask for the maximum; a card not answered
-# by then ends the reply with the question as text (ELI-142).
+# OWUI clamps a request:user_input call to 60..240s and removes the card on
+# timeout. An unanswered card ends the reply with the question as text (ELI-142).
 _NATIVE_CARD_TIMEOUT_MS = 240_000
 
 
@@ -378,12 +318,8 @@ def _split_option_description(text: str) -> tuple[str, str]:
 
 
 def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
-    """Questions from a JSON needs-input body, or None for the text form.
-
-    The body after the marker line may be a JSON object (optionally in a code
-    fence) shaped like OWUI's ask_user arguments:
-    {"questions": [{"header": ..., "question": ..., "options": [...]}]}.
-    Options are strings or {"label", "description"} objects.
+    """Questions from a JSON needs-input body (optionally fenced), shaped like
+    OWUI's ask_user arguments, or None for the text form.
     """
     body = _strip_input_marker_line(_truncate_at_repeated_marker(prompt_text or "")).strip()
     fence = re.match(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", body, re.DOTALL)
@@ -433,12 +369,8 @@ def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
 
 
 def _ask_user_fallback_text(prompt_text: str) -> str:
-    """A prompt nobody answered in a card, as the text that ends the reply.
-
-    The JSON form reads as its questions, numbered when there are several,
-    each with its options listed under it, then one line on how to answer
-    (ELI-142: it showed as the raw JSON). Any other prompt is its own text
-    without the marker line."""
+    """An unanswered prompt as the reply's closing text: the JSON form reads as
+    its questions and options, not raw JSON (ELI-142)."""
     questions = _parse_ask_user_json(prompt_text)
     if not questions and _is_secret_prompt(prompt_text):
         return _secret_not_received_text(prompt_text)
@@ -456,17 +388,14 @@ def _ask_user_fallback_text(prompt_text: str) -> str:
     return "\n".join(lines) + "\n\n_Answer in your next message._"
 
 
-# The card picks one option per question, so a multi-select question lists
-# its options by number in the question text and takes typed numbers. The
-# labels ride along under this key for mapping the answer back.
+# The card picks one option per question, so a multi-select question takes
+# typed numbers; its labels ride under this key to map the answer back.
 _MULTI_CHOICES_KEY = "openclaw_choices"
 
 
 def _native_ask_user_payload(prompt_text: str) -> dict | None:
-    """Build OWUI's native `request:user_input` question card for a prompt.
-
-    Returns None for a prompt asking for a secret: the card has no masked
-    input (see _secret_input_payload).
+    """OWUI's native `request:user_input` card for a prompt, or None for a
+    secret (the card has no masked input).
     """
     questions = _parse_ask_user_json(prompt_text)
     if questions is None:
@@ -480,8 +409,7 @@ def _native_ask_user_payload(prompt_text: str) -> dict | None:
             "options": [],
             "allow_other": True,
         }
-        # The numbered list moves out of the text: into `options`, or into
-        # one line of numbered choices for a multi-select question.
+        # The numbered list moves into `options`, or one line for a multi-select.
         message = re.sub(r"(?m)^\s*\d+[.)]\s+.*$\n?", "", fields["message"]).strip()
         if fields["confirm"]:
             question["options"] = [
@@ -490,7 +418,6 @@ def _native_ask_user_payload(prompt_text: str) -> dict | None:
             ]
             question["allow_other"] = False
         elif fields["options"] and fields["multi"]:
-            # The card shows the question as one line of plain text.
             listed = " · ".join(f"{n}. {label}" for n, label in enumerate(fields["options"], 1))
             question["question"] = (f"{message or fields['title']} {listed}. "
                                     "Type the numbers you pick, like 1, 3")
@@ -512,12 +439,8 @@ def _native_ask_user_payload(prompt_text: str) -> dict | None:
 
 
 def _map_multi_answer(text: str, choices: list[str]) -> str:
-    """A typed multi-select answer as the chosen options, comma-joined.
-
-    "1,3", "1 3", "Cheese, Mushrooms" and "1, Mushrooms" all name options;
-    an option's short label (before " - ") names it too. Anything that does
-    not name options only (a number out of range, other text) is the
-    answer as typed.
+    """A typed multi-select answer ("1,3", "Cheese, 1") as the chosen options,
+    comma-joined; anything else is the answer as typed.
     """
     text = (text or "").strip()
     picked = _picked_choices(text, choices)
@@ -525,8 +448,7 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
 
 
 def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
-    """The options a typed multi-select answer names, in order (see
-    _map_multi_answer); None when it does not name options only."""
+    """The options a typed multi-select answer names, or None."""
     by_name = {}
     for choice in choices:
         by_name.setdefault(choice.lower(), choice)
@@ -550,12 +472,8 @@ def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
 
 
 def _format_native_answers(questions: list[dict], answers: dict) -> str:
-    """Turn the card's {question_id: answer} into the text sent to the agent.
-
-    One question returns the bare answer (the label, or what was typed); a
-    Yes/No confirmation returns "yes"/"no"; a multi-select question returns
-    the chosen options, comma-joined. Several questions return one
-    "Header: answer" line each.
+    """The card's {question_id: answer} as the text sent to the agent: the bare
+    answer for one question, "Header: answer" lines for several.
     """
     lines = []
     for question in questions:
@@ -584,10 +502,8 @@ async def _call_on_chat_tab(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict,
     timeout_s: float,
 ):
-    """Show `payload` on the user's socket viewing the chat, or return None
-    when there is none. A question card goes as OWUI's own get_event_call
-    sends it: a fresh interaction_id, and the closing request:interaction:done
-    event that removes the card from the screen."""
+    """Show `payload` on a socket viewing the chat, or None when there is none.
+    Sent as OWUI's get_event_call does, closing with request:interaction:done."""
     try:
         from open_webui.socket.main import sio, SESSION_POOL
     except Exception as ex:
@@ -641,10 +557,9 @@ async def _ask_where_the_chat_is(
     poll_interval_s: float,
     owui_session_id: str | None,
 ):
-    """Ask once on the socket the turn started on (`owui_session_id`). Once
-    it is gone (a reload; no socket for an API caller) the question moves
-    once to the tab viewing the chat. Never re-shown after a timeout: that
-    keeps a reply open with nothing on screen (ELI-142)."""
+    """Ask on the turn's own socket, else once on a tab viewing the chat. Never
+    re-shown after a timeout: that keeps a reply open with nothing on screen
+    (ELI-142)."""
     response = await _event_call_while_session_lives(
         __event_call__, payload, owui_session_id, timeout_s + grace_s, poll_interval_s
     )
@@ -671,12 +586,9 @@ async def _ask_user_native_card(
     poll_interval_s: float,
     owui_session_id: str | None = None,
 ) -> str | None:
-    """Ask once through OWUI's native question card.
-
-    Only an answer or a cancel shows the card was seen. Anything else (OWUI's
-    timeout, a cancel the moment it arrives on a tab viewing another chat, a
-    socket that never answers) returns None, as a cancel does: the reply then
-    ends with the question as text (ELI-107).
+    """Ask once through OWUI's native card. Only an answer or a cancel proves it
+    was seen; anything else returns None and the reply ends with the question
+    as text (ELI-107).
     """
     response = await _ask_where_the_chat_is(
         __event_call__, payload, payload["data"]["timeout_ms"] / 1000, grace_s=15,
@@ -700,9 +612,8 @@ async def _ask_user_secret(
     poll_interval_s: float,
     owui_session_id: str | None = None,
 ) -> str | None:
-    """Ask for a secret through OWUI's masked input dialog, as the card is
-    asked. OWUI puts no timeout on this dialog, so `timeout_s` ends the wait;
-    unanswered, the question ends the reply as text."""
+    """Ask for a secret in OWUI's masked dialog. OWUI puts no timeout on it, so
+    `timeout_s` ends the wait."""
     try:
         response = await _ask_where_the_chat_is(
             __event_call__, _secret_input_payload(prompt_text), timeout_s,
@@ -712,8 +623,7 @@ async def _ask_user_secret(
     except asyncio.TimeoutError:
         response = {"error": f"no answer in {timeout_s:g} s"}
     if response is False:
-        # The dialog's Cancel (EventConfirmDialog resolves it with False),
-        # not a "no": the agent hears that the user cancelled.
+        # The dialog's Cancel (EventConfirmDialog resolves False), not a "no".
         pipe_log("  secret dialog cancelled by the user")
         return SECRET_CANCELLED_FOR_AGENT
     answer = _normalize_event_call_response(response)
@@ -723,26 +633,16 @@ async def _ask_user_secret(
 
 
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
-    """Render an answered ask-user prompt as a native OWUI tool-call block.
-
-    OWUI's frontend only special-cases a handful of `<details type="...">`
-    values with a nice icon + collapsible UI (confirmed by grepping the
-    compiled frontend bundle): "tool_calls", "reasoning", "code_interpreter".
-    There's no dedicated type for Q&A, so we reuse "tool_calls" (labelled as
-    an "Ask User" call) to get the same familiar rendering users already
-    know from real tool calls, inserted inline at the point the question
-    was asked/answered -- instead of showing nothing (previous behavior:
-    the raw prompt text was fully suppressed once answered).
+    """An answered ask-user prompt as an "Ask User" `<details type="tool_calls">`
+    block: OWUI has no Q&A type, and tool_calls renders collapsible.
     """
     json_questions = _parse_ask_user_json(prompt_text)
     if SECRET_NOT_RECEIVED_FOR_AGENT in answer:
-        # The agent was told nothing came: the reply shows the question as
-        # not received, as an unanswered secret ends any reply.
         return "\n" + _secret_not_received_text(prompt_text) + "\n"
     if SECRET_CANCELLED_FOR_AGENT in answer:
         answer = SECRET_CANCELLED_SHOWN
     elif _is_secret_prompt(prompt_text):
-        # The block is written into the chat, so into Open WebUI's database.
+        # The block is stored in Open WebUI's database.
         answer = SECRET_ANSWER_SHOWN
     if json_questions:
         question_display = "\n\n".join(
@@ -766,14 +666,9 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
 
 @dataclass
 class UserInputResult:
-    """Outcome of trying to answer a needs-input prompt via an OWUI modal.
-
-    handled=False  -> not a prompt, user cancelled, or delivery failed;
-                      the caller should show the text as a fallback.
-    handled=True, new_run_id=None -> answer delivered, the run resumed in
-                      place (steer); keep consuming the current run.
-    handled=True, new_run_id="..." -> answer spawned a new run; the caller
-                      should switch its consumer to that run.
+    """Outcome of answering a needs-input prompt via an OWUI modal.
+    handled=False: the caller shows the text as a fallback. new_run_id: the
+    answer started a new run to follow; None means the run went on in place.
     """
 
     handled: bool
@@ -785,26 +680,21 @@ class UserInputResult:
 
 
 def _normalize_event_call_response(response) -> str:
-    """Extract text from common OWUI __event_call__ return shapes.
-    Returns empty string for errors, None, or unrecognized shapes.
-    """
+    """Text from common OWUI __event_call__ return shapes, else empty string."""
     if response is None:
         return ""
-    # Confirmation modals resolve to a bare boolean: True=confirm, False=cancel.
-    # (bool is a subclass of int, so this must be handled before dict/str.)
+    # Confirmation modals resolve to a bare bool; bool is an int, so check it first.
     if isinstance(response, bool):
         return "yes" if response else "no"
     if isinstance(response, str):
         return response.strip()
     if isinstance(response, dict):
-        # Error responses
         if "error" in response:
             return ""
         for key in ("value", "text", "content", "message", "response"):
             value = response.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        # Confirm type with options
         value = response.get("option")
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -816,18 +706,10 @@ def _normalize_event_call_response(response) -> str:
 
 
 def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = None) -> str | None:
-    """Find a currently-connected OWUI session_id belonging to user_id.
-
-    session_pool is OWUI's own SESSION_POOL dict (sid -> user dict with an
-    'id' field), imported live from the running process: the pipe runs
-    inside the OWUI backend, so it can import its `sio` and SESSION_POOL.
-
-    With `chat_id`, only a socket viewing that chat: OWUI 0.12 records the
-    chats a socket has joined (`chat_ids`, events:chat join/leave). The
-    user's first socket can be another tab or another client, where the card
-    never shows (ELI-58). The newest such socket is the tab the
-    user opened last; with none, None, so the card waits for the user to
-    open the chat. An OWUI that records no `chat_ids` gets any socket.
+    """A connected OWUI session_id of `user_id` (newest first), or None.
+    With `chat_id`, only a socket viewing that chat: the user's first socket may
+    be another tab where the card never shows (ELI-58). An OWUI without
+    `chat_ids` gets any socket.
     """
     mine = [(sid, s) for sid, s in list(session_pool.items()) if s and s.get("id") == user_id]
     if chat_id and any("chat_ids" in s for _sid, s in mine):
@@ -838,11 +720,8 @@ def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = 
 
 async def _event_call_while_session_lives(__event_call__, payload: dict, session_id: str | None,
                                           timeout_s: float, poll_interval_s: float):
-    """`__event_call__(payload)`, given up once the socket it is bound to
-    leaves OWUI's SESSION_POOL (the tab was reloaded or closed): OWUI answers
-    a call on a gone socket only at its own timeout, up to 240 s, and the
-    card can be shown on the user's new socket only after that (ELI-58).
-    Answers as OWUI does for a gone socket."""
+    """`__event_call__(payload)`, given up once its socket leaves SESSION_POOL:
+    OWUI answers a gone socket only at its own timeout, up to 240 s (ELI-58)."""
     call = asyncio.ensure_future(asyncio.wait_for(__event_call__(payload), timeout=timeout_s))
     try:
         from open_webui.socket.main import SESSION_POOL
@@ -871,10 +750,8 @@ async def _ask_user_input_modal(
     poll_interval_s: float = 5,
     owui_session_id: str | None = None,
 ) -> str | None:
-    """Ask the user a needs-input prompt in the chat's tab: OWUI's question
-    card (see _ask_user_native_card), or for a secret its masked input
-    dialog (_ask_user_secret). None when unanswered: the question then ends
-    the reply as text."""
+    """Ask a needs-input prompt in the chat's tab: the question card, or the
+    masked dialog for a secret. None when unanswered."""
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
     native_payload = _native_ask_user_payload(prompt_text)
@@ -903,34 +780,21 @@ async def _ask_user_input_modal(
 # ---------------------------------------------------------------------------
 # Secret requests from the Gateway (ELI-96)
 # ---------------------------------------------------------------------------
-# The agent's `secrets` tool, action=request, is a Gateway question with one
-# store-bound secret question: {questionId: "secret_value", isSecret: true,
-# secretStore: {name, kind: "secret", allowedHosts?, reason?}}. The Gateway
-# broadcasts it as `question.requested`. `question.resolve {id, answers:
-# {answers: {secret_value: [value]}}}` from an operator makes the Gateway
-# itself write the value into its secret store, register it for log
-# redaction and answer the agent "stored"; `{id, cancel: true}` answers it
-# "cancelled". `question.resolved` follows either way, and on expiry
-# (2026.10.10-beta.1 dist: secrets-tool-f-CystZd.mjs:1253 request, :1298-1301
-# the agent's statuses; question-CtUDaC2R.mjs:230 broadcast, :289-370 resolve).
+# The `secrets` tool's request is a Gateway question with one store-bound
+# question {questionId: "secret_value", isSecret: true, secretStore}.
+# `question.resolve` makes the Gateway itself store the value and answer the
+# agent "stored" (2026.10.10-beta.1 dist: secrets-tool-f-CystZd.mjs:1253,
+# question-CtUDaC2R.mjs:289-370).
 #
-# It is asked as the ask-user secret is (ELI-148): the masked input dialog on
-# the reply's own socket, moved once to the tab viewing the chat. The typed
-# value goes from the dialog's answer straight into question.resolve. It is
-# never yielded, emitted, persisted or logged, so the chat, the database, the
-# transcript and the model only ever see the request and "stored".
-#
-# It is asked whenever the Gateway offers that question protocol (hello-ok
-# features), whatever its version. Whether a run can then use the stored value
-# is the Gateway's config (secrets.egressProxy), the same on every release line
-# (ELI-97); the dialog only replaces the Control UI as the place to type it.
+# Asked like the ask-user secret (ELI-148). The typed value goes straight into
+# question.resolve and is never yielded, emitted, persisted or logged. Whether
+# a run can use it is Gateway config (secrets.egressProxy, ELI-97).
 
 SECRET_REQUEST_METHODS = ("question.resolve",)
 SECRET_REQUEST_EVENTS = ("question.requested", "question.resolved")
 # question id -> the task asking for it
 _SECRET_REQUESTS: dict = {}
-# session key -> the reply streaming its run, which asks the run's Gateway
-# questions (secret requests, the ask_user tool's) on its own socket
+# session key -> the reply streaming its run, which asks its Gateway questions
 _SECRET_ASKERS: dict = {}
 
 
@@ -958,8 +822,7 @@ def _secret_request_question(record) -> dict | None:
 
 
 def _secret_request_payload(question: dict) -> dict:
-    """The masked dialog for a secret request. Built from the request's
-    metadata only: there is no value to put in it."""
+    """The masked dialog for a secret request, from its metadata only."""
     store = question["secretStore"]
     lines = [str(store.get("reason") or "The agent asks for a secret.")]
     hosts = store.get("allowedHosts") or []
@@ -981,8 +844,7 @@ def _secret_asker_leave(turn) -> None:
 
 def secret_request_seen(conn, record) -> bool:
     """`question.requested`: ask a secret request made in an Open WebUI chat.
-    False for anything else, or on a Gateway that does not offer the question
-    protocol it needs."""
+    False otherwise, or when the Gateway lacks the question protocol."""
     question = _secret_request_question(record)
     if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
         return False
@@ -997,8 +859,7 @@ def secret_request_seen(conn, record) -> bool:
 
 
 def secret_request_resolved(payload) -> None:
-    """`question.resolved`: answered elsewhere (the Control UI), cancelled or
-    expired. The dialog's wait ends; whatever it gets later is dropped."""
+    """`question.resolved`: the dialog's wait ends; a later answer is dropped."""
     task = _SECRET_REQUESTS.pop((payload or {}).get("id"), None)
     if task is not None:
         task.cancel()
@@ -1008,12 +869,10 @@ GUEST_SECRET_NOTE = "_The agent asked for the secret `{name}`. That needs the ow
 
 
 async def _cancel_guest_secret_request(conn, record: dict, name: str) -> None:
-    """Cancel a secret request made in a guest's chat and say so in the reply
-    of the run that asked, as a note of its own (ELI-229)."""
+    """Cancel a secret request from a guest's chat and note it in the run's reply (ELI-229)."""
     qid = record["id"]
-    # Out of the registry before the request, as the owner path does: the
-    # Gateway broadcasts `question.resolved` right behind its answer, and
-    # `secret_request_resolved` would cancel this task before it says so.
+    # Out of the registry first: `question.resolved` follows the answer right
+    # away, and `secret_request_resolved` would cancel this task.
     if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
         del _SECRET_REQUESTS[qid]
     try:
@@ -1035,13 +894,9 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
     timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
     payload = _secret_request_payload(question)
     if not await _sender_is_owner(conn, record.get("sessionKey") or ""):
-        # The store is the owner's: a guest's chat cannot write into it. Nor is
-        # it left pending: answered in the Control UI, it would hand the
-        # owner's secret to a run whose output the guest reads, and until then
-        # the run waits out the request (15 minutes by default). A run the
-        # guest sends cannot ask at all (its connection lacks
-        # operator.questions); one the agent starts in the guest's chat (a
-        # cron wake, an announce) can (ELI-229).
+        # The store is the owner's: a guest's chat cannot write it, and a
+        # pending request answered in the Control UI would hand the owner's
+        # secret to a run the guest reads (ELI-229).
         await _cancel_guest_secret_request(conn, record, name)
         return
     turn = _SECRET_ASKERS.get(record.get("sessionKey"))
@@ -1061,11 +916,10 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
         return
     del _SECRET_REQUESTS[qid]
     if response is None:
-        # Expired with the dialog open, or no tab shows the chat: the Gateway
-        # expires it and the agent hears "No credential arrived".
+        # The Gateway expires it and the agent hears "No credential arrived".
         pipe_log(f"  secret request: {name} not answered in Open WebUI")
         return
-    # Only typed text is a value: a cancelled dialog answers False.
+    # A cancelled dialog answers False.
     value = response.strip() if isinstance(response, str) else ""
     params = ({"id": qid, "answers": {"answers": {question["questionId"]: [value]}},
                "resolvedBy": "openwebui"} if value
@@ -1090,36 +944,23 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
 # ---------------------------------------------------------------------------
 # The agent's ask_user tool (ELI-216)
 # ---------------------------------------------------------------------------
-# OpenClaw's `ask_user` tool registers a Gateway question as the secret
-# request does: `question.requested` with up to three questions, each
-# {questionId, header, question, options: [{label, description?}],
-# multiSelect?, isOther: true}, and waits on `question.waitAnswer` for
-# `question.resolve {id, answers: {answers: {questionId: [values]}}}`
-# (2026.10.5 dist: ask-user-tool-*.mjs, ask-user-tool-normalization-*.mjs;
-# 2026.9.3 the same calls in openclaw-tools-*.mjs). A Gateway client chat
-# gets no prompt of its own: unanswered, the run waited out the tool's
-# timeout (15 minutes by default) on "Thinking".
+# `ask_user` registers a Gateway question (`question.requested`, up to three
+# questions) and waits on `question.waitAnswer` (2026.10.5 dist:
+# ask-user-tool-*.mjs). A Gateway client chat gets no prompt of its own, so
+# the run used to wait out the 15 minute timeout.
 #
-# It is asked in Open WebUI's question card, on the newest tab that has
-# loaded the chat (else the reply's own socket while it shows the chat). A
-# question asked with no such tab stays pending: the card shows once a tab
-# opens the chat, and moves to a newer one (a reload, a phone back from
-# sleep). The card gets no timeout of its own: Open WebUI answers its timeout
-# as it answers Cancel. So the question ends only on the card's Cancel, an
-# answer here or elsewhere (the Control UI), or the Gateway's own timeout.
-#
-# "Loaded the chat" is the composer watcher's ack (composer_watch.py): a tab
-# acks an `execute` only once it shows the chat, and cancels a card at once
-# while it does not, which must not read as the user's Cancel.
+# Asked in Open WebUI's card on the newest tab that loaded the chat, moving to
+# newer tabs. The card has no timeout: Open WebUI answers its timeout as a
+# Cancel. "Loaded" is the composer watcher's ack: a tab cancels a card at once
+# while it does not show the chat, which must not read as the user's Cancel.
 
 # question id -> the task asking it
 _AGENT_QUESTIONS: dict = {}
 
 
 def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
-    """Open WebUI's question card for an ask_user question record, or None
-    for anything else (a secret, no questions). `timeout_ms` None: the card
-    has no countdown of its own."""
+    """Open WebUI's card for an ask_user question record, or None (a secret,
+    no questions)."""
     questions = record.get("questions") if isinstance(record, dict) else None
     if not isinstance(questions, list) or not questions:
         return None
@@ -1141,8 +982,7 @@ def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
             "allow_other": not options or raw.get("isOther") is not False,
         }
         if raw.get("multiSelect") and options:
-            # The card picks one option, so the options are listed by
-            # number and the picks typed, as for a needs-input multi-select.
+            # The card picks one option, so picks are typed as numbers.
             listed = " · ".join(f"{n}. {o['label']}" for n, o in enumerate(options, 1))
             question.update(question=f"{text} {listed}. Type the numbers you pick, like 1, 3",
                             options=[], allow_other=True)
@@ -1153,9 +993,7 @@ def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
 
 
 def _agent_question_answers(questions: list[dict], answers) -> dict:
-    """The card's {question id: answer} as question.resolve's
-    {questionId: [values]}: the option's label as the agent wrote it, the
-    typed text, or a multi-select question's picked options."""
+    """The card's answers as question.resolve's {questionId: [values]}."""
     out = {}
     for question in questions:
         answer = answers.get(question["id"]) if isinstance(answers, dict) else None
@@ -1171,8 +1009,7 @@ def _agent_question_answers(questions: list[dict], answers) -> dict:
 
 
 def agent_question_seen(conn, record) -> bool:
-    """`question.requested`: ask an ask_user question made in an Open WebUI
-    chat. False for anything else."""
+    """`question.requested`: ask an ask_user question from an Open WebUI chat."""
     if not isinstance(record, dict) or record.get("status", "pending") != "pending" \
             or not record.get("id") or record["id"] in _AGENT_QUESTIONS:
         return False
@@ -1186,8 +1023,7 @@ def agent_question_seen(conn, record) -> bool:
 
 
 def _open_writer_message_id(conn, chat_id: str, session_key: str) -> str | None:
-    """The reply a turn writer streams the session's run into, for a run no
-    inline reply streams (one the agent started)."""
+    """The reply a turn writer streams the session's run into (agent-started runs)."""
     for writer in list(getattr(conn, "_turn_writers", {}).values()):
         if writer.chat_id == chat_id and writer.session_key == session_key and not writer.closed:
             return writer.message_id
@@ -1257,10 +1093,8 @@ def _chat_tab_signal(chat_id):
 
 
 async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline):
-    """Show the card on `sid` until it answers: (response, None), or
-    (None, "moved") once a newer tab has loaded the chat or `sid` stops
-    showing it, or (None, None) at the deadline. The card leaves the screen
-    when the wait ends, however it ends."""
+    """Show the card on `sid`: (response, None), (None, "moved") when a newer
+    tab loads the chat or `sid` leaves it, or (None, None) at the deadline."""
     interaction_id = str(uuid.uuid4())
     data = {**payload["data"], "interaction_id": interaction_id}
     pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
@@ -1276,9 +1110,8 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
                     return None, None
                 tab_change = asyncio.ensure_future(newer.wait())
                 try:
-                    # The wait wakes on the answer, on a tab that loads the
-                    # chat, or every few seconds to see this socket is still
-                    # there (Open WebUI keeps a call to a gone socket open).
+                    # Wake often enough to notice a gone socket: Open WebUI
+                    # keeps a call to one open.
                     done, _ = await asyncio.wait({call, tab_change}, timeout=min(left, 5.0),
                                                  return_when=asyncio.FIRST_COMPLETED)
                 finally:
@@ -1290,7 +1123,6 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
                         pipe_log(f"  ask_user: the card on {sid[:8]}... failed: {ex!r}")
                         return None, "moved"
                     if not _views_chat(session_pool, sid, user_id, chat_id):
-                        # Cancelled by a tab that left the chat, not by the user.
                         return None, "moved"
                     return response, None
                 newer.clear()
@@ -1308,8 +1140,7 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
 
 
 async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline):
-    """The card's response, shown on whichever tab has the chat, or None at
-    the deadline."""
+    """The card's response from whichever tab has the chat, or None at the deadline."""
     try:
         from open_webui.socket.main import sio, SESSION_POOL
     except Exception as ex:
@@ -1344,8 +1175,7 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
     if not message_id:
-        # A card needs the reply it belongs to: Open WebUI cancels one for a
-        # message the tab does not have. Left to the Control UI.
+        # Open WebUI cancels a card for a message the tab lacks: left to the Control UI.
         _AGENT_QUESTIONS.pop(qid, None)
         pipe_log(f"  ask_user: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
         return
@@ -1355,7 +1185,6 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
         return
     del _AGENT_QUESTIONS[qid]
     if response is None:
-        # The Gateway's timeout ends it and tells the agent.
         pipe_log("  ask_user: not answered before the question expired")
         return
     answers = (_agent_question_answers(questions, response.get("answers"))
@@ -1379,8 +1208,7 @@ def question_requested(conn, record) -> bool:
 
 
 def question_resolved(payload) -> None:
-    """`question.resolved`: answered elsewhere, cancelled or expired; the
-    card's or dialog's wait ends and whatever it gets later is dropped."""
+    """`question.resolved`: the pending wait ends; a later answer is dropped."""
     secret_request_resolved(payload)
     task = _AGENT_QUESTIONS.pop((payload or {}).get("id"), None)
     if task is not None:

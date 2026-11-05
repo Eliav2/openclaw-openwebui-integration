@@ -7,32 +7,18 @@
 # ---------------------------------------------------------------------------
 # Channels: one OpenClaw session per Open WebUI channel thread.
 #
-# Open WebUI calls a model in a channel only for an @mention or a reply to the
-# model's message (routers/channels.py `model_response_handler`), and answers
-# in a thread on that message (`channels.model_response_mode`, default
-# "thread"). With that:
-#
-# - The thread is the conversation: its session is
-#   `agent:<AGENT_ID>:openwebui:channel:<channel id>:thread:<root message id>`.
-# - The mention that opens a thread sends the channel's messages since the
-#   agent last saw the channel, and the mention itself, as one block of
-#   `[HH:MM] Name (user id): text` lines. A mention in a thread the agent
-#   follows sends the thread's messages since its last turn.
-# - The agent then follows the thread: a watcher reads the thread's new
-#   messages (no mention needed). A short judge on the Gateway's utility model
-#   (`sessions.companion.ask`) decides whether one is meant for the agent; if
-#   so, or when there is no judge, a full turn runs and may answer `[skip]`,
-#   which posts nothing. Messages it does not answer reach it as context with
-#   its next turn.
-# - Every channel turn goes over the same Gateway connection whoever sent it
-#   (`_sender_is_owner`): owner and non-owner turns alternating in one session
-#   would change its tool list, and claude-cli then starts the session over.
-#
-# State (cursors, followed threads) is one JSON file in STATE_DIR, read and
-# written under an flock, so several Open WebUI workers share it. A follow-up
-# turn is claimed with its `idempotencyKey` (`chanfollow-<message id>`): of
-# several watchers that send it, only the one the Gateway answers `started`
-# posts the reply.
+# Open WebUI calls a model in a channel only for an @mention or a reply to its
+# message (routers/channels.py `model_response_handler`), answering in a thread.
+# - Session: `agent:<AGENT_ID>:openwebui:channel:<channel id>:thread:<root id>`.
+# - The opening mention sends the channel's messages since the agent last saw it.
+# - The agent then follows the thread: a judge on the utility model
+#   (`sessions.companion.ask`) picks messages meant for it; a full turn may
+#   answer `[skip]`.
+# - Every channel turn uses one Gateway connection whoever sent it: owner and
+#   non-owner turns alternating would change the tool list, and claude-cli then
+#   starts the session over.
+# State is one JSON file under an flock, shared by Open WebUI workers. A
+# follow-up turn is claimed by its `idempotencyKey` (`chanfollow-<message id>`).
 # ---------------------------------------------------------------------------
 
 _CHANNEL_CHAT_PREFIX = "channel:"
@@ -45,8 +31,7 @@ _CHANNEL_JUDGE_CONTEXT_CHARS = 15000
 _CHANNEL_WATCH_ATTR = "_openclaw_channel_watcher_v1"
 _CHANNEL_MENTION_RE = re.compile(r"<@([A-Z]):([^|>]+)(?:\|[^>]+)?>")
 
-# `{name}` is the model's name in the channel. The Gateway takes at most 400
-# characters here; the thread goes in `selectionContext`.
+# The Gateway takes at most 400 characters here; the thread goes in `selectionContext`.
 _CHANNEL_JUDGE_QUESTION = (
     "Classify, don't answer: should the assistant {name} reply to the NEW message(s) in the "
     "selection? YES if they ask or name it, or ask nobody in particular something it could answer "
@@ -64,8 +49,7 @@ _CHANNEL_MENTION_NOTE = "You were mentioned in the last message above: answer it
 
 
 def _channel_id_of(chat_id) -> "str | None":
-    """The channel id when Open WebUI calls the Pipe for a channel mention
-    (`chat_id = "channel:<id>"`), else None."""
+    """The channel id of a channel mention call (`chat_id = "channel:<id>"`), else None."""
     if isinstance(chat_id, str) and chat_id.startswith(_CHANNEL_CHAT_PREFIX):
         return chat_id[len(_CHANNEL_CHAT_PREFIX):] or None
     return None
@@ -80,16 +64,9 @@ def _channel_mentions_a_model(content) -> bool:
 
 
 def _channel_trigger(msg: dict, *, followed, bot_message_ids=()) -> "str | None":
-    """What a new channel message asks of the agent. The one place this is
-    decided, so a later "answer when addressed by name" changes only here.
-
-    - None: the agent's own message, or an empty one.
-    - "answer": a mention of a model, or a reply to the agent's message.
-      Open WebUI sends these to the model itself (this Pipe's or another
-      one), so the watcher leaves them alone.
-    - "judge": a message in a thread the agent follows: maybe for it.
-    - "context": anything else: the agent sees it with its next turn there.
-    """
+    """What a new channel message asks of the agent: None, "answer" (Open WebUI
+    sends it to the model itself, so the watcher leaves it), "judge" (in a
+    followed thread) or "context"."""
     if (msg.get("meta") or {}).get("model_id") or not (msg.get("content") or "").strip():
         return None
     if _channel_mentions_a_model(msg.get("content")) or (
@@ -119,8 +96,7 @@ def _channel_line(msg: dict, names: dict) -> str:
 
 
 def _channel_block(msgs: list, names: dict, limit: int, title: str) -> str:
-    """The messages as one block, oldest first, at most `limit` of them; the
-    first line says how many earlier ones were left out."""
+    """At most `limit` messages as one block, oldest first, noting how many were left out."""
     shown = msgs[-limit:] if limit > 0 else []
     dropped = len(msgs) - len(shown)
     lines = [f"{title} ({len(shown)}):"]
@@ -131,8 +107,7 @@ def _channel_block(msgs: list, names: dict, limit: int, title: str) -> str:
 
 
 def _channel_reply_text(text) -> "str | None":
-    """What to post for a follow-up turn's final text: None for `[skip]` (or
-    nothing), else the text without a leading `[skip]`."""
+    """The text to post for a follow-up's final text, or None for `[skip]`."""
     t = (text or "").strip()
     if t.startswith(_CHANNEL_SKIP):
         t = t[len(_CHANNEL_SKIP):].strip()
@@ -147,10 +122,7 @@ def _channel_state_path(state_dir) -> str:
 
 @contextlib.contextmanager
 def _channel_state(state_dir):
-    """The channel state, read and written back under an flock:
-    {"channels": {cid: {"cursor": ns}},
-     "threads": {root: {"channel", "cursor", "judged", "active", "model_id", "model_name",
-                        "function"}}}"""
+    """The channel state, read and written back under an flock."""
     path = _channel_state_path(state_dir)
     with open(path + ".lock", "a") as lock:
         try:
@@ -180,10 +152,8 @@ def _channel_followed(state_dir, idle_hours: float, now_ns: "int | None" = None)
 
 async def _channel_rows(channel_id: str, *, parent_id=None, top_level=False,
                         after_ns: int = 0, upto_ns: "int | None" = None, parents=None) -> list:
-    """Channel messages as dicts, oldest first: the thread of `parent_id`, or
-    the top-level timeline, or replies to any of `parents`; newer than
-    `after_ns` (and not newer than `upto_ns`). One query through Open WebUI's
-    own engine (SQLite or Postgres)."""
+    """Channel messages as dicts, oldest first, in one query through Open
+    WebUI's own engine (SQLite or Postgres)."""
     from sqlalchemy import select
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.messages import Message
@@ -230,8 +200,7 @@ async def _channel_names(user_ids) -> dict:
 
 async def _channel_post_reply(channel_id: str, root_id: str, user_id: str, model_id: str,
                               model_name: str, text: str) -> "str | None":
-    """Post the agent's reply in the thread through Open WebUI's own message
-    path (insert, the live `events:channel` updates, membership checks)."""
+    """Post the reply through Open WebUI's own message path (live updates, membership checks)."""
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.messages import MessageForm
     from open_webui.models.users import Users
@@ -251,9 +220,8 @@ async def _channel_post_reply(channel_id: str, root_id: str, user_id: str, model
 
 async def _channel_mention_context(state_dir: str, channel_id: str, reply_message_id, model_id: str,
                                    limit: int) -> dict:
-    """For a mention Open WebUI sent: the thread root (the parent of the
-    reply bubble Open WebUI made), the turn's text, and `commit()` to run once
-    the Gateway took the turn (advances the cursors, follows the thread)."""
+    """For a mention: the thread root, the turn's text, and `commit()` to run
+    once the Gateway took the turn."""
     reply = await _channel_message(reply_message_id) if reply_message_id else None
     root = (reply or {}).get("parent_id") or reply_message_id
     upto = (reply or {}).get("created_at") or time.time_ns()
@@ -262,8 +230,7 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
         thread = dict(st["threads"].get(root) or {})
         chan_cursor = (st["channels"].get(channel_id) or {}).get("cursor", 0)
     if reply_message_id and thread.get("reply_id") == reply_message_id and thread.get("text"):
-        # Open WebUI called the Pipe again for the same reply: the same text,
-        # so the Pipe follows the run the first call started.
+        # Open WebUI called again for the same reply: follow the first call's run.
         return {"root": root, "text": thread["text"], "commit": lambda: None, "messages": 0}
     if thread:
         msgs = await _channel_rows(channel_id, parent_id=root, after_ns=thread.get("cursor", 0), upto_ns=upto)
@@ -273,7 +240,6 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
         replies = await _channel_rows(channel_id, parent_id=root, upto_ns=upto)
         msgs = sorted(timeline + replies, key=lambda m: m["created_at"])
         title = "Channel messages since you last looked"
-    # Not the agent's own replies: its session already has them.
     msgs = [m for m in msgs if m["id"] != reply_message_id and (m["content"] or "").strip()
             and not (m.get("meta") or {}).get("model_id")]
     names = await _channel_names(m["user_id"] for m in msgs)
@@ -303,12 +269,8 @@ def _channel_judge_question(name) -> str:
 
 async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool,
                          name: str = "") -> "bool | None":
-    """YES/NO from the Gateway's utility model (`sessions.companion.ask`), or
-    None when there is no judge right now (no utility model, rate limited,
-    an error, a timeout, the Side chat already answering a question in
-    this session). Never retried: a refusal means the full turn
-    decides instead, so the judge never competes with the Control UI's Side
-    chat for its shared rate limit."""
+    """YES/NO from the utility model, or None when no judge is available. Never
+    retried, so it never competes with the Side chat for its shared rate limit."""
     target = conn if owner else await _get_restricted_connection(conn._valves)
     try:
         r = await asyncio.wait_for(target.send_request(
@@ -330,14 +292,10 @@ async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool,
 
 async def _channel_run(conn, session_key: str, message: str, idempotency_key: str,
                        *, owner: bool, still_needed=None) -> "tuple[str, str | None]":
-    """Run one follow-up turn and wait for its final text. Returns
-    ("started", text) for the watcher that got the turn, ("taken", None)
-    when another one already sent this key, ("covered", None) when a turn
-    that ran meanwhile (a mention) already carried the messages, and
-    ("failed", None) otherwise."""
-    # As a chat message does: wait for the session's run to end before
-    # sending, under the per-session send lock. A send into a running turn
-    # (a mention in the same thread) is merged into it and never ends.
+    """Run one follow-up turn: ("started", text), or ("taken" | "covered" |
+    "failed", None)."""
+    # A send into a running turn is merged into it and never ends, so wait for
+    # the session's run under the send lock first.
     async with conn.send_section(session_key):
         async def thread_active():
             return await _session_list_active(conn, session_key, missing=False)
@@ -357,8 +315,7 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
             conn.unregister_consumer(session_key, run_id, queue=queue)
             pipe_log(f"[channels] follow-up send failed: {ex}")
             return "failed", None
-        # Only the first sender of a key gets "started"; another gets
-        # "in_flight" (or the finished run's status) for the same run.
+        # Only the first sender of a key gets "started".
         if (resp or {}).get("status") != "started":
             conn.unregister_consumer(session_key, run_id, queue=queue)
             pipe_log(f"[channels] follow-up {idempotency_key[:24]} is {(resp or {}).get('status')}: not mine")
@@ -368,9 +325,6 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
             run_id = resp["runId"]
             queue = conn.register_consumer(session_key, run_id)
     try:
-        # Until the run ends, however long that takes: its end arrives as the
-        # run's own final / error event, a restart marker, or the row after a
-        # reconnect (`_channel_run_text`).
         return await _channel_run_text(conn, session_key, run_id, queue)
     finally:
         conn.unregister_consumer(session_key, run_id)
@@ -391,8 +345,7 @@ async def _channel_run_text(conn, session_key: str, run_id: str, queue) -> "tupl
                 try:
                     hist = await conn.session_history(session_key, limit=10)
                 except Exception as ex:
-                    # A reconnect right at the end: the streamed text is the
-                    # reply (the run is over), or there is none to post.
+                    # A reconnect at the end: the streamed text is the reply.
                     pipe_log(f"[channels] follow-up {run_id[:24]}: transcript unreadable ({ex!r}); "
                              "using the streamed text")
                     return ("started", text) if text else ("failed", None)
@@ -414,9 +367,8 @@ async def _channel_run_text(conn, session_key: str, run_id: str, queue) -> "tupl
 
 async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: dict, pending: list,
                              *, use_judge: bool = True, post=None) -> str:
-    """Handle a followed thread's new messages (after the debounce): judge,
-    then maybe a full turn, then maybe a post. Returns what happened:
-    "judged-no", "skip", "posted", "taken" or "failed"."""
+    """Judge, maybe run, maybe post. Returns "judged-no", "skip", "posted",
+    "taken" or "failed"."""
     post = post or _channel_post_reply
     channel_id = thread["channel"]
     agent_id = getattr(valves, "AGENT_ID", "main") or "main"
@@ -475,9 +427,7 @@ async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: di
 # --- the watcher ----------------------------------------------------------------
 
 class _ChannelWatcher:
-    """Reads the followed threads' new messages every `_CHANNEL_POLL_S` while
-    at least one thread is followed, and stops when none is (the next mention
-    starts it again). One per Pipe function (`_ensure_channel_watcher`)."""
+    """Polls followed threads every `_CHANNEL_POLL_S`; stops when none is followed."""
 
     def __init__(self, valves_getter, function_id=None, conn_getter=None, now=time.time_ns):
         self.valves_getter = valves_getter
@@ -494,8 +444,7 @@ class _ChannelWatcher:
         state_dir = _state_dir(getattr(valves, "STATE_DIR", ""))
         idle = float(getattr(valves, "CHANNEL_THREAD_IDLE_HOURS", 24) or 24)
         debounce_ns = int(float(getattr(valves, "CHANNEL_THREAD_DEBOUNCE_S", 15) or 0) * 1e9)
-        # Only this Pipe function's threads: another copy of the Pipe (its own
-        # AGENT_ID) follows the threads its model was mentioned in.
+        # Another copy of the Pipe follows its own threads.
         followed = {r: t for r, t in _channel_followed(state_dir, idle, self.now()).items()
                     if t.get("function") == self.function_id}
         if not followed:
@@ -508,8 +457,7 @@ class _ChannelWatcher:
                 continue
             after = min(t.get("judged", 0) for t in threads.values())
             rows = await _channel_rows(channel_id, parents=threads.keys(), after_ns=after)
-            # A reply to the agent's message is Open WebUI's to send (as is a
-            # mention): leave it to that turn.
+            # A reply to the agent's message is Open WebUI's own turn.
             bot_ids = {m["id"] for m in rows if (m.get("meta") or {}).get("model_id")}
             for ref in {m.get("reply_to_id") for m in rows} - bot_ids - {None, ""}:
                 ref_row = await _channel_message(ref)
@@ -564,10 +512,8 @@ def _channel_watch_slot(function_id) -> str:
 
 
 def _ensure_channel_watcher(valves_getter):
-    """Start the watcher when a thread is followed and none runs for this Pipe
-    function. Its task sits in a slot (per function id) on Open WebUI's own
-    socket module, so a new load of the Pipe cancels the previous load's
-    watcher and two copies of the Pipe keep their own."""
+    """Start the watcher when a thread is followed. Its slot (per function id)
+    on Open WebUI's socket module lets a new load cancel the old one."""
     global _channel_watcher_task
     try:
         if _channel_watcher_task is not None and not _channel_watcher_task.done():
