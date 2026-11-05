@@ -15065,6 +15065,20 @@ class AutoTitleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.title_events(), [(self.CHAT, {"type": "chat:title", "data": self.GENERATED},
                                                 f"user:{self.USER}")])
 
+    async def test_an_image_in_the_first_exchange_never_reaches_the_title_prompt(self):
+        """S12: a first message with an image is a list of blocks; slicing the list kept the base64
+        image, and the title run failed with a prompt of millions of tokens."""
+        image = "data:image/png;base64," + "A" * 100_000
+        body = {"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "what is in this photo?"},
+                                         {"type": "image_url", "image_url": {"url": image}}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "A temple in Kyoto."}]},
+            {"role": "user", "content": "and now?"}]}
+        await self.pipe._auto_title(body, None, "and now?", self.CHAT,
+                                    session_key="agent:main:x", user_id=self.USER, message_id=self.MID)
+        self.assertEqual(self.pipe._generate_title_text.call_args.args[1:3],
+                         ("what is in this photo?", "A temple in Kyoto."))
+
     async def test_new_chat_is_replaced(self):
         self.rename("New Chat")
         await self.second_message()

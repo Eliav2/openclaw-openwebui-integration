@@ -148,15 +148,19 @@ _OWUI_SKILL_MENTION_RE = re.compile(
     rf'<(?:\$({_OWUI_SKILL_ID})(?:\|([^>]*))?|/({_OWUI_SKILL_ID})\|([^>]*))>')
 
 
+def _message_text(content) -> str:
+    """A message's text: the string, or the text blocks of a block list
+    (images and files left out)."""
+    if isinstance(content, list):
+        return "\n".join(p["text"] for p in content if isinstance(p, dict)
+                         and p.get("type") == "text" and isinstance(p.get("text"), str))
+    return content if isinstance(content, str) else ""
+
+
 def _owui_title_from_message(content) -> str:
     """The title Open WebUI gives a chat from its first message when its own
     title task gives none (the Pipe skips that task)."""
-    if isinstance(content, list):
-        content = "\n".join(p["text"] for p in content if isinstance(p, dict)
-                            and p.get("type") == "text" and isinstance(p.get("text"), str))
-    if not isinstance(content, str):
-        return ""
-    text = _OWUI_TITLE_STRIP_RE.sub("", content).strip()
+    text = _OWUI_TITLE_STRIP_RE.sub("", _message_text(content)).strip()
     return _OWUI_SKILL_MENTION_RE.sub(lambda m: m.group(2) or m.group(4) or m.group(0), text)
 
 
@@ -623,8 +627,8 @@ class Pipe:
             return
 
         # Build title from the FIRST exchange, not the current message
-        user_text = user_msgs[0].get("content", "")[:400]
-        assistant_preview = assistant_msgs[0].get("content", "")[:400]
+        user_text = _message_text(user_msgs[0].get("content"))[:400]
+        assistant_preview = _message_text(assistant_msgs[0].get("content"))[:400]
 
         try:
             from open_webui.models.chats import Chats
