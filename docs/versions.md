@@ -8,12 +8,12 @@ Applies to: Pipe, Action, Filter
 
 | | Minimum | Tested in CI |
 |---|---|---|
-| Open WebUI | 0.12.4 | 0.12.5 and 0.13.0 |
-| OpenClaw Gateway | 2026.9.3 | 2026.10.5 |
+| Open WebUI | 0.12.4 | 0.13.0 |
+| OpenClaw Gateway | 2026.9.3 | 2026.10.10, and 2026.10.5 as the oldest supported |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
-The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). For Open WebUI that is two blocking lanes: the pinned release, and the next one an upgrade moves to. The OpenClaw minimum, and the Open WebUI releases below 0.12.0, come from the same suite run once on each older release; the results are below. The Open WebUI minimum, 0.12.4, does not: the suite passes on 0.12.0 to 0.12.3, and 0.12.4 is the first release without the two page bugs listed under What each feature needs.
+The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). The blocking lane runs what the live install runs; a second lane on the oldest supported OpenClaw (2026.10.5) reports without blocking. A pull request that only changes docs, Markdown, `tests/` or comments and docstrings skips the end-to-end suite. The OpenClaw minimum, and the Open WebUI releases below 0.12.0, come from the same suite run once on each older release; the results are below. The Open WebUI minimum, 0.12.4, does not: the suite passes on 0.12.0 to 0.12.3, and 0.12.4 is the first release without the two page bugs listed under What each feature needs.
 
 Below the minimums the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, and on OpenClaw 2026.9.1 or older, cron replies never appear; on Open WebUI 0.12.0 to 0.12.3, a tab that was loading the chat can show a reply cut, and an approval or question dialog can lose its answer.
 
@@ -56,8 +56,8 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 2026.9.1 | 14 of 17 pass | the same as 2026.8.35 | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641691738) |
 | 2026.9.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 2026.10.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641695395) |
-| 2026.10.5 | pass | | every pull request |
-| 2026.10.10 | pass (on Open WebUI 0.13.0) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41675560751) |
+| 2026.10.5 | pass | | every pull request that can change runtime behaviour (reports, never blocks) |
+| 2026.10.10 | pass (on Open WebUI 0.13.0) | | every pull request that can change runtime behaviour ([first run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41675560751)) |
 
 ## Keeping this page true
 
