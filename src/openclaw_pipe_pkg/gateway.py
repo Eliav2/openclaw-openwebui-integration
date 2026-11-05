@@ -10,6 +10,12 @@ GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 # gives non-owner turns (often exec and read) stay available. read: history, sessions, models, usage and the
 # event subscriptions. write: send, abort and the model override.
 RESTRICTED_SCOPES = ["operator.read", "operator.write"]
+# The Gateway removes a silently paired device when another silent client with the same client id, mode and
+# displayName pairs while the first has no open socket (device pairing prune), and every local client here is
+# id "webchat", mode "cli". The restricted identity is the one that re-pairs silently, so it gets a displayName of
+# its own: wlsync's or a harness's pairing then cannot evict it, nor its re-pair evict them. The main identity is
+# an explicitly approved record the prune never touches, and keeps sending none.
+RESTRICTED_DISPLAY_NAME = "owui-pipe-restricted"
 
 
 def _parse_owner_users(raw: str) -> frozenset:
@@ -1734,7 +1740,8 @@ class _GatewayConnection:
     """
 
     def __init__(self, valves_ref, writes_turns: bool = True, scopes: list | None = None,
-                 identity_name: str = "identity", requests_only: bool = False):
+                 identity_name: str = "identity", requests_only: bool = False,
+                 display_name: str | None = None):
         # Weak reference to Pipe valves (re-read on each call)
         self._valves = valves_ref
         # The scopes this connection requests and signs. A connection built with
@@ -1744,6 +1751,7 @@ class _GatewayConnection:
         self.scopes = list(GATEWAY_SCOPES if scopes is None else scopes)
         self._identity_name = identity_name
         self.requests_only = requests_only
+        self._display_name = display_name
         self._ws: websockets.WebSocketClientProtocol | None = None
         # (host, port, tls) the socket was last opened for: `endpoint_moved`
         # compares it with the valve. A connection a valve change replaced
@@ -3601,7 +3609,8 @@ class _GatewayConnection:
             type="req", id="1", method="connect", params=dict(
                 minProtocol=4, maxProtocol=4,
                 client=dict(id="webchat", version="1",
-                            platform="linux", mode="cli"),
+                            platform="linux", mode="cli",
+                            **({"displayName": self._display_name} if self._display_name else {})),
                 role="operator",
                 scopes=self.scopes,
                 auth=auth,
@@ -4483,7 +4492,8 @@ _restricted_init_lock = asyncio.Lock()
 
 def _new_restricted_connection(valves_getter) -> "_GatewayConnection":
     return _GatewayConnection(valves_getter, writes_turns=False, scopes=RESTRICTED_SCOPES,
-                              identity_name="identity-restricted", requests_only=True)
+                              identity_name="identity-restricted", requests_only=True,
+                              display_name=RESTRICTED_DISPLAY_NAME)
 
 
 async def _get_restricted_connection(valves_getter) -> "_GatewayConnection":
