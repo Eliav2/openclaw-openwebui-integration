@@ -38,7 +38,7 @@ class PayloadTests(unittest.TestCase):
         body = web_push.encode_payload(web_push.build_payload(finished()))
         self.assertNotIn("SECRET-REPLY-TEXT", body)
         self.assertEqual(json.loads(body), {"v": 2, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
-                                            "title": "Trip plan", "url": "/c/c1"})
+                                            "title": "Trip plan", "url": "/c/c1", "actions": ["reply"]})
 
     def test_the_link_is_relative_whatever_the_event_says(self):
         payload = web_push.build_payload(finished(url="https://elsewhere.example/phish"))
@@ -113,6 +113,25 @@ class PreviewTests(unittest.TestCase):
 
     def test_an_empty_reply_has_no_body(self):
         self.assertNotIn("body", web_push.build_payload(finished(message="```\nx\n```"), preview_chars=600))
+
+
+class ActionsTests(unittest.TestCase):
+    """NOTIFICATION_ACTIONS: the buttons, in order (Android Chrome shows the first two)."""
+
+    def test_the_default_is_reply_and_mute(self):
+        self.assertEqual(web_push.Event.Valves().NOTIFICATION_ACTIONS, "reply,mute")
+        self.assertEqual(web_push.build_payload(finished(), fn="web_push")["actions"], ["reply", "mute"])
+
+    def test_the_valve_order_unknown_names_and_repeats(self):
+        self.assertEqual(web_push.parse_actions(" read , reply,nope,read"), ["read", "reply"])
+        self.assertEqual(web_push.parse_actions(""), [])
+
+    def test_mute_needs_the_function_id(self):
+        """Mute writes this function's user valves: without its id, no Mute button."""
+        self.assertEqual(web_push.build_payload(finished(), actions=["reply", "mute", "read"])["actions"], ["reply", "read"])
+
+    def test_no_chat_no_buttons(self):
+        self.assertNotIn("actions", web_push.build_payload(finished(chat_id=""), fn="web_push"))
 
 
 class MuteTests(unittest.TestCase):
@@ -278,7 +297,7 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual([r["device"] for r in res["received"]], ["dev1", "dev2"])
         for r in res["received"]:
             self.assertEqual(r["payload"], {"v": 2, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
-                                            "title": "Trip plan", "url": "/c/c1", "fn": "web_push"})
+                                            "title": "Trip plan", "url": "/c/c1", "fn": "web_push", "actions": ["reply", "mute"]})
             self.assertNotIn("SECRET-REPLY-TEXT", json.dumps(r["payload"]))
             self.assertEqual(r["headers"]["Content-Encoding"], "aes128gcm")
             self.assertEqual((r["headers"]["TTL"], r["headers"]["Urgency"]), ("3600", "normal"))

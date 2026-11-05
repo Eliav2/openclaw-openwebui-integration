@@ -8,9 +8,21 @@ self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 // WebKit revokes the subscription.
 const MUST_SHOW = /iPhone|iPad|iPod/.test(self.navigator.userAgent) ||
   (/Macintosh/.test(self.navigator.userAgent) && self.navigator.maxTouchPoints > 1);
-const MUTE_ACTION_S = 8 * 3600;
+const HOUR_S = 3600;
+const MUTE_ACTION_HOURS = 8;
+const MUTE_ACTION_S = MUTE_ACTION_HOURS * HOUR_S;
+const MS_PER_S = 1000;
+const VISIBLE = "visible";
+// A notification's buttons (`event.action`, "" for the notification itself).
+const ACTION = Object.freeze({ REPLY: "reply", READ: "read", MUTE: "mute" });
 // The notification tag is per chat (oc-push.js uses the same).
 const TAG_PREFIX = "chat-";
+// The buttons a push may ask for. "text" gives Reply a text field in the shade.
+const BUTTONS = {
+  [ACTION.REPLY]: { action: ACTION.REPLY, title: "Reply", type: "text", placeholder: "Reply" },
+  [ACTION.READ]: { action: ACTION.READ, title: "Mark as read" },
+  [ACTION.MUTE]: { action: ACTION.MUTE, title: `Mute ${MUTE_ACTION_HOURS} h` },
+};
 // Where a reply that could not be sent waits for the page (oc-push.js reads it).
 const DRAFTS = "oc-push-drafts";
 
@@ -21,7 +33,7 @@ self.addEventListener("push", (e) => {
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     // Open WebUI is in front of the user on this device, whatever chat is open:
     // nothing to tell, as in a messaging app (the page has its own cues).
-    const inFront = wins.some((c) => c.focused && c.visibilityState === "visible");
+    const inFront = wins.some((c) => c.focused && c.visibilityState === VISIBLE);
     const shown = MUST_SHOW || !inFront;
     if (shown) {
       await self.registration.showNotification(p.title || "Open WebUI", {
@@ -31,12 +43,10 @@ self.addEventListener("push", (e) => {
         icon: "/static/favicon.png",
         badge: "/static/favicon.png",
         data: { url: p.url || "/", chat_id: p.chat_id || "", fn: p.fn || "" },
-        // Android Chrome shows two (Notification.maxActions); Chrome adds its own
-        // "Unsubscribe" after them. "text" gives Reply a text field in the shade.
-        actions: p.chat_id ? [
-          { action: "reply", title: "Reply", type: "text", placeholder: "Reply" },
-          ...(p.fn ? [{ action: "mute", title: "Mute 8 h" }] : []),
-        ] : [],
+        // The function's NOTIFICATION_ACTIONS, in order (a v2 push has none: Reply
+        // and Mute). Android Chrome shows two (Notification.maxActions) and adds
+        // its own "Unsubscribe" after them.
+        actions: p.chat_id ? (p.actions || [ACTION.REPLY, ...(p.fn ? [ACTION.MUTE] : [])]).filter((a) => BUTTONS[a]).map((a) => BUTTONS[a]) : [],
       });
     }
     // Each decision, once acted on, to the open pages (`oc-push` messages), for tests and tools.
@@ -69,7 +79,7 @@ async function sendReply(chatId, text) {
   if (!model) throw new Error("no model");
   const uid = crypto.randomUUID(), aid = crypto.randomUUID();
   const userMessage = { id: uid, parentId: leaf, childrenIds: [], role: "user", content: text,
-    timestamp: Math.floor(Date.now() / 1000), models: [model] };
+    timestamp: Math.floor(Date.now() / MS_PER_S), models: [model] };
   await api("/api/chat/completions", {
     stream: true, model, chat_id: chatId, id: aid, parent_id: leaf, user_message: userMessage,
     message_ids: [{ model_id: model, message_id: aid, modelIdx: 0 }],
@@ -85,8 +95,54 @@ async function mute(fn, chatId, seconds) {
   const valves = (await api(path)) || {};
   let mutes = {};
   try { mutes = JSON.parse(valves.mutes || "{}") || {}; } catch (_) {}
-  mutes[chatId] = seconds ? Math.floor(Date.now() / 1000) + seconds : 0;
+  mutes[chatId] = seconds ? Math.floor(Date.now() / MS_PER_S) + seconds : 0;
   await api(path + "/update", { ...valves, mutes: JSON.stringify(mutes) });
+}
+
+// Mark a chat read, as opening it does: Open WebUI 0.13 keeps the sidebar's
+// unread dot on the server (chat.last_read_at), and sets it for one chat only
+// through its Socket.IO event `events:chat` {type: "last_read_at"}; it then
+// tells every open window of the user (`chat:list`), so the dot goes at once.
+// The token comes from the session cookie (GET /api/v1/auths/), and is not kept.
+const READ_TIMEOUT_MS = 15000;   // a safety net for a socket that never answers
+// Engine.IO 4 packets (open, ping, pong) and Socket.IO's on the default namespace
+// (connect, connect error, event): the first characters of each frame.
+const EIO = Object.freeze({ OPEN: "0", PING: "2", PONG: "3" });
+const SIO = Object.freeze({ CONNECT: "40", CONNECT_ERROR: "44", EVENT: "42" });
+const SECURE_PROTOCOL = "https:";
+// Open WebUI 0.13's read event, and its answer to the user's windows.
+const READ_EVENT = "events:chat", READ_TYPE = "last_read_at";
+const ANSWER_EVENT = "events", ANSWER_TYPE = "chat:list";
+async function markRead(chatId) {
+  const { token } = await api("/api/v1/auths/");
+  if (!token) throw new Error("no session");
+  const url = new URL("/ws/socket.io/?EIO=4&transport=websocket", self.location.origin);
+  url.protocol = url.protocol === SECURE_PROTOCOL ? "wss:" : "ws:";
+  const ws = new WebSocket(url);
+  try {
+    await new Promise((ok, fail) => {
+      const timer = setTimeout(() => fail(new Error("socket timeout")), READ_TIMEOUT_MS);
+      const done = (f, v) => { clearTimeout(timer); f(v); };
+      ws.onerror = () => done(fail, new Error("socket error"));
+      ws.onclose = () => done(fail, new Error("socket closed"));
+      ws.onmessage = ({ data }) => {
+        if (data === EIO.PING) return ws.send(EIO.PONG);
+        if (data.startsWith(SIO.CONNECT_ERROR)) return done(fail, new Error("socket refused"));
+        if (data.startsWith(SIO.CONNECT)) {
+          return ws.send(SIO.EVENT + JSON.stringify([READ_EVENT, { chat_id: chatId, data: { type: READ_TYPE } }]));
+        }
+        if (data.startsWith(SIO.EVENT)) {
+          const [name, ev] = JSON.parse(data.slice(SIO.EVENT.length));
+          if (name === ANSWER_EVENT && ev?.chat_id === chatId && ev.data?.type === ANSWER_TYPE) done(ok);
+          return;
+        }
+        if (data.startsWith(EIO.OPEN)) ws.send(SIO.CONNECT + JSON.stringify({ token }));
+      };
+    });
+  } finally {
+    ws.onclose = null;
+    ws.close();
+  }
 }
 
 async function openChat(url) {
@@ -103,7 +159,7 @@ async function openChat(url) {
 // What a tap does. `action`: "" (the notification), "reply" or "mute".
 async function act(action, data, reply) {
   const url = new URL(data.url || "/", self.location.origin).href;
-  if (action === "mute" && data.fn && data.chat_id) {
+  if (action === ACTION.MUTE && data.fn && data.chat_id) {
     try {
       await mute(data.fn, data.chat_id, MUTE_ACTION_S);
       return "muted";
@@ -112,7 +168,17 @@ async function act(action, data, reply) {
       return "mute-failed";
     }
   }
-  if (action === "reply" && data.chat_id) {
+  if (action === ACTION.READ && data.chat_id) {
+    try {
+      await markRead(data.chat_id);
+      return "read";
+    } catch (_) {
+      // Not marked: opening the chat marks it read.
+      await openChat(url);
+      return "read-failed";
+    }
+  }
+  if (action === ACTION.REPLY && data.chat_id) {
     const text = (reply || "").trim();
     if (text) {
       try {

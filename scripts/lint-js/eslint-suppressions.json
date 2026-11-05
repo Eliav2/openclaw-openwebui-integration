@@ -29,11 +29,8 @@
     }
   },
   "push/web/oc-sw.js": {
-    "no-magic-numbers": {
-      "count": 4
-    },
     "no-restricted-syntax": {
-      "count": 4
+      "count": 1
     }
   },
   "scripts/owui_live_fold.ts": {
