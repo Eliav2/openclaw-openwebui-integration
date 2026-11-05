@@ -5,7 +5,7 @@ author_url: https://github.com/Eliav2
 project_url: https://github.com/Eliav2/openclaw-openwebui-integration
 version: 1.0.0
 license: MIT
-required_open_webui_version: 0.12.0
+required_open_webui_version: 0.12.4
 description: Per-chat thinking / reasoning-effort control for the OpenClaw Gateway pipe. Adds a toggle to the message input and a level dropdown, and writes the standard reasoning_effort field the pipe reads.
 
 OpenClaw Thinking Filter for Open WebUI

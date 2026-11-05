@@ -6,7 +6,7 @@ project_url: https://github.com/Eliav2/openclaw-openwebui-integration
 version: 1.0.0
 license: MIT
 requirements: websockets, cryptography
-required_open_webui_version: 0.12.0
+required_open_webui_version: 0.12.4
 description: Chat with an OpenClaw Gateway agent inside Open WebUI over the Gateway's native WebSocket protocol, with real-time streaming, native tool-call cards, and a persistent agent session per conversation.
 
 OpenClaw Gateway Pipe for Open WebUI
@@ -34,7 +34,7 @@ How it works
 
 Requirements
 ------------
-- Open WebUI 0.12.0+ and an OpenClaw Gateway 2026.9.3+, reachable from the
+- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.9.3+, reachable from the
   Open WebUI backend. What an older release loses:
   https://github.com/Eliav2/openclaw-openwebui-integration/blob/main/docs/versions.md
 - Python modules: websockets, cryptography, pydantic
@@ -2034,105 +2034,6 @@ async def _live_output(request, chat_id: str | None, message_id: str | None) -> 
     return copy.deepcopy(output) if output else None
 
 
-
-# ---------------------------------------------------------------------------
-# A tab's input dialog and `execute` share one callback (ELI-195).
-#
-# Open WebUI 0.12's Chat.svelte keeps one callback slot for its `input` and
-# `confirmation` dialogs and for `execute`: each of these events overwrites
-# it on arrival, and the dialog's Confirm / Cancel answers whatever the slot
-# holds then. An `execute` that reaches a tab while its dialog is open takes
-# the dialog's answer, so the click is lost and the asker never hears back.
-# While a dialog is open on a socket, the socket is recorded here (shared by
-# the Pipe and the Action through `_shared_gateway_state`): an emitted
-# `execute` skips it and is delivered once the dialog is answered, and a
-# called one (a query) is not sent to it.
-# ---------------------------------------------------------------------------
-
-_SLOT_DIALOG_TYPES = ("input", "confirmation")
-_local_dialog_holds: dict = {}
-
-
-def _dialog_holds() -> dict:
-    """sid -> {"user_id", "open": open dialogs, "held": event payloads}."""
-    state = _shared_gateway_state()
-    return _local_dialog_holds if state is None else state.setdefault("dialog_holds", {})
-
-
-def _dialog_open_on(sid) -> bool:
-    return bool(sid) and sid in _dialog_holds()
-
-
-@contextlib.asynccontextmanager
-async def _holding_executes(sid, user_id, kind):
-    """Record `sid` as showing a dialog of `kind` for the block's duration,
-    then deliver the `execute` events held for it meanwhile, in order."""
-    if not sid or kind not in _SLOT_DIALOG_TYPES:
-        yield
-        return
-    holds = _dialog_holds()
-    entry = holds.get(sid)
-    if entry is None:
-        entry = holds[sid] = {"user_id": user_id, "open": 0, "held": []}
-    entry["open"] += 1
-    try:
-        yield
-    finally:
-        entry["open"] -= 1
-        if entry["open"] <= 0 and holds.get(sid) is entry:
-            del holds[sid]
-            if entry["held"]:
-                pipe_log(f"  dialog on {str(sid)[:8]}... answered: delivering "
-                         f"{len(entry['held'])} held execute event(s)")
-            for payload in entry["held"]:
-                try:
-                    from open_webui.socket.main import sio
-                    await sio.emit("events", payload, to=sid)
-                except Exception as ex:
-                    pipe_log(f"  held execute to {str(sid)[:8]}... failed: {ex!r}")
-
-
-def _dialog_safe_emitter(emitter, user_id, chat_id, message_id):
-    """`emitter`, except that an `execute` skips the user's sockets with an
-    open dialog (OWUI's emitter sends to the whole `user:<id>` room) and is
-    held for them."""
-    if emitter is None or not user_id:
-        return emitter
-
-    async def emit(event):
-        busy = []
-        if isinstance(event, dict) and event.get("type") == "execute":
-            holds = _dialog_holds()
-            busy = [sid for sid, e in list(holds.items()) if e.get("user_id") == user_id]
-        if not busy:
-            return await emitter(event)
-        payload = {"chat_id": chat_id, "message_id": message_id, "data": event}
-        for sid in busy:
-            holds[sid]["held"].append(payload)
-        pipe_log(f"  execute held for {len(busy)} tab(s) with an open dialog")
-        from open_webui.socket.main import sio
-        await sio.emit("events", payload, room=f"user:{user_id}", skip_sid=busy)
-
-    return emit
-
-
-def _dialog_safe_event_call(event_call, sid, user_id):
-    """`event_call` (bound to socket `sid`), recording its dialogs and never
-    sending an `execute` while one is open there: that query answers None."""
-    if event_call is None:
-        return None
-
-    async def call(payload):
-        kind = (payload or {}).get("type")
-        if kind == "execute" and _dialog_open_on(sid):
-            pipe_log(f"  execute query not sent: {str(sid)[:8]}... shows a dialog")
-            return None
-        async with _holding_executes(sid, user_id, kind):
-            return await event_call(payload)
-
-    return call
-
-
 # --- composer --------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -2963,9 +2864,6 @@ class _ComposerWatcher:
                 _chat_tab_ready(sid, chat_id)
             if st is None:
                 continue
-            if result == "held":
-                st["attempts"] -= 1
-                continue
             if result == "retry" and st["attempts"] < _COMPOSER_WATCH_ATTEMPTS:
                 st["next"] = now + _COMPOSER_WATCH_RETRY_S
             else:
@@ -2973,9 +2871,7 @@ class _ComposerWatcher:
         return pushed
 
     async def _push(self, sid, chat_id, user_id) -> str:
-        """"acked" (the tab ran it), "skip" (not ours to push), "retry", or
-        "held": the tab shows an input dialog, which an `execute` would take
-        the answer of (ELI-195), so the push waits for it to close."""
+        """"acked" (the tab ran it), "skip" (not ours to push), or "retry"."""
         if not user_id:
             return "skip"
         head = await self._chat_head(chat_id)
@@ -2994,8 +2890,6 @@ class _ComposerWatcher:
         code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id,
                                              chat_model=model))
-        if _dialog_open_on(sid):
-            return "held"
         acked = await self._call_sid(sid, {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -3678,13 +3572,12 @@ async def _call_on_chat_tab(
     if card:
         payload = {**payload, "data": {**payload["data"], "interaction_id": interaction_id}}
     try:
-        async with _holding_executes(sid, owui_user_id, payload.get("type")):
-            return await sio.call(
-                "events",
-                {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
-                to=sid,
-                timeout=timeout_s,
-            )
+        return await sio.call(
+            "events",
+            {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
+            to=sid,
+            timeout=timeout_s,
+        )
     except Exception as ex:
         return {"error": f"Event call timed out: {ex!r}"}
     finally:
@@ -9664,44 +9557,6 @@ def _turn_message_patch(message_id: str, parent: str | None, message: dict) -> d
     return nodes
 
 
-# ELI-230: a tab that loads the chat while the writer introduces its message
-# can lose it. Open WebUI's loadChat fetches the chat, awaits its tags, then
-# assigns the history it fetched first, over the introduction merged in
-# meanwhile; every later event for the message is then dropped (the page
-# handles events only for messages it has). The page draws no message until
-# that assignment, so once the parent is drawn, whether the message is drawn
-# too is the tab's answer.
-_TAB_PROBE_WAIT_S = 10.0
-_TAB_PROBE_TIMEOUT_S = _TAB_PROBE_WAIT_S + 2.0
-
-
-def _tab_probe_js(parent: str, message_id: str) -> str:
-    """'present' or 'missing' once the tab has drawn `parent`; 'loading'
-    when it has not within _TAB_PROBE_WAIT_S."""
-    return (
-        "const p = " + json.dumps(f"message-{parent}") + ", m = " + json.dumps(f"message-{message_id}") + ";"
-        "const drawn = await new Promise((resolve) => {"
-        "  if (document.getElementById(p)) return resolve(true);"
-        "  const obs = new MutationObserver(() => { if (document.getElementById(p)) { obs.disconnect(); resolve(true); } });"
-        "  obs.observe(document.body, {childList: true, subtree: true});"
-        "  setTimeout(() => { obs.disconnect(); resolve(false); }, " + str(int(_TAB_PROBE_WAIT_S * 1000)) + ");"
-        "});"
-        "if (!drawn) return 'loading';"
-        "return document.getElementById(m) ? 'present' : 'missing';"
-    )
-
-
-def _tabs_showing(user_id: str, chat_id: str) -> list:
-    """The user's sockets whose page has joined the chat."""
-    try:
-        from open_webui.socket.main import SESSION_POOL
-    except Exception:
-        return []
-    return [sid for sid, sess in list((SESSION_POOL or {}).items())
-            if isinstance(sess, dict) and sess.get("id") == user_id
-            and chat_id in (sess.get("chat_ids") or [])]
-
-
 def _owui_redis():
     """Open WebUI's redis client, or None in a single-process install
     (`create_task` handles both)."""
@@ -10291,10 +10146,6 @@ async def _page_cancel_intent(user_id: str, chat_id: str, message_id: str) -> st
             and chat_id in (sess.get("chat_ids") or [])]
     answers = set()
     for sid in sids:
-        if _dialog_open_on(sid):
-            # The query would take the open dialog's answer (ELI-195).
-            pipe_log(f"  turn writer: {sid[:8]}... shows a dialog; its intent is not asked")
-            continue
         try:
             resp = await socket_main.sio.call("events", {
                 "chat_id": chat_id, "message_id": message_id,
@@ -10387,11 +10238,6 @@ class _TurnWriter:
         # Two pumps feed one writer when a recovery continues M; only one may
         # claim it.
         self._open_lock = asyncio.Lock()
-        # ELI-230: tabs that showed M once their page had loaded the chat, and
-        # tabs with a probe out. A repair and a stream step never interleave:
-        # the repair carries `sent_output`, the base of the next diff.
-        self._tabs_confirmed: set = set()
-        self._tabs_probing: set = set()
         self._emit_lock = asyncio.Lock()
 
     async def open(self, takeover: bool = False) -> bool:
@@ -10540,10 +10386,9 @@ class _TurnWriter:
             from open_webui.socket.main import get_event_emitter
 
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = _dialog_safe_emitter(await get_event_emitter(
+            self._emit = await get_event_emitter(
                 {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False),
-                self.user_id, self.chat_id, self.message_id)
+                 "user_id": self.user_id}, update_db=False)
         return self._emit
 
     async def _stream(self) -> None:
@@ -10562,62 +10407,10 @@ class _TurnWriter:
         if self.handover_owed and (self.request_task is None or self.request_task.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
-        self._probe_tabs()
 
     def _introduced(self) -> bool:
         """M is a message this writer inserted and introduced to open tabs."""
         return bool(self._claim and self._claim.get("how") == "new" and self._claim.get("parent"))
-
-    def _probe_tabs(self) -> None:
-        """Ask each tab showing the chat that has not shown M yet whether it
-        does, one probe per tab at a time, until the run ends (ELI-230)."""
-        if self.closed or not self._introduced():
-            return
-        for sid in _tabs_showing(self.user_id, self.chat_id):
-            if sid in self._tabs_confirmed or sid in self._tabs_probing or _dialog_open_on(sid):
-                continue
-            self._tabs_probing.add(sid)
-            spawn_background(self._probe_tab(sid))
-
-    async def _probe_tab(self, sid: str) -> None:
-        parent = self._claim["parent"]
-        try:
-            from open_webui.socket.main import sio
-            # Under the parent's id: the tab drops an event for a message it
-            # does not have, which is M in exactly the case looked for.
-            resp = await sio.call("events", {
-                "chat_id": self.chat_id, "message_id": parent,
-                "data": {"type": "execute", "data": {"code": _tab_probe_js(parent, self.message_id)}},
-            }, to=sid, timeout=_TAB_PROBE_TIMEOUT_S)
-        except Exception:
-            resp = None  # still loading (no parent yet), or gone: the next step asks again
-        try:
-            answer = _intent_answer(resp)
-            if answer == "present":
-                self._tabs_confirmed.add(sid)
-            elif answer == "missing" and not self.closed:
-                await self._repair_tab(sid)
-                self._tabs_confirmed.add(sid)
-        finally:
-            self._tabs_probing.discard(sid)
-
-    async def _repair_tab(self, sid: str) -> None:
-        """Show M in tab `sid` as it stands: the output the tab's next diff
-        starts from. Only this tab, which lacks M, so nothing it shows is
-        overwritten."""
-        from open_webui.socket.main import sio
-
-        async with self._emit_lock:
-            message = {**self._claim["messages"][self.message_id],
-                       "content": self.sent_text, "output": copy.deepcopy(self.sent_output), "done": False}
-            await sio.emit("events", {
-                "chat_id": self.chat_id, "message_id": self.message_id, "user_id": self.user_id, "shared": True,
-                "data": {"type": "chat:messages", "data": {
-                    "messages": _turn_message_patch(self.message_id, self._claim["parent"], message),
-                    "currentId": self.message_id}},
-            }, to=sid)
-        pipe_log(f"  turn writer: repaired {self.message_id[:8]}... in tab {sid[:8]}... of chat "
-                 f"{self.chat_id[:8]}...: the tab loaded the chat without it (ELI-230)")
 
     def _rewrite(self, text: str) -> str:
         for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
@@ -10770,7 +10563,7 @@ class _TurnWriter:
     async def _push_final(self, text: str, output: list) -> None:
         """M finished, as a shared `chat:messages` to the chat's room. Only for
         a message this writer inserted does it carry the parent's link and move
-        the view to M (ELI-230: a tab that lost M). A taken-over M is in every
+        the view to M. A taken-over M is in every
         saved copy of the chat already, and can have later messages under it:
         the page would replace the parent's children with M alone, or show M
         as the end of the chat."""
@@ -14475,12 +14268,6 @@ def _channel_session_key(agent_id: str, channel_id: str, root_id: str) -> str:
     return f"agent:{agent_id}:openwebui:channel:{channel_id}:thread:{root_id}"
 
 
-def _parse_channel_session_key(key) -> "tuple[str, str, str] | None":
-    """(agent id, channel id, thread root id) of a channel thread's session."""
-    m = _CHANNEL_KEY_RE.match(key or "")
-    return (m.group(1), m.group(2), m.group(3)) if m else None
-
-
 def _channel_mentions_a_model(content) -> bool:
     return any(kind == "M" for kind, _id in _CHANNEL_MENTION_RE.findall(content or ""))
 
@@ -15755,12 +15542,6 @@ class Pipe:
             return
         # Compares a timestamp; a due check runs in the background.
         _ensure_slash_prompts(lambda: self.valves)
-        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
-        meta = __metadata__ or {}
-        user_id = (__user__ or {}).get("id")
-        __event_emitter__ = _dialog_safe_emitter(
-            __event_emitter__, user_id, meta.get("chat_id"), meta.get("message_id"))
-        __event_call__ = _dialog_safe_event_call(__event_call__, meta.get("session_id"), user_id)
         # aclosing: when OWUI closes this generator, close the inner one now
         # rather than whenever it is garbage-collected, so its cancel handling
         # runs before the next message arrives.

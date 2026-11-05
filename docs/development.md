@@ -46,15 +46,6 @@ User-facing problems are in [Troubleshooting](./troubleshooting.md).
 | [`docs/rehydration-persistence.md`](./rehydration-persistence.md) | How Open WebUI 0.12 keeps an assistant message mid-run, so a client reconnecting mid-turn sees the answer so far, and why a done:false message cannot be written. Read this before changing anything about streaming or persistence. |
 | [`docs/design/ask-user-modal.md`](./design/ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written**: see the banner at the top; the shipped approach intercepts `OpenClaw needs input:` text. |
 
-`scripts/migrate_stale_chat_models.py` repoints chats whose saved model the
-Gateway no longer offers. Open WebUI drops an unlisted model id before the
-Pipe runs (the browser swaps in the default model, the API answers "Model not
-found"), so the Pipe cannot map old ids itself; the stored chat has to change.
-It picks each successor from the live model list (same model under another
-provider, else the newest model of the same Claude family, else `default`),
-is a dry run unless given `--apply`, writes a backup before changing anything,
-and `--restore <backup>` undoes it. Re-run it after the Gateway drops models.
-
 ### Running the tests
 
 ```bash
@@ -131,16 +122,16 @@ naming that test and the log line, since a lock that is never released
 at once and the lock cleared; the run goes on, and its summary lists the line
 under "Open WebUI database lock that cleared".
 
-**Drop gates.** Two Open WebUI bugs have Pipe workarounds: an `execute` that
-takes an open input dialog's answer (ELI-195, held by `emit.py`) and a
-cancelled chat write that wedges SQLite (ELI-205, shielded by `turns.py`'s
-`_uncancellable`). Each has a test that produces the bug's precondition itself
-and runs two ways: through the workaround (`held` / `shielded`), which must
-pass on any Open WebUI, and without it (`raw`), marked strict `xfail`. While
-the pinned Open WebUI has the bug, `raw` fails as expected. When a release
-fixes it, `raw` passes and the strict `xfail` fails the run: that is the
-signal to drop the workaround together with its gate. Compat watch runs the
-same suites against `open-webui:latest`, so it shows up there first.
+**Drop gates.** One Open WebUI bug still has a Pipe workaround: a cancelled
+chat write that wedges SQLite (ELI-205, shielded by `turns.py`'s
+`_uncancellable`). Its test produces the bug's precondition itself and runs
+two ways: through the workaround (`shielded`), which must pass on any Open
+WebUI, and without it (`raw`), which shows whether Open WebUI still needs
+it. A new workaround for an upstream bug gets the same pair, with `raw`
+marked strict `xfail` while the pinned release has the bug: when a release
+fixes it, the `xfail` fails the run, the signal to drop the workaround.
+Compat watch runs the same suites against `open-webui:latest`, so it shows
+up there first.
 
 The versions it runs against are pinned in `e2e/versions.env`. The pins stay
 on what the live install runs. A new release first gets a "next" pin

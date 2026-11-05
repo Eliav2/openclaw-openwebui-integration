@@ -66,19 +66,6 @@
  "scripts/media.py": {
   "stamp([a for a in argv[1:] if a not in flags], same=\"--same\" in argv[1:], manual=\"--manual\" in argv[1:])": 2
  },
- "scripts/migrate_stale_chat_models.py": {
-  "return key.split(\"/\", 1)[0] if \"/\" in key else \"\"": 1
- },
- "scripts/owui_api.py": {
-  "elif action == \"delete-all-files\":": 1,
-  "elif action == \"delete-chat\":": 1,
-  "elif action == \"get-chat\":": 1,
-  "elif action == \"list-chats\":": 1,
-  "elif action == \"list-files\":": 1,
-  "elif action == \"set-title\":": 1,
-  "if action == \"login\":": 1,
-  "if not line or line.startswith(\"#\") or \"=\" not in line:": 1
- },
  "scripts/owui_css.py": {
   "if argv[0] == \"dump\":": 1
  },
@@ -198,7 +185,6 @@
  },
  "src/openclaw_pipe_pkg/composer_watch.py": {
   "if result == \"acked\":": 1,
-  "if result == \"held\":": 1,
   "if result == \"retry\" and st[\"attempts\"] < _COMPOSER_WATCH_ATTEMPTS:": 1,
   "if role == \"assistant\" and model is None:": 1,
   "if role == \"user\" and target is None:": 1,
@@ -213,8 +199,6 @@
   "if ch == \"\\n\":": 1,
   "if ch in \"'\\\"\":": 1,
   "if ch in \";|`\" or command.startswith(\"$(\", i) or ch in \"()\":": 2,
-  "if isinstance(event, dict) and event.get(\"type\") == \"execute\":": 1,
-  "if kind == \"execute\" and _dialog_open_on(sid):": 1,
   "if len(objective) > 40:": 1,
   "if n >= 1_000:": 1,
   "if n >= 1_000_000:": 1,
@@ -436,14 +420,12 @@
   "done = [e for e in runs or [] if e.get(\"action\") == \"finished\"": 1,
   "elif (payload.get(\"state\") == \"final\" and not payload.get(\"message\")": 1,
   "elif (payload.get(\"stream\") == CODEX_ITEM_STREAM and data.get(\"phase\") == \"completed\"": 1,
-  "elif answer == \"missing\" and not self.closed:": 1,
   "first = next(i for i in rest_out if i.get(\"type\") == \"message\")": 1,
   "held_cards = sum(1 for i in current.get(\"output\") or [] if i.get(\"type\") == \"function_call\")": 1,
   "if \"MEDIA:\" not in text:": 1,
   "if \"content\" in inspect.signature(save_response_stream).parameters:": 1,
   "if \"database is locked\" in str(ex):": 1,
   "if (messages[start - 1] or {}).get(\"role\") == \"user\":": 1,
-  "if answer == \"present\":": 1,
   "if any(i.get(\"type\") == \"function_call\" for i in self.renderer.output):": 1,
   "if claim[\"how\"] == \"gone\":": 1,
   "if claim[\"how\"] == \"new\":": 1,

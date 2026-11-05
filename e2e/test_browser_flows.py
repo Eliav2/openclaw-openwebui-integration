@@ -29,7 +29,6 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "screenshots"))
 import capture  # noqa: E402
-from owui_version import has_fix_0_12_4  # noqa: E402
 
 TURN_MS = 120_000
 
@@ -304,13 +303,7 @@ def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,
     and that reply is finished: no "Thinking..." left on it, also after a
-    reload; the new message gets its own answer. Skipped on the OpenClaw 2026.10 lane while
-    Open WebUI lacks the ELI-205 fix (0.12.4): see below."""
-    if _openclaw_release() >= (2026, 10) and not has_fix_0_12_4():
-        pytest.skip("OpenClaw 2026.10 lane on Open WebUI before 0.12.4: this flow's Stop lands as the "
-                    "reply ends, so Open WebUI's own end-of-reply save is cancelled mid-transaction and "
-                    "keeps the SQLite lock, and every later test in the job fails (ELI-205, "
-                    "https://linear.app/eliavb/issue/ELI-205).")
+    reload; the new message gets its own answer."""
     capture.new_chat(page)
     capture.send(page, "E2E_ASK_SINGLE")
     capture.wait_js(page, "() => document.body.innerText.includes('Which color?') "
@@ -1590,9 +1583,10 @@ def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
 
 
 def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, token):
-    """ELI-230: Open WebUI's loadChat fetches the chat, awaits its tags, then
-    assigns the history it fetched first. A reply the agent starts in that
-    window is introduced, merged, then overwritten: the tab never showed it
+    """ELI-230: before 0.12.4 (open-webui#32761), loadChat
+    fetched the chat, awaited its tags, then assigned the history it fetched
+    first. A reply the agent starts in that window was introduced, merged,
+    then overwritten: the tab never showed it
     until a reload. The second tab's tags are held until the reply's message
     is in the DB, which puts its introduction in that window every time. The
     tab shows the reply while it runs; the tab open all along shows it once,
@@ -2075,58 +2069,30 @@ def test_a_cloned_chat_starts_with_the_copied_messages(page):
     assert f"User: clone source question {n}" in first, first[:600]
 
 
-ELI195_UPSTREAM = "https://github.com/open-webui/open-webui/issues/32742"
-
-
-class Eli195Present(AssertionError):
-    """The dialog's answer never reached the function. Only this fails the
-    drop gate's expected way."""
-
-
-class Eli195ProbeIneffective(AssertionError):
-    """`raw` could not show either way: the probe never got the `execute`
-    under the open dialog, or never replied. A real failure, never the
-    expected one, never a pass."""
-
-
 # A function that asks for input and, a second later, sends an `execute` to
-# the user's tabs while the dialog is open: open-webui#32742's probe. With
-# HOLD it wraps both the way the Pipe does before a turn (pipe.py, ELI-195),
-# from the Pipe file the test copied into the container.
+# the user's tabs while the dialog is open: open-webui#32742's probe.
 ELI195_PROBE = '''"""
 title: ELI-195 probe
 """
 import asyncio
-import importlib.util
-
-HOLD = %s
 
 
 class Pipe:
-    async def pipe(self, body: dict, __user__=None, __metadata__=None,
-                   __event_emitter__=None, __event_call__=None):
+    async def pipe(self, body: dict, __event_emitter__=None, __event_call__=None):
         # A new chat's tab learns the chat id only when the request returns,
         # and drops a dialog for a chat it does not show yet: ask in the
         # chat's second turn, never its first.
         if sum(m.get("role") == "user" for m in body.get("messages", [])) < 2:
             return "ready"
-        emit, call = __event_emitter__, __event_call__
-        if HOLD:
-            spec = importlib.util.spec_from_file_location("openclaw_pipe_probe", "/tmp/openclaw_pipe_probe.py")
-            pipe = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(pipe)
-            meta, user_id = __metadata__ or {}, (__user__ or {}).get("id")
-            emit = pipe._dialog_safe_emitter(emit, user_id, meta.get("chat_id"), meta.get("message_id"))
-            call = pipe._dialog_safe_event_call(call, meta.get("session_id"), user_id)
 
         async def poke():
             await asyncio.sleep(1)
-            await emit({"type": "execute", "data": {"code": "window.__eli195Poked = true"}})
+            await __event_emitter__({"type": "execute", "data": {"code": "window.__eli195Poked = true"}})
             await __event_emitter__({"type": "status", "data": {"description": "execute sent", "done": False}})
 
         poked = asyncio.create_task(poke())
         try:
-            value = await asyncio.wait_for(call({"type": "input", "data": {
+            value = await asyncio.wait_for(__event_call__({"type": "input", "data": {
                 "title": "Probe", "message": "Type anything", "placeholder": "here"}}), 30)
         except asyncio.TimeoutError:
             value = "NO ANSWER"
@@ -2135,74 +2101,40 @@ class Pipe:
 '''
 
 
-@pytest.mark.parametrize("mode", [
-    "held",
-    # Fixed upstream in 0.12.4 (open-webui#32744): the raw mode is expected to fail only on older
-    # releases, and to pass from 0.12.4 on.
-    pytest.param("raw", marks=pytest.mark.xfail(not has_fix_0_12_4(), strict=True, raises=Eli195Present, reason=(
-        "ELI-195 drop gate: on this Open WebUI an `execute` reaching a tab while its input dialog "
-        f"is open takes the dialog's answer ({ELI195_UPSTREAM}). An XPASS means the pinned release "
-        "fixed it: drop the Pipe's execute hold (emit.py dialog holds) and this gate."))),
-])
-def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(page, token, mode):
+def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(page, token):
     """ELI-195: a function's `execute` that reaches a tab while that tab
-    shows an input dialog. The probe produces it every time: it asks, then
-    sends an `execute` a second later; the page must run that `execute` while
-    the dialog is open (or, held, right after it) and the answer must reach
-    the function. `held` (the Pipe's wrappers) must always pass; `raw` shows
-    whether Open WebUI still needs them."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, "..", "openclaw_pipe.py"), "rb") as f:
-        subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c", "cat > /tmp/openclaw_pipe_probe.py"], stdin=f,
-                       check=True, capture_output=True, timeout=60)
-    fid = f"eli195_probe_{mode}"
+    shows an input dialog. Before Open WebUI 0.12.4 (open-webui#32742) it
+    took the dialog's answer, so the Pipe held executes while a dialog was
+    open; from 0.12.4, the minimum, the page runs the `execute` under the
+    dialog and the answer still reaches the function. The probe asks, then
+    sends an `execute` a second later."""
+    fid = "eli195_probe"
     capture.api("DELETE", f"/api/v1/functions/id/{fid}/delete", token=token) if any(
         f.get("id") == fid for f in capture.api("GET", "/api/v1/functions/", token=token)) else None
     capture.api("POST", "/api/v1/functions/create", {"id": fid, "name": fid, "meta": {"description": fid},
-                                                     "content": ELI195_PROBE % (mode == "held")}, token=token)
+                                                     "content": ELI195_PROBE}, token=token)
     capture.api("POST", f"/api/v1/functions/id/{fid}/toggle", token=token)
     try:
-        _eli195_probe(page, mode, fid)
-    except Eli195Present:
-        raise
-    except Exception as ex:
-        if mode == "raw":
-            # Raw has three outcomes only: the bug (Eli195Present), its
-            # absence (a pass), or this.
-            raise Eli195ProbeIneffective(f"{type(ex).__name__}: {ex}") from None
-        raise
+        page.goto(f"{capture.BASE}/?models={fid}")
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        capture.dismiss_popups(page)
+        page.evaluate("() => { window.__eli195Poked = false; }")
+        capture.send(page, "hi")
+        _wait(page, _reply_js(-1, "r.done && r.text.includes('ready')"), "the probe's first reply", 60_000)
+        capture.send(page, "ask")
+        page.get_by_text("Type anything").wait_for(timeout=60_000)
+        # The precondition: the page ran the `execute` while the dialog is open.
+        page.get_by_text("execute sent").wait_for(timeout=30_000)
+        assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
+        _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
+        page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
+        page.get_by_role("button", name="Confirm", exact=True).click()
+        # The probe always replies `got <answer>`, `got 'NO ANSWER'` after 30 s.
+        _wait(page, _last_assistant_js("t.includes('got ')"), "the probe's reply", 60_000)
+        reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+        assert "got 'hello'" in reply, f"the execute took the dialog's answer: {reply[-200:]}"
     finally:
         capture.api("DELETE", f"/api/v1/functions/id/{fid}/delete", token=token)
-
-
-def _eli195_probe(page, mode: str, fid: str) -> None:
-    page.goto(f"{capture.BASE}/?models={fid}")
-    page.wait_for_selector("#chat-input", timeout=60_000)
-    capture.dismiss_popups(page)
-    page.evaluate("() => { window.__eli195Poked = false; }")
-    capture.send(page, "hi")
-    _wait(page, _reply_js(-1, "r.done && r.text.includes('ready')"), "the probe's first reply", 60_000)
-    capture.send(page, "ask")
-    page.get_by_text("Type anything").wait_for(timeout=60_000)
-    # The precondition: the `execute` went out while the dialog is open;
-    # raw, the page also ran it under the dialog; held, it did not.
-    page.get_by_text("execute sent").wait_for(timeout=30_000)
-    assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
-    if mode == "raw":
-        _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
-    else:
-        assert page.evaluate("() => window.__eli195Poked") is False, "the held execute ran under the dialog"
-    page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
-    page.get_by_role("button", name="Confirm", exact=True).click()
-    # The probe always replies `got <answer>`, `got 'NO ANSWER'` after 30 s.
-    _wait(page, _last_assistant_js("t.includes('got ')"), "the probe's reply", 60_000)
-    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
-    print(f"ELI-195 probe ({mode}): execute ran under the dialog: {mode == 'raw'}; reply: {reply[-80:]!r}")
-    if "got 'hello'" not in reply:
-        raise Eli195Present(reply[-200:])
-    if mode == "held":
-        # Held, the `execute` runs once the dialog is answered.
-        _wait(page, "() => window.__eli195Poked === true", "the held execute after the answer", 30_000)
 
 
 def test_one_message_to_two_models_is_answered_by_each_without_a_note(page, token):
