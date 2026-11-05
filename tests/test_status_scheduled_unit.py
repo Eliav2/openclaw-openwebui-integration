@@ -163,6 +163,15 @@ class ReadTests(unittest.IsolatedAsyncioTestCase):
         await action._read_scheduled(conn, KEY)
         self.assertEqual(len(conn.calls), 2)
 
+    async def test_the_cache_keeps_only_current_reads_and_is_bounded(self):
+        conn = _Conn([_job("mine")])
+        await action._read_scheduled(conn, "agent:main:old")
+        conn.cron_changed()
+        with mock.patch.object(action, "_SCHEDULED_CACHE_MAX", 2):
+            for key in ("agent:main:a", "agent:main:b", "agent:main:c"):
+                await action._read_scheduled(conn, key)
+        self.assertEqual(list(action._scheduled_cache), ["agent:main:b", "agent:main:c"])
+
     async def test_a_new_connection_reads_again(self):
         await action._read_scheduled(_Conn([_job("mine")]), KEY)
         other = _Conn([_job("mine")])
@@ -209,14 +218,34 @@ class GatewayCronEventTests(unittest.TestCase):
         waiter = conn.cron_event()
         conn._on_cron_changed()
         self.assertTrue(waiter.is_set())
-        self.assertEqual(conn.cron_revision, start + 1)
+        after_event = conn.cron_revision
+        self.assertNotEqual(after_event, start)
         self.assertIsNot(conn.cron_event(), waiter)
         gap = conn.cron_event()
         conn._wake_session_waiters()          # a socket gap: a `cron` event may be lost
         self.assertTrue(gap.is_set())
-        self.assertEqual(conn.cron_revision, start + 2)
+        after_gap = conn.cron_revision
+        self.assertNotIn(after_gap, (start, after_event))
         conn._wake_session_waiters("agent:main:x")   # one session's change is not a cron change
-        self.assertEqual(conn.cron_revision, start + 2)
+        self.assertEqual(conn.cron_revision, after_gap)
+
+    def test_no_two_connections_share_a_revision(self):
+        a = openclaw_pipe._GatewayConnection(lambda: None)
+        b = openclaw_pipe._GatewayConnection(lambda: None)
+        self.assertNotEqual(a.cron_revision, b.cron_revision)
+        a._on_cron_changed()
+        b._on_cron_changed()
+        self.assertNotEqual(a.cron_revision, b.cron_revision)
+
+
+class GatewayCloseTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_closing_wakes_a_waiting_follow(self):
+        conn = openclaw_pipe._GatewayConnection(lambda: None)
+        start, waiter = conn.cron_revision, conn.cron_event()
+        await conn.disconnect()
+        self.assertTrue(waiter.is_set())
+        self.assertNotEqual(conn.cron_revision, start)
 
 
 def _fill(emitted, name="scheduled"):
@@ -240,13 +269,13 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
 
     async def ask(self, conn, dialog_id, revision, user=USER):
         emitted = []
-        with action_gateway(conn):
-            task = asyncio.ensure_future(Action().action(
-                {"chat_id": CHAT, "mode": "scheduled-rows", "dialogId": dialog_id, "revision": revision},
-                __user__={"id": user}, __event_emitter__=RecordingEmitter(emitted)))
-            for _ in range(20):
-                await asyncio.sleep(0)
-            return task, emitted
+        self.enterContext(action_gateway(conn))      # for the whole test: the follow connects again
+        task = asyncio.ensure_future(Action().action(
+            {"chat_id": CHAT, "mode": "scheduled-rows", "dialogId": dialog_id, "revision": revision},
+            __user__={"id": user}, __event_emitter__=RecordingEmitter(emitted)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return task, emitted
 
     async def test_it_waits_for_the_cron_event_then_fills(self):
         conn = _Conn([_job("mine")])
@@ -293,6 +322,26 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await asyncio.wait_for(task, 5))["status"], "error")
         self.assertIsNone(_fill(emitted))
         self.assertEqual(conn.calls, [])
+        # The page is told, not left following nothing (another worker's dialog).
+        self.assertIn("This dialog is out of date", json.dumps(_emitted_codes(emitted)))
+
+    async def test_a_changed_revision_past_the_follow_bound_is_not_read(self):
+        conn = _Conn([_job("mine")])
+        dialog_id, dialog = self.dialog()
+        dialog["expires"] = 0
+        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision - 1)
+        self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
+        self.assertIsNone(_fill(emitted))
+        self.assertEqual(conn.calls, [])
+
+    async def test_a_closed_dialog_with_a_changed_revision_is_not_read(self):
+        conn = _Conn([_job("mine")])
+        dialog_id, dialog = self.dialog()
+        dialog["closed"].set()
+        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision - 1)
+        self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
+        self.assertIsNone(_fill(emitted))
+        self.assertEqual(conn.calls, [])
 
 
 class OpenTests(unittest.IsolatedAsyncioTestCase):
@@ -329,6 +378,32 @@ for (let s = 0; s < (input.advance || 0); s++) { now += 1000; [...timers.values(
 out.after = leaves();
 out.fetches = fetches;
 console.log(JSON.stringify(out));
+"""
+
+_SCHED_TITLES_JS = _FAKE_DOM_JS + r"""
+global.localStorage = { getItem: () => 'tok' };
+global.fetch = () => new Promise(() => {});
+run(input.open);
+input.fills.forEach(run);
+const section = document.getElementById('openclaw-status-section-scheduled');
+console.log(JSON.stringify(section.walk().map((e) => e.title).filter(Boolean)));
+"""
+
+# The follow's retries: every answer after `answers` runs out is a network failure;
+# a retry's wait fires at once. Prints how many requests the page made.
+_SCHED_RETRY_JS = _FAKE_DOM_JS + r"""
+let asks = 0;
+global.localStorage = { getItem: () => 'tok' };
+global.fetch = () => {
+  asks++;
+  const a = input.answers.shift();
+  return a ? Promise.resolve({ ok: a.ok, json: () => Promise.resolve(a.body) }) : Promise.reject(new Error('net'));
+};
+const realTimeout = setTimeout;
+global.setTimeout = (fn) => { Promise.resolve().then(fn); return 0; };
+run(input.open);
+input.fills.forEach(run);
+realTimeout(() => console.log(JSON.stringify(asks)), 50);
 """
 
 IDENTITY = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x", "dialogId": "d1"}
@@ -372,6 +447,27 @@ class PageTests(unittest.TestCase):
                 self.assertIn("Scheduled", seen["before"])
                 self.assertFalse(any("(0)" in t for t in seen["before"]), seen["before"])
                 self.assertTrue(any(note in t for t in seen["before"]), seen["before"])
+
+    def test_a_meta_line_shows_whole_on_hover(self):
+        error = "Last run failed: " + "x" * 300
+        row = action._scheduled_rows([{**_job("broken"), "nextRunAtMs": NOW + H}], KEY, USER)
+        row["rows"][0].update(status="failed", error="x" * 300, failedInARow=1)
+        fill = action._render_scheduled_fill_js({"source": "pipe", "fetchedAt": NOW, "error": None,
+                                                 "revision": 4, **row})
+        seen = run_page(_SCHED_TITLES_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY), "fills": [fill]})
+        self.assertIn(error, seen)
+
+    def test_a_failed_follow_request_is_asked_again_a_few_times(self):
+        for answers, asks in (([], 4),                                         # network down: 1 + 3 retries
+                              ([{"ok": True, "body": {"status": "error", "detail": "x"}}], 4),
+                              ([{"ok": True, "body": {"status": "ok"}}], 1),    # closed or past the bound
+                              ([{"ok": True, "body": {"status": "error", "detail": "unknown dialog"}}], 1)):
+            with self.subTest(answers=answers):
+                fill = action._render_scheduled_fill_js({"source": "pipe", "fetchedAt": NOW, "error": None,
+                                                         "revision": 4, **action._scheduled_rows([], KEY, USER)})
+                seen = run_page(_SCHED_RETRY_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY),
+                                                  "fills": [fill], "answers": answers})
+                self.assertEqual(seen, asks)
 
     def test_due_says_now(self):
         row = action._scheduled_rows([{**_job("due"), "nextRunAtMs": NOW + 2000}], KEY, USER)

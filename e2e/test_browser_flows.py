@@ -1386,9 +1386,10 @@ def test_the_open_status_dialog_follows_this_chats_schedule(page):
     add = {"schedule": {"kind": "every", "everyMs": 2 * 3_600_000}, "agentId": "main",
            "payload": {"kind": "agentTurn", "message": "E2E check the build\nsecond line"},
            "delivery": {"mode": "none"}}
-    mine = _gateway_call("cron.add", {"name": "e2e-sched-mine", "sessionTarget": f"session:{key}", **add})
-    other = _gateway_call("cron.add", {"name": "e2e-sched-other", "sessionTarget": "isolated", **add})
+    mine = other = None
     try:
+        mine = _gateway_call("cron.add", {"name": "e2e-sched-mine", "sessionTarget": f"session:{key}", **add})
+        other = _gateway_call("cron.add", {"name": "e2e-sched-other", "sessionTarget": "isolated", **add})
         page.wait_for_function(shows, arg="e2e-sched-mine", timeout=30_000)
         text = page.locator(section).inner_text()
         assert "(1)" in text, text

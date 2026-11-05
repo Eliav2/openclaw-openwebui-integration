@@ -5540,6 +5540,9 @@ PLUGIN_APPROVAL_CAP = "plugin-approvals"
 
 
 class _GatewayConnection:
+    # Cron revisions are issued from one sequence for every connection, so a
+    # revision a page holds never matches a different connection's.
+    _cron_revisions_issued = 0
     """Persistent WebSocket connection to the Gateway: dispatches events to
     per-run queues and reconnects with backoff."""
 
@@ -5705,7 +5708,7 @@ class _GatewayConnection:
         # or finished), or a socket gap: the waiter, and a count readers keep
         # to tell a cached job list is old.
         self._cron_waiter: asyncio.Event | None = None
-        self.cron_revision = 0
+        self.cron_revision = self._next_cron_revision()
         self._tool_events_seen: dict[tuple, bool] = {}
         # A waiting command returns its "Take control" link on every poll.
         self._control_links_shown: dict[tuple, bool] = {}
@@ -5851,8 +5854,13 @@ class _GatewayConnection:
             self._cron_waiter = asyncio.Event()
         return self._cron_waiter
 
+    @staticmethod
+    def _next_cron_revision() -> int:
+        _GatewayConnection._cron_revisions_issued += 1
+        return _GatewayConnection._cron_revisions_issued
+
     def _on_cron_changed(self) -> None:
-        self.cron_revision += 1
+        self.cron_revision = self._next_cron_revision()
         waiter, self._cron_waiter = self._cron_waiter, None
         if waiter is not None:
             waiter.set()
@@ -7000,6 +7008,8 @@ class _GatewayConnection:
             except Exception:
                 pass
             self._ws = None
+        # A follow waiting on this connection reads again, through a live one.
+        self._on_cron_changed()
 
     # ── Internal ────────────────────────────────────────────────────
 

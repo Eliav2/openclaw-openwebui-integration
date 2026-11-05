@@ -2269,6 +2269,9 @@ PLUGIN_APPROVAL_CAP = "plugin-approvals"
 
 
 class _GatewayConnection:
+    # Cron revisions are issued from one sequence for every connection, so a
+    # revision a page holds never matches a different connection's.
+    _cron_revisions_issued = 0
     """Persistent WebSocket connection to the Gateway: dispatches events to
     per-run queues and reconnects with backoff."""
 
@@ -2434,7 +2437,7 @@ class _GatewayConnection:
         # or finished), or a socket gap: the waiter, and a count readers keep
         # to tell a cached job list is old.
         self._cron_waiter: asyncio.Event | None = None
-        self.cron_revision = 0
+        self.cron_revision = self._next_cron_revision()
         self._tool_events_seen: dict[tuple, bool] = {}
         # A waiting command returns its "Take control" link on every poll.
         self._control_links_shown: dict[tuple, bool] = {}
@@ -2580,8 +2583,13 @@ class _GatewayConnection:
             self._cron_waiter = asyncio.Event()
         return self._cron_waiter
 
+    @staticmethod
+    def _next_cron_revision() -> int:
+        _GatewayConnection._cron_revisions_issued += 1
+        return _GatewayConnection._cron_revisions_issued
+
     def _on_cron_changed(self) -> None:
-        self.cron_revision += 1
+        self.cron_revision = self._next_cron_revision()
         waiter, self._cron_waiter = self._cron_waiter, None
         if waiter is not None:
             waiter.set()
@@ -3729,6 +3737,8 @@ class _GatewayConnection:
             except Exception:
                 pass
             self._ws = None
+        # A follow waiting on this connection reads again, through a live one.
+        self._on_cron_changed()
 
     # ── Internal ────────────────────────────────────────────────────
 
@@ -6699,6 +6709,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
       meta.dataset.openclawMeta = '1';
       meta.className = 'text-xs text-gray-500 dark:text-gray-400 mt-0.5';
       meta.textContent = text;
+      meta.title = text;
       el.appendChild(oneLine(meta));
     });
     if (o.preview) {
@@ -7352,8 +7363,22 @@ _SCHEDULED_FILL_JS_TEMPLATE = r"""
 
   // The next fill, when the jobs change. One ask per fill; none once the
   // dialog is gone or the Action ended the follow without a fill.
+  // A request that fails (network, or the Action could not reach the
+  // Gateway) is asked again a few times; an answer without a fill (closed,
+  // or past the follow bound) is not.
   S.schedFills = (S.schedFills || 0) + 1;
-  if (DATA.revision != null) S.askAction({ mode: 'scheduled-rows', revision: DATA.revision });
+  const RETRY_MS = 5000, RETRIES = 3;
+  const fills = S.schedFills;
+  function follow(tries) {
+    if (S.schedFills !== fills || !section.isConnected) return;
+    function retry() {
+      if (tries < RETRIES) setTimeout(function() { follow(tries + 1); }, RETRY_MS);
+    }
+    S.askAction({ mode: 'scheduled-rows', revision: DATA.revision })
+      .then(function(r) { return r.ok === false ? { status: 'error' } : r.json ? r.json().catch(function() { return null; }) : null; })
+      .then(function(j) { if (j && j.status === 'error' && j.detail !== 'unknown dialog') retry(); }, retry);
+  }
+  if (DATA.revision != null) follow(0);
 })();
 """
 
@@ -7957,6 +7982,8 @@ _SCHEDULED_MESSAGE_MAX = 200
 
 # session key -> (connection, cron_revision, jobs)
 _scheduled_cache: dict = {}
+# Chats whose jobs are kept at once.
+_SCHEDULED_CACHE_MAX = 256
 # connection -> (cron_revision, jobs): the full list, without the filter.
 _all_jobs_cache: dict = {}
 
@@ -8023,9 +8050,13 @@ async def _read_scheduled(conn, session_key: str) -> "list | None":
             everything = _all_jobs_cache[conn] = (token, await _cron_pages(conn, {}))
         jobs = [j for j in everything[1] if _job_bound_to(j, session_key)]
     jobs = [j for j in jobs if j.get("enabled", True)]
-    # Only the current connection's reads are kept.
-    for k in [k for k, v in _scheduled_cache.items() if v[0] is not conn]:
+    # Only the current connection's reads at the current revision are kept,
+    # and at most _SCHEDULED_CACHE_MAX of them (the oldest go first).
+    for k in [k for k, v in _scheduled_cache.items() if v[0] is not conn or v[1] != token]:
         _scheduled_cache.pop(k, None)
+    _scheduled_cache.pop(session_key, None)
+    while len(_scheduled_cache) >= _SCHEDULED_CACHE_MAX:
+        _scheduled_cache.pop(next(iter(_scheduled_cache)))
     _scheduled_cache[session_key] = (conn, token, jobs)
     return jobs
 
@@ -9194,13 +9225,21 @@ class Action:
         closes or its follow bound passes, and the page then stops asking."""
         user_id = (__user__ or {}).get("id") or "unknown"
         dialog = _dialog_of(body, user_id)
-        if dialog is None:
-            return {"status": "error", "detail": "unknown dialog"}
-        session_key = dialog["session"]
 
         async def emit(code):
             await __event_emitter__({"type": "execute", "data": {"code": code}})
 
+        if dialog is None:
+            # Another worker's dialog, or one this worker forgot: say so.
+            await emit(_render_section_error_js("scheduled", "This dialog is out of date: open it again."))
+            return {"status": "error", "detail": "unknown dialog"}
+        session_key = dialog["session"]
+
+        def ended() -> bool:
+            return dialog["closed"].is_set() or time.time() >= dialog["expires"]
+
+        if ended():
+            return {"status": "ok"}
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
         except Exception as ex:
@@ -9219,8 +9258,16 @@ class Action:
                     w.cancel()
             if not done or dialog["closed"].is_set():
                 return {"status": "ok"}
+            # The connection may have closed (that wakes the wait too): read through a live one.
+            try:
+                conn, source = await _get_action_connection(lambda: self.valves)
+            except Exception as ex:
+                pipe_log(f"[status-action] scheduled-rows reconnect failed: {ex}")
+                return {"status": "error", "detail": str(ex)}
         data = await _scheduled_data(conn, asyncio.ensure_future(_read_scheduled(conn, session_key)),
                                      session_key, user_id, source)
+        if dialog["closed"].is_set():
+            return {"status": "ok"}
         await emit(_render_scheduled_fill_js(data))
         return {"status": "ok"}
 

@@ -80,9 +80,9 @@ The Background section lists what runs for this chat outside a reply, running fi
 - **Image, Music and Video** jobs.
 - **Agents**: Claude Code Agent calls started in the background, until the reply they hold open ends. A tap shows the task and the result, as under In-process agents.
 
-Sub-agents are listed under Subagents, and the chat's automations and their runs under [Scheduled](#scheduled), not here.
+Runs of the chat's automations are listed here like any other background task; the automations themselves (what is scheduled, and when it runs next) are under [Scheduled](#scheduled). Sub-agents are listed under Subagents.
 
-The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it.
+The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), and media jobs are not listed (2026.10 has no per-chat list of them). Automation runs are not in that list either: there a running automation shows only under [Scheduled](#scheduled), first, as running. A Gateway with neither list says background commands and media jobs are not available on it.
 
 While a background agent holds a reply open, the reply's status row says so, so the chat does not look busy for no reason:
 
@@ -105,7 +105,7 @@ The Scheduled section lists the automations (OpenClaw cron jobs) that run in thi
 
 There is no cancel button yet: ask the agent, or use the Control UI.
 
-**Which jobs are this chat's** is the Gateway's own rule (`cron.list` with `sessionKey`, OpenClaw 2026.10.5 and later): a job whose target is `session:<this chat's session>`; a job made in this chat with the target "current", or given this chat's session at creation; and a job made from this chat's conversation. A job aimed at the agent's main session, or run isolated, belongs to no chat and is not listed. On an older Gateway the dialog reads the whole list once and matches the first two forms itself; a job tied to the chat only by the conversation it came from is then missed.
+**Which jobs are this chat's** is the Gateway's own rule (`cron.list` with `sessionKey`, OpenClaw 2026.10.5 and later): a job whose target is `session:<this chat's session>`; a job made in this chat with the target "current", or given this chat's session at creation; and a job made from this chat's conversation. A job aimed at the agent's main session belongs to no chat and is not listed; neither is an isolated job, unless it was given this chat's session or made from this chat's conversation (then it is listed like the others). On an older Gateway the dialog reads the whole list once and matches the first two forms itself; a job tied to the chat only by the conversation it came from is then missed.
 
 **When it reads.** Once per chat when a dialog opens, shared by every dialog and tab on that chat. The Gateway sends a `cron` event when a job is added, changed, removed, starts or finishes; the open dialog reads again then, and only then (no timer). A lost connection counts as a change too.
 
