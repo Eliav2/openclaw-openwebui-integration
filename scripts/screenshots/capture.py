@@ -472,14 +472,6 @@ CARDS_STATE = f"""() => {{
 }}"""
 
 
-def wait_reply_done(page: Page) -> None:
-    """The last reply is finished (its Copy button is there). A message sent
-    before that is steered into the running run on OpenClaw 2026.10.10+ and
-    shows the pending note, not a turn of its own."""
-    wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); "
-                  "return m && m.querySelector('button[aria-label=\"Copy\"]'); }", "the reply finished", 60_000)
-
-
 def last_text_has(*needles: str, lacks: str | None = None) -> str:
     """JS predicate: the last assistant message shows every needle (and not `lacks`)."""
     cond = " && ".join(f"t.includes({json.dumps(n)})" for n in needles)
@@ -1088,7 +1080,6 @@ class Scenes:
         new_chat(page)
         chat = send(page, "Keep at it until the hourly view is on staging.")
         wait_js(page, last_text_has("Goal set"), "the reply that sets the goal")
-        wait_reply_done(page)
         send(page, "Start with the build.")
         wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
         set_title(self.token, chat, "Hourly view to staging")
@@ -1192,8 +1183,7 @@ class Scenes:
             new_chat(page)
             chat = send(page, "Help me plan the hourly view release.")
             wait_js(page, last_text_has("What's left"), "the first reply")
-            wait_reply_done(page)
-            send(page, "What should go in the release notes?")
+                send(page, "What should go in the release notes?")
             wait_js(page, last_text_has("Lead with the hourly strip"), "the second reply")
             deadline = time.time() + 120
             while "Hourly view release plan" not in chat_title(self.token, chat):
