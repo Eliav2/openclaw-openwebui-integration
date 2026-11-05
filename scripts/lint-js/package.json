@@ -1,0 +1,11 @@
+{
+  "name": "openclaw-openwebui-integration-lint-js",
+  "private": true,
+  "type": "module",
+  "description": "ESLint for the no-magic-numbers-or-strings rule (AGENTS.md); see run.sh",
+  "devDependencies": {
+    "eslint": "9.39.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.46.0"
+  }
+}

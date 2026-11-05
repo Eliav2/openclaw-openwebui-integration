@@ -1,0 +1,12 @@
+# The "no magic numbers or strings" rule (AGENTS.md): a literal compared with
+# `==`, `<`, `in`, ... gets a name. `scripts/magic_baseline.py` runs this
+# config and fails CI only on hits the baseline does not already hold.
+# Allowed without a name: 0, 1, -1 and "" (ruff's built-in trivial values).
+target-version = "py310"
+
+[lint]
+select = ["PLR2004"]
+
+[lint.pylint]
+# ruff's default allows str and bytes, which would let `kind == "final"` through.
+allow-magic-value-types = []
