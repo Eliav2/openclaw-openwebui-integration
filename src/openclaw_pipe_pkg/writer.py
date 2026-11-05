@@ -1051,7 +1051,8 @@ class _TurnWriter:
             note = TURN_CUT_OFF_NOTE
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             if not (row["lastRunError"].strip() == EMPTY_RESPONSE_ERROR and await self._run_is_inter_session()):
-                note = f"**Error:** {row['lastRunError']}"
+                request = self.request or (await self._run_request())[0]
+                note = _plain_error(ERROR_RUN, row["lastRunError"], request)
         if note is None and await self._ask_question():
             return
         if not self._showable():
