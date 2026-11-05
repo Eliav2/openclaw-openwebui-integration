@@ -334,6 +334,7 @@ def add_chat_automation(session_key: str) -> str:
         "name": "Morning forecast chart", "agentId": "main",
         "schedule": {"kind": "cron", "expr": "0 7 * * *", "tz": "UTC"},
         "sessionTarget": f"session:{session_key}",
+        "owner": {"agentId": "main", "sessionKey": session_key},
         "payload": {"kind": "agentTurn", "message": "Morning chart for the forecast app",
                     "model": AUTOMATION_MODEL},
         "delivery": {"mode": "none"}})
@@ -345,7 +346,7 @@ def add_chat_automation(session_key: str) -> str:
 USAGE_DELAY_FILE = "/tmp/openclaw-screenshot-usage-delay-ms"
 STATUS_ROOT = "#openclaw-status-modal-root"
 # Each Status dialog section: still loading (its skeleton) or filled.
-SECTION_STATES = """() => Object.fromEntries(['context', 'limits', 'background', 'subagents', 'agents'].map(n => {
+SECTION_STATES = """() => Object.fromEntries(['context', 'limits', 'background', 'scheduled', 'subagents', 'agents'].map(n => {
   const s = document.getElementById('openclaw-status-section-' + n);
   return [n, !s ? 'missing' : s.querySelector(':scope > [data-openclaw-loading]') ? 'loading' : 'filled'];
 }))"""
@@ -839,8 +840,8 @@ class Scenes:
         """ELI-163: work left running in this chat. #1 the dialog with one
         source held back (the sample rate limits), every other section
         already filled; #2 Background unfolded with the four imports, the
-        failed check before them (ELI-232: a command without a title) and the
-        chat's automation, the other sections opened."""
+        failed check before them (ELI-232: a command without a title), the
+        other sections opened; #3 Scheduled with the chat's automation."""
         new_chat(page)
         chat = send(page, "Import the station data for all four regions.")
         wait_js(page, last_text_has("All four imports are running"), "the reply")
@@ -856,7 +857,7 @@ class Scenes:
                 opened = time.monotonic()
                 page.locator('button[aria-label="OpenClaw status"]').click()
                 wait_js(page, f"""() => {{ const st = ({SECTION_STATES})();
-                  return st.limits === 'loading' && ['context', 'background', 'subagents', 'agents'].every(n => st[n] === 'filled')
+                  return st.limits === 'loading' && ['context', 'background', 'scheduled', 'subagents', 'agents'].every(n => st[n] === 'filled')
                     && /import-stations/.test(document.querySelector('{root}').innerText); }}""",
                         "every section but Rate limits filled", 20_000)
                 print(f"  {time.monotonic() - opened:.1f}s after the click: " + json.dumps(page.evaluate(SECTION_STATES)),
@@ -867,18 +868,22 @@ class Scenes:
             wait_js(page, f"() => ({SECTION_STATES})().limits === 'filled' && /week/i.test(document.querySelector('{root}').innerText)",
                     "Rate limits, once its source answers", 40_000)
             print(f"  Rate limits filled {time.monotonic() - opened:.1f}s after the click", flush=True)
+            open_fold(page, "scheduled")
             open_fold(page, "subagents")
             open_fold(page, "agents")
             wait_js(page, f"""() => {{ const t = document.querySelector('{root}').innerText;
-              return /background \\(6\\)/i.test(t) && /Morning forecast chart/.test(t) && /no sub-agents/i.test(t)
-                && /no such region/.test(t); }}""",
-                    "Background with the imports and the automation, every section open", 30_000)
+              return /background \\(5\\)/i.test(t) && /scheduled \\(1\\)/i.test(t) && /Morning forecast chart/.test(t)
+                && /no sub-agents/i.test(t) && /no such region/.test(t); }}""",
+                    "Background with the imports, Scheduled with the automation, every section open", 30_000)
             print("  background: " + json.dumps(page.locator("#openclaw-status-section-background").inner_text()[:600]),
                   flush=True)
             # Opening the last section scrolled the dialog down; back to Background.
             page.evaluate("() => document.getElementById('openclaw-status-section-background').scrollIntoView({block: 'start'})")
             page.wait_for_timeout(300)
             self.s.shot(page, "status-dialog-background", text_selector=root)
+            page.evaluate("() => document.getElementById('openclaw-status-section-scheduled').scrollIntoView({block: 'start'})")
+            page.wait_for_timeout(300)
+            self.s.shot(page, "status-dialog-scheduled", selector="#openclaw-status-section-scheduled")
             page.keyboard.press("Escape")
         finally:
             gateway_call("cron.remove", {"id": job})
