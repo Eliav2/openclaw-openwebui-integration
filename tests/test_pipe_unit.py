@@ -6516,6 +6516,26 @@ class ConnectRejectionMessageTests(unittest.TestCase):
                          "some novel failure")
 
 
+class FileServerValveOffOnLoadTests(unittest.TestCase):
+    """A deploy that turns ENABLE_FILE_SERVER off must close the port an
+    earlier load left open: the first model list after the load does it."""
+
+    def _pipes(self, enabled):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Pipe()
+            p.valves.STATE_DIR = tmp
+            p.valves.ENABLE_FILE_SERVER = enabled
+            with mock.patch("openclaw_pipe._stop_file_server") as stop:
+                asyncio.run(p.pipes())
+            return stop
+
+    def test_the_model_list_closes_the_file_server_when_the_valve_is_off(self):
+        self._pipes(False).assert_called_once_with()
+
+    def test_the_model_list_leaves_it_alone_when_the_valve_is_on(self):
+        self._pipes(True).assert_not_called()
+
+
 class UnverifiedModelListTests(unittest.TestCase):
     """On a fresh install pipes() has no connection and no cache, so fallback models are marked
     unverified instead of looking real."""

@@ -1446,9 +1446,20 @@ def _reap_stale_file_server() -> None:
     try:
         stale.shutdown()
         stale.server_close()
+        setattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, None)
         pipe_log("  reaped stale file server from a previous deploy")
     except Exception as ex:
         pipe_log(f"  failed to reap stale file server (non-fatal): {ex}")
+
+
+def _stop_file_server() -> None:
+    """ENABLE_FILE_SERVER is off: close the port a server of this load or of
+    an earlier deploy still holds. Only starting a server reaps the old one,
+    and with the valve off none starts, so a deploy that turned it off would
+    leave the port open until Open WebUI restarted."""
+    global _file_server_started
+    _reap_stale_file_server()
+    _file_server_started = False
 
 
 def _remember_file_server(server) -> None:
@@ -13271,7 +13282,9 @@ class Pipe:
                 "USE_OWUI_FILES is off or an upload fails. Note it is "
                 "unauthenticated -- leave off if port 18791 is exposed. With "
                 "it off, a file that cannot be uploaded shows as an error "
-                "in the reply, not as a link that never loads."
+                "in the reply, not as a link that never loads. Turning it off "
+                "closes the port at the next model list or message, no "
+                "Open WebUI restart needed."
         )
         USE_OWUI_FILES: bool = Field(
             default=True,
@@ -13493,6 +13506,10 @@ class Pipe:
         and returns one entry per model plus a 'Default' entry.
         """
         type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
+        # The first model list after a deploy: with the valve off, close a
+        # file server an earlier load left on the port.
+        if not self.valves.ENABLE_FILE_SERVER:
+            _stop_file_server()
         # Every page load lists models, so this is the earliest point the
         # composer watcher can start after an Open WebUI restart or redeploy.
         _ensure_composer_watcher(lambda: self.valves)
@@ -13901,6 +13918,8 @@ class _PipeTurn:
         run to take over, and the model patch."""
         if self.pipe.valves.ENABLE_FILE_SERVER:
             _start_file_server()
+        else:
+            _stop_file_server()
         preset = self.pipe._selected_preset(self.body)
         self.model_override = self.pipe._model_override_for_preset(preset)
 

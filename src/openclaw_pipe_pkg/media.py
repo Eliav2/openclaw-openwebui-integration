@@ -493,9 +493,20 @@ def _reap_stale_file_server() -> None:
     try:
         stale.shutdown()
         stale.server_close()
+        setattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, None)
         pipe_log("  reaped stale file server from a previous deploy")
     except Exception as ex:
         pipe_log(f"  failed to reap stale file server (non-fatal): {ex}")
+
+
+def _stop_file_server() -> None:
+    """ENABLE_FILE_SERVER is off: close the port a server of this load or of
+    an earlier deploy still holds. Only starting a server reaps the old one,
+    and with the valve off none starts, so a deploy that turned it off would
+    leave the port open until Open WebUI restarted."""
+    global _file_server_started
+    _reap_stale_file_server()
+    _file_server_started = False
 
 
 def _remember_file_server(server) -> None:
