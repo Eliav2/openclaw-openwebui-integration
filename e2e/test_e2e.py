@@ -2045,23 +2045,31 @@ def test_the_reply_to_a_background_commands_end_finishes(token):
 def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token):
     """ELI-175, through the real path: each user's own Status dialog, read
     from the stack's Gateway with the installed Action's settings and the
-    Pipe's saved OWNER_USERS (the owner's user id). An automation that runs
-    elsewhere reaches neither the owner's page nor the guest's; the one bound
-    to the chat is listed (so the list was read)."""
+    Pipe's saved OWNER_USERS (the owner's user id; the guest is not an owner).
+    The Scheduled section lists the jobs the Gateway binds to the chat (a
+    "session:<key>" target, and a "current" job made in it); one that runs
+    elsewhere reaches neither the owner's page nor the guest's. Never "0":
+    the list was read, so the count is real."""
     me = _me(token)
     _set_owner_users(token, me["id"])
 
-    def add(name, target):
+    def add(name, target, **extra):
         return _gw("cron.add", {"name": name, "schedule": {"kind": "cron", "expr": "0 4 1 1 *"},
                                 "sessionTarget": target, "payload": {"kind": "agentTurn", "message": "noop"},
-                                "delivery": {"mode": "none"}, "agentId": "main"})
+                                "delivery": {"mode": "none"}, "agentId": "main", **extra})
     jobs = [add("e2e-elsewhere-automation", "isolated")]
     try:
         for tok, prompt in ((token, "E2E_OWNER_BG"), (guest_token, "E2E_GUEST_BG")):
             chat_id, _ = _chat_turn(tok, f"Respond with exactly: {prompt}")
-            jobs.append(add(f"e2e-this-chat-{prompt}", f"session:{_session_key(tok, chat_id)}"))
-            view, codes = _background(tok, chat_id, token)
-            assert [r["title"] for r in view["rows"] if r.get("job")] == [f"e2e-this-chat-{prompt}"], view
+            key = _session_key(tok, chat_id)
+            jobs.append(add(f"e2e-this-chat-{prompt}", f"session:{key}"))
+            jobs.append(add(f"e2e-made-here-{prompt}", "current", sessionKey=key))
+            _view, codes = _background(tok, chat_id, token)
+            sched = _section_data(codes, "openclaw-status-section-scheduled")
+            assert sched["available"] is True and sched["error"] is None, sched
+            assert sorted(r["title"] for r in sched["rows"]) == sorted(
+                [f"e2e-this-chat-{prompt}", f"e2e-made-here-{prompt}"]), sched
+            assert all(r["cadence"] == "Cron 0 4 1 1 *" and r["message"] == "noop" for r in sched["rows"]), sched
             assert not any("e2e-elsewhere-automation" in c for c in codes), f"another automation reached {prompt}'s page"
     finally:
         for job in jobs:

@@ -2430,6 +2430,11 @@ class _GatewayConnection:
         self._session_change_waiters: dict[str, asyncio.Event] = {}
         self._session_message_waiters: dict[str, asyncio.Event] = {}
         self._session_child_waiters: dict[str, asyncio.Event] = {}
+        # The Gateway's `cron` event (a job added, changed, removed, started
+        # or finished), or a socket gap: the waiter, and a count readers keep
+        # to tell a cached job list is old.
+        self._cron_waiter: asyncio.Event | None = None
+        self.cron_revision = 0
         self._tool_events_seen: dict[tuple, bool] = {}
         # A waiting command returns its "Take control" link on every poll.
         self._control_links_shown: dict[tuple, bool] = {}
@@ -2568,7 +2573,22 @@ class _GatewayConnection:
             ev = self._session_change_waiters[session_key] = asyncio.Event()
         return ev
 
+    def cron_event(self) -> asyncio.Event:
+        """An Event set by the next `cron` event or a socket gap. Take it
+        BEFORE reading the jobs so no change slips between the read and the wait."""
+        if self._cron_waiter is None:
+            self._cron_waiter = asyncio.Event()
+        return self._cron_waiter
+
+    def _on_cron_changed(self) -> None:
+        self.cron_revision += 1
+        waiter, self._cron_waiter = self._cron_waiter, None
+        if waiter is not None:
+            waiter.set()
+
     def _wake_session_waiters(self, session_key: str | None = None) -> None:
+        if session_key is None:
+            self._on_cron_changed()     # a gap may have lost a `cron` event too
         keys = [session_key] if session_key else list(self._session_change_waiters)
         for key in keys:
             ev = self._session_change_waiters.pop(key, None)
@@ -3999,6 +4019,7 @@ class _GatewayConnection:
                                           "data", "seq", "ts") if k in p}}
                 if msg.get("type") == "event" and msg.get("event") == "cron":
                     self.note_cron_event(msg.get("payload") or {})
+                    self._on_cron_changed()
                     continue
                 if msg.get("type") != "event" or \
                    msg.get("event") not in ("agent", "chat"):
@@ -5926,6 +5947,14 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return deltaS + 's';
   }
 
+  // Until a scheduled run: "in 2h05m", "now" once it is due.
+  function untilTime(atMs) {
+    const at = toMs(atMs);
+    if (at == null) return '';
+    if (at <= Date.now()) return 'now';
+    return 'in ' + elapsedTime(Date.now(), at);
+  }
+
   // The dialog's own requests back to this same Action, the way
   // triggerCompact() makes one: same-origin, OWUI's stored token, and the
   // opening click's identity, so the Action's pushed fills reach this tab.
@@ -6644,8 +6673,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   }
 
   // One list row (ELI-155): a one-line title, a status chip and the time,
-  // then at most two lines of preview. A row with `open` is a button that
-  // opens its detail.
+  // then optional one-line `meta` lines, then at most two lines of preview. A
+  // row with `open` is a button that opens its detail.
   function listRow(o) {
     const el = document.createElement(o.open ? 'button' : 'div');
     if (o.open) {
@@ -6665,6 +6694,13 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     top.appendChild(statusChip(o.status));
     if (o.time) top.appendChild(o.time);
     el.appendChild(top);
+    (o.meta || []).filter(Boolean).forEach(function(text) {
+      const meta = document.createElement('div');
+      meta.dataset.openclawMeta = '1';
+      meta.className = 'text-xs text-gray-500 dark:text-gray-400 mt-0.5';
+      meta.textContent = text;
+      el.appendChild(oneLine(meta));
+    });
     if (o.preview) {
       const preview = document.createElement('div');
       preview.dataset.openclawPreview = '1';
@@ -6703,7 +6739,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
     skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime, controlUiLink: controlUiLink,
-    triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
+    triggerCompact: triggerCompact, elapsedTime: elapsedTime, untilTime: untilTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer, openAgentDetail: openAgentDetail, openDrawer: openDrawer,
     fillDrawer: fillDrawer, statusChip: statusChip, oneLine: oneLine, clampLines: clampLines,
     countLabel: countLabel, collapsible: collapsible, listRow: listRow, timeCell: timeCell,
@@ -6799,6 +6835,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     }
     root.querySelectorAll('[data-openclaw-started-ms]').forEach(function(el) {
       el.textContent = elapsedTime(Number(el.dataset.openclawStartedMs), null);
+    });
+    root.querySelectorAll('[data-openclaw-next-ms]').forEach(function(el) {
+      el.textContent = untilTime(Number(el.dataset.openclawNextMs));
     });
   }, 1000);
   window.__openclawStatusTicker = ticker;
@@ -7256,6 +7295,65 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   rows.forEach(function(r) { fold.body.appendChild(row(r)); });
   S.touchFooter(DATA.fetchedAt, DATA.source);
   follow(rows);
+})();
+"""
+
+# The Scheduled section: this chat's automations, read-only. Each row: when
+# it fires next (counting down) and at what time, once or how often, the
+# first line of its message, and who made it. Unreadable says so, never "0".
+# After each fill the page asks for the next one; the Action answers when the
+# Gateway's `cron` event says the jobs changed (no timer).
+_SCHEDULED_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const S = window.__openclawStatus;
+  const section = document.getElementById('openclaw-status-section-scheduled');
+  if (!section || !S) return;
+  section.innerHTML = '';
+  section.className = 'mb-4';
+  const rows = DATA.rows || [];
+  const known = DATA.available && !DATA.error;
+  const label = known ? S.countLabel('Scheduled', rows.length, DATA.total || 0) : 'Scheduled';
+  const fold = S.collapsible('scheduled', label, rows.some(function(r) { return r.status === 'running'; }));
+  section.appendChild(fold.wrap);
+  if (DATA.error) fold.body.appendChild(S.errorEl(DATA.error));
+  else if (!DATA.available) {
+    fold.body.appendChild(S.noteEl('Scheduled automations are unavailable on this Gateway.'));
+  } else if (!rows.length) fold.body.appendChild(S.noteEl('Nothing scheduled for this chat.'));
+
+  function exact(ms) {
+    return new Date(ms).toLocaleString([], {
+      weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
+  }
+  // When it runs next and who made it; then how often; then a failure.
+  function meta(r) {
+    const when = r.nextRunAtMs && r.status !== 'running' ? 'Next ' + exact(r.nextRunAtMs) : null;
+    const failed = r.status === 'failed'
+      ? (r.failedInARow > 1 ? 'Failed ' + r.failedInARow + ' times in a row' : 'Last run failed')
+        + (r.error ? ': ' + r.error : '')
+      : null;
+    return [[when, r.createdBy ? 'by ' + r.createdBy : null].filter(Boolean).join(' · '), r.cadence, failed];
+  }
+  rows.forEach(function(r) {
+    let time = null;
+    if (r.status === 'running') time = S.elapsedCell(r.startedAt, null, true);
+    else if (r.nextRunAtMs) {
+      time = S.timeCell(S.untilTime(r.nextRunAtMs));
+      time.dataset.openclawNextMs = String(r.nextRunAtMs);
+      time.title = exact(r.nextRunAtMs);
+    }
+    fold.body.appendChild(S.listRow({
+      kind: 'openclawScheduledRow', title: r.title, status: r.status === 'completed' ? 'scheduled' : r.status,
+      time: time, meta: meta(r), preview: r.message,
+    }));
+  });
+  S.touchFooter(DATA.fetchedAt, DATA.source);
+
+  // The next fill, when the jobs change. One ask per fill; none once the
+  // dialog is gone or the Action ended the follow without a fill.
+  S.schedFills = (S.schedFills || 0) + 1;
+  if (DATA.revision != null) S.askAction({ mode: 'scheduled-rows', revision: DATA.revision });
 })();
 """
 
@@ -7770,6 +7868,10 @@ def _render_background_fill_js(data: dict) -> str:
     return _BACKGROUND_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+def _render_scheduled_fill_js(data: dict) -> str:
+    return _SCHEDULED_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
 def _render_agents_fill_js(data: dict) -> str:
     return _AGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
@@ -7785,11 +7887,12 @@ _DIALOG_SECTIONS = (
     ("context", "Context"),
     ("limits", "Rate limits"),
     ("background", "Background"),
+    ("scheduled", "Scheduled"),
     ("subagents", "Subagents"),
     ("agents", "In-process agents"),
 )
 # The sections the Gateway fills.
-_GATEWAY_SECTIONS = ("context", "limits", "background", "subagents")
+_GATEWAY_SECTIONS = ("context", "limits", "background", "scheduled", "subagents")
 
 
 # ---------------------------------------------------------------------------
@@ -7827,19 +7930,224 @@ def _subagent_previews(previews_resp) -> tuple:
     return _subagent_task_texts(previews_resp), latest
 
 
-async def _read_automations(conn) -> "list | None":
-    """Every enabled automation, or None on a Gateway without `cron.list`."""
+# ---------------------------------------------------------------------------
+# The Scheduled section: the automations bound to this chat, read-only.
+#
+# `cron.list` takes `sessionKey` from OpenClaw 2026.10.5: the Gateway then
+# lists the jobs its own binding rule ties to that session
+# (resolveCronJobBoundSessionKeys): sessionTarget "session:<key>"; the job's
+# `sessionKey` (the session a "current" job was made in, or one given at
+# creation, any target); and the session of the conversation it came from
+# (`sourceConversation`, not in the public job). "main" binds to the agent's
+# main session and "isolated"/"current" to `cron:<jobId>`, never a chat.
+# A Gateway without the parameter (2026.9.3) gets one shared full list,
+# matched here on the forms the public job carries: "session:<key>" and
+# `sessionKey`; a job bound only through its source conversation is missed.
+#
+# One read per session, shared by every dialog of that chat, kept until the
+# Gateway's `cron` event (a job added, changed, removed, started or
+# finished) or a socket gap moves the connection's `cron_revision`.
+
+# The page's ask for the section's next fill (`_run_scheduled_rows`).
+_SCHEDULED_ROWS_MODE = "scheduled-rows"
+# A page of `cron.list`: the Gateway's largest `limit`.
+_CRON_PAGE_LIMIT = 200
+# A job's message as its row shows it: the first line, at most this long.
+_SCHEDULED_MESSAGE_MAX = 200
+
+# session key -> (connection, cron_revision, jobs)
+_scheduled_cache: dict = {}
+# connection -> (cron_revision, jobs): the full list, without the filter.
+_all_jobs_cache: dict = {}
+
+
+def _cron_token(conn):
+    return getattr(conn, "cron_revision", None)
+
+
+# How a Gateway before 2026.10.5 refuses `sessionKey` (its closed schema), lowercased.
+_NO_SESSION_FILTER_TEXT = "unexpected property 'sessionkey'"
+
+
+def _no_session_filter(ex: Exception) -> bool:
+    """`cron.list` refused `sessionKey`: a Gateway before 2026.10.5."""
+    return _NO_SESSION_FILTER_TEXT in str(ex).lower()
+
+
+async def _cron_pages(conn, params: dict) -> list:
+    jobs, offset = [], 0
+    while True:
+        page = (await conn.send_request("cron.list", dict(
+            params, limit=_CRON_PAGE_LIMIT, offset=offset, includeDeliveryPreviews=False), timeout=5)) or {}
+        batch = page.get("jobs") or []
+        jobs += batch
+        nxt = page.get("nextOffset")
+        if not page.get("hasMore") or not isinstance(nxt, int) or nxt <= offset or not batch:
+            return jobs
+        offset = nxt
+
+
+def _job_key_form(job: dict, key: str) -> str:
+    """A key as the Gateway writes it for the job's agent: bare keys get the prefix."""
+    agent = job.get("effectiveAgentId") or job.get("agentId") or "main"
+    return key if key.startswith("agent:") else f"agent:{agent}:{key}"
+
+
+def _job_bound_to(job: dict, session_key: str) -> bool:
+    """The fallback match (no `sessionKey` filter): "session:<key>", or the
+    job's `sessionKey`, as the Gateway resolves them."""
+    target = job.get("sessionTarget") or ""
+    keys = [target[len("session:"):]] if target.startswith("session:") else []
+    if isinstance(job.get("sessionKey"), str) and job["sessionKey"].strip():
+        keys.append(job["sessionKey"].strip())
+    return session_key in {_job_key_form(job, k) for k in keys}
+
+
+async def _read_scheduled(conn, session_key: str) -> "list | None":
+    """The enabled automations bound to the session, or None when this
+    Gateway has no `cron.list`."""
+    token = _cron_token(conn)
+    cached = _scheduled_cache.get(session_key)
+    if cached and cached[0] is conn and cached[1] == token:
+        return cached[2]
     try:
-        resp = await conn.send_request("cron.list", dict(limit=200), timeout=5)
+        jobs = await _cron_pages(conn, dict(sessionKey=session_key))
     except Exception as ex:
         if _is_unknown_method(ex):
             return None
-        raise
-    return (resp or {}).get("jobs") or []
+        if not _no_session_filter(ex):
+            raise
+        everything = _all_jobs_cache.get(conn)
+        if not everything or everything[0] != token:
+            _all_jobs_cache.clear()
+            everything = _all_jobs_cache[conn] = (token, await _cron_pages(conn, {}))
+        jobs = [j for j in everything[1] if _job_bound_to(j, session_key)]
+    jobs = [j for j in jobs if j.get("enabled", True)]
+    # Only the current connection's reads are kept.
+    for k in [k for k, v in _scheduled_cache.items() if v[0] is not conn]:
+        _scheduled_cache.pop(k, None)
+    _scheduled_cache[session_key] = (conn, token, jobs)
+    return jobs
 
 
-async def _background_data(tasks_task, jobs_task, chat_task, session_key: str, source: str) -> dict:
-    """The Background section's fill; a failed Gateway read says so and the rest shows."""
+# One, several, and its length in seconds.
+_DURATION_UNITS = (("day", "days", 86_400), ("h", "h", 3_600), ("min", "min", 60), ("s", "s", 1))
+
+
+def _duration_text(ms) -> str:
+    """"30 min", "2 h", "1 h 30 min", "3 days"; seconds only under a minute."""
+    rest, parts = int(ms // 1000), []
+    for one, several, size in _DURATION_UNITS:
+        n, rest = divmod(rest, size)
+        if n and (size > 1 or not parts):
+            parts.append(f"{n} {several if n > 1 else one}")
+    return " ".join(parts) or "0 s"
+
+
+# OpenClaw's schedule kinds and the payload kind that carries a message.
+_SCHEDULE_ONCE, _SCHEDULE_EVERY, _SCHEDULE_CRON = "at", "every", "cron"
+_SCHEDULE_STREAM, _SCHEDULE_EVENT = "stream", "event"
+_PAYLOAD_AGENT_TURN = "agentTurn"
+
+
+def _cadence(schedule: dict) -> tuple:
+    """(recurring, how) for a job's schedule: once, every N, a cron line, or events."""
+    kind = schedule.get("kind")
+    if kind == _SCHEDULE_ONCE:
+        return False, "Once"
+    every = schedule.get("everyMs")
+    if kind == _SCHEDULE_EVERY and isinstance(every, (int, float)) and every > 0:
+        return True, f"Every {_duration_text(every)}"
+    if kind == _SCHEDULE_CRON and schedule.get("expr"):
+        tz = f" ({schedule['tz']})" if schedule.get("tz") else ""
+        return True, f"Cron {schedule['expr']}{tz}"
+    if kind == _SCHEDULE_STREAM:
+        return True, "On a command's output"
+    if kind == _SCHEDULE_EVENT:
+        return True, f"On {schedule['source']} events" if schedule.get("source") else "On events"
+    return True, "Recurring"
+
+
+def _job_message(payload: dict) -> str | None:
+    """The first line of what the job sends: an agent turn's message, a
+    system event's text; a script has none to show."""
+    text = payload.get("message") if payload.get("kind") == _PAYLOAD_AGENT_TURN else payload.get("text")
+    if not isinstance(text, str):
+        return None
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    return first[:_SCHEDULED_MESSAGE_MAX] or None
+
+
+# "agent:<agent id>:<rest>", and the rest of an agent's main session key.
+_AGENT_SESSION_KEY_RE = re.compile(r"^agent:([^:]+):(.+)$")
+_MAIN_SESSION_NAME = "main"
+
+
+def _job_creator(job: dict, session_key: str, user_id: str) -> str | None:
+    """Who made the job, from its owner session, said without another
+    person's ids: this chat, another chat of the same user, the agent's main
+    session, or another session."""
+    owner = (job.get("owner") or {}).get("sessionKey")
+    if not isinstance(owner, str) or not owner:
+        return None
+    if owner == session_key:
+        return "this chat"
+    m = _AGENT_SESSION_KEY_RE.match(owner)
+    if m:
+        agent, rest = m.groups()
+        if rest.startswith(f"openwebui-{user_id}-"):
+            return "another chat of yours"
+        if rest == _MAIN_SESSION_NAME:
+            return f"the {agent} agent's main session"
+    return "another session"
+
+
+def _scheduled_row(job: dict, session_key: str, user_id: str) -> dict:
+    state = job.get("state") or {}
+    recurring, how = _cadence(job.get("schedule") or {})
+    status = _job_status(job)
+    return {
+        "id": job.get("id"),
+        "title": (job.get("displayName") or job.get("name") or "").strip() or "Automation",
+        "status": status,
+        "nextRunAtMs": job.get("nextRunAtMs") or state.get("nextRunAtMs"),
+        "startedAt": state.get("runningAtMs") if status == "running" else None,
+        "recurring": recurring,
+        "cadence": how,
+        "message": _job_message(job.get("payload") or {}),
+        "createdBy": _job_creator(job, session_key, user_id),
+        "error": state.get("lastError") if status == "failed" else None,
+        "failedInARow": state.get("consecutiveErrors") or 0,
+    }
+
+
+def _scheduled_rows(jobs, session_key: str, user_id: str) -> dict:
+    """None `jobs`: not readable, which the section says (never "0")."""
+    if jobs is None:
+        return {"available": False, "rows": [], "total": 0}
+    rows = sorted((_scheduled_row(j, session_key, user_id) for j in jobs),
+                  key=lambda r: (r["status"] not in _LIVE_TASK_STATUSES, r["nextRunAtMs"] or float("inf")))
+    return {"available": True, "rows": rows, "total": len(rows)}
+
+
+async def _scheduled_data(conn, jobs_task, session_key: str, user_id: str, source: str) -> dict:
+    """The Scheduled section's fill, with the revision its follow waits past."""
+    token = _cron_token(conn)
+    try:
+        jobs = await jobs_task
+        error = None
+    except Exception as ex:
+        pipe_log(f"[status-action] cron.list (scheduled) failed: {ex}")
+        jobs, error = None, f"Could not read this chat's automations: {ex}"
+    return {**_scheduled_rows(jobs, session_key, user_id), "error": error, "source": source,
+            "revision": token if isinstance(token, int) else None,
+            "fetchedAt": int(time.time() * 1000)}
+
+
+async def _background_data(tasks_task, chat_task, session_key: str, source: str) -> dict:
+    """The Background section's fill; a failed Gateway read says so and the rest
+    shows. The chat's automations are the Scheduled section's; their runs are
+    listed here."""
     errors = []
     try:
         tasks = await tasks_task
@@ -7847,14 +8155,8 @@ async def _background_data(tasks_task, jobs_task, chat_task, session_key: str, s
         pipe_log(f"[status-action] tasks.list failed: {ex}")
         tasks = []
         errors.append(f"Could not read background tasks: {ex}")
-    try:
-        jobs = await jobs_task
-    except Exception as ex:
-        pipe_log(f"[status-action] cron.list failed: {ex}")
-        jobs = []
-        errors.append(f"Could not read automations: {ex}")
     chat = await chat_task
-    data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key, commands=_exec_commands(chat))
+    data = _background_rows(tasks, _agent_call_rows(chat), session_key, commands=_exec_commands(chat))
     return {**data, "errors": errors, "source": source, "fetchedAt": int(time.time() * 1000), "error": None}
 
 
@@ -8075,13 +8377,6 @@ def _command_row(task: dict, card: dict, live: bool) -> dict:
     }
 
 
-def _job_bound_to(job: dict, session_key: str) -> bool:
-    """An automation that runs in this chat: `session:<key>`, or "current"
-    with the session it was made in."""
-    target = job.get("sessionTarget") or ""
-    return target == f"session:{session_key}" or (target == "current" and job.get("sessionKey") == session_key)
-
-
 def _job_status(job: dict) -> str:
     state = job.get("state") or {}
     if state.get("runningAtMs"):
@@ -8090,37 +8385,14 @@ def _job_status(job: dict) -> str:
     return {"ok": "completed", "error": "failed", "skipped": "skipped"}.get(last, "scheduled")
 
 
-def _automation_row(job: dict) -> dict:
-    state = job.get("state") or {}
-    status = _job_status(job)
-    return {
-        "id": job.get("id"),
-        "kind": "Automation",
-        "job": True,    # a schedule, not one run: its time is its next run
-        "title": (job.get("displayName") or job.get("name") or "").strip() or "Automation",
-        "status": status,
-        "startedAt": state.get("runningAtMs") if status == "running" else None,
-        "endedAt": None,
-        "error": state.get("lastError") if status == "failed" else None,
-        "failedInARow": state.get("consecutiveErrors") or 0,
-        "nextRunAtMs": job.get("nextRunAtMs") or state.get("nextRunAtMs"),
-        "lastRunAtMs": state.get("lastRunAtMs"),
-    }
-
-
-def _background_rows(tasks, jobs, agents, session_key: str, *, commands: dict) -> dict:
+def _background_rows(tasks, agents, session_key: str, *, commands: dict) -> dict:
     """The Background section's data: only what belongs to this chat, whoever
-    asks (ELI-175). None `tasks` / `jobs`: not readable."""
-    automations_available = jobs is not None
-    jobs = [j for j in jobs or [] if j.get("enabled", True)]
-    mine = [j for j in jobs if _job_bound_to(j, session_key)]
-    job_ids = {j.get("id") for j in mine}
-    rows = [_automation_row(j) for j in mine]
+    asks (ELI-175). None `tasks`: not readable. Automation runs are listed
+    here; the automations themselves under Scheduled."""
+    rows = []
     for t in tasks or []:
         if not _belongs_to(t, session_key) or (t.get("kind") or t.get("runtime")) not in _BACKGROUND_KINDS:
             continue
-        if t.get("kind") == "automation_run" and t.get("sourceId") in job_ids:
-            continue    # its automation's own row says how it went
         rows.append(_task_row(t, commands))
     for a in agents or []:
         if a.get("state") != "launched":
@@ -8133,13 +8405,12 @@ def _background_rows(tasks, jobs, agents, session_key: str, *, commands: dict) -
         })
     live = [r for r in rows if r["status"] in _LIVE_TASK_STATUSES]
     rest = sorted((r for r in rows if r["status"] not in _LIVE_TASK_STATUSES),
-                  key=lambda r: r.get("startedAt") or r.get("lastRunAtMs") or 0, reverse=True)
+                  key=lambda r: r.get("startedAt") or 0, reverse=True)
     live.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
     return {
         "rows": live + rest[:_BACKGROUND_FINISHED_CAP],
         "total": len(rows),
         "tasksAvailable": tasks is not None,
-        "automationsAvailable": automations_available,
     }
 
 
@@ -8461,6 +8732,8 @@ class Action:
             return await self._run_subagent_rows(body, __user__, __event_emitter__)
         if mode == "background-rows":
             return await self._run_background_rows(body, __user__, __event_emitter__)
+        if mode == _SCHEDULED_ROWS_MODE:
+            return await self._run_scheduled_rows(body, __user__, __event_emitter__)
         if mode is None:
             marker = _SUBAGENT_TASK_ID_MARKER_RE.search(body.get("content") or "")
             if marker:
@@ -8563,7 +8836,7 @@ class Action:
         seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
             _list_all_sessions(conn))
         tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))
-        jobs_task = asyncio.ensure_future(_read_automations(conn))
+        jobs_task = asyncio.ensure_future(_read_scheduled(conn, session_key))
 
         def list_children():
             return conn.send_request(
@@ -8656,7 +8929,11 @@ class Action:
 
         async def fill_background():
             await emit(_render_background_fill_js(
-                await _background_data(tasks_task, jobs_task, chat_task, session_key, source)))
+                await _background_data(tasks_task, chat_task, session_key, source)))
+
+        async def fill_scheduled():
+            await emit(_render_scheduled_fill_js(
+                await _scheduled_data(conn, jobs_task, session_key, user_id, source)))
 
         children_seen, task_texts, latest = {}, {}, {}
         untitled: list = []
@@ -8780,10 +9057,11 @@ class Action:
         limits_ready = asyncio.ensure_future(fill_limits())
         background_ready = asyncio.ensure_future(fill_background())
         subagents_ready = asyncio.ensure_future(fill_subagents(read_children(), at_open=True))
+        scheduled_ready = asyncio.ensure_future(fill_scheduled())
 
         results = await asyncio.gather(context_ready, limits_ready, background_ready, subagents_ready,
-                                       agents_ready, return_exceptions=True)
-        for name, result in zip(("context", "limits", "background", "subagents", "agents"), results):
+                                       agents_ready, scheduled_ready, return_exceptions=True)
+        for name, result in zip(("context", "limits", "background", "subagents", "agents", "scheduled"), results):
             if isinstance(result, BaseException):
                 pipe_log(f"[status-action] {name} section failed: {result!r}")
                 await emit(_render_section_error_js(name, f"Could not load this section: {result}"))
@@ -8903,10 +9181,47 @@ class Action:
             chat_task.cancel()
             return {"status": "error", "detail": str(ex)}
         data = await _background_data(
-            asyncio.ensure_future(_read_background_tasks(conn, session_key)),
-            asyncio.ensure_future(_read_automations(conn)), chat_task, session_key, source)
+            asyncio.ensure_future(_read_background_tasks(conn, session_key)), chat_task, session_key, source)
         # A failed refill keeps the rows shown (ELI-261).
         await emit(_render_background_fill_js({**data, "refill": True}))
+        return {"status": "ok"}
+
+    async def _run_scheduled_rows(self, body: dict, __user__, __event_emitter__):
+        """The Scheduled section's follow: the page asks once per fill; this
+        waits for the Gateway's `cron` event past the revision the page shows
+        (or a socket gap), then reads and fills again. No timer: nothing is
+        read until something changed. It ends without a fill when the dialog
+        closes or its follow bound passes, and the page then stops asking."""
+        user_id = (__user__ or {}).get("id") or "unknown"
+        dialog = _dialog_of(body, user_id)
+        if dialog is None:
+            return {"status": "error", "detail": "unknown dialog"}
+        session_key = dialog["session"]
+
+        async def emit(code):
+            await __event_emitter__({"type": "execute", "data": {"code": code}})
+
+        try:
+            conn, source = await _get_action_connection(lambda: self.valves)
+        except Exception as ex:
+            pipe_log(f"[status-action] scheduled-rows connect failed: {ex}")
+            return {"status": "error", "detail": str(ex)}
+        # Compared and taken with no await between: a change after it sets the event.
+        if body.get("revision") == _cron_token(conn):
+            changed = conn.cron_event()
+            waits = [asyncio.ensure_future(changed.wait()), asyncio.ensure_future(dialog["closed"].wait())]
+            try:
+                done, _pending = await asyncio.wait(
+                    waits, timeout=max(dialog["expires"] - time.time(), 0),
+                    return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for w in waits:
+                    w.cancel()
+            if not done or dialog["closed"].is_set():
+                return {"status": "ok"}
+        data = await _scheduled_data(conn, asyncio.ensure_future(_read_scheduled(conn, session_key)),
+                                     session_key, user_id, source)
+        await emit(_render_scheduled_fill_js(data))
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):

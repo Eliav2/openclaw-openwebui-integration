@@ -676,9 +676,9 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "following")
         codes = _emitted_codes(emitted)
-        # open + 5 fills; the follow's re-read (ELI-127) found the same rows,
+        # open + 6 fills; the follow's re-read (ELI-127) found the same rows,
         # so it is not sent (ELI-268)
-        self.assertEqual(len(codes), 6)
+        self.assertEqual(len(codes), 7)
 
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
         self.assertIn("anthropic", context_code)
@@ -762,7 +762,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         marker = "if (S && S.sectionError) S.sectionError("
         errors = [c for c in codes if marker in c and "gateway unreachable" in c]
         self.assertEqual(sorted(json.loads(c.split(marker, 1)[1].split(",", 1)[0]) for c in errors),
-                         ["background", "context", "limits", "subagents"])
+                         ["background", "context", "limits", "scheduled", "subagents"])
         self.assertTrue(any("getElementById('openclaw-status-section-agents')" in c for c in codes))
 
     async def test_per_section_rpc_failure_only_errors_that_section(self):

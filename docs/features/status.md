@@ -13,7 +13,7 @@ _Separate function: install the Status Action first, see [Status button](../inst
 
 _The rate limits in this screenshot are sample data._
 
-The Status Action adds a button to the message toolbar. It opens a dialog, titled **Claw**, with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
+The Status Action adds a button to the message toolbar. It opens a dialog, titled **Claw**, with six sections: Context, Rate limits, [Background](#background), [Scheduled](#scheduled), [Subagents](#sub-agents) and In-process agents.
 
 <img src="../img/toolbar-button-light.png" alt="The Status Action's crab-claw button at the end of a reply's toolbar" width="300">
 
@@ -27,7 +27,8 @@ _Here the rate limits were held back on purpose, to show it._
 |---|---|
 | Context | `sessions.describe` |
 | Rate limits | `usage.status`, for the provider Context's read names (the same request); `claudeCliUsage.status` only when `usage.status` has no windows |
-| Background | `tasks.list` (OpenClaw 2026.9) or `sessions.processes.list` (2026.10), `cron.list`, and the chat's last 40 messages |
+| Background | `tasks.list` (OpenClaw 2026.9) or `sessions.processes.list` (2026.10), and the chat's last 40 messages |
+| Scheduled | `cron.list` with the chat's `sessionKey` (the Gateway's own match), shared with every dialog of the chat until the Gateway's `cron` event |
 | Subagents | `sessions.list` with `spawnedBy` (the current children, store rows only) and the [child index](#sub-agents); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
 | In-process agents | The chat's last 40 messages (the same read as Background's) |
 
@@ -35,7 +36,7 @@ Each source is read once per open, all at the same time. None grows with the cha
 
 Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Claw button skips it. The model comes from the page script's delivery, else from the reply's own avatar. The script arrives within about a second of opening a chat; a click before that, or on a reply that is not on an OpenClaw model, goes through Open WebUI's handler as before.
 
-Background, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
+Background, Scheduled, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
 
 <img src="../img/status-dialog-scrolled-light.png" alt="The Status dialog on a small phone, scrolled to its end: the title bar and the footer stay on screen" width="320">
 
@@ -77,18 +78,36 @@ The Background section lists what runs for this chat outside a reply, running fi
 
 - **Commands** left running in the background (`exec` with `background`, or one that outlived its wait), named by the title the agent gave the call, with the command's first real step under it while it runs ("python3 ci_wake.py 163", without the `cd ...` before it or an inline script). A command without a title is named by that step. One that exits with a code other than 0 is Failed. Once it ends, the line under it says how: a failure's exit code or the signal that stopped it, and its last line of output ("exit 2 · islands: no such region"). Hover over a command, or tap it, to see the whole command.
 - **Image, Music and Video** jobs.
-- **Automations** that run in this chat: whether one is running, its next run, and its last error when it failed ("Failed 3 times in a row: ...").
 - **Agents**: Claude Code Agent calls started in the background, until the reply they hold open ends. A tap shows the task and the result, as under In-process agents.
 
-Sub-agents are listed under Subagents, not here.
+Sub-agents are listed under Subagents, and the chat's automations and their runs under [Scheduled](#scheduled), not here.
 
-The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it, and still lists the chat's automations.
+The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it.
 
 While a background agent holds a reply open, the reply's status row says so, so the chat does not look busy for no reason:
 
 <img src="../img/background-agent-waiting-light.png" alt="A reply's status row: Waiting on 1 background agent" width="320">
 
 It counts the background agents the reply started and stays until the reply ends.
+
+## Scheduled
+
+The Scheduled section lists the automations (OpenClaw cron jobs) that run in this chat, read-only, the running one first, then by when each runs next. A row has:
+
+- its name, and a countdown to its next run ("in 2h05m", "now" once due), which counts down while the dialog is open; hover over it for the exact time;
+- once, or how often: "Every 30 min", "Cron 0 9 * * 1-5 (Asia/Jerusalem)", "On github events";
+- the exact time of the next run, on your clock;
+- who made it: this chat, another chat of yours, the agent's main session, or another session (never another person's ids);
+- its last error when it failed ("failed 3 times in a row: ...");
+- the first line of the message it sends to the agent (or of the system event's text).
+
+There is no cancel button yet: ask the agent, or use the Control UI.
+
+**Which jobs are this chat's** is the Gateway's own rule (`cron.list` with `sessionKey`, OpenClaw 2026.10.5 and later): a job whose target is `session:<this chat's session>`; a job made in this chat with the target "current", or given this chat's session at creation; and a job made from this chat's conversation. A job aimed at the agent's main session, or run isolated, belongs to no chat and is not listed. On an older Gateway the dialog reads the whole list once and matches the first two forms itself; a job tied to the chat only by the conversation it came from is then missed.
+
+**When it reads.** Once per chat when a dialog opens, shared by every dialog and tab on that chat. The Gateway sends a `cron` event when a job is added, changed, removed, starts or finishes; the open dialog reads again then, and only then (no timer). A lost connection counts as a change too.
+
+**When it cannot read.** On a Gateway without `cron.list` the section says scheduled automations are unavailable, and when the read fails it shows the error; either way it never says "0". It shows only this chat's jobs, to anyone who can see the chat, owner or not: the Action reads with the Pipe's own Gateway connection, and the chat's session is the filter.
 
 ## Sub-agents
 

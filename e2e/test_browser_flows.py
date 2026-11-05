@@ -1350,6 +1350,65 @@ def test_a_background_command_that_ends_shows_done_in_the_open_dialog(page):
     page.keyboard.press("Escape")
 
 
+def _gateway_call(method: str, params: dict) -> dict:
+    out = subprocess.run(["openclaw", "gateway", "call", method, "--json", "--params", json.dumps(params)],
+                         capture_output=True, text=True, timeout=90)
+    assert out.returncode == 0, f"{method} failed: {out.stderr[-1500:]}"
+    return json.loads(out.stdout[out.stdout.find("{"):])
+
+
+def _chat_session_key(page) -> str:
+    """This page's chat's session key: its user (OWUI's /auths with the page's
+    own token) and the chat id in the address."""
+    chat_id = re.search(r"/c/([0-9a-f-]{36})", page.url).group(1)
+    me = page.evaluate("""() => fetch('/api/v1/auths/', {headers: {Authorization: 'Bearer '
+                          + localStorage.getItem('token')}}).then(r => r.json())""")
+    return f"agent:main:openwebui-{me['id']}-{chat_id}"
+
+
+def test_the_open_status_dialog_follows_this_chats_schedule(page):
+    """Scheduled section: a job added for this chat while the dialog is open
+    shows in it, counting down to its next run, and goes when it is removed,
+    with the dialog never opened again: the Gateway's `cron` event refills
+    it, no timer. A job for another session never shows."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: schedule")
+    _wait(page, _turn_over("schedule"), "the reply")
+    key = _chat_session_key(page)
+    _open_status(page)
+    section = "#openclaw-status-section-scheduled"
+    shows = f"""(want) => {{ const s = document.querySelector('{section}');
+                  return !!s && s.innerText.includes(want); }}"""
+    # Folded at the open (nothing runs); a tap opens it and it stays open.
+    page.wait_for_function(shows, arg="(0)", timeout=60_000)
+    page.locator('[data-openclaw-fold-head="scheduled"]').click()
+    page.wait_for_function(shows, arg="Nothing scheduled for this chat.", timeout=10_000)
+    add = {"schedule": {"kind": "every", "everyMs": 2 * 3_600_000}, "agentId": "main",
+           "payload": {"kind": "agentTurn", "message": "E2E check the build\nsecond line"},
+           "delivery": {"mode": "none"}}
+    mine = _gateway_call("cron.add", {"name": "e2e-sched-mine", "sessionTarget": f"session:{key}", **add})
+    other = _gateway_call("cron.add", {"name": "e2e-sched-other", "sessionTarget": "isolated", **add})
+    try:
+        page.wait_for_function(shows, arg="e2e-sched-mine", timeout=30_000)
+        text = page.locator(section).inner_text()
+        assert "(1)" in text, text
+        assert "Every 2 h" in text and "E2E check the build" in text and "second line" not in text, text
+        assert re.search(r"in 1h5\dm|in 2h00m|in 1h59m", text), text
+        assert "e2e-sched-other" not in text, text
+        if os.environ.get("E2E_SHOTS"):
+            page.locator("#openclaw-status-modal-root").screenshot(
+                path=os.path.join(os.environ["E2E_SHOTS"], "scheduled.png"))
+        _gateway_call("cron.remove", {"id": mine["id"]})
+        mine = None
+        page.wait_for_function(shows, arg="Nothing scheduled for this chat.", timeout=30_000)
+        assert page.locator("#openclaw-status-modal-root").count() == 1
+    finally:
+        for job in (mine, other):
+            if job:
+                _gateway_call("cron.remove", {"id": job["id"]})
+    page.keyboard.press("Escape")
+
+
 # The drawer's close control (× on a wide screen, ‹ Back on a phone) is on
 # screen and is what a tap at its centre reaches; and the task shown whole
 # scrolls inside its own box, which ends on screen.

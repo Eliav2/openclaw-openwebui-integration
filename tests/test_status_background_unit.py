@@ -100,9 +100,9 @@ class ShortCommandTests(unittest.TestCase):
 class RowTests(unittest.TestCase):
     """_background_rows: what belongs to this chat, and how it reads."""
 
-    def rows(self, tasks=(), jobs=(), chat=None):
+    def rows(self, tasks=(), chat=None):
         chat = chat or _chat()
-        return action._background_rows(list(tasks), list(jobs), action._agent_call_rows(chat), KEY,
+        return action._background_rows(list(tasks), action._agent_call_rows(chat), KEY,
                                        commands=action._exec_commands(chat))
 
     def test_a_background_command_is_titled_by_its_cards_title(self):
@@ -158,14 +158,12 @@ class RowTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in data["rows"]], ["live", "f0", "f1", "f2", "f3", "f4"])
         self.assertEqual(data["total"], 9)
 
-    def test_an_automation_bound_to_this_chat_says_how_it_last_went(self):
-        mine = _job("nightly", f"session:{KEY}", lastRunStatus="error", lastError="model 529",
-                    consecutiveErrors=3)
-        run = _task("automation_run", "completed", sourceId="j-nightly")    # told by its job's row
-        data = self.rows([run], [mine, _job("elsewhere", f"session:{OTHER_KEY}")], chat={"history": {}})
-        (row,) = data["rows"]
-        self.assertEqual((row["title"], row["status"], row["error"], row["failedInARow"], row["job"]),
-                         ("nightly", "failed", "model 529", 3, True))
+    def test_automation_runs_are_listed_and_the_automations_are_not(self):
+        """The automations are the Scheduled section's; their runs are Background rows."""
+        run = _task("automation_run", "completed", sourceId="j-nightly", id="t-run")
+        data = self.rows([run], chat={"history": {}})
+        self.assertEqual([(r["id"], r["kind"]) for r in data["rows"]], [("t-run", "Automation")])
+        self.assertNotIn("automationsAvailable", data)
 
     def test_a_background_agent_runs_until_its_reply_is_done(self):
         self.assertEqual([r["status"] for r in self.rows()["rows"] if r["kind"] == "Agent"], ["running"])
@@ -173,12 +171,12 @@ class RowTests(unittest.TestCase):
                          ["completed"])
 
     def test_no_task_list_on_this_gateway_is_said_not_failed(self):
-        data = action._background_rows(None, [], [], KEY, commands={})
+        data = action._background_rows(None, [], KEY, commands={})
         self.assertFalse(data["tasksAvailable"])
-        self.assertTrue(data["automationsAvailable"])
 
 
-def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs=None, processes=None):
+def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs=None, processes=None,
+             cron_params=None, no_session_filter=False):
     """A 9.3 Gateway for one open; `fail` raises, `unknown` lacks, `slow` waits."""
     children = [{"key": CHILD, "status": "running" if running_child else "done", "spawnedBy": KEY,
                  "label": "research", "startedAt": NOW - 9000, "endedAt": None if running_child else NOW}]
@@ -207,7 +205,16 @@ def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs
             assert params == {"key": KEY}, params
             return {"sessionId": "s1", "processes": processes or [], "truncated": False}
         if method == "cron.list":
-            return {"jobs": jobs if jobs is not None else [_job("heartbeat", "main")]}
+            if cron_params is not None:
+                cron_params.append(dict(params))
+            listed = jobs if jobs is not None else [_job("heartbeat", "main")]
+            if "sessionKey" in params:
+                if no_session_filter:
+                    raise RuntimeError("invalid cron.list params: at root: unexpected property 'sessionKey'")
+                # The Gateway's own binding rule, for the forms these jobs use.
+                listed = [j for j in listed if j["sessionTarget"] == f"session:{params['sessionKey']}"
+                          or j.get("sessionKey") == params["sessionKey"]]
+            return {"jobs": listed, "hasMore": False, "nextOffset": None}
         raise AssertionError(f"unexpected RPC: {method}")
 
     conn = mock.Mock()
@@ -237,7 +244,7 @@ def _fills(emitted):
             name, message = json.loads("[" + code.split(marker, 1)[1].split(");\n", 1)[0] + "]")
             out[name] = {"error": message}
             continue
-        for name in ("context", "limits", "background", "subagents", "agents"):
+        for name in ("context", "limits", "background", "scheduled", "subagents", "agents"):
             if f"getElementById('openclaw-status-section-{name}')" in code and "const DATA = " in code:
                 out[name] = json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0])
     return out
@@ -274,7 +281,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_section_fills(self):
         _result, emitted = await self._open(_gateway([]))
         fills = _fills(emitted)
-        self.assertEqual(sorted(fills), ["agents", "background", "context", "limits", "subagents"])
+        self.assertEqual(sorted(fills), ["agents", "background", "context", "limits", "scheduled", "subagents"])
         self.assertTrue(all(not f.get("error") for f in fills.values()), fills)
         bg = fills["background"]
         self.assertEqual([(r["kind"], r["title"]) for r in bg["rows"]],
@@ -283,12 +290,13 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_failing_source_leaves_the_other_sections_intact(self):
         """Each source in turn fails; only the sections that read it say so."""
         readers = {"sessions.describe": {"context", "limits"}, "usage.status": {"limits"},
-                   "sessions.list": {"subagents"}, "tasks.list": {"background"}, "cron.list": {"background"}}
+                   "sessions.list": {"subagents"}, "tasks.list": {"background"}, "cron.list": {"scheduled"}}
         for method, hit in readers.items():
             with self.subTest(failing=method):
                 _result, emitted = await self._open(_gateway([], fail=(method,)))
                 fills = _fills(emitted)
-                self.assertEqual(sorted(fills), ["agents", "background", "context", "limits", "subagents"])
+                self.assertEqual(sorted(fills), ["agents", "background", "context", "limits", "scheduled",
+                                                 "subagents"])
                 for name, data in fills.items():
                     broken = bool(data.get("error") or data.get("errors"))
                     self.assertEqual(broken, name in hit, (name, data))
@@ -306,7 +314,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             before = sorted(_fills(emitted))
             gate.set()
             await asyncio.wait_for(opening, 5)
-        self.assertEqual(before, ["agents", "context", "limits", "subagents"])
+        self.assertEqual(before, ["agents", "context", "limits", "scheduled", "subagents"])
         self.assertIn("background", _fills(emitted))
 
     async def test_on_2026_10_commands_come_from_the_sessions_processes(self):
@@ -336,10 +344,10 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         mine = _job("mine", f"session:{KEY}")
         _result, emitted = await self._open(
             _gateway([], unknown=("tasks.list", "sessions.processes.list"), jobs=[mine]))
-        bg = _fills(emitted)["background"]
-        self.assertFalse(bg["tasksAvailable"])
-        self.assertEqual(bg["errors"], [])
-        self.assertIn("mine", [r["title"] for r in bg["rows"]])
+        fills = _fills(emitted)
+        self.assertFalse(fills["background"]["tasksAvailable"])
+        self.assertEqual(fills["background"]["errors"], [])
+        self.assertEqual([r["title"] for r in fills["scheduled"]["rows"]], ["mine"])
 
     async def test_no_one_gets_the_gateways_other_automations(self):
         """ELI-175: only the chat's own automation is listed, even for OWNER_USERS."""
@@ -347,15 +355,19 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(user=user):
                 jobs = [_job("gw-heartbeat", "main"), _job("gw-watch", "isolated", lastRunStatus="error"),
                         _job("mine", f"session:agent:main:openwebui-{user}-{CHAT}")]
-                _result, emitted = await self._open(_gateway([], jobs=jobs), user=user)
-                bg = _fills(emitted)["background"]
-                self.assertEqual([r["title"] for r in bg["rows"] if r.get("job")], ["mine"])
+                calls = []
+                _result, emitted = await self._open(_gateway(calls, jobs=jobs, cron_params=calls), user=user)
+                sched = _fills(emitted)["scheduled"]
+                self.assertEqual([r["title"] for r in sched["rows"]], ["mine"])
+                # Only this chat's key is ever asked for.
+                self.assertEqual({c["sessionKey"] for c in calls if isinstance(c, dict)},
+                                 {f"agent:main:openwebui-{user}-{CHAT}"})
                 self.assertNotIn("gw-", json.dumps(_emitted_codes(emitted)))
                 seen = run_page(_BG_PAGE_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY),
-                                              "fills": [action._render_background_fill_js(bg)],
-                                              "read": ["background", "other-automations"], "steps": []})
-                self.assertIn("mine", seen["background"]["texts"])
-                self.assertFalse(any("Other automations" in t for t in seen["background"]["texts"]))
+                                              "fills": [action._render_scheduled_fill_js(sched)],
+                                              "read": ["scheduled", "other-automations"], "steps": []})
+                self.assertIn("mine", seen["scheduled"]["texts"])
+                self.assertFalse(any("Other automations" in t for t in seen["scheduled"]["texts"]))
                 self.assertIsNone(seen["other-automations"]["open"], "no fold of other automations")
 
     async def test_the_page_reads_the_background_section_again(self):
@@ -365,7 +377,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             result = await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
                                            __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
         self.assertEqual(result, {"status": "ok"})
-        self.assertEqual(collections.Counter(calls), {"tasks.list": 1, "cron.list": 1})
+        self.assertEqual(collections.Counter(calls), {"tasks.list": 1})
         self.assertEqual(chat_reads, [CHAT])
         fills = _fills(emitted)
         self.assertEqual(sorted(fills), ["background"])
@@ -459,7 +471,7 @@ IDENTITY = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x",
 def _bg(rows, **kw):
     return action._render_background_fill_js({
         "rows": rows, "total": len(rows),
-        "tasksAvailable": True, "automationsAvailable": True, "errors": [], "source": "pipe",
+        "tasksAvailable": True, "errors": [], "source": "pipe",
         "fetchedAt": NOW, "error": None, **kw})
 
 

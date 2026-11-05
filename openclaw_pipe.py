@@ -5701,6 +5701,11 @@ class _GatewayConnection:
         self._session_change_waiters: dict[str, asyncio.Event] = {}
         self._session_message_waiters: dict[str, asyncio.Event] = {}
         self._session_child_waiters: dict[str, asyncio.Event] = {}
+        # The Gateway's `cron` event (a job added, changed, removed, started
+        # or finished), or a socket gap: the waiter, and a count readers keep
+        # to tell a cached job list is old.
+        self._cron_waiter: asyncio.Event | None = None
+        self.cron_revision = 0
         self._tool_events_seen: dict[tuple, bool] = {}
         # A waiting command returns its "Take control" link on every poll.
         self._control_links_shown: dict[tuple, bool] = {}
@@ -5839,7 +5844,22 @@ class _GatewayConnection:
             ev = self._session_change_waiters[session_key] = asyncio.Event()
         return ev
 
+    def cron_event(self) -> asyncio.Event:
+        """An Event set by the next `cron` event or a socket gap. Take it
+        BEFORE reading the jobs so no change slips between the read and the wait."""
+        if self._cron_waiter is None:
+            self._cron_waiter = asyncio.Event()
+        return self._cron_waiter
+
+    def _on_cron_changed(self) -> None:
+        self.cron_revision += 1
+        waiter, self._cron_waiter = self._cron_waiter, None
+        if waiter is not None:
+            waiter.set()
+
     def _wake_session_waiters(self, session_key: str | None = None) -> None:
+        if session_key is None:
+            self._on_cron_changed()     # a gap may have lost a `cron` event too
         keys = [session_key] if session_key else list(self._session_change_waiters)
         for key in keys:
             ev = self._session_change_waiters.pop(key, None)
@@ -7270,6 +7290,7 @@ class _GatewayConnection:
                                           "data", "seq", "ts") if k in p}}
                 if msg.get("type") == "event" and msg.get("event") == "cron":
                     self.note_cron_event(msg.get("payload") or {})
+                    self._on_cron_changed()
                     continue
                 if msg.get("type") != "event" or \
                    msg.get("event") not in ("agent", "chat"):
