@@ -109,9 +109,9 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("fetch-depth: 0", scope)
 
     def test_only_the_oldest_lane_is_non_blocking(self):
-        lanes = {name: re.search(r"blocking: (\S+)", body) for name, body in self.jobs
+        lanes = {name: re.search(r"^\s*blocking: (.+)$", body, re.M) for name, body in self.jobs
                  if "uses: ./.github/workflows/e2e.yml" in body}
-        self.assertEqual({n for n, m in lanes.items() if m and m.group(1).strip('"') == "false"}, {"e2e-oldest"})
+        self.assertEqual({n for n, m in lanes.items() if m and "'false'" in m.group(1)}, {"e2e-oldest"})
 
 
 if __name__ == "__main__":

@@ -181,4 +181,6 @@ jobs:
     with:
       lane: oldest
       openclaw_version: oldest
-      blocking: "false"
+      # An expression, so actionlint reads the string input as a string (a bare
+      # "false" is typed bool there).
+      blocking: ${{ 'false' }}
