@@ -1575,7 +1575,19 @@ import asyncio  # noqa: E402
 import tempfile  # noqa: E402
 
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # e2e/fake_llm.py's task for E2E_SPAWN
-_ACTION_STATE_DIR = tempfile.mkdtemp(prefix="e2e-action-")
+_ACTION_STATE_DIR = None   # set by `_action_state_dir` for this module's tests
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _action_state_dir():
+    """One device identity for every Action call in this module, removed after it. Made here, not
+    at import, so a run that only collects leaves nothing in /tmp."""
+    global _ACTION_STATE_DIR
+    with tempfile.TemporaryDirectory(prefix="e2e-action-") as path:
+        _ACTION_STATE_DIR = path
+        yield path
+    _ACTION_STATE_DIR = None
+    assert not os.path.exists(path), f"the Action's state dir outlived the module: {path}"
 
 
 def _action_valves(token: str) -> dict:
@@ -1592,7 +1604,7 @@ def _run_action(token: str, call) -> list:
     """Every execute code the Status Action emits for `call(action, emit)`."""
     import openclaw_status_action as sa
     valves = _action_valves(token)
-    state_dir = _ACTION_STATE_DIR   # one device identity for every call
+    state_dir = _ACTION_STATE_DIR
     codes: list = []
 
     async def emit(evt):
