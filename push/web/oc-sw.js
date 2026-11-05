@@ -470,19 +470,22 @@ async function navigate(e, req) {
   const other = (v) => v !== null && v !== kept;
   const version = asked.then(async (v) => {
     if (other(v)) await dropCaches(() => true);
+    // A login instead of a version: the kept page is not opened again.
+    else if (redirected) await cache.delete(PAGE_KEY);
     return v;
   });
-  // The page's own first /api/version read gets this answer: it is this load's.
+  // The page's own first /api/version read gets this load's answer: no second round trip.
   bootVersion.clear();
   bootVersion.set(e.resultingClientId, asked);
   // A copy taken as the answer comes, before the page reads its body.
   e.waitUntil(keepPage(net.then((res) => res && res.clone()), version));
   if (!saved) return (await net) || Response.error();
   if (kept !== undefined) {
-    const stale = version.then(async (v) => {
-      if (redirected) await cache.delete(PAGE_KEY);
-      return other(v) || redirected;
-    });
+    // The kept app is that version, so its own /api/version read gets that at once:
+    // Open WebUI waits for it while it starts, and the server's answer is only for
+    // the check here (a silent network leaves the app running, the check pending).
+    bootVersion.set(e.resultingClientId, Promise.resolve(kept));
+    const stale = version.then((v) => other(v) || redirected);
     staleApp.clear();
     staleApp.set(e.resultingClientId, stale);
     e.waitUntil(stale.then(async (yes) => {
@@ -499,6 +502,8 @@ async function navigate(e, req) {
   if (first.res) return first.res;
   if (first.v !== undefined && first.v !== kept) return (await net) || Response.error();
   if (first.silent) {
+    // Nothing heard: the page's /api/version goes the usual way (the kept copy, as any read).
+    bootVersion.delete(e.resultingClientId);
     e.waitUntil(version.then(async (v) => {
       if (other(v)) (await self.clients.get(e.resultingClientId))?.postMessage({ type: NEW_VERSION });
     }));

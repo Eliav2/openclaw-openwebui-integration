@@ -204,10 +204,15 @@
     return null;
   }
 
-  async function loadMutes() {
-    const v = (await valves("")) || {};
-    mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
-    hasDevices = parse(v.subscriptions, "[]").length > 0;
+  // Open WebUI navigates a few times while it starts (each runs chatPage): they
+  // share the one read on its way instead of each asking the server.
+  let loadingMutes = null;
+  function loadMutes() {
+    return loadingMutes ||= valves("").then((v) => {
+      v ||= {};
+      mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
+      hasDevices = parse(v.subscriptions, "[]").length > 0;
+    }).finally(() => { loadingMutes = null; });
   }
 
   async function loadFolders() {

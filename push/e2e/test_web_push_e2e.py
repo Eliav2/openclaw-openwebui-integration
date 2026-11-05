@@ -1262,6 +1262,111 @@ def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
         srv.shutdown()
 
 
+VALVES_READ = "/api/v1/functions/id/web_push/valves/user"
+
+
+def test_a_load_reads_the_users_valves_once(owui, pw):
+    """Open WebUI navigates a few times while it starts; the page script reads the user's valves
+    (mutes, devices) once for all of them. Notifications not asked yet (no subscription to save)."""
+    chat, _ = new_chat(owui, "stub", "Chat One Read")
+    body = json.dumps(api(VALVES_READ, token=owui)).encode()
+    reads, answered = [], threading.Event()
+    def answer(path):
+        reads.append(path)
+        answered.set()
+        return body, "application/json"
+    srv = slow_server(answer)
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"{BASE}/c/{chat}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        # A slow answer (a slow network): Open WebUI's start navigations come while it is on its way.
+        ctx.route(f"**{VALVES_READ}", lambda route: route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}/")
+                  if route.request.method == "GET" else route.fallback())
+        page.reload()
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        assert answered.wait(WAIT_MS / 1000), "the page script never read the valves"
+        # Open WebUI's start navigations all came while that first read was on its way.
+        assert len(reads) == 1, reads
+    finally:
+        ctx.close()
+        srv.shutdown()
+
+
+SLOW_ANSWER_S = 2   # a Slow 3G round trip
+
+
+def slow_server(answer, delay=SLOW_ANSWER_S, gate=None):
+    """A local server whose answers come late (or, with `gate`, only once it is set)."""
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if gate is not None:
+                gate.wait(WAIT_MS / 1000)
+            else:
+                time.sleep(delay)
+            body, kind = answer(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@needs_offline
+def test_the_kept_app_runs_while_the_version_check_gets_no_answer(owui, browser):
+    """A network that says nothing (lie-fi): the kept app opens and draws the chat; the version
+    check stays pending beside it, and nothing in the app waits for it."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Silent")
+    warm(page, chat)
+    silent = threading.Event()
+    srv = slow_server(lambda path: (b"{}", "application/json"), gate=silent)
+    def no_answer(route):
+        if route.request.service_worker is None:
+            return route.fallback()
+        route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}/api/version")
+    ctx.route("**/api/version", no_answer)
+    try:
+        page.reload(wait_until="commit")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.get_by_text("Chat Silent").first.wait_for(timeout=WAIT_MS)
+        assert not silent.is_set()
+    finally:
+        ctx.unroute("**/api/version", no_answer)
+        silent.set()
+        srv.shutdown()
+
+
+@needs_offline
+def test_a_login_instead_of_a_version_drops_a_page_kept_without_one(owui, browser):
+    """A page kept without its version (by an earlier worker) and an expired Access session: the
+    login shows, and the kept page goes."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Old Kept")
+    warm(page, chat)
+    page.evaluate("() => caches.open('oc-shell-v1').then((c) => c.delete('/_oc/version'))")
+    login = "<html><body>Cloudflare Access login</body></html>"
+    to_login = lambda r: r.fulfill(status=302, headers={"location": f"{BASE}/access-login"})
+    ctx.route("**/access-login", lambda r: r.fulfill(status=200, content_type="text/html", body=login))
+    ctx.route(f"**/c/{chat}", to_login)
+    ctx.route("**/api/version", to_login)
+    try:
+        page.goto(f"{BASE}/c/{chat}")
+        page.wait_for_url("**/access-login", timeout=WAIT_MS)
+        settled(page, "() => caches.open('oc-shell-v1').then((c) => c.match('/')).then((r) => !r)")
+    finally:
+        ctx.unroute(f"**/c/{chat}"); ctx.unroute("**/api/version"); ctx.unroute("**/access-login")
+
+
 MODEL_AVATARS = "img[src*='/models/model/profile/image']"
 AVATARS_DRAWN = f"""() => {{ const i = [...document.querySelectorAll("{MODEL_AVATARS}")];
     return i.length > 0 && i.every((x) => x.complete && x.naturalWidth > 0); }}"""
