@@ -66,6 +66,10 @@ The Gateway device token is saved to `STATE_DIR/device-token.json` after a succe
 
 `STATE_DIR` is a directory inside the Open WebUI container. The Pipe uses its `STATE_DIR` valve, or the `OPENCLAW_BRIDGE_STATE_DIR` environment variable when the valve is empty, or `/data/openclaw-bridge`. The installer sets the valve from its `--state-dir` flag.
 
+## The device name
+
+The Pipe connects as `owui-pipe-<first 8 characters of its device id>` (the second device below as `owui-pipe-restricted-<its own 8>`), and the Status Action uses the same name because it shares the main identity. On a loopback Gateway a new device is approved silently, and the Gateway removes a silently approved device when another silent client with the same client id, mode and name pairs while the first is offline. A name of its own keeps scripts and other local clients from evicting the Pipe, and the device id in it keeps two Pipe installs on one Gateway from evicting each other. The Gateway stores the name from the latest connect, so a Pipe or Status Action build from before this change clears it until the next connect with the new build; update both together. `openclaw devices list` shows the name.
+
 ## If STATE_DIR isn't writable
 
 The Pipe falls back to `/tmp/openclaw-bridge` and logs `STATE_DIR unavailable`, rather than failing. `/tmp` usually does not survive a container restart, so the identity and device token are lost and you get a fresh pairing prompt every time.
