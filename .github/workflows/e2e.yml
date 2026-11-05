@@ -2,8 +2,9 @@ name: E2E
 
 # The full stack, real everywhere except the model: Open WebUI in Docker, this
 # integration installed by its own installers, a real OpenClaw Gateway, and a
-# deterministic fake model (e2e/fake_llm.py). Called by ci.yml (every push and
-# PR) and compat-watch.yml (daily, against upstream's latest).
+# deterministic fake model (e2e/fake_llm.py). Called by ci.yml (every push to main,
+# and every PR that can change runtime behaviour) and compat-watch.yml (daily,
+# against upstream's latest).
 
 on:
   workflow_call:
@@ -13,13 +14,17 @@ on:
         type: string
         default: ""
       openclaw_version:
-        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "next" = OPENCLAW_NEXT_VERSION there)
+        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "oldest" = OPENCLAW_OLDEST_VERSION, "next" = OPENCLAW_NEXT_VERSION there)
         type: string
         default: ""
       lane:
         description: Name shown in the job title and artifact
         type: string
         default: pinned
+      blocking:
+        description: '"false" makes a failure of this lane report without failing the workflow run'
+        type: string
+        default: "true"
   workflow_dispatch:
     inputs:
       owui_image:
@@ -34,6 +39,10 @@ on:
         description: Lane name
         type: string
         default: manual
+      blocking:
+        description: '"false" makes a failure of this lane report without failing the workflow run'
+        type: string
+        default: "true"
       tests:
         description: pytest -k expression for the end-to-end suite (empty = all; for repeating one test)
         type: string
@@ -51,6 +60,7 @@ jobs:
     name: E2E (${{ inputs.lane }} ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    continue-on-error: ${{ inputs.blocking == 'false' }}
     strategy:
       fail-fast: false
       matrix:

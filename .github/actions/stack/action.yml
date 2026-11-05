@@ -7,10 +7,10 @@ description: >-
 
 inputs:
   owui_image:
-    description: Open WebUI image (empty = the pinned one in e2e/versions.env, "next" = OWUI_NEXT_IMAGE there)
+    description: Open WebUI image (empty = the pinned one in e2e/versions.env, "next" = OWUI_NEXT_IMAGE there, which exists only while a release is being moved to)
     default: ""
   openclaw_version:
-    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "next" = OPENCLAW_NEXT_VERSION there)
+    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "oldest" = OPENCLAW_OLDEST_VERSION there, "next" = OPENCLAW_NEXT_VERSION there, which exists only while a release is being moved to)
     default: ""
   log_dir:
     description: Where the stack writes its logs
@@ -26,8 +26,13 @@ runs:
         IN_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
       run: |
         set -a; . e2e/versions.env; set +a
-        if [ "$IN_OPENCLAW_VERSION" = next ]; then IN_OPENCLAW_VERSION=$OPENCLAW_NEXT_VERSION; fi
-        if [ "$IN_OWUI_IMAGE" = next ]; then IN_OWUI_IMAGE=$OWUI_NEXT_IMAGE; fi
+        # A named lane whose pin is not in versions.env fails here, instead of
+        # silently running the pinned versions under another name.
+        case "$IN_OPENCLAW_VERSION" in
+          oldest) IN_OPENCLAW_VERSION=${OPENCLAW_OLDEST_VERSION:?no OPENCLAW_OLDEST_VERSION in e2e/versions.env} ;;
+          next) IN_OPENCLAW_VERSION=${OPENCLAW_NEXT_VERSION:?no OPENCLAW_NEXT_VERSION in e2e/versions.env} ;;
+        esac
+        if [ "$IN_OWUI_IMAGE" = next ]; then IN_OWUI_IMAGE=${OWUI_NEXT_IMAGE:?no OWUI_NEXT_IMAGE in e2e/versions.env}; fi
         echo "OWUI_IMAGE=${IN_OWUI_IMAGE:-$OWUI_IMAGE}" >> "$GITHUB_ENV"
         echo "OPENCLAW_VERSION=${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}" >> "$GITHUB_ENV"
         echo "Open WebUI: ${IN_OWUI_IMAGE:-$OWUI_IMAGE} / OpenClaw: openclaw@${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
