@@ -254,6 +254,41 @@ class InstallerCoreTests(unittest.TestCase):
         self.assertFalse(inst.function_status(owui, self.filter))
 
 
+class UpdateValvesTests(unittest.TestCase):
+    """A re-run keeps the switches an operator turned off: ENABLE_FILE_SERVER
+    off must survive a deploy, or the deploy's smoke test starts the
+    unauthenticated file server again."""
+
+    CFG = dict(owui_url="http://o", owui_email="e", owui_password="p", gateway_url="localhost:18789",
+               gateway_token="t", agent_id="main", state_dir="/data/openclaw-bridge",
+               owui_api_base_url="http://127.0.0.1:8080", owui_api_key="", file_server_base_url="")
+
+    def _run(self, stored):
+        owui = _FakeOwui([{"id": inst.FUNCTION_ID, "type": "pipe", "content": "pipe"}],
+                         {inst.FUNCTION_ID: stored} if stored is not None else {})
+        inst.update_valves(owui, inst.Config(**self.CFG))
+        return owui.valves[inst.FUNCTION_ID]
+
+    def test_a_first_install_turns_the_switches_on(self):
+        v = self._run(None)
+        self.assertEqual([v[k] for k in ("ENABLE_FILE_SERVER", "USE_OWUI_FILES", "SEND_STOP_ON_CANCEL")],
+                         [True, True, True])
+
+    def test_a_re_run_keeps_a_switch_the_operator_turned_off(self):
+        stored = {"ENABLE_FILE_SERVER": False, "USE_OWUI_FILES": False, "SEND_STOP_ON_CANCEL": False,
+                  "GATEWAY_URL": "other:1", "STATE_DIR": "/old"}
+        v = self._run(stored)
+        self.assertEqual([v[k] for k in ("ENABLE_FILE_SERVER", "USE_OWUI_FILES", "SEND_STOP_ON_CANCEL")],
+                         [False, False, False])
+        # The connection valves are still the run's own.
+        self.assertEqual((v["GATEWAY_URL"], v["STATE_DIR"]), ("localhost:18789", "/data/openclaw-bridge"))
+
+    def test_a_switch_missing_from_an_old_install_is_added_on(self):
+        v = self._run({"ENABLE_FILE_SERVER": False})
+        self.assertEqual((v["ENABLE_FILE_SERVER"], v["USE_OWUI_FILES"], v["SEND_STOP_ON_CANCEL"]),
+                         (False, True, True))
+
+
 class _OwuiChatCompletions:
     """Open WebUI's /api/chat/completions as measured on 0.13.0: a `metadata` field in the
     request is dropped, a top-level `chat_id` must name a chat row (404 otherwise), and a
