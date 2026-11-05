@@ -1,6 +1,6 @@
 # Mid-run rehydration and persistence
 
-How Open WebUI 0.12 (the minimum) keeps an assistant message while its reply is still running, so a tab that reloads or opens the chat mid-turn sees the answer so far. Verified against Open WebUI 0.12.0's source and a live 0.12.0 instance.
+How Open WebUI 0.12 (0.12.4 is the minimum) keeps an assistant message while its reply is still running, so a tab that reloads or opens the chat mid-turn sees the answer so far. Verified against Open WebUI 0.12.0's source and a live 0.12.0 instance.
 
 ## Open WebUI owns the in-flight message
 

@@ -135,44 +135,6 @@ def _turn_message_patch(message_id: str, parent: str | None, message: dict) -> d
     return nodes
 
 
-# ELI-230: a tab that loads the chat while the writer introduces its message
-# can lose it. Open WebUI's loadChat fetches the chat, awaits its tags, then
-# assigns the history it fetched first, over the introduction merged in
-# meanwhile; every later event for the message is then dropped (the page
-# handles events only for messages it has). The page draws no message until
-# that assignment, so once the parent is drawn, whether the message is drawn
-# too is the tab's answer.
-_TAB_PROBE_WAIT_S = 10.0
-_TAB_PROBE_TIMEOUT_S = _TAB_PROBE_WAIT_S + 2.0
-
-
-def _tab_probe_js(parent: str, message_id: str) -> str:
-    """'present' or 'missing' once the tab has drawn `parent`; 'loading'
-    when it has not within _TAB_PROBE_WAIT_S."""
-    return (
-        "const p = " + json.dumps(f"message-{parent}") + ", m = " + json.dumps(f"message-{message_id}") + ";"
-        "const drawn = await new Promise((resolve) => {"
-        "  if (document.getElementById(p)) return resolve(true);"
-        "  const obs = new MutationObserver(() => { if (document.getElementById(p)) { obs.disconnect(); resolve(true); } });"
-        "  obs.observe(document.body, {childList: true, subtree: true});"
-        "  setTimeout(() => { obs.disconnect(); resolve(false); }, " + str(int(_TAB_PROBE_WAIT_S * 1000)) + ");"
-        "});"
-        "if (!drawn) return 'loading';"
-        "return document.getElementById(m) ? 'present' : 'missing';"
-    )
-
-
-def _tabs_showing(user_id: str, chat_id: str) -> list:
-    """The user's sockets whose page has joined the chat."""
-    try:
-        from open_webui.socket.main import SESSION_POOL
-    except Exception:
-        return []
-    return [sid for sid, sess in list((SESSION_POOL or {}).items())
-            if isinstance(sess, dict) and sess.get("id") == user_id
-            and chat_id in (sess.get("chat_ids") or [])]
-
-
 def _owui_redis():
     """Open WebUI's redis client, or None in a single-process install
     (`create_task` handles both)."""
@@ -762,10 +724,6 @@ async def _page_cancel_intent(user_id: str, chat_id: str, message_id: str) -> st
             and chat_id in (sess.get("chat_ids") or [])]
     answers = set()
     for sid in sids:
-        if _dialog_open_on(sid):
-            # The query would take the open dialog's answer (ELI-195).
-            pipe_log(f"  turn writer: {sid[:8]}... shows a dialog; its intent is not asked")
-            continue
         try:
             resp = await socket_main.sio.call("events", {
                 "chat_id": chat_id, "message_id": message_id,
@@ -858,11 +816,6 @@ class _TurnWriter:
         # Two pumps feed one writer when a recovery continues M; only one may
         # claim it.
         self._open_lock = asyncio.Lock()
-        # ELI-230: tabs that showed M once their page had loaded the chat, and
-        # tabs with a probe out. A repair and a stream step never interleave:
-        # the repair carries `sent_output`, the base of the next diff.
-        self._tabs_confirmed: set = set()
-        self._tabs_probing: set = set()
         self._emit_lock = asyncio.Lock()
 
     async def open(self, takeover: bool = False) -> bool:
@@ -1011,10 +964,9 @@ class _TurnWriter:
             from open_webui.socket.main import get_event_emitter
 
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = _dialog_safe_emitter(await get_event_emitter(
+            self._emit = await get_event_emitter(
                 {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False),
-                self.user_id, self.chat_id, self.message_id)
+                 "user_id": self.user_id}, update_db=False)
         return self._emit
 
     async def _stream(self) -> None:
@@ -1033,62 +985,10 @@ class _TurnWriter:
         if self.handover_owed and (self.request_task is None or self.request_task.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
-        self._probe_tabs()
 
     def _introduced(self) -> bool:
         """M is a message this writer inserted and introduced to open tabs."""
         return bool(self._claim and self._claim.get("how") == "new" and self._claim.get("parent"))
-
-    def _probe_tabs(self) -> None:
-        """Ask each tab showing the chat that has not shown M yet whether it
-        does, one probe per tab at a time, until the run ends (ELI-230)."""
-        if self.closed or not self._introduced():
-            return
-        for sid in _tabs_showing(self.user_id, self.chat_id):
-            if sid in self._tabs_confirmed or sid in self._tabs_probing or _dialog_open_on(sid):
-                continue
-            self._tabs_probing.add(sid)
-            spawn_background(self._probe_tab(sid))
-
-    async def _probe_tab(self, sid: str) -> None:
-        parent = self._claim["parent"]
-        try:
-            from open_webui.socket.main import sio
-            # Under the parent's id: the tab drops an event for a message it
-            # does not have, which is M in exactly the case looked for.
-            resp = await sio.call("events", {
-                "chat_id": self.chat_id, "message_id": parent,
-                "data": {"type": "execute", "data": {"code": _tab_probe_js(parent, self.message_id)}},
-            }, to=sid, timeout=_TAB_PROBE_TIMEOUT_S)
-        except Exception:
-            resp = None  # still loading (no parent yet), or gone: the next step asks again
-        try:
-            answer = _intent_answer(resp)
-            if answer == "present":
-                self._tabs_confirmed.add(sid)
-            elif answer == "missing" and not self.closed:
-                await self._repair_tab(sid)
-                self._tabs_confirmed.add(sid)
-        finally:
-            self._tabs_probing.discard(sid)
-
-    async def _repair_tab(self, sid: str) -> None:
-        """Show M in tab `sid` as it stands: the output the tab's next diff
-        starts from. Only this tab, which lacks M, so nothing it shows is
-        overwritten."""
-        from open_webui.socket.main import sio
-
-        async with self._emit_lock:
-            message = {**self._claim["messages"][self.message_id],
-                       "content": self.sent_text, "output": copy.deepcopy(self.sent_output), "done": False}
-            await sio.emit("events", {
-                "chat_id": self.chat_id, "message_id": self.message_id, "user_id": self.user_id, "shared": True,
-                "data": {"type": "chat:messages", "data": {
-                    "messages": _turn_message_patch(self.message_id, self._claim["parent"], message),
-                    "currentId": self.message_id}},
-            }, to=sid)
-        pipe_log(f"  turn writer: repaired {self.message_id[:8]}... in tab {sid[:8]}... of chat "
-                 f"{self.chat_id[:8]}...: the tab loaded the chat without it (ELI-230)")
 
     def _rewrite(self, text: str) -> str:
         for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
@@ -1241,7 +1141,7 @@ class _TurnWriter:
     async def _push_final(self, text: str, output: list) -> None:
         """M finished, as a shared `chat:messages` to the chat's room. Only for
         a message this writer inserted does it carry the parent's link and move
-        the view to M (ELI-230: a tab that lost M). A taken-over M is in every
+        the view to M. A taken-over M is in every
         saved copy of the chat already, and can have later messages under it:
         the page would replace the parent's children with M alone, or show M
         as the end of the chat."""
