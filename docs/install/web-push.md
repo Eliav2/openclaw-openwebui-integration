@@ -169,7 +169,7 @@ What it does, request by request (only `GET` requests to your own Open WebUI; ev
 
 | Request | How |
 |---|---|
-| A page (`/`, `/c/<id>`, any route: Open WebUI is one page) | The kept page, but only once your Open WebUI answers `/api/version` with the version the page was kept with. Another version: everything kept is deleted and the server's own page loads, however slow. A page answer that comes first (a new page, a login redirect) is used as it is. No network: the kept page at once. |
+| A page (`/`, `/c/<id>`, any route: Open WebUI is one page) | The kept page at once, when it was kept with its Open WebUI version; `/api/version` is asked alongside it. Another version: everything kept is deleted and the page reloads once onto the server's own app. A redirect instead of a version (an expired Cloudflare Access session): the kept page is deleted and the reload shows the login. No page kept yet: the network. |
 | Open WebUI's hashed files (`/_app/immutable/`) | Kept on first use and then read from the device: their names change with their content. |
 | `/static/`, `/assets/`, your settings, models, config, banners, tags, functions, skills | The kept copy at once, refreshed in the background for the next open. |
 | The chat list, pinned chats, folders, each chat you open, `/api/version`, `/_app/version.json`, `/manifest.json` | The network; the kept copy only when it fails. |

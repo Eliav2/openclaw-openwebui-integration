@@ -18,6 +18,7 @@ import threading
 import time
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -997,14 +998,17 @@ def test_offline_keeps_no_redirect_and_drops_an_old_builds_files(owui, browser):
     # Access's answer to an expired session: a redirect to its login page.
     login = "<html><body>Cloudflare Access login</body></html>"
     ctx.route("**/access-login", lambda r: r.fulfill(status=200, content_type="text/html", body=login))
-    ctx.route(f"**/c/{r_chat}", lambda r: r.fulfill(status=302, headers={"location": f"{BASE}/access-login"}))
+    to_login = lambda r: r.fulfill(status=302, headers={"location": f"{BASE}/access-login"})
+    # Access answers every request of an expired session so, /api/version too.
+    ctx.route(f"**/c/{r_chat}", to_login)
+    ctx.route("**/api/version", to_login)
     try:
         page.goto(f"{BASE}/c/{r_chat}")
         page.wait_for_url("**/access-login", timeout=WAIT_MS)
         page.wait_for_timeout(MENU_DRAWN_WAIT_MS)
         assert "Access login" not in page.evaluate(kept)
     finally:
-        ctx.unroute(f"**/c/{r_chat}"); ctx.unroute("**/access-login")
+        ctx.unroute(f"**/c/{r_chat}"); ctx.unroute("**/api/version"); ctx.unroute("**/access-login")
     # An old build's file and the page it came with; the next page load drops it.
     page.goto(f"{BASE}/c/{r_chat}")
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
@@ -1020,7 +1024,8 @@ def test_offline_keeps_no_redirect_and_drops_an_old_builds_files(owui, browser):
 # --- ELI-352 PR 2: the error page after a network change, a newer Open WebUI, the
 # offline pill, another user on the same browser, the kill switch.
 
-APP_FILE = "**/_app/immutable/nodes/0.*"   # Open WebUI's root layout: without it the app cannot start
+APP_FILE = "**/_app/immutable/nodes/0.*"
+CUT_ATTEMPTS = 2   # the service worker asks a read cut on its way once more (oc-sw.js again())   # Open WebUI's root layout: without it the app cannot start
 ERROR_PAGE = "() => !!document.querySelector('body > .error > .status')"
 RELOADED_FLAG = "() => sessionStorage.getItem('ocReloadedAfterError')"
 # The kept copy of that file (offline open on) would hide a network failure: the test drops it.
@@ -1067,9 +1072,12 @@ def test_the_error_page_after_a_network_change_reloads_once_into_the_chat(owui, 
     opened(page, chat)
     failed = []
     def fail_once(route):
-        if failed:
+        # The first load's request fails: the page's own, or (offline open on) the service
+        # worker's and the one retry it makes.
+        mine = [k for k in failed if k == bool(route.request.service_worker)]
+        if len(mine) >= (CUT_ATTEMPTS if route.request.service_worker else 1):
             return route.continue_()
-        failed.append(route.request.url)
+        failed.append(bool(route.request.service_worker))
         route.abort("internetdisconnected")   # what ERR_NETWORK_CHANGED does to the import
     loads, stop = page_loads(page)
     page.evaluate(DROP_APP_FILE)
@@ -1192,7 +1200,8 @@ def test_a_newer_open_webui_never_runs_the_kept_app(owui, browser):
     try:
         page.goto(f"{BASE}/c/{chat}", timeout=WAIT_MS)
         assert from_worker, "the service worker never asked the server for the page"
-        assert page.evaluate("() => !!document.querySelector('meta[name=oc-e2e-build]')"), "the kept app of the old version ran"
+        # The kept app may open first; told the version differs, the page reloads onto the newer one.
+        page.wait_for_function("() => !!document.querySelector('meta[name=oc-e2e-build]')", timeout=WAIT_MS)
         settled(page, f"() => ({SHELL_VERSION})().then((v) => v === {json.dumps(UPGRADED_VERSION)})")
     finally:
         ctx.unroute(f"**/c/{chat}", upgraded_page)
@@ -1201,8 +1210,56 @@ def test_a_newer_open_webui_never_runs_the_kept_app(owui, browser):
     # The real server again: its version differs from the kept one, so its own page.
     page.goto(f"{BASE}/c/{chat}", timeout=WAIT_MS)
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-    assert not page.evaluate("() => !!document.querySelector('meta[name=oc-e2e-build]')")
+    page.wait_for_function("() => !document.querySelector('meta[name=oc-e2e-build]')", timeout=WAIT_MS)
     settled(page, f"() => ({SHELL_VERSION})().then((v) => v === {json.dumps(real)})")
+
+
+# Shorter than the 4.2 s lie-fi wait of the worker before this change (so that one waited for
+# the answer), long enough to see the app drawn without it.
+SLOW_VERSION_DELAY_S = 3
+
+
+@needs_offline
+def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
+    """The kept app (kept with its version) opens at once: the server's /api/version is asked
+    alongside it, not before it."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Instant")
+    warm(page, chat)
+    real = urllib.request.urlopen(OWUI + "/api/version", timeout=30).read()
+    answered = threading.Event()
+    class SlowVersion(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(SLOW_VERSION_DELAY_S)   # a slow network's answer
+            answered.set()
+            body, kind = (real, "application/json") if self.path == "/api/version" else (page_html, "text/html")
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowVersion)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    page_html = urllib.request.urlopen(OWUI + "/", timeout=30).read()
+    def slow(route):
+        if route.request.service_worker is None:
+            return route.fallback()
+        route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}{urllib.parse.urlsplit(route.request.url).path}")
+    # A slow network: the page and the version both slow (a fast page alone would be used as it comes).
+    ctx.route("**/api/version", slow)
+    ctx.route(f"**/c/{chat}", slow)
+    try:
+        page.reload(wait_until="commit")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        assert not answered.is_set(), "the app waited for the network"
+    finally:
+        ctx.unroute("**/api/version", slow)
+        ctx.unroute(f"**/c/{chat}", slow)
+        answered.wait(WAIT_MS / 1000)
+        srv.shutdown()
 
 
 MODEL_AVATARS = "img[src*='/models/model/profile/image']"
