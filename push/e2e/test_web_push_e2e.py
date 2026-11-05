@@ -32,6 +32,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PUSH = os.path.dirname(HERE)
 CHROME = os.environ.get("E2E_CHROME", "/usr/bin/google-chrome")
 WAIT_MS = 60000  # a safety net for each state wait, never expected to expire
+CHAT_LOAD_DELAY_MS = 200  # chat F arrives just after the reply is in the box (inside Open WebUI's 500 ms draft-save debounce)
+DRAFT_RESTORE_WAIT_MS = 4000  # Open WebUI has loaded the chat and handled its own draft by then
 SECRETS = ("STUB-SECRET-REPLY", "PIPE-SECRET-REPLY")
 
 
@@ -575,3 +577,49 @@ def test_mark_as_read_from_the_notification(owui, browser):
     finally:
         api("/api/v1/functions/id/web_push/valves/update",
             {**api("/api/v1/functions/id/web_push/valves", token=token), "NOTIFICATION_ACTIONS": "reply,mute"}, token)
+
+
+def tap(page, action, data, reply=None):
+    """A tap on the notification (or one of its buttons), as the service worker handles it; returns at once."""
+    page.evaluate("(m) => navigator.serviceWorker.controller.postMessage(m)",
+                  {"type": "oc-push-act", "action": action, "data": data, "reply": reply})
+
+
+def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
+    """An open Open WebUI window goes to the chat in the app (no document load): timeOrigin is the page's identity."""
+    ctx, page = browser
+    token = owui
+    a_chat, _ = new_chat(token, "stub", "Chat TA")
+    b_chat, _ = new_chat(token, "stub", "Chat TB")
+    page.goto(f"{BASE}/c/{b_chat}")
+    assert ready(page) in ("kept", "saved")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    origin = page.evaluate("() => performance.timeOrigin")
+    # On chat B, the notification for chat A.
+    tap(page, "", {"chat_id": a_chat, "url": f"/c/{a_chat}"})
+    page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=a_chat, timeout=WAIT_MS)
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+    assert page.evaluate("() => window.ocPushOpened") == a_chat
+    # The same chat's notification: nothing to do.
+    tap(page, "", {"chat_id": a_chat, "url": f"/c/{a_chat}"})
+    page.wait_for_function("() => window.ocPushOpenedSame === true", timeout=WAIT_MS)
+    assert page.evaluate("() => performance.timeOrigin") == origin
+    # Reply that cannot be sent: the chat opens in the app, the text in the message box.
+    f_chat, _ = new_chat(token, "stub", "Chat TF")
+    api(f"/api/v1/chats/{f_chat}", {"chat": {"models": ["no-such-model"]}}, token)
+    # A guard, not a fail-first: chat F has a draft of its own in this tab (Open WebUI 0.13 keeps one
+    # per chat in sessionStorage and puts it back while it loads the chat); the reply must stay.
+    page.evaluate("(c) => sessionStorage.setItem('chat-input-' + c, JSON.stringify({prompt: 'an older draft'}))", f_chat)
+    # Chat F arrives (and its draft goes back in) just after the reply is in the box.
+    page.evaluate("""([c, ms]) => { const f = window.fetch; window.fetch = async (u, o) => {
+        if (String(u).endsWith('/api/v1/chats/' + c)) await new Promise((ok) => setTimeout(ok, ms));
+        return f(u, o); }; }""", [f_chat, CHAT_LOAD_DELAY_MS])
+    tap(page, "reply", {"chat_id": f_chat, "url": f"/c/{f_chat}", "fn": "web_push"}, "kept, not reloaded")
+    page.wait_for_function("() => window.ocPushReply && window.ocPushReply.text === 'kept, not reloaded'", timeout=WAIT_MS)
+    assert "/c/" + f_chat in page.url and "oc-reply" not in page.url
+    page.wait_for_timeout(DRAFT_RESTORE_WAIT_MS)
+    assert "kept, not reloaded" in page.locator("#chat-input").inner_text(), "chat F's own draft replaced the reply"
+    assert page.evaluate("(c) => caches.open('oc-push-drafts').then(d => d.match('/oc-push/draft/' + c)).then(r => !r)", f_chat), \
+        "the cached reply was kept after it was put in the box"
+    assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"

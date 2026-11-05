@@ -307,11 +307,12 @@
     if (!id || !mode) return;
     q.delete("oc-reply");
     history.replaceState(history.state, "", location.pathname + (q.size ? "?" + q : "") + location.hash);
-    let text = "";
+    let text = "", drafts = null;
+    const key = "/oc-push/draft/" + id;
     try {
-      const drafts = await caches.open("oc-push-drafts");
-      const r = await drafts.match("/oc-push/draft/" + id);
-      if (r) { text = (await r.json()).text || ""; await drafts.delete("/oc-push/draft/" + id); }
+      drafts = await caches.open("oc-push-drafts");
+      const r = await drafts.match(key);
+      if (r) text = (await r.json()).text || "";
     } catch (_) {}
     const box = await new Promise((ok) => {
       const find = () => document.querySelector("#chat-input");
@@ -322,7 +323,11 @@
     });
     if (box) {
       box.focus();
-      if (text) document.execCommand("insertText", false, text);
+      if (text) {
+        document.execCommand("insertText", false, text);
+        // Dropped only once it is in the box: with no box, the next open finds it again.
+        await drafts?.delete(key).catch(() => {});
+      }
     }
     if (text) notice("Your reply was not sent. It is in the message box.");
     window.ocPushReply = { mode, text };
@@ -391,6 +396,34 @@
     // Mutes may have changed on another device.
     if (store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
+
+  // A tap on a notification while this page is open: the service worker asks
+  // the page to open the chat (oc-sw.js "oc-open-chat"). It opens like a link in
+  // the sidebar: SvelteKit handles a click on any same-origin link in the
+  // document, so the page stays (no reload). Already on it: nothing to do.
+  const OPEN_CHAT = "oc-open-chat", OPEN_CHAT_ACK = "oc-open-chat-ack";
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const m = e.data || {};
+    if (m.type !== OPEN_CHAT) return;
+    // To the worker that asked (it holds the request), not the page's controller:
+    // a page can have none, or a newer one.
+    e.source?.postMessage({ type: OPEN_CHAT_ACK, id: m.id });
+    const to = new URL(m.url, location.origin);
+    if (to.origin !== location.origin) return;
+    if (to.pathname === location.pathname && !to.search) {
+      window.ocPushOpenedSame = true;
+      seen(chatIdNow()).catch(() => {});
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = to.pathname + to.search;
+    a.hidden = true;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.ocPushOpened = to.pathname.slice("/c/".length);
+  });
+  navigator.serviceWorker.startMessages?.();
 
   window.ocPushEnable = enable;
   window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
