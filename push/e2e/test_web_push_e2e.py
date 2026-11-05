@@ -520,6 +520,7 @@ def test_opening_a_chat_clears_its_notifications(owui, browser):
     assert read(page, chats["Y"]) == [tag["Z"]]
     # In the background, a chat on the page is not read; coming back to the front on it is.
     other()
+    page.wait_for_function("() => document.visibilityState === 'hidden'", timeout=WAIT_MS)   # focus goes first
     page.evaluate("(c) => history.replaceState({}, '', '/c/' + c)", chats["Z"])
     assert page.evaluate("() => window.ocPushRead") == chats["Y"]
     page.bring_to_front()
