@@ -138,10 +138,33 @@ jobs:
             | tar -xz gitleaks
           ./gitleaks git --redact --verbose .
 
+  scope:
+    # Whether the PR can change what runs. A docs, Markdown, tests/ or
+    # comments-and-docstrings-only PR skips the E2E lanes (12 jobs of about 8
+    # minutes before this gate); everything else, and every push to main, runs
+    # them. Nothing requires an E2E check to merge, so a skipped lane is no
+    # blocker (scripts/ci_scope.py has the rule).
+    name: Runtime scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runtime: ${{ steps.scope.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci_scope.py "$EVENT" "$BASE_SHA" "$HEAD_SHA" | tee -a "$GITHUB_OUTPUT"
+
   e2e:
     # What the live install runs (e2e/versions.env): OpenClaw and Open WebUI.
     name: E2E
-    needs: [lint, test]
+    needs: [lint, test, scope]
+    if: needs.scope.outputs.runtime == 'true'
     uses: ./.github/workflows/e2e.yml
     with:
       lane: pinned
@@ -152,7 +175,8 @@ jobs:
     # lane is a fact about that release, not about the PR. Remove it when the
     # documented minimum moves up (ELI-356).
     name: E2E oldest
-    needs: [lint, test]
+    needs: [lint, test, scope]
+    if: needs.scope.outputs.runtime == 'true'
     uses: ./.github/workflows/e2e.yml
     with:
       lane: oldest
