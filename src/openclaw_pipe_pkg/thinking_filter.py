@@ -3,15 +3,9 @@
 # Source of truth: src/openclaw_pipe_pkg/<module>.py + build.py
 # ------------------------------------------------------------------
 
-# The Filter class and its pydantic surface. Split from `thinking` so the Pipe
-# can reuse the ranks and the clamp without also inheriting a Filter class it
-# must not expose.
-#
-# pydantic is the only non-stdlib import here, and Open WebUI ships it. This
-# deliberately does NOT reuse the pipe's _prelude, which pulls in websockets and
-# cryptography: a filter runs on every message, and one that cannot import takes
-# the whole chat down with it. A transport dependency is not worth that risk for
-# a control that only writes one dict key.
+# The Filter class, split from `thinking` so the Pipe does not expose a Filter.
+# Does not use the Pipe's _prelude (websockets, cryptography): a filter that
+# fails to import takes the whole chat down. pydantic ships with Open WebUI.
 
 import json
 import os
@@ -20,28 +14,15 @@ from typing import Optional
 from pydantic import BaseModel, Field, create_model
 
 
-# ---------------------------------------------------------------------------
-# Reading the ladder cache
-# ---------------------------------------------------------------------------
-
 def _state_dir():
-    """Same default and env override as the pipe, without importing it.
-
-    Read-only here, so unlike the pipe this never creates or falls back to a
-    writable directory: a missing directory just means no cache yet.
-    """
+    """The Pipe's state dir, read-only: a missing dir means no cache yet."""
     return os.environ.get("OPENCLAW_BRIDGE_STATE_DIR") or "/data/openclaw-bridge"
 
 
 def _read_ladder_cache(path=None):
-    """Return the level ids the pipe has actually seen a gateway offer.
+    """Level ids the Pipe cached (gateway.py writes {"levels": [...], "updated": ts}).
 
-    The cache is written by the pipe (see gateway.py) as::
-
-        {"levels": ["off", "minimal", ...], "updated": 1786784049}
-
-    Anything unreadable, malformed, or empty falls back rather than raising:
-    a broken cache must degrade to a shorter dropdown, never to a broken chat.
+    Returns None on any bad cache, never raises.
     """
     path = path or os.path.join(_state_dir(), LADDER_CACHE_NAME)
     try:
@@ -59,25 +40,17 @@ def _read_ladder_cache(path=None):
 
 
 def available_levels(path=None):
-    """The dropdown contents: UNSET first, then real levels ordered by rank.
+    """Dropdown: UNSET, then the union of all models' levels by rank.
 
-    This is the union across the models the gateway knows about, not the ladder
-    of the currently selected model. Open WebUI builds a valve dropdown once,
-    from the class, so it cannot vary per message. The pipe closes that gap by
-    clamping against the live session ladder at send time and saying so.
+    OWUI builds the dropdown once per class, so the Pipe clamps per model.
     """
     levels = _read_ladder_cache(path) or FALLBACK_LEVELS
     ordered = sorted(set(levels), key=lambda lv: (LEVEL_RANKS[lv], lv))
     return [UNSET] + ordered
 
 
-# ---------------------------------------------------------------------------
-# Filter
-# ---------------------------------------------------------------------------
-
-# Black stroke on purpose: Open WebUI renders this via <img src=...> and applies
-# `dark:invert-[80%]` to any `data:image/svg` icon, so currentColor never
-# resolves and a themed stroke shows up invisible in one of the two themes.
+# Black stroke: OWUI shows it via <img> with `dark:invert-[80%]`, so
+# currentColor never resolves.
 ICON = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20"
@@ -88,12 +61,7 @@ ICON = (
 
 
 def _build_user_valves(levels):
-    """Build the UserValves model with the dropdown baked in.
-
-    A pydantic Literal is fixed when the class is defined, so the choices have
-    to be known at import time. create_model is what lets the list come from
-    the gateway's real ladders instead of being hardcoded here.
-    """
+    """UserValves with the level dropdown, built at import from the cache."""
     return create_model(
         "UserValves",
         level=(
@@ -132,23 +100,15 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Open WebUI caches the Filter *instance*, not the module, so `toggle`
-        # and `icon` have to be instance attributes. Set at class level they are
-        # invisible to get_filter_items_from_module() and the row silently never
-        # renders, which reads exactly like the filter not being installed.
+        # Must be instance attributes: OWUI's get_filter_items_from_module()
+        # does not see class-level ones and the toggle never renders.
         self.toggle = True
         self.icon = ICON
 
     def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """Write the chosen level into the field the pipe reads.
+        """Write the level into body["reasoning_effort"], the key Advanced Params also sets.
 
-        `body["reasoning_effort"]` is the single source of truth. Open WebUI's
-        Advanced Params control writes the same key, so the two controls move
-        one value instead of racing over two.
-
-        Reached only when the toggle is on: Open WebUI does not run a toggled
-        filter's inlet otherwise. So an untouched chat behaves exactly as if
-        this filter were not installed.
+        OWUI runs this only while the toggle is on.
         """
         if not isinstance(body, dict):
             return body
@@ -159,8 +119,6 @@ class Filter:
             level = user_valves.get("level")
 
         if not level or level == UNSET:
-            # Nothing chosen. Leave whatever Advanced Params set, including
-            # leaving the key absent, so the pipe omits it downstream.
             return body
 
         if body.get("reasoning_effort") and not self.valves.override_advanced_params:

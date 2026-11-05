@@ -105,24 +105,14 @@ from cryptography.hazmat.backends import default_backend
 
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 def pipe_log(*args):
     """Log to stdout so it appears in OWUI's backend logs."""
     print(f"[openclaw-pipe] {' '.join(str(a) for a in args)}", flush=True)
 
 
 
-# ---------------------------------------------------------------------------
-# Background tasks
-# ---------------------------------------------------------------------------
-
-# The event loop keeps only a weak reference to a task, so a fire-and-forget
-# asyncio.create_task() can be garbage-collected before it finishes and its
-# work silently never happens. Background work goes through spawn_background,
-# which holds the reference until the task is done.
+# The event loop holds tasks weakly, so a bare create_task() can be collected
+# before it runs. spawn_background keeps a reference until the task is done.
 _BACKGROUND_TASKS: set = set()
 
 
@@ -135,13 +125,8 @@ def spawn_background(coro):
 
 # --- identity --------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Device Identity helpers
-# ---------------------------------------------------------------------------
-
 def _generate_device_identity():
-    """Generate a fresh Ed25519 key pair and return a dict with id, publicKey,
-    and privateKey (PEM)."""
+    """New Ed25519 identity: dict with id, publicKey and privateKey (PEM)."""
     pk = ed25519.Ed25519PrivateKey.generate()
     pub = pk.public_key()
     raw = pub.public_bytes(
@@ -159,8 +144,8 @@ def _generate_device_identity():
 
 
 def _sign_challenge(ident, nonce, ts, token_str="", scopes=None):
-    """Sign the WebSocket challenge using the device identity. The Gateway
-    checks the scope list in the signed payload against the scopes requested."""
+    """Sign the WebSocket challenge. The Gateway checks the signed scope list
+    against the scopes requested."""
     parts = [
         "v2", ident["id"], "webchat", "cli", "operator",
         ",".join(GATEWAY_SCOPES if scopes is None else scopes), str(ts), token_str, nonce
@@ -240,41 +225,22 @@ def _write_json_file(path, data):
 
 
 
-# ---------------------------------------------------------------------------
-# Sub-agent child index: the child sessions each chat's session spawned.
-#
-# The Status dialog lists a chat's children, ended ones included (ELI-152).
-# The Gateway has no "children of" read: `sessions.list {spawnedBy}` keeps an
-# ended child for 30 minutes only, and a read without it returns every session
-# (1.35 MB for 422 rows live). So the Pipe records each spawn it sees accepted
-# (`_spawned_child`), and the Status Action keeps each child's last row here,
-# so an ended child is listed from this file and a child the window dropped is
-# looked up by its own key. One file in the bridge state dir, shared by the
-# Pipe and the Action (separate modules in one Open WebUI process), so it
-# survives restarts and redeploys. Each change is a read-modify-write under an
-# flock. Parents untouched for 180 days are dropped, and each keeps its 200
-# newest children. `tasks`: the task each spawn call was given, by child key,
-# which titles the child before its transcript holds the spawn message (on
-# 2026.10 that is written after the spawn returns, ELI-178). `runs`: each
-# spawn's run id and label, by child key. A child spawned with cleanup
-# "delete" has no session once its run is done, so its row comes from its run
-# (`agent.wait`), and so does a failed child's real error (ELI-276, ELI-277).
-# `seeded`: children spawned before this file existed were folded in once,
-# from one full list.
-# ---------------------------------------------------------------------------
+# Sub-agent child index (ELI-152). The Gateway has no "children of" read and
+# `sessions.list {spawnedBy}` drops ended children after 30 min, so the Pipe
+# and Status Action share this flock-guarded file. `tasks` title a child before
+# its transcript has the spawn message (ELI-178). `runs` let a cleanup "delete"
+# child be read via `agent.wait` (ELI-276, ELI-277).
 
 _SUBAGENT_INDEX_NAME = "subagent-children.json"
 _SUBAGENT_INDEX_KEEP_MS = 180 * 86400 * 1000
 _SUBAGENT_INDEX_PER_PARENT = 200
-# What a Subagents row needs of a child session's row.
 _SUBAGENT_SNAPSHOT_KEYS = ("key", "label", "status", "startedAt", "createdAt", "updatedAt", "endedAt",
                            "lastRunError", "spawnedBy", "parentSessionKey", "gone")
 
 
 def _subagent_ended(row) -> bool:
-    """A child session row (or `sessions.changed` push) whose run is over:
-    the row to keep, since a cleanup "delete" removes the session seconds
-    later (ELI-276)."""
+    """Whether a child row's run is over; keep it, as cleanup "delete" removes
+    the session soon after (ELI-276)."""
     return (row or {}).get("status") not in (None, "running", "queued") and row.get("hasActiveRun") is not True
 
 
@@ -335,15 +301,13 @@ def _subagent_tasks(parent) -> dict:
 
 
 def _subagent_runs(parent) -> dict:
-    """{child key: {"runId", "label", "error"}} of `parent`'s spawns: the run
-    each was started with, and that run's own error once read."""
+    """{child key: {"runId", "label", "error"}} of `parent`'s spawns."""
     entry = _subagent_index_read()["parents"].get(parent) or {}
     return dict(entry.get("runs") or {})
 
 
 def _subagent_record(child) -> dict | None:
-    """What the index holds of one child, under whichever parent spawned it:
-    {"parent", "row" (or None), "task", "run"}; None for a child it never saw."""
+    """{"parent", "row", "task", "run"} for one child, or None if unknown."""
     for parent, entry in _subagent_index_read()["parents"].items():
         if child in (entry.get("children") or {}):
             return {"parent": parent, "row": entry["children"][child],
@@ -353,9 +317,7 @@ def _subagent_record(child) -> dict | None:
 
 
 def _subagent_remember(parent, rows=(), keys=(), tasks=None, runs=None) -> None:
-    """Record `parent`'s children: `keys` seen spawned, `rows` as just read,
-    `tasks` {child key: the task its spawn call was given}, `runs` {child
-    key: fields of its run}, merged into what is kept."""
+    """Merge spawned `keys`, read `rows`, `tasks` and `runs` into `parent`'s entry."""
     rows, keys, tasks, runs = list(rows), list(keys), dict(tasks or {}), dict(runs or {})
     if not parent or not (rows or keys or tasks or runs):
         return
@@ -877,25 +839,12 @@ def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
 
 
 # --- thinking --------------------------------------------------------------
-# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
-# and the pipe enforces them against the live session ladder, so the ranks and
-# the clamping rule have to be one implementation, not two that agree today.
-#
-# Deliberately has no imports, no classes, and no module-level names beyond the
-# five below. It is concatenated into the Pipe artifact, where every name in it
-# lands in the same flat namespace as every other fragment: a helper named like
-# one of the pipe's own (a `_state_dir`, say) would silently shadow it
-# depending on fragment order. Filter-only helpers live in `thinking_filter`
-# for exactly that reason.
+# Shared by the Thinking filter and the Pipe so both use one ranking and clamp.
+# No imports or extra names: it lands in the Pipe's flat namespace, where a
+# helper could shadow a Pipe name. Filter-only helpers go in thinking_filter.
 
-# ---------------------------------------------------------------------------
-# Levels
-# ---------------------------------------------------------------------------
-
-# Ranks mirror the gateway's own table (off is genuinely a level, not an
-# absence). Used to order the dropdown and to clamp downward, never upward:
-# asking for less thinking than requested is a safe degradation, asking for
-# more is a surprise on someone's bill.
+# Mirrors the Gateway's table. Clamp only downward: less thinking is safe,
+# more costs money.
 LEVEL_RANKS = {
     "off": 0,
     "minimal": 10,
@@ -908,54 +857,32 @@ LEVEL_RANKS = {
     "ultra": 80,
 }
 
-# The sentinel meaning "do not send the field at all". Distinct from "off",
-# which is an explicit instruction to not think. "default" leaves the agent's
-# own configured level alone; "off" overrides it.
+# Means "send no level": keep the agent's own. "off" is an explicit level.
 UNSET = "default"
 
-# Used until the pipe has run once and written a real ladder cache. Every
-# provider observed supports at least these, so nothing here can be a lie.
+# Used until the Pipe writes a ladder cache. Every known provider has these.
 FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
 
 LADDER_CACHE_NAME = "thinking-ladders.json"
 
-# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
-# are identical (`label: id`). The one divergence is the binary profile, which
-# labels `low` as "on". Mapping it back is the difference between learning a
-# model's real two-level ladder and learning a one-level lie.
+# The Gateway's rejection lists labels, not ids. The binary profile labels
+# `low` as "on".
 LEVEL_LABEL_ALIASES = {"on": "low"}
 
-# The exact anchors of the Gateway's hard validation error, e.g.:
+# Anchors of the Gateway's validation error, all required and in order:
 #   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
-# All three must be present and in order. That is deliberately at least as
-# narrow as matching the whole sentence: it can never fire on genuine assistant
-# text that happens to discuss thinking levels.
 _REJECT_HEAD = 'Thinking level "'
 _REJECT_MID = '" is not supported for '
 _REJECT_TAIL = ". Use one of: "
 
 
 def parse_thinking_rejection(text):
-    """Read the Gateway's own rejection as an authoritative per-model ladder.
+    """Parse the Gateway's level rejection into the model's real ladder.
 
-    This exists because `sessions.describe` cannot be trusted for this. Describe
-    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
-    never sees the catalog's `reasoning: false` and falls through to the generic
-    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
-    whose real ladder is `["off"]`. The send path resolves the same question
-    WITH the catalog and rejects. So the rejection is the only place the truth
-    is stated, and throwing it away is what made this misfire once per turn
-    forever instead of once per model.
-
-    Returns None when `text` is not that rejection. Otherwise a dict:
-    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
-    `levels` may be empty if every listed label is unrecognised -- the caller
-    still learns which model rejected which level, so it must check for None
-    rather than for falsiness.
-
-    Pure string parsing on purpose: this fragment is shared with the Thinking
-    filter, which imports nothing (not even `re`) so that a filter running on
-    every message can never fail on an import it did not need.
+    `sessions.describe` builds its ladder without the model catalog, so it
+    over-reports levels; only the send path's rejection is accurate.
+    Returns None, or `{"level", "model", "levels"}`; `levels` may be empty, so
+    check for None. No `re`, since the filter shares this fragment.
     """
     if not text:
         return None
@@ -973,8 +900,7 @@ def parse_thinking_rejection(text):
     level = text[level_start:mid].strip().lower()
     model = text[mid + len(_REJECT_MID):tail].strip()
     if not level or not model or " " in model:
-        # A model ref never contains a space. Anything that does means the
-        # anchors matched something that merely reads like the rejection.
+        # A model ref has no space, so this is not the real rejection.
         return None
 
     listed = text[tail + len(_REJECT_TAIL):]
@@ -992,22 +918,14 @@ def parse_thinking_rejection(text):
 
 
 def clamp_to_ladder(level, ladder):
-    """Fit a requested level to what a model actually supports.
+    """Fit a level to a model's ladder. Returns (level, note to show or None).
 
-    Returns (resolved_level, note). `note` is None when the request went
-    through untouched, otherwise a short human sentence explaining what
-    changed, which the caller is expected to show rather than swallow.
-
-    Clamping is always downward to the nearest supported rank. If the model
-    supports nothing at or below the request (a ladder of only higher levels,
-    which no observed provider has, but which costs nothing to handle), the
-    lowest supported level is used.
+    Clamps down to the nearest supported rank, else to the lowest one.
     """
     if not level or level == UNSET:
         return None, None
     if not ladder:
-        # No ladder known: pass the request through and let the gateway rule on
-        # it. Silently dropping a level the user explicitly picked is worse.
+        # Unknown ladder: let the Gateway rule rather than drop the user's pick.
         return level, None
     if level in ladder:
         return level, None
@@ -5321,74 +5239,32 @@ async def _live_output(request, chat_id: str | None, message_id: str | None) -> 
 # --- composer --------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Composer "Status" button (experiment).
+# Composer "Status" button.
 #
-# Open WebUI (0.12) has no hook for adding a button to the composer row:
-# filter chips there only toggle a filter or open its valves. So the button is
-# installed by an `execute` event, the same unsandboxed in-page JS channel the
-# Status dialog already uses. Chat.svelte runs an `execute` event only when
-# its chat_id is the chat the tab shows AND its message_id is already in that
-# tab's history; anything else is silently dropped. The snippet:
+# OWUI 0.12 has no hook for composer buttons, so an `execute` event installs
+# one. Chat.svelte runs it only if its chat_id is the shown chat and its
+# message_id is in that tab's history. The snippet is idempotent and
+# versioned, keeps the button alive with a debounced MutationObserver, shows
+# it only on chats of this Pipe's models, and on click POSTs to the Status
+# Action. It also takes over the toolbar's "OpenClaw Status" button, since
+# OWUI's handler uploads and saves the whole chat (8 s on a 14 MB chat).
+# The button moves out of the chip row when it does not fit, as that row
+# scrolls (OWUI 0.13's Model controls button narrows it on phones).
 #
-#   * is idempotent: it records itself on `window.__openclawComposerBtn` with a
-#     version, so a repeat delivery only refreshes its config, and a newer
-#     version tears the old one down before installing itself;
-#   * keeps the button present with one MutationObserver (debounced), across
-#     re-renders and chat switches (OWUI is a SPA, the composer is rebuilt
-#     freely), and gives up for good if it ever has to re-insert the button
-#     in a tight loop;
-#   * shows the button only on `/c/<id>` pages whose chat model is one of this
-#     Pipe's models (one chat fetch per chat, cached for the page lifetime),
-#     and removes it everywhere else;
-#   * places it right after the "OpenClaw Thinking" filter chip, or at the end
-#     of the composer's chip group when that chip is off; when neither anchor
-#     exists it shows nothing. The chip row scrolls sideways when it is full:
-#     a button that does not fit whole there moves to the end of the left
-#     group (after Integrations), which never scrolls. Open WebUI 0.13 added a
-#     Model controls button on the right, which leaves a 375 px phone's chip
-#     row 25 px narrower. It goes back to the chip row once the window is
-#     wider than when it moved;
-#   * on click POSTs to the Status Action with the same body shape the dialog's
-#     own Compact button uses, so the existing Action flow opens the real
-#     dialog. The body is built from what the page already has: the chat's
-#     model (each delivery names it) and the latest user message on screen,
-#     so a click never downloads the chat;
-#   * takes over the message toolbar's "OpenClaw Status" button the same way
-#     when it knows the chat's model. Open WebUI's own handler uploads every
-#     message of the branch before the Action runs and saves the whole chat
-#     after it returns: on a 14 MB chat over a phone connection that is 8 s
-#     before the dialog shows and a 14 MB upload after (perf/status_open.py).
-#     Unknown model: Open WebUI's handler runs as before;
-#   * never throws into the page: errors become one console warning each and,
-#     for a failed click, a small toast.
-#
-# It is delivered three ways, all cheap and all idempotent:
-#   (a) the Status Action emits it after every status run (one spark click
-#       installs it);
-#   (b) the Pipe emits it at the start of each turn;
-#   (c) the Pipe's composer watcher pushes it to one socket as soon as that
-#       socket opens a chat on one of this Pipe's models (Open WebUI 0.12
-#       records each socket's open chat in SESSION_POOL[sid]["chat_ids"]).
-#
-# (a) and (b) target whatever message the emitter is bound to. (c) targets the
-# chat's latest *user* message on purpose: OWUI's event handler writes back a
-# shallow copy of the targeted message after running the code, and a user
-# message is the one kind that never streams, so the push can never clobber a
-# reply that is streaming into the same tab.
+# Delivered by the Status Action, at each Pipe turn, and by the composer
+# watcher when a socket opens a Pipe chat. The watcher targets the latest
+# *user* message: OWUI writes the targeted message back after running the
+# code, and a user message never streams, so no reply gets clobbered.
 # ---------------------------------------------------------------------------
 
 _COMPOSER_BUTTON_VERSION = "9"
 
-# The Status Action's function id (install_action.py's FUNCTION_ID; the
-# dialog's own JS calls the same fixed id) and the Pipe's default function id.
-# A Pipe installed under another id still works: it adds its own id (from the
-# module name OWUI gives it) and the prefix of every model it serves.
+# Status Action id (install_action.py FUNCTION_ID) and the default Pipe id;
+# a Pipe under another id adds its own prefixes.
 _COMPOSER_ACTION_ID = "openclaw_status_action"
 _COMPOSER_DEFAULT_MODEL_PREFIX = "openclaw_gateway."
 
-# Name of the Thinking filter's chip (install_filter.py registers the filter
-# under this name, and OWUI renders it as the chip icon's alt text). The button
-# goes right after that chip when it is on screen.
+# The Thinking filter chip's alt text (install_filter.py); the button follows it.
 _COMPOSER_THINKING_CHIP_LABEL = "OpenClaw Thinking"
 
 _COMPOSER_BUTTON_JS_TEMPLATE = r"""
@@ -5890,17 +5766,13 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
 
 def _composer_own_function_id():
-    """This artifact's Open WebUI function id, from the module name OWUI's
-    loader gives it (`function_<id>_<32 hex>`, utils/plugin.py), or None
-    outside Open WebUI."""
+    """Function id from the module name `function_<id>_<32 hex>`, or None."""
     m = re.match(r"^function_(.+)_[0-9a-f]{32}$", globals().get("__name__") or "")
     return m.group(1) if m else None
 
 
 def _composer_model_prefixes(model_id=None, own_id=None) -> list:
-    """The model-id prefixes the button treats as OpenClaw chats: the default
-    Pipe id, the Pipe's own function id when known, and the function id of
-    `model_id` (a model this Pipe actually served)."""
+    """Model-id prefixes that count as OpenClaw chats."""
     prefixes = [_COMPOSER_DEFAULT_MODEL_PREFIX]
     extra = []
     if isinstance(own_id, str) and own_id:
@@ -5915,10 +5787,8 @@ def _composer_model_prefixes(model_id=None, own_id=None) -> list:
 
 def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=None,
                                chat_model=None) -> str:
-    """The install snippet with its config embedded as one JSON literal (same
-    no-interpolation rule as action.py's `_json_for_js`: `<` escaped so the
-    payload can never close an enclosing script tag). `chat_model` is the
-    vouched chat's model, carried only with `chat_id`."""
+    """The snippet with its config as one JSON literal, `<` escaped so it
+    cannot close a script tag. `chat_model` is sent only with `chat_id`."""
     config = {
         "version": _COMPOSER_BUTTON_VERSION,
         "actionId": _COMPOSER_ACTION_ID,
@@ -5934,9 +5804,7 @@ def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=
 
 async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=None,
                                 chat_id=None, model_prefixes=None, chat_model=None) -> bool:
-    """Emit the install snippet through an OWUI event emitter. Best effort:
-    returns False instead of raising, because a cosmetic button must never
-    fail the turn or the Action that carries it."""
+    """Emit the snippet; returns False rather than raise, so it never fails a turn."""
     if not __event_emitter__:
         return False
     try:

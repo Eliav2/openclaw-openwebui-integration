@@ -4,13 +4,8 @@
 # ------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Device Identity helpers
-# ---------------------------------------------------------------------------
-
 def _generate_device_identity():
-    """Generate a fresh Ed25519 key pair and return a dict with id, publicKey,
-    and privateKey (PEM)."""
+    """New Ed25519 identity: dict with id, publicKey and privateKey (PEM)."""
     pk = ed25519.Ed25519PrivateKey.generate()
     pub = pk.public_key()
     raw = pub.public_bytes(
@@ -28,8 +23,8 @@ def _generate_device_identity():
 
 
 def _sign_challenge(ident, nonce, ts, token_str="", scopes=None):
-    """Sign the WebSocket challenge using the device identity. The Gateway
-    checks the scope list in the signed payload against the scopes requested."""
+    """Sign the WebSocket challenge. The Gateway checks the signed scope list
+    against the scopes requested."""
     parts = [
         "v2", ident["id"], "webchat", "cli", "operator",
         ",".join(GATEWAY_SCOPES if scopes is None else scopes), str(ts), token_str, nonce

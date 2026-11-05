@@ -4,53 +4,18 @@
 # ------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Plugin approvals
-# ---------------------------------------------------------------------------
-# A plugin's `before_tool_call` hook can answer `requireApproval`: the tool
-# call waits for a person to allow or deny it. The Gateway registers a
-# `plugin.approval.request` and offers it only to a connected client that can
-# show one: scope operator.admin or operator.approvals, and the
-# "plugin-approvals" cap in its connect frame (2026.10.6 dist:
-# server-request-context-*.mjs `canDeliverApprovals`). With no such client the
-# request ends at once and the tool call fails with "Plugin approval
-# unavailable (no approval route)"; a webchat turn has no channel route to
-# fall back on (approval-shared-*.mjs `hasApprovalTurnSourceRoute`).
-#
-# The connection that writes turns holds operator.admin and declares the cap
-# (`_GatewayConnection._connect_caps`), so the Gateway broadcasts it
-# `plugin.approval.requested` {id, request: {title, description, severity,
-# toolName, pluginId, allowedDecisions?, sessionKey, ...}, expiresAtMs}.
-# A request made in an Open WebUI chat is asked in Open WebUI's question card,
-# where the ask_user tool's questions are asked (askuser.py `_ask_agent_card`),
-# and the pick goes back as `plugin.approval.resolve {id, decision}`, decision
-# one of the request's allowedDecisions (allow-once, allow-always, deny).
-# `plugin.approval.resolved` (answered in the Control UI or with /approve,
-# expired, or cancelled by Stop) takes the card off the screen.
-#
-# Only the owner approves, and only for sessions this Pipe copy owns: its own
-# chats (`agent:<AGENT_ID>:openwebui-<user>-<chat>`) and channel threads
-# (`agent:<AGENT_ID>:openwebui:channel:...`), matched by the AGENT_ID valve. A
-# request for any other session (another agent's, another channel's, a
-# sub-agent's) is never answered here, so a second Pipe copy on another agent
-# cannot touch this one's approvals, nor this one theirs.
-# - A guest's chat (a user not in OWNER_USERS) is denied at once with a note in
-#   the reply, as a guest's secret request is cancelled: left pending, it
-#   would wait out the approval's timeout with the guest's reply on
-#   "Thinking", and an approval from the Control UI would run the tool for a
-#   guest.
-# - A channel thread has no question card and is shared by everyone in it, so
-#   it is denied at once too: left pending, the thread would stand still for
-#   the approval's timeout (up to 10 minutes). The agent gets the denial and
-#   says so in the thread, which carries only its own text.
-# - A sub-agent's session gets no card here: its parent's turn already waits
-#   on it, and the Control UI (or the timeout) answers it.
+# Plugin approvals: a `before_tool_call` hook answering `requireApproval`.
+# The Gateway offers `plugin.approval.request` only to a client with
+# operator.admin/approvals scope and the "plugin-approvals" cap
+# (`canDeliverApprovals`); without one, a webchat turn's tool call fails with
+# "no approval route". The owner answers in the ask_user question card.
+# Only sessions this copy owns (by AGENT_ID) are handled. Guest chats and
+# channel threads are denied at once, so the turn does not stall until the
+# timeout (up to 10 min). Sub-agent sessions are left to the Control UI.
 
 PLUGIN_APPROVAL_METHODS = ("plugin.approval.resolve",)
 PLUGIN_APPROVAL_EVENTS = ("plugin.approval.requested", "plugin.approval.resolved")
-# The card's options, in this order, for the decisions a request allows. Deny
-# first: Open WebUI tags the card's first option "Recommended", and that
-# belongs on the fail-closed answer, not on letting the tool run.
+# Deny first: OWUI tags the first option "Recommended".
 PLUGIN_APPROVAL_CHOICES = (("deny", "Deny"), ("allow-once", "Allow once"), ("allow-always", "Always allow"))
 _PLUGIN_APPROVAL_QID = "approval"
 GUEST_APPROVAL_NOTE = "_The agent asked to use `{tool}`. That needs the owner's approval; it was denied here._"
@@ -60,16 +25,14 @@ _PLUGIN_APPROVALS: dict = {}
 
 
 def _plugin_approvals_offered(conn) -> bool:
-    """The Gateway offers what an approval needs: its events and the resolve
-    method (hello-ok features)."""
+    """Whether hello-ok lists the approval events and resolve method."""
     methods = getattr(conn, "gateway_methods", None) or ()
     events = getattr(conn, "gateway_events", None) or ()
     return all(m in methods for m in PLUGIN_APPROVAL_METHODS) and all(e in events for e in PLUGIN_APPROVAL_EVENTS)
 
 
 def _plugin_approval_decisions(request: dict) -> list[str]:
-    """The decisions the request allows, deny always among them (the Gateway
-    adds it too: plugin-approval-canonical-decisions-*.mjs)."""
+    """Allowed decisions, deny always first (the Gateway adds deny too)."""
     known = [d for d, _ in PLUGIN_APPROVAL_CHOICES]
     raw = request.get("allowedDecisions") if isinstance(request, dict) else None
     allowed = [d for d in known if isinstance(raw, list) and d in raw] or known
@@ -77,8 +40,7 @@ def _plugin_approval_decisions(request: dict) -> list[str]:
 
 
 def _plugin_approval_payload(record) -> dict | None:
-    """Open WebUI's question card for a `plugin.approval.requested` record,
-    or None when it is not one."""
+    """OWUI question card for a `plugin.approval.requested` record, or None."""
     request = record.get("request") if isinstance(record, dict) else None
     if not isinstance(request, dict):
         return None
@@ -105,8 +67,7 @@ def _plugin_approval_payload(record) -> dict | None:
 
 
 def _plugin_approval_decision(response, allowed: list[str]) -> str:
-    """The decision the card's answer names; anything else (Cancel, no
-    answer) denies."""
+    """The decision the card's answer names; anything else denies."""
     if isinstance(response, dict) and response.get("status") == "answered":
         answer = (response.get("answers") or {}).get(_PLUGIN_APPROVAL_QID)
         label = str((answer or {}).get("label") or "").strip() if isinstance(answer, dict) else ""
@@ -117,9 +78,7 @@ def _plugin_approval_decision(response, allowed: list[str]) -> str:
 
 
 def _plugin_approval_session(conn, key: str) -> tuple | None:
-    """What this Pipe copy makes of a request's session: ("chat", user id,
-    chat id), ("channel",), or None for a session it does not own (another
-    agent's, a sub-agent's, anything else)."""
+    """("chat", user id, chat id), ("channel",), or None if not this copy's."""
     parsed = conn.parse_owui_session_key(key or "")   # matches AGENT_ID
     if parsed:
         return ("chat", *parsed)
@@ -131,8 +90,7 @@ def _plugin_approval_session(conn, key: str) -> tuple | None:
 
 
 def plugin_approval_requested(conn, record) -> bool:
-    """`plugin.approval.requested`: ask, or deny, an approval requested in a
-    session this Pipe copy owns. False for anything else."""
+    """Ask or deny an approval in a session this copy owns; False otherwise."""
     if not isinstance(record, dict) or not record.get("id") or record["id"] in _PLUGIN_APPROVALS:
         return False
     if _plugin_approval_payload(record) is None or not _plugin_approvals_offered(conn):
@@ -145,8 +103,7 @@ def plugin_approval_requested(conn, record) -> bool:
 
 
 def plugin_approval_resolved(payload) -> None:
-    """`plugin.approval.resolved`: answered elsewhere, expired or cancelled;
-    the card's wait ends."""
+    """Answered elsewhere, expired or cancelled: end the card's wait."""
     task = _PLUGIN_APPROVALS.pop((payload or {}).get("id"), None)
     if task is not None:
         pipe_log(f"  plugin approval: resolved elsewhere ({(payload or {}).get('decision')} by "
@@ -164,11 +121,9 @@ async def _resolve_plugin_approval(conn, approval_id: str, decision: str) -> str
 
 
 async def _deny_plugin_approval(conn, record: dict, tool: str, why: str, note: str | None) -> None:
-    """Deny an approval at once, and say so in the reply of the run that asked
-    when `note` is given."""
+    """Deny at once; with `note`, say so in the asking run's reply."""
     approval_id, request = record["id"], record.get("request") or {}
-    # Out of the registry before the request: `plugin.approval.resolved`
-    # follows the answer and would cancel this task before it says so.
+    # Unregister first: `plugin.approval.resolved` would cancel this task.
     if _PLUGIN_APPROVALS.get(approval_id) is asyncio.current_task():
         del _PLUGIN_APPROVALS[approval_id]
     shown = await _resolve_plugin_approval(conn, approval_id, "deny")
@@ -199,8 +154,7 @@ async def _answer_plugin_approval(conn, record: dict, kind: str, user_id: str = 
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
     if not message_id:
-        # A card needs the reply it belongs to (askuser.py
-        # `_answer_agent_question`). Left to the Control UI.
+        # A card needs its reply message. Left to the Control UI.
         _PLUGIN_APPROVALS.pop(approval_id, None)
         pipe_log(f"  plugin approval: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
         return

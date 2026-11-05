@@ -3,25 +3,12 @@
 # Source of truth: src/openclaw_pipe_pkg/<module>.py + build.py
 # ------------------------------------------------------------------
 
-# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
-# and the pipe enforces them against the live session ladder, so the ranks and
-# the clamping rule have to be one implementation, not two that agree today.
-#
-# Deliberately has no imports, no classes, and no module-level names beyond the
-# five below. It is concatenated into the Pipe artifact, where every name in it
-# lands in the same flat namespace as every other fragment: a helper named like
-# one of the pipe's own (a `_state_dir`, say) would silently shadow it
-# depending on fragment order. Filter-only helpers live in `thinking_filter`
-# for exactly that reason.
+# Shared by the Thinking filter and the Pipe so both use one ranking and clamp.
+# No imports or extra names: it lands in the Pipe's flat namespace, where a
+# helper could shadow a Pipe name. Filter-only helpers go in thinking_filter.
 
-# ---------------------------------------------------------------------------
-# Levels
-# ---------------------------------------------------------------------------
-
-# Ranks mirror the gateway's own table (off is genuinely a level, not an
-# absence). Used to order the dropdown and to clamp downward, never upward:
-# asking for less thinking than requested is a safe degradation, asking for
-# more is a surprise on someone's bill.
+# Mirrors the Gateway's table. Clamp only downward: less thinking is safe,
+# more costs money.
 LEVEL_RANKS = {
     "off": 0,
     "minimal": 10,
@@ -34,54 +21,32 @@ LEVEL_RANKS = {
     "ultra": 80,
 }
 
-# The sentinel meaning "do not send the field at all". Distinct from "off",
-# which is an explicit instruction to not think. "default" leaves the agent's
-# own configured level alone; "off" overrides it.
+# Means "send no level": keep the agent's own. "off" is an explicit level.
 UNSET = "default"
 
-# Used until the pipe has run once and written a real ladder cache. Every
-# provider observed supports at least these, so nothing here can be a lie.
+# Used until the Pipe writes a ladder cache. Every known provider has these.
 FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
 
 LADDER_CACHE_NAME = "thinking-ladders.json"
 
-# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
-# are identical (`label: id`). The one divergence is the binary profile, which
-# labels `low` as "on". Mapping it back is the difference between learning a
-# model's real two-level ladder and learning a one-level lie.
+# The Gateway's rejection lists labels, not ids. The binary profile labels
+# `low` as "on".
 LEVEL_LABEL_ALIASES = {"on": "low"}
 
-# The exact anchors of the Gateway's hard validation error, e.g.:
+# Anchors of the Gateway's validation error, all required and in order:
 #   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
-# All three must be present and in order. That is deliberately at least as
-# narrow as matching the whole sentence: it can never fire on genuine assistant
-# text that happens to discuss thinking levels.
 _REJECT_HEAD = 'Thinking level "'
 _REJECT_MID = '" is not supported for '
 _REJECT_TAIL = ". Use one of: "
 
 
 def parse_thinking_rejection(text):
-    """Read the Gateway's own rejection as an authoritative per-model ladder.
+    """Parse the Gateway's level rejection into the model's real ladder.
 
-    This exists because `sessions.describe` cannot be trusted for this. Describe
-    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
-    never sees the catalog's `reasoning: false` and falls through to the generic
-    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
-    whose real ladder is `["off"]`. The send path resolves the same question
-    WITH the catalog and rejects. So the rejection is the only place the truth
-    is stated, and throwing it away is what made this misfire once per turn
-    forever instead of once per model.
-
-    Returns None when `text` is not that rejection. Otherwise a dict:
-    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
-    `levels` may be empty if every listed label is unrecognised -- the caller
-    still learns which model rejected which level, so it must check for None
-    rather than for falsiness.
-
-    Pure string parsing on purpose: this fragment is shared with the Thinking
-    filter, which imports nothing (not even `re`) so that a filter running on
-    every message can never fail on an import it did not need.
+    `sessions.describe` builds its ladder without the model catalog, so it
+    over-reports levels; only the send path's rejection is accurate.
+    Returns None, or `{"level", "model", "levels"}`; `levels` may be empty, so
+    check for None. No `re`, since the filter shares this fragment.
     """
     if not text:
         return None
@@ -99,8 +64,7 @@ def parse_thinking_rejection(text):
     level = text[level_start:mid].strip().lower()
     model = text[mid + len(_REJECT_MID):tail].strip()
     if not level or not model or " " in model:
-        # A model ref never contains a space. Anything that does means the
-        # anchors matched something that merely reads like the rejection.
+        # A model ref has no space, so this is not the real rejection.
         return None
 
     listed = text[tail + len(_REJECT_TAIL):]
@@ -118,22 +82,14 @@ def parse_thinking_rejection(text):
 
 
 def clamp_to_ladder(level, ladder):
-    """Fit a requested level to what a model actually supports.
+    """Fit a level to a model's ladder. Returns (level, note to show or None).
 
-    Returns (resolved_level, note). `note` is None when the request went
-    through untouched, otherwise a short human sentence explaining what
-    changed, which the caller is expected to show rather than swallow.
-
-    Clamping is always downward to the nearest supported rank. If the model
-    supports nothing at or below the request (a ladder of only higher levels,
-    which no observed provider has, but which costs nothing to handle), the
-    lowest supported level is used.
+    Clamps down to the nearest supported rank, else to the lowest one.
     """
     if not level or level == UNSET:
         return None, None
     if not ladder:
-        # No ladder known: pass the request through and let the gateway rule on
-        # it. Silently dropping a level the user explicitly picked is worse.
+        # Unknown ladder: let the Gateway rule rather than drop the user's pick.
         return level, None
     if level in ladder:
         return level, None
