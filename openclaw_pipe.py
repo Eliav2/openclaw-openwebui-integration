@@ -7669,6 +7669,11 @@ class _GatewayConnection:
         if consumer.ended and _discards(consumer):
             # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go,
             # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
+            # Its writer's pump, which its events no longer reach, learns it ended: a
+            # message committed before the settle is no steer into it (`_steer`).
+            pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
+            if pump is not None:
+                pump.terminal.set()
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
             self.unregister_run_target(consumer.session_key, consumer.run_id)
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
@@ -7687,16 +7692,17 @@ class _GatewayConnection:
         if not (message.get("role") == "user" and idem.endswith(":user")
                 and steers_mid_run_messages(self.gateway_version)):
             return
+        # Only into the run the Gateway names: one it queued instead is
+        # committed when its own run starts, while another may still work.
+        into = (message.get("__openclaw") or {}).get("steerTargetRunId")
+        if not into:
+            return
         run_id = idem[:-len(":user")]
         consumer = self._consumers.get(f"{session_key}:{run_id}")
         if consumer is not None and not (consumer.started or consumer.steered):
-            self._steer(consumer)
+            self._steer(consumer, into=into)
         elif consumer is None and (handed := self._steer_handed_over(session_key, run_id)) is not None:
-            # Only into the run the Gateway names: one it queued instead is
-            # committed when its own run starts, while another may work.
-            into = (message.get("__openclaw") or {}).get("steerTargetRunId")
-            if into:
-                self._steer(handed, into=into)
+            self._steer(handed, into=into)
 
     def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
         """The steer target of a message whose reply a turn writer took over
@@ -7891,7 +7897,11 @@ class _GatewayConnection:
             # The cancelled message keeps what it showed (the caller's forced
             # snapshot). The run's tail belongs to whoever claims it: never
             # back-filled into the stopped message, never written as a turn of
-            # its own.
+            # its own. A message still waiting to be steered keeps waiting in
+            # it (`_steer_handed_over`): the target that says so goes here.
+            target = self._run_targets.get(f"{session_key}:{run_id}") or {}
+            if reply is not None and target.get("steer_pending"):
+                reply = {**reply, "steer_pending": True}
             self.unregister_run_target(session_key, run_id)
             self.mark_delivered_live(session_key, run_id)
 
@@ -11681,7 +11691,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
                          "thinking": thinking or (target or {}).get("thinking"), "shown": "",
                          "no_resume": bool(reply.get("no_resume")),
                          "request_task_id": (target or {}).get("request_task_id"),
-                         "steer_pending": bool((target or {}).get("steer_pending"))}
+                         "steer_pending": bool(reply.get("steer_pending")
+                                               or (target or {}).get("steer_pending"))}
         pump.started = _handover_started(pump.handover)
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
@@ -16730,7 +16741,9 @@ class _PipeTurn:
         earlier = run_text.pop("earlier", None)
         # This reply's own run stays registered, steered, until its lone final
         # (`_note_run_event`), so that final never reads as a run to write.
-        await _emit_status(self.__event_emitter__, "", done=True)
+        # The agent works on this message now: the reply reads like any whose
+        # run works, until its end replaces the line.
+        await _emit_status(self.__event_emitter__, "Thinking...", done=False)
         # The reply that ended where this message went in, and this reply's
         # own part of the transcript: both are settled from it once the run
         # ends (`_settle_steered_replies`).

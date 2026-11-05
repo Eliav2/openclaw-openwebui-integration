@@ -4021,6 +4021,11 @@ class _GatewayConnection:
         if consumer.ended and _discards(consumer):
             # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go,
             # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
+            # Its writer's pump, which its events no longer reach, learns it ended: a
+            # message committed before the settle is no steer into it (`_steer`).
+            pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
+            if pump is not None:
+                pump.terminal.set()
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
             self.unregister_run_target(consumer.session_key, consumer.run_id)
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
@@ -4039,16 +4044,17 @@ class _GatewayConnection:
         if not (message.get("role") == "user" and idem.endswith(":user")
                 and steers_mid_run_messages(self.gateway_version)):
             return
+        # Only into the run the Gateway names: one it queued instead is
+        # committed when its own run starts, while another may still work.
+        into = (message.get("__openclaw") or {}).get("steerTargetRunId")
+        if not into:
+            return
         run_id = idem[:-len(":user")]
         consumer = self._consumers.get(f"{session_key}:{run_id}")
         if consumer is not None and not (consumer.started or consumer.steered):
-            self._steer(consumer)
+            self._steer(consumer, into=into)
         elif consumer is None and (handed := self._steer_handed_over(session_key, run_id)) is not None:
-            # Only into the run the Gateway names: one it queued instead is
-            # committed when its own run starts, while another may work.
-            into = (message.get("__openclaw") or {}).get("steerTargetRunId")
-            if into:
-                self._steer(handed, into=into)
+            self._steer(handed, into=into)
 
     def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
         """The steer target of a message whose reply a turn writer took over
@@ -4243,7 +4249,11 @@ class _GatewayConnection:
             # The cancelled message keeps what it showed (the caller's forced
             # snapshot). The run's tail belongs to whoever claims it: never
             # back-filled into the stopped message, never written as a turn of
-            # its own.
+            # its own. A message still waiting to be steered keeps waiting in
+            # it (`_steer_handed_over`): the target that says so goes here.
+            target = self._run_targets.get(f"{session_key}:{run_id}") or {}
+            if reply is not None and target.get("steer_pending"):
+                reply = {**reply, "steer_pending": True}
             self.unregister_run_target(session_key, run_id)
             self.mark_delivered_live(session_key, run_id)
 

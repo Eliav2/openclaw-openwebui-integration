@@ -2236,7 +2236,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
                          "thinking": thinking or (target or {}).get("thinking"), "shown": "",
                          "no_resume": bool(reply.get("no_resume")),
                          "request_task_id": (target or {}).get("request_task_id"),
-                         "steer_pending": bool((target or {}).get("steer_pending"))}
+                         "steer_pending": bool(reply.get("steer_pending")
+                                               or (target or {}).get("steer_pending"))}
         pump.started = _handover_started(pump.handover)
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
