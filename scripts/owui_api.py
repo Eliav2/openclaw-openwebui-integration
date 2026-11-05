@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import uuid
+from http import HTTPStatus
 from typing import Optional
 
 
@@ -110,7 +111,7 @@ class OwuiClient:
             f"{self.base_url}{path}", headers=self._auth_headers(), method="DELETE"
         )
         resp = urllib.request.urlopen(req, timeout=15)
-        if resp.status == 204:
+        if resp.status == HTTPStatus.NO_CONTENT:
             return {}
         return self._json(resp)
 
@@ -215,8 +216,11 @@ class OwuiClient:
 
 # ── CLI ──────────────────────────────────────────────────────────────
 
+MIN_ARGV = 2   # the script name and an action
+
+
 def _main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < MIN_ARGV:
         print("Usage: owui_api.py <action> [args...]")
         print("Actions: login, list-chats, get-chat <id>, set-title <id> <title>, delete-chat <id>, list-files, delete-all-files")
         sys.exit(1)

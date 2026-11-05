@@ -48,6 +48,9 @@ MAX_VIDEO_BYTES = 1024 * 1024    # each of the MP4 and the WebM
 # than this is dead time: the screen did not change, it only took that long on this runner.
 WAIT_HELD_MAX = 0.4
 TYPE_DELAY_MS = 45
+CLICK_SETTLE_PX = 2        # a target that moved less than this since the last look has stopped
+REPLY_STABLE_POLLS = 4     # polls in a row with the same reply text before it counts as finished
+STEP_REPORT_MIN_S = 0.5    # a step shorter than this is left out of the where-the-time-went line
 
 # The drawn cursor, the click ripple and the key badge: page elements that
 # follow the real mouse and keyboard events, so the screencast shows them.
@@ -279,7 +282,7 @@ class Demo:
         for _ in range(5):
             await self.page.wait_for_timeout(200)
             nx, ny = await self.point_of(step["selector"])
-            if abs(nx - x) < 2 and abs(ny - y) < 2:
+            if abs(nx - x) < CLICK_SETTLE_PX and abs(ny - y) < CLICK_SETTLE_PX:
                 break
             x, y = nx, ny
             await self.move(x, y, steps=6)
@@ -308,7 +311,7 @@ class Demo:
 
     async def _wait_reply_done(self, step: dict) -> None:
         last, stable, deadline = "", 0, time.monotonic() + step.get("timeout_ms", 150_000) / 1000
-        while stable < 4:
+        while stable < REPLY_STABLE_POLLS:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"the last reply did not finish: {last[-200:]!r}")
             await self.page.wait_for_timeout(250)
@@ -419,7 +422,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         durs = rec.durations() if rec.frames else []
         bounds = [i for _, i in starts] + [len(durs)]
         steps = [f"{do} {sum(durs[a:b]):.1f}" for (do, _), a, b in zip(starts, bounds, bounds[1:])
-                 if sum(durs[a:b]) >= 0.5]
+                 if sum(durs[a:b]) >= STEP_REPORT_MIN_S]
         hits = capture.deny_hits(await page.evaluate("() => document.body.innerText"), (host,) if host else ())
         if hits:
             raise AssertionError(f"{spec['name']}: deny-listed text visible: {sorted(set(hits))[:10]}")

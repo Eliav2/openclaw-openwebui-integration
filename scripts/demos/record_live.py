@@ -42,6 +42,9 @@ import record  # noqa: E402  (the CI recorder: cursor, screencast, ffmpeg)
 capture = record.capture
 PROMPT = "Open Google and search for a picture of a cute kitten for me. Find the cutest one and send it here."
 MAX_SECONDS = 30.0
+AVATAR_RGB = (120, 65, 195)   # the purple of the user avatar the screenshot must still show
+AVATAR_RGB_TOLERANCE = 30     # per channel
+AVATAR_MIN_PIXELS = 12        # in the 480x320 downscale
 
 # The live view is in the reply: an iframe tall enough to be a browser tab, not the empty waiting note.
 LIVE_VIEW_UP = """() => { const a = [...document.querySelectorAll('.chat-assistant')].pop();
@@ -187,7 +190,8 @@ def purple(path: str) -> bool:
     except ImportError:
         return False
     px = Image.open(path).convert("RGB").resize((480, 320)).getdata()
-    return sum(1 for r, g, b in px if abs(r - 120) < 30 and abs(g - 65) < 30 and abs(b - 195) < 30) > 12
+    return sum(1 for r, g, b in px if abs(r - AVATAR_RGB[0]) < AVATAR_RGB_TOLERANCE and abs(g - AVATAR_RGB[1]) < AVATAR_RGB_TOLERANCE
+               and abs(b - AVATAR_RGB[2]) < AVATAR_RGB_TOLERANCE) > AVATAR_MIN_PIXELS
 
 
 async def still_run(a) -> None:

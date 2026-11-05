@@ -39,6 +39,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 
 import click
@@ -247,7 +248,7 @@ class OwuiClient:
             "/api/v1/auths/signin",
             {"email": self.email, "password": self.password},
         )
-        if status != 200 or not isinstance(payload, dict):
+        if status != HTTPStatus.OK or not isinstance(payload, dict):
             raise SystemExit(f"OWUI login failed: {payload}")
         self.token = payload.get("token") or payload.get("access_token")
         if not self.token:
@@ -339,14 +340,14 @@ def choose_identity(existing_valves: dict) -> dict:
 
 def get_function(client: OwuiClient, function_id: str = FUNCTION_ID) -> dict | None:
     status, payload = client.request("GET", f"/api/v1/functions/id/{function_id}")
-    if status == 200 and isinstance(payload, dict) and payload.get("id") == function_id:
+    if status == HTTPStatus.OK and isinstance(payload, dict) and payload.get("id") == function_id:
         return payload
     return None
 
 
 def get_functions(client: OwuiClient) -> list[dict]:
     status, payload = client.request("GET", "/api/v1/functions/")
-    if status == 200 and isinstance(payload, list):
+    if status == HTTPStatus.OK and isinstance(payload, list):
         return payload
     return []
 
@@ -360,7 +361,7 @@ def get_function_summary(client: OwuiClient, function_id: str = FUNCTION_ID) -> 
 
 def get_valves(client: OwuiClient, function_id: str = FUNCTION_ID) -> dict:
     status, payload = client.request("GET", f"/api/v1/functions/id/{function_id}/valves")
-    if status == 200 and isinstance(payload, dict):
+    if status == HTTPStatus.OK and isinstance(payload, dict):
         return payload
     return {}
 
@@ -372,14 +373,14 @@ def post_valves(client: OwuiClient, function_id: str, current: dict, desired: di
     if changed:
         status, payload = client.request(
             "POST", f"/api/v1/functions/id/{function_id}/valves/update", desired)
-        if status != 200 or not isinstance(payload, dict):
+        if status != HTTPStatus.OK or not isinstance(payload, dict):
             raise SystemExit(f"Valve update failed: {payload}")
     return changed
 
 
 def model_exists(client: OwuiClient) -> bool:
     status, payload = client.request("GET", "/api/v1/models")
-    if status != 200 or not isinstance(payload, dict):
+    if status != HTTPStatus.OK or not isinstance(payload, dict):
         return False
     ids = {m.get("id") for m in payload.get("data", [])}
     has_default = DEFAULT_MODEL_ID in ids
@@ -531,7 +532,7 @@ def deploy_function_code(client: OwuiClient, spec: FunctionSpec, code: str) -> d
             "POST", f"/api/v1/functions/id/{spec.id}/update",
             {"id": spec.id, "name": spec.name, "content": code, "meta": meta},
         )
-        if status != 200 or not isinstance(payload, dict) or payload.get("id") != spec.id:
+        if status != HTTPStatus.OK or not isinstance(payload, dict) or payload.get("id") != spec.id:
             raise SystemExit(f"Function update failed: {payload}")
         info(f"Updated {spec.label} function in place")
         return preserved_valves
@@ -539,7 +540,7 @@ def deploy_function_code(client: OwuiClient, spec: FunctionSpec, code: str) -> d
         "POST", "/api/v1/functions/create",
         {"id": spec.id, "name": spec.name, "content": code, "type": spec.type, "meta": meta},
     )
-    if status != 200 or not isinstance(payload, dict) or payload.get("id") != spec.id:
+    if status != HTTPStatus.OK or not isinstance(payload, dict) or payload.get("id") != spec.id:
         raise SystemExit(f"Function create failed: {payload}")
     info(f"Created {spec.label} function")
     return preserved_valves
@@ -554,7 +555,7 @@ def ensure_active(client: OwuiClient, spec: FunctionSpec) -> None:
 
     if not summary.get("is_active"):
         status, payload = client.request("POST", f"/api/v1/functions/id/{spec.id}/toggle")
-        if status != 200:
+        if status != HTTPStatus.OK:
             raise SystemExit(f"Failed to activate function: {payload}")
         info(f"Activated {spec.label} function")
     else:
@@ -566,7 +567,7 @@ def ensure_active(client: OwuiClient, spec: FunctionSpec) -> None:
             warn(spec.global_warning)
     elif not summary.get("is_global"):
         status, payload = client.request("POST", f"/api/v1/functions/id/{spec.id}/toggle/global")
-        if status != 200:
+        if status != HTTPStatus.OK:
             raise SystemExit(f"Failed to make function global: {payload}")
         info(f"Made {spec.label} function global")
     else:
@@ -827,7 +828,7 @@ def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
         },
         timeout=90,
     )
-    if status != 200 or not isinstance(payload, dict):
+    if status != HTTPStatus.OK or not isinstance(payload, dict):
         fail(f"Smoke test HTTP failed: {payload}")
         return False
 
@@ -855,7 +856,7 @@ def route_smoke_test(client: OwuiClient) -> bool:
     which no longer applies now that presets are discovered dynamically
     instead of hardcoded (see ELI-11)."""
     status, payload = client.request("GET", "/api/v1/models")
-    if status != 200 or not isinstance(payload, dict):
+    if status != HTTPStatus.OK or not isinstance(payload, dict):
         fail(f"Route smoke test: could not list models: {payload}")
         return False
     ids = [m.get("id") for m in payload.get("data", [])]
@@ -890,7 +891,7 @@ def route_smoke_test(client: OwuiClient) -> bool:
         },
         timeout=120,
     )
-    if status != 200 or not isinstance(payload, dict):
+    if status != HTTPStatus.OK or not isinstance(payload, dict):
         fail(f"Route smoke HTTP failed: {payload}")
         return False
 

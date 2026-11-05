@@ -27,6 +27,7 @@ import re
 import sys
 
 SKIP_LABEL = "no-visual-change"
+MAX_LISTED_FILES = 5   # the files a failing message names before "..."
 
 # Sources of what users see in the browser: the Status dialog and the
 # sub-agent drawer (action.py), the composer's buttons and notes (composer.py,
@@ -104,8 +105,8 @@ def check(paths, body: str | None, labels) -> str | None:
     touched = visual_files(paths)
     if not touched or has_image(body):
         return None
-    return ("This PR changes what users see (" + ", ".join(touched[:5])
-            + (", ..." if len(touched) > 5 else "") + ") but its description has no image.\n"
+    return ("This PR changes what users see (" + ", ".join(touched[:MAX_LISTED_FILES])
+            + (", ..." if len(touched) > MAX_LISTED_FILES else "") + ") but its description has no image.\n"
             "Add a Before and After pair from the Screenshots workflow, uploaded with gh pr edit --attach "
             "(AGENTS.md, \"Docs and screenshots ship with the feature\"), or, when nothing "
             f"on screen changes, add the label `{SKIP_LABEL}`.")
