@@ -436,6 +436,7 @@ ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section
 FIRST_ASSISTANT = "document.querySelector('.chat-assistant')"
 REBUILD_SAYS = "Rebuilding the cache from the forecast API."
 REBUILD_DONE = "The cache is rebuilt"
+GOAL_ANSWER = "Next is the staging deploy script"
 # From OpenClaw 2026.10.10 the Gateway steers a message sent while a run works
 # into that run: the run ends its reply at the next step and the scripted
 # model answers the new message, so the rebuild's closing line is never said
@@ -470,6 +471,17 @@ CARDS_STATE = f"""() => {{
   return {{done: a.querySelectorAll('[role=button] .text-emerald-500, [role=button] .text-red-500').length,
           active: a.querySelectorAll('[role=button] .shimmer').length}};
 }}"""
+
+
+def reply_with(text: str) -> str:
+    """JS expression: the assistant reply that shows `text` (the first one, or null)."""
+    return f"[...document.querySelectorAll('.chat-assistant')].find(a => a.innerText.includes({json.dumps(text)}))"
+
+
+def reply_done_js(reply: str) -> str:
+    """JS predicate: the reply (a `reply_with` expression) is finished: its Copy button is there."""
+    return (f"() => {{ const a = {reply}; const m = a && a.closest('[id^=message-]'); "
+            "return !!(m && m.querySelector('button[aria-label=\"Copy\"]')); }")
 
 
 def last_text_has(*needles: str, lacks: str | None = None) -> str:
@@ -1076,25 +1088,40 @@ class Scenes:
 
     def usage_goal(self, page: Page) -> None:
         """The status rows under a reply: context, the rate-limit window, and
-        the session's goal, which the agent set with its create_goal tool."""
+        the session's goal, which the agent set with its create_goal tool.
+
+        From OpenClaw 2026.10.10 an active goal keeps the session going: after
+        each turn the Gateway queues its own "Advance the active goal" turn
+        (scenes.json answers it slowly, so the loop is a turn every few
+        seconds, not a flood). The replies of those turns pile up under the
+        scene's, so the scene holds the reply that answers its message, never
+        "the last one"."""
         new_chat(page)
         chat = send(page, "Keep at it until the hourly view is on staging.")
         wait_js(page, last_text_has("Goal set"), "the reply that sets the goal")
+        # The goal keeps the session going, and a message sent while it does is
+        # held behind the loop for minutes (steered into a follow-up turn it
+        # cannot join). Stop ends the running turn and the queued ones; the goal
+        # stays active, and the next message is an ordinary turn.
+        page.locator('button[aria-label="Stop"]').click()
+        wait_js(page, "() => !document.querySelector('button[aria-label=\"Stop\"]')", "the goal's turn stopped")
         send(page, "Start with the build.")
-        wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
+        answer = reply_with(GOAL_ANSWER)
+        wait_js(page, reply_done_js(answer), "the reply that answers, finished")
         set_title(self.token, chat, "Hourly view to staging")
         # Open the status history. From Open WebUI 0.13 a transparent "Toggle status history"
         # button lies over the status line and takes the click.
-        toggle = page.locator(".chat-assistant").last.locator('button[aria-label="Toggle status history"]')
+        mine = page.locator(".chat-assistant").filter(has_text=GOAL_ANSWER).last
+        toggle = mine.locator('button[aria-label="Toggle status history"]')
         if toggle.count():
             toggle.first.click()
         else:
-            page.locator(".chat-assistant").last.get_by_text(re.compile(r"\d+(\.\d+)?[km]/\d+(\.\d+)?[km]")).first.click()
-        wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
-        print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
+            mine.get_by_text(re.compile(r"\d+(\.\d+)?[km]/\d+(\.\d+)?[km]")).first.click()
+        wait_js(page, f"() => {answer}.innerText.includes('\U0001F3AF')", "the goal row", 60_000)
+        print("  status rows: " + json.dumps(page.evaluate(f"() => {answer}.innerText")[:400]), flush=True)
         clip = f"""() => {{
           // From the model's name over the first status row (the 🧠 line) to the end of the reply.
-          const a = {LAST_ASSISTANT};
+          const a = {answer};
           const w = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
           let row = null;
           while (w.nextNode()) {{ if (w.currentNode.textContent.includes('🧠')) {{ row = w.currentNode.parentElement; break; }} }}
@@ -1105,7 +1132,12 @@ class Scenes:
           const top = Math.max(row.getBoundingClientRect().top - 36, navBottom);  // with the model's name
           return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 8, innerHeight) - top}};
         }}"""
-        self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
+        self.s.shot(page, "usage-goal", clip_js=clip,
+                    text_selector=f'.chat-assistant:has-text("{GOAL_ANSWER}") >> nth=-1')
+        # The goal stays active; stop its loop so it does not run through the scenes after.
+        stop = page.locator('button[aria-label="Stop"]')
+        if stop.count():
+            stop.first.click()
 
     def compaction_note(self, page: Page) -> None:
         """A context compaction in the middle of a reply (the sample plugin
