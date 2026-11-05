@@ -307,3 +307,64 @@ class RoundTripTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _png_rgba(data):
+    """Width, height and RGBA rows of an 8-bit RGBA or palette PNG (what make_icons.py writes)."""
+    import struct
+    import zlib
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, chunks = 8, {}
+    while pos < len(data):
+        n, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        chunks.setdefault(kind, []).append(data[pos + 8:pos + 8 + n]); pos += 12 + n
+    w, h, depth, ctype = struct.unpack(">IIBB", chunks[b"IHDR"][0][:10])
+    assert depth == 8 and ctype in (3, 6), (depth, ctype)
+    bpp = 4 if ctype == 6 else 1
+    raw, rows, prev = zlib.decompress(b"".join(chunks[b"IDAT"])), [], bytes(w * bpp)
+    for y in range(h):
+        f, line = raw[y * (w * bpp + 1)], bytearray(raw[y * (w * bpp + 1) + 1:(y + 1) * (w * bpp + 1)])
+        for i in range(len(line)):
+            a, b, c = (line[i - bpp] if i >= bpp else 0), prev[i], (prev[i - bpp] if i >= bpp else 0)
+            p = a + b - c
+            pred = [0, a, b, (a + b) // 2, a if abs(p - a) <= min(abs(p - b), abs(p - c)) else (b if abs(p - b) <= abs(p - c) else c)][f]
+            line[i] = (line[i] + pred) & 0xFF
+        rows.append(bytes(line)); prev = bytes(line)
+    if ctype == 3:
+        pal = chunks[b"PLTE"][0]; trns = chunks.get(b"tRNS", [b""])[0]
+        rows = [b"".join(pal[3 * i:3 * i + 3] + bytes([trns[i] if i < len(trns) else 255]) for i in r) for r in rows]
+    return w, h, rows
+
+
+class NotificationImageTests(unittest.TestCase):
+    """The badge is Android's status-bar icon, drawn from its alpha only: an opaque image is a square."""
+
+    def setUp(self):
+        import base64
+        import re
+        src = open(os.path.join(ROOT, "push", "web", "oc-sw.js")).read()
+        self.src = src
+        self.urls = {k: v for k, v in re.findall(r'const (BADGE|ICON) = "data:image/png;base64,([^"]+)"', src)}
+        self.png = {k: _png_rgba(base64.b64decode(v)) for k, v in self.urls.items()}
+
+    def test_the_notification_uses_them(self):
+        self.assertIn("icon: ICON,", self.src)
+        self.assertIn("badge: BADGE,", self.src)
+        self.assertNotIn("/static/favicon.png", self.src)
+
+    def test_the_badge_is_a_white_mask_with_a_transparent_background(self):
+        w, h, rows = self.png["BADGE"]
+        self.assertEqual((w, h), (96, 96))
+        px = [r[i:i + 4] for r in rows for i in range(0, len(r), 4)]
+        seen = [p for p in px if p[3]]
+        self.assertTrue(all(p[:3] == b"\xff\xff\xff" for p in seen), "only white where it is drawn")
+        share = len([p for p in px if p[3] > 128]) / len(px)
+        self.assertTrue(0.2 < share < 0.6, f"a shape, not a square: {share:.2f} of it is drawn")
+        corners = [rows[0][0:4], rows[0][-4:], rows[-1][0:4], rows[-1][-4:]]
+        self.assertTrue(all(c[3] == 0 for c in corners))
+
+    def test_the_icon_is_in_colour(self):
+        w, h, rows = self.png["ICON"]
+        self.assertEqual((w, h), (192, 192))
+        px = {r[i:i + 3] for r in rows for i in range(0, len(r), 4)}
+        self.assertTrue(any(p[0] > 180 and p[1] < 110 and p[2] < 110 for p in px), "the red claw")
