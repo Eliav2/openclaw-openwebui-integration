@@ -32,6 +32,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PUSH = os.path.dirname(HERE)
 CHROME = os.environ.get("E2E_CHROME", "/usr/bin/google-chrome")
 WAIT_MS = 60000  # a safety net for each state wait, never expected to expire
+CHAT_LOAD_DELAY_MS = 200  # chat F arrives just after the reply is in the box (inside Open WebUI's 500 ms draft-save debounce)
+DRAFT_RESTORE_WAIT_MS = 4000  # Open WebUI has loaded the chat and handled its own draft by then
 SECRETS = ("STUB-SECRET-REPLY", "PIPE-SECRET-REPLY")
 
 
@@ -606,8 +608,18 @@ def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
     # Reply that cannot be sent: the chat opens in the app, the text in the message box.
     f_chat, _ = new_chat(token, "stub", "Chat TF")
     api(f"/api/v1/chats/{f_chat}", {"chat": {"models": ["no-such-model"]}}, token)
+    # A guard, not a fail-first: chat F has a draft of its own in this tab (Open WebUI 0.13 keeps one
+    # per chat in sessionStorage and puts it back while it loads the chat); the reply must stay.
+    page.evaluate("(c) => sessionStorage.setItem('chat-input-' + c, JSON.stringify({prompt: 'an older draft'}))", f_chat)
+    # Chat F arrives (and its draft goes back in) just after the reply is in the box.
+    page.evaluate("""([c, ms]) => { const f = window.fetch; window.fetch = async (u, o) => {
+        if (String(u).endsWith('/api/v1/chats/' + c)) await new Promise((ok) => setTimeout(ok, ms));
+        return f(u, o); }; }""", [f_chat, CHAT_LOAD_DELAY_MS])
     tap(page, "reply", {"chat_id": f_chat, "url": f"/c/{f_chat}", "fn": "web_push"}, "kept, not reloaded")
     page.wait_for_function("() => window.ocPushReply && window.ocPushReply.text === 'kept, not reloaded'", timeout=WAIT_MS)
     assert "/c/" + f_chat in page.url and "oc-reply" not in page.url
-    assert "kept, not reloaded" in page.locator("#chat-input").inner_text()
+    page.wait_for_timeout(DRAFT_RESTORE_WAIT_MS)
+    assert "kept, not reloaded" in page.locator("#chat-input").inner_text(), "chat F's own draft replaced the reply"
+    assert page.evaluate("(c) => caches.open('oc-push-drafts').then(d => d.match('/oc-push/draft/' + c)).then(r => !r)", f_chat), \
+        "the cached reply was kept after it was put in the box"
     assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
