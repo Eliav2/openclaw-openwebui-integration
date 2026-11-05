@@ -17345,6 +17345,24 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         writer = types.SimpleNamespace(steered_into=self.R1, conn=None)
         self.assertEqual(await openclaw_pipe._TurnWriter._stored_media(writer, {"messages": []}), ([], []))
 
+    async def test_a_turn_writer_steered_into_a_run_ends_from_its_own_span_even_when_empty(self):
+        """CI browser test_a_reply_interrupted_while_queued_says_its_message_went_with_the_next
+        on #300: A and B were taken in at one boundary, so A's writer streamed
+        B's answer between the two commits and kept it, though its own span is
+        empty (the answer is B's). Its span decides, and A says where its
+        message went."""
+        renderer = openclaw_pipe._TurnRenderer()
+        renderer.feed(self._delta(self.R1, "BROWSER_TWICE_B")["payload"])
+        writer = types.SimpleNamespace(steered_into=self.R1, runs=[self.R2], run_id=self.R2,
+                                       run_started={}, renderer=renderer, message_id="w2")
+        with mock.patch.object(openclaw_pipe, "_history_span_messages", return_value=[]):
+            rebuilt = openclaw_pipe._TurnWriter._from_transcript(writer, {"messages": []})
+        self.assertIsNotNone(rebuilt)
+        self.assertEqual((rebuilt.text, rebuilt.output), ("", []))
+        with mock.patch.object(openclaw_pipe, "_history_span_messages", return_value=None):
+            self.assertIsNone(openclaw_pipe._TurnWriter._from_transcript(writer, {"messages": []}),
+                              "while the run it went into has not closed, what streamed stays")
+
     async def test_a_run_whose_steered_reply_a_turn_writer_has_is_let_go_at_its_end(self):
         """The run's events after such a steer go nowhere until the next one;
         with none, its end lets it go, so the session reads idle."""

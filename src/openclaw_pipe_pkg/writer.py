@@ -1788,6 +1788,11 @@ class _TurnWriter:
         the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
         spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
+        if self.steered_into and self.runs == [self.run_id] and spans[0] is not None:
+            # M streamed the run its message went into from the commit on, and
+            # what streamed may be a later message's answer (both taken in at
+            # one boundary): its own span decides, also when it is empty.
+            return _history_renderer(spans[0])
         if any(s is None for s in spans):
             pipe_log(f"  turn writer: the transcript does not show {self.message_id[:8]}...'s "
                      f"{len(self.runs)} run(s) closed; keeping what streamed")
