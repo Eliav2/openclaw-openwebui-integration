@@ -5754,6 +5754,19 @@ _action_fallback_connection: "_GatewayConnection | None" = None
 _action_fallback_lock = asyncio.Lock()
 
 
+def _known_action_connection():
+    """The connection `_get_action_connection` would use, up or down, without
+    connecting: something to wait on while the Gateway is unreachable."""
+    try:
+        import open_webui.socket.main as _owui_socket_main
+        pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
+        if pipe_conn is not None and not pipe_conn.endpoint_moved():
+            return pipe_conn
+    except Exception:
+        pass
+    return _action_fallback_connection
+
+
 async def _get_action_connection(valves_getter):
     """Return (connection, source) where source is "pipe" or "action-own"."""
     try:
@@ -7322,6 +7335,18 @@ _SCHEDULED_FILL_JS_TEMPLATE = r"""
   if (!section || !S) return;
   section.innerHTML = '';
   section.className = 'mb-4';
+  // The rows shown stay; a note under them says they may be old.
+  S.schedStale = function(text) {
+    const el = document.getElementById('openclaw-status-section-scheduled');
+    if (!el) return;
+    let note = el.querySelectorAll('[data-openclaw-sched-stale]')[0];
+    if (!note) {
+      note = S.noteEl(text);
+      note.dataset.openclawSchedStale = '1';
+      el.appendChild(note);
+    }
+    note.textContent = text;
+  };
   const rows = DATA.rows || [];
   const known = DATA.available && !DATA.error;
   const label = known ? S.countLabel('Scheduled', rows.length, DATA.total || 0) : 'Scheduled';
@@ -7363,22 +7388,16 @@ _SCHEDULED_FILL_JS_TEMPLATE = r"""
 
   // The next fill, when the jobs change. One ask per fill; none once the
   // dialog is gone or the Action ended the follow without a fill.
-  // A request that fails (network, or the Action could not reach the
-  // Gateway) is asked again a few times; an answer without a fill (closed,
-  // or past the follow bound) is not.
+  // While the Gateway is unreachable the Action keeps the request and marks
+  // the rows out of date; it fills again when the connection is back. A
+  // request that never reaches the Action (Open WebUI itself is down) marks
+  // them out of date for good: reopening the dialog reads again. No retries.
   S.schedFills = (S.schedFills || 0) + 1;
-  const RETRY_MS = 5000, RETRIES = 3;
-  const fills = S.schedFills;
-  function follow(tries) {
-    if (S.schedFills !== fills || !section.isConnected) return;
-    function retry() {
-      if (tries < RETRIES) setTimeout(function() { follow(tries + 1); }, RETRY_MS);
-    }
-    S.askAction({ mode: 'scheduled-rows', revision: DATA.revision })
-      .then(function(r) { return r.ok === false ? { status: 'error' } : r.json ? r.json().catch(function() { return null; }) : null; })
-      .then(function(j) { if (j && j.status === 'error' && j.detail !== 'unknown dialog') retry(); }, retry);
+  if (DATA.revision != null) {
+    S.askAction({ mode: 'scheduled-rows', revision: DATA.revision }).catch(function() {
+      S.schedStale('This section is out of date: open the dialog again to update it.');
+    });
   }
-  if (DATA.revision != null) follow(0);
 })();
 """
 
@@ -7895,6 +7914,33 @@ def _render_background_fill_js(data: dict) -> str:
 
 def _render_scheduled_fill_js(data: dict) -> str:
     return _SCHEDULED_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+# The Scheduled rows are kept but may be old: the Gateway is unreachable.
+_SCHEDULED_STALE_TEXT = "Out of date: the Gateway is unreachable. This updates when it is back."
+_SCHEDULED_STALE_JS = r"""
+(function() {
+  const S = window.__openclawStatus;
+  if (S && S.schedStale) S.schedStale(__OPENCLAW_TEXT__);
+})();
+"""
+
+
+def _render_scheduled_stale_js() -> str:
+    return _SCHEDULED_STALE_JS.replace("__OPENCLAW_TEXT__", _json_for_js(_SCHEDULED_STALE_TEXT))
+
+
+async def _changed_or_ended(changed: asyncio.Event, dialog: dict) -> bool:
+    """Wait for `changed` (a `cron` event, a reconnect, a close of the
+    connection) or the dialog's end; True only for a change to an open dialog."""
+    waits = [asyncio.ensure_future(changed.wait()), asyncio.ensure_future(dialog["closed"].wait())]
+    try:
+        await asyncio.wait(waits, timeout=max(dialog["expires"] - time.time(), 0),
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waits:
+            w.cancel()
+    return changed.is_set() and not dialog["closed"].is_set()
 
 
 def _render_agents_fill_js(data: dict) -> str:
@@ -9238,32 +9284,34 @@ class Action:
         def ended() -> bool:
             return dialog["closed"].is_set() or time.time() >= dialog["expires"]
 
-        if ended():
-            return {"status": "ok"}
-        try:
-            conn, source = await _get_action_connection(lambda: self.valves)
-        except Exception as ex:
-            pipe_log(f"[status-action] scheduled-rows connect failed: {ex}")
-            return {"status": "error", "detail": str(ex)}
-        # Compared and taken with no await between: a change after it sets the event.
-        if body.get("revision") == _cron_token(conn):
-            changed = conn.cron_event()
-            waits = [asyncio.ensure_future(changed.wait()), asyncio.ensure_future(dialog["closed"].wait())]
-            try:
-                done, _pending = await asyncio.wait(
-                    waits, timeout=max(dialog["expires"] - time.time(), 0),
-                    return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                for w in waits:
-                    w.cancel()
-            if not done or dialog["closed"].is_set():
+        # Every wait here is on an event: a `cron` event, the connection's
+        # reconnect (hello) or close, the dialog's close, or its follow bound.
+        waited = False
+        stale = False
+        while True:
+            if ended():
                 return {"status": "ok"}
-            # The connection may have closed (that wakes the wait too): read through a live one.
+            known = _known_action_connection()
+            back = known.cron_event() if known is not None else None
             try:
                 conn, source = await _get_action_connection(lambda: self.valves)
             except Exception as ex:
-                pipe_log(f"[status-action] scheduled-rows reconnect failed: {ex}")
-                return {"status": "error", "detail": str(ex)}
+                pipe_log(f"[status-action] scheduled-rows connect failed: {ex}")
+                if back is None:
+                    return {"status": "error", "detail": str(ex)}
+                if not stale:
+                    stale = True
+                    await emit(_render_scheduled_stale_js())
+                if not await _changed_or_ended(back, dialog):
+                    return {"status": "ok"}
+                continue
+            # Compared and taken with no await between: a change after it sets the event.
+            if not waited and not stale and body.get("revision") == _cron_token(conn):
+                waited = True
+                if not await _changed_or_ended(conn.cron_event(), dialog):
+                    return {"status": "ok"}
+                continue        # read through a live connection: this one may have closed
+            break
         data = await _scheduled_data(conn, asyncio.ensure_future(_read_scheduled(conn, session_key)),
                                      session_key, user_id, source)
         if dialog["closed"].is_set():

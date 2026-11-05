@@ -263,13 +263,18 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         action._scheduled_cache.clear()
         action._open_dialogs.clear()
 
+    def patch(self, patcher):
+        """`enterContext` without Python 3.11: started now, stopped at cleanup."""
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def dialog(self):
         dialog_id, dialog = action._dialog_open(USER, KEY)
         return dialog_id, dialog
 
     async def ask(self, conn, dialog_id, revision, user=USER):
         emitted = []
-        self.enterContext(action_gateway(conn))      # for the whole test: the follow connects again
+        self.patch(action_gateway(conn))      # for the whole test: the follow connects again
         task = asyncio.ensure_future(Action().action(
             {"chat_id": CHAT, "mode": "scheduled-rows", "dialogId": dialog_id, "revision": revision},
             __user__={"id": user}, __event_emitter__=RecordingEmitter(emitted)))
@@ -334,6 +339,27 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_fill(emitted))
         self.assertEqual(conn.calls, [])
 
+    async def test_an_unreachable_gateway_marks_out_of_date_and_fills_on_reconnect(self):
+        conn = _Conn([_job("mine")])
+        dialog_id, _dialog = self.dialog()
+        emitted = []
+        connect = mock.AsyncMock(side_effect=[RuntimeError("gateway down"), (conn, "pipe")])
+        self.patch(mock.patch("openclaw_status_action._get_action_connection", new=connect))
+        self.patch(mock.patch("openclaw_status_action._known_action_connection", return_value=conn))
+        task = asyncio.ensure_future(Action().action(
+            {"chat_id": CHAT, "mode": "scheduled-rows", "dialogId": dialog_id, "revision": conn.cron_revision},
+            __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted)))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertFalse(task.done())                 # waiting for the connection, not retrying
+        self.assertEqual(connect.await_count, 1)
+        self.assertIn(action._SCHEDULED_STALE_TEXT, json.dumps(_emitted_codes(emitted)))
+        self.assertIsNone(_fill(emitted))
+        conn.cron_changed()                           # the reconnect's hello wakes waiters
+        self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
+        self.assertEqual(connect.await_count, 2)
+        self.assertEqual([r["title"] for r in _fill(emitted)["rows"]], ["mine"])
+
     async def test_a_closed_dialog_with_a_changed_revision_is_not_read(self):
         conn = _Conn([_job("mine")])
         dialog_id, dialog = self.dialog()
@@ -389,21 +415,18 @@ const section = document.getElementById('openclaw-status-section-scheduled');
 console.log(JSON.stringify(section.walk().map((e) => e.title).filter(Boolean)));
 """
 
-# The follow's retries: every answer after `answers` runs out is a network failure;
-# a retry's wait fires at once. Prints how many requests the page made.
-_SCHED_RETRY_JS = _FAKE_DOM_JS + r"""
+# A follow request that never reaches the Action (Open WebUI down).
+_SCHED_FAILED_ASK_JS = _FAKE_DOM_JS + r"""
 let asks = 0;
 global.localStorage = { getItem: () => 'tok' };
-global.fetch = () => {
-  asks++;
-  const a = input.answers.shift();
-  return a ? Promise.resolve({ ok: a.ok, json: () => Promise.resolve(a.body) }) : Promise.reject(new Error('net'));
-};
-const realTimeout = setTimeout;
-global.setTimeout = (fn) => { Promise.resolve().then(fn); return 0; };
+global.fetch = () => { asks++; return Promise.reject(new Error('net')); };
 run(input.open);
 input.fills.forEach(run);
-realTimeout(() => console.log(JSON.stringify(asks)), 50);
+setTimeout(() => {
+  const section = document.getElementById('openclaw-status-section-scheduled');
+  const texts = section.walk().filter((e) => e.children.length === 0 && e.text).map((e) => e.text);
+  console.log(JSON.stringify({ asks, texts }));
+}, 50);
 """
 
 IDENTITY = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x", "dialogId": "d1"}
@@ -457,17 +480,14 @@ class PageTests(unittest.TestCase):
         seen = run_page(_SCHED_TITLES_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY), "fills": [fill]})
         self.assertIn(error, seen)
 
-    def test_a_failed_follow_request_is_asked_again_a_few_times(self):
-        for answers, asks in (([], 4),                                         # network down: 1 + 3 retries
-                              ([{"ok": True, "body": {"status": "error", "detail": "x"}}], 4),
-                              ([{"ok": True, "body": {"status": "ok"}}], 1),    # closed or past the bound
-                              ([{"ok": True, "body": {"status": "error", "detail": "unknown dialog"}}], 1)):
-            with self.subTest(answers=answers):
-                fill = action._render_scheduled_fill_js({"source": "pipe", "fetchedAt": NOW, "error": None,
-                                                         "revision": 4, **action._scheduled_rows([], KEY, USER)})
-                seen = run_page(_SCHED_RETRY_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY),
-                                                  "fills": [fill], "answers": answers})
-                self.assertEqual(seen, asks)
+    def test_a_follow_request_that_never_arrives_marks_the_rows_out_of_date(self):
+        row = action._scheduled_rows([{**_job("nightly"), "nextRunAtMs": NOW + H}], KEY, USER)
+        fill = action._render_scheduled_fill_js({"source": "pipe", "fetchedAt": NOW, "error": None,
+                                                 "revision": 4, **row})
+        seen = run_page(_SCHED_FAILED_ASK_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY), "fills": [fill]})
+        self.assertEqual(seen["asks"], 1)            # asked once; no retry, no timer
+        self.assertIn("nightly", seen["texts"])      # the rows stay
+        self.assertTrue(any("out of date" in t for t in seen["texts"]), seen["texts"])
 
     def test_due_says_now(self):
         row = action._scheduled_rows([{**_job("due"), "nextRunAtMs": NOW + 2000}], KEY, USER)
