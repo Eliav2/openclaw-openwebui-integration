@@ -493,6 +493,19 @@ def _remember_file_server(server) -> None:
     setattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, server)
 
 
+def _upload_dest(directory: str, raw_path: str) -> str | None:
+    """Where an upload to `raw_path` (the request path) is written: a file
+    directly inside `directory`, after symlinks resolve. None to refuse it."""
+    name = raw_path.strip("/").split("?")[0]
+    root = os.path.realpath(directory)
+    dest = os.path.realpath(os.path.join(root, name))
+    # Resolved, then prefixed (the check CodeQL's py/path-injection
+    # recognises); a direct child only, so "", ".", ".." and "a/b" fail too.
+    if not dest.startswith(root + os.sep) or os.path.dirname(dest) != root:
+        return None
+    return dest
+
+
 def _start_file_server(port=18791):
     """Start the media file server, once per process."""
     global _file_server_started
@@ -520,19 +533,18 @@ def _start_file_server(port=18791):
                 self.wfile.write(b"empty")
                 return
             body = self.rfile.read(length)
-            path = self.path.strip("/").split("?")[0]
-            if not path or ".." in path or "/" in path:
+            dest = _upload_dest(directory, self.path)
+            if dest is None:
                 self.send_response(400)
                 self.end_headers()
                 self.wfile.write(b"bad path")
                 return
-            dest = os.path.join(directory, os.path.basename(path))
             with open(dest, "wb") as f:
                 f.write(body)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(f"ok:{path}".encode())
+            self.wfile.write(f"ok:{os.path.basename(dest)}".encode())
 
         def do_PUT(self):
             self._handle_upload()
