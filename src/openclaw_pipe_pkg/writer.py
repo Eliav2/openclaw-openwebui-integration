@@ -825,6 +825,10 @@ class _TurnWriter:
         # one event is a `chat` final with no message, and the answer is
         # that run's, which the last message steered into it shows.
         self.steered_message = False
+        # The run M's message was steered into, whose events M shows from the
+        # commit (`steered_in`): its images are that run's, as for a live
+        # steered reply (`finish_final_images`), not looked up as M's own.
+        self.steered_into: str | None = None
         self.sent_output: list = []     # the `output` open tabs hold
         self.sent_text = ""              # and its text
         # A handover owes M one write: Open WebUI's end-of-stream save of the
@@ -934,7 +938,7 @@ class _TurnWriter:
     async def working(self) -> None:
         """M's message went into the running run: M reads like any reply whose
         run works until its answer, and its end replaces the line."""
-        if self.opened:
+        if self.opened and not self.closed:
             emit = await self._emitter()
             await emit({"type": "status", "data": {"description": "Thinking...", "done": False}})
 
@@ -1613,7 +1617,10 @@ class _TurnWriter:
         into M, as the inline reply reads them (`finish_final_images`): the
         Gateway attaches a run's images to its stored message after the
         run's final, so a run that made or named some is read again on each
-        transcript change until they are there (ELI-328)."""
+        transcript change until they are there (ELI-328). Not for a message
+        steered into another run, as for a live steered reply."""
+        if self.steered_into:
+            return [], []
         for _s, _e, fname in _media_scan(self.renderer.text)[0]:
             if _is_gateway_media_name(fname):
                 self.gateway_media.add(fname)
@@ -2410,6 +2417,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 # M's message was steered into run `item["run"]`: its events come
                 # here from now on, after what the reply before showed (`_steer`).
                 if writer is not None:
+                    writer.steered_into = item.get("run")
                     writer.renderer.seed(item.get("run_text"))
                     await writer.working()
                     pipe_log(f"  turn writer: {writer.message_id[:8]}... shows run "

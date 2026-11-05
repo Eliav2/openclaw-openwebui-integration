@@ -17283,12 +17283,30 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([k for k in conn._turn_pumps if k[1] == self.R1], [(sk, self.R1)],
                          "and no writer of its own")
 
+        # What tomato's pump wrote: the first reply's baselines, then its answer.
+        tomato.writer = mock.Mock(chat_id=self.CHAT, message_id="w2", renderer=openclaw_pipe._TurnRenderer())
+        tomato.writer.renderer.seed(steered["run_text"])
+        tomato.writer.renderer.feed(self._delta(self.R1, "tomato")["payload"])
+
         conn._on_session_message(self._commit(self.R3, "say blue", into=self.R1)["payload"])
-        self.assertEqual(q3.get_nowait()["_steered"]["run"], self.R1, "the next steer takes the run")
+        blue = q3.get_nowait()["_steered"]
+        self.assertEqual(blue["run"], self.R1, "the next steer takes the run")
+        # Review on #300: the run's target and shadow renderer went at its
+        # handover, so blue's reply started with no baselines and no earlier reply.
+        self.assertEqual(blue["run_text"]["received"], "21-40 41-50tomato", "after what tomato's reply showed")
+        self.assertEqual(blue["earlier"]["message_id"], "w2")
         await conn._dispatch_run_event(self._delta(self.R1, "blue"))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R1)
         self.assertTrue(host.queue.empty(), "nothing of the run after the commit reached the first reply")
         self.assertTrue(tomato.queue.empty(), "nor, after the next steer, tomato's")
+        # Review on #300: both writers it took the run from still wait for the
+        # settle, so a clean end marks them too, for the next run's first event.
+        await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
+        self.assertEqual((host.ended_clean, tomato.ended_clean), (self.R1, self.R1))
+        conn.register_consumer(sk, self._run_id(4))
+        await conn._dispatch_run_event(self._lifecycle(self._run_id(4), "model"))
+        self.assertEqual(host.queue.get_nowait(), ("settled", None))
+        self.assertEqual(tomato.queue.get_nowait(), ("settled", None))
 
     async def test_a_turn_writer_whose_message_was_steered_in_shows_the_rest_as_working(self):
         """The pump's side of the steer above: tomato's writer starts after
@@ -17308,6 +17326,24 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         second.renderer.seed.assert_called_once_with(baseline)
         second.working.assert_awaited_once()
         second.feed.assert_awaited_once_with(delta)
+
+    async def test_a_closed_turn_writer_does_not_read_as_working(self):
+        """Review on #300: a steered message taken in after Stop finalized M
+        set M back to "Thinking..." until a reload."""
+        emit = mock.AsyncMock()
+        writer = types.SimpleNamespace(opened=True, closed=True, _emitter=mock.AsyncMock(return_value=emit))
+        await openclaw_pipe._TurnWriter.working(writer)
+        emit.assert_not_awaited()
+        writer.closed = False
+        await openclaw_pipe._TurnWriter.working(writer)
+        emit.assert_awaited_once_with({"type": "status", "data": {"description": "Thinking...", "done": False}})
+
+    async def test_a_turn_writer_steered_into_a_run_does_not_wait_for_its_images_as_its_own(self):
+        """Review on #300: from the commit M counts the images of the run its
+        message went into, which it then looked up under its own run id and
+        waited for in vain. As for a live steered reply, none are looked up."""
+        writer = types.SimpleNamespace(steered_into=self.R1, conn=None)
+        self.assertEqual(await openclaw_pipe._TurnWriter._stored_media(writer, {"messages": []}), ([], []))
 
     async def test_a_run_whose_steered_reply_a_turn_writer_has_is_let_go_at_its_end(self):
         """The run's events after such a steer go nowhere until the next one;

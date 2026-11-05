@@ -1737,6 +1737,10 @@ class _Consumer:
     # socket drop can lose its lone final.
     steered: bool = False
     steered_into: str = ""
+    # Pumps of turn writers that showed this run before a steer took it from
+    # them: they end at the settle, or at the next run's first event once the
+    # run ended cleanly (`_turn_next_run`).
+    held: list = field(default_factory=list)
 
 
 # The turn writer's entry points (writer.py's `_TurnHooks`), which the Pipe
@@ -3026,6 +3030,12 @@ class _GatewayConnection:
             return False
         consumer.started = True
         consumer.ended = consumer.ended or terminal
+        if terminal and (payload.get("state") == _CHAT_FINAL
+                         or (payload.get("data") or {}).get("phase") == _PHASE_END):
+            # The writers that showed the run end at the next run's first event
+            # if no settle comes first.
+            for p in [*consumer.held, *(q.pump for q in consumer.queues if isinstance(q, _WriterQueue))]:
+                p.ended_clean = consumer.run_id
         if consumer.ended and _feeds_writer(consumer):
             # A turn writer shows the rest of its run (`_steer_handed_over`) and ends at the
             # settle: the run's end lets it go, and a late event of it (its `chat` final
@@ -3035,11 +3045,6 @@ class _GatewayConnection:
             pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
             if pump is not None:
                 pump.terminal.set()
-            if payload.get("state") == _CHAT_FINAL or (payload.get("data") or {}).get("phase") == _PHASE_END:
-                # Both writers end at the next run's first event if no settle comes first.
-                for p in [pump, *(q.pump for q in consumer.queues)]:
-                    if p is not None:
-                        p.ended_clean = consumer.run_id
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
             self.unregister_run_target(consumer.session_key, consumer.run_id)
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
@@ -3101,12 +3106,23 @@ class _GatewayConnection:
             run = active[0]
             if into and run.run_id != into:
                 return False
-            earlier = self._run_targets.get(f"{sess}:{run.run_id}")
-            earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
-                "span_run": earlier.get("span_run") or run.run_id, "before": earlier.get("before") or []}
-            shadow = self._run_renderers.get(f"{sess}:{run.run_id}")
-            run_text = ({"received": shadow.received, "stream": shadow.received,
-                         "item": shadow.last_item} if shadow is not None else None)
+            if _feeds_writer(run):
+                # A turn writer shows the run (`_steer_handed_over`), whose target
+                # and shadow renderer went at its handover: its baselines and
+                # message are the writer's. It stays open until the settle.
+                fed = run.queues[0].pump
+                writer = fed.writer
+                earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
+                                      "request_task_id": None, "span_run": run.run_id}
+                run_text = _pump_baselines(fed)
+                run.held.append(fed)
+            else:
+                earlier = self._run_targets.get(f"{sess}:{run.run_id}")
+                earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
+                    "span_run": earlier.get("span_run") or run.run_id, "before": earlier.get("before") or []}
+                shadow = self._run_renderers.get(f"{sess}:{run.run_id}")
+                run_text = ({"received": shadow.received, "stream": shadow.received,
+                             "item": shadow.last_item} if shadow is not None else None)
             for q in run.queues:
                 q.put_control({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
             run.queues = list(consumer.queues)
@@ -3132,7 +3148,8 @@ class _GatewayConnection:
             else:
                 pump.queue.put_nowait(("steered", run_text))
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
-                session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
+                session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True,
+                held=[pump] if _feeds_writer(consumer) else [])
         else:
             return False
         consumer.steered, consumer.steered_into = True, run_id
