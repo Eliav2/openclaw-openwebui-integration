@@ -17331,12 +17331,22 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         """Review on #300: a steered message taken in after Stop finalized M
         set M back to "Thinking..." until a reload."""
         emit = mock.AsyncMock()
-        writer = types.SimpleNamespace(opened=True, closed=True, _emitter=mock.AsyncMock(return_value=emit))
-        await openclaw_pipe._TurnWriter.working(writer)
-        emit.assert_not_awaited()
-        writer.closed = False
-        await openclaw_pipe._TurnWriter.working(writer)
-        emit.assert_awaited_once_with({"type": "status", "data": {"description": "Thinking...", "done": False}})
+        writer = types.SimpleNamespace(opened=True, closed=True, _emitter=mock.AsyncMock(return_value=emit),
+                                       conn=self.conn, chat_id=self.CHAT, message_id="w2")
+        saved = {"statusHistory": [{"description": "Sent while the agent works", "done": False}]}
+        chats = types.SimpleNamespace(get_message_by_id_and_message_id=mock.AsyncMock(return_value=saved))
+        models = types.ModuleType("open_webui.models.chats")
+        models.Chats = chats
+        with mock.patch.dict(sys.modules, {"open_webui.models.chats": models}), \
+                mock.patch.object(openclaw_pipe, "_owui_upsert_message", mock.AsyncMock()) as upsert:
+            await openclaw_pipe._TurnWriter.working(writer)
+            emit.assert_not_awaited()
+            writer.closed = False
+            await openclaw_pipe._TurnWriter.working(writer)
+        line = {"description": "Thinking...", "done": False}
+        emit.assert_awaited_once_with({"type": "status", "data": line})
+        # Review on #300: a tab that loads the chat now reads it from the message.
+        upsert.assert_awaited_once_with(self.CHAT, "w2", {"statusHistory": [*saved["statusHistory"], line]})
 
     async def test_a_turn_writer_steered_into_a_run_does_not_wait_for_its_images_as_its_own(self):
         """Review on #300: from the commit M counts the images of the run its
@@ -17406,11 +17416,14 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         queued = [host.queue.get_nowait() for _ in range(host.queue.qsize())] + [
             tomato.queue.get_nowait() for _ in range(tomato.queue.qsize())]
         self.assertNotIn("settled", [kind for kind, _item in queued], "no run started")
+        tomato.writer = types.SimpleNamespace(newer_run=False)
         q3 = conn.register_consumer(sk, self.R3)
         await conn._dispatch_run_event(self._lifecycle(self.R3, "model"))
         self.assertEqual(host.queue.get_nowait(), ("settled", None))
         self.assertEqual(tomato.queue.get_nowait(), ("settled", None))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R3, "the next run's reply gets it")
+        # Review on #300: their end must not mark the chat inactive while that run works.
+        self.assertTrue(tomato.writer.newer_run)
         await conn._dispatch_run_event(self._delta(self.R3, "blue"))
         self.assertTrue(host.queue.empty() and tomato.queue.empty(), "once")
 

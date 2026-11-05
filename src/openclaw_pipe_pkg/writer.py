@@ -829,6 +829,9 @@ class _TurnWriter:
         # commit (`steered_in`): its images are that run's, as for a live
         # steered reply (`finish_final_images`), not looked up as M's own.
         self.steered_into: str | None = None
+        # A later run of the session works (`_turn_next_run`): M's end leaves
+        # the chat's active state to that run's reply.
+        self.newer_run = False
         self.sent_output: list = []     # the `output` open tabs hold
         self.sent_text = ""              # and its text
         # A handover owes M one write: Open WebUI's end-of-stream save of the
@@ -939,8 +942,16 @@ class _TurnWriter:
         """M's message went into the running run: M reads like any reply whose
         run works until its answer, and its end replaces the line."""
         if self.opened and not self.closed:
+            line = {"description": "Thinking...", "done": False}
             emit = await self._emitter()
-            await emit({"type": "status", "data": {"description": "Thinking...", "done": False}})
+            await emit({"type": "status", "data": line})
+            # Saved too: a tab that loads the chat now reads the status from the
+            # message, where the line M waited with is the last one.
+            from open_webui.models.chats import Chats
+            async with self.conn._chat_write_lock(self.chat_id):
+                saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+                await _owui_upsert_message(self.chat_id, self.message_id, {
+                    "statusHistory": [*(saved.get("statusHistory") or []), line]})
 
     def _showable(self) -> bool:
         """Condition B: a tool call start, or text that is not a silent
@@ -1605,7 +1616,8 @@ class _TurnWriter:
                                                              "output": output}})
             for line in status:
                 await emit({"type": "status", "data": line})
-            await emit({"type": "chat:active", "data": {"active": False}})
+            if not self.newer_run:
+                await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")
             pipe_log(f"  turn writer: finalized {self.message_id[:8]}... ({len(text)} chars, "
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
@@ -2309,6 +2321,8 @@ def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
     for (s, run), pump in list(conn._turn_pumps.items()):
         if s == sess and pump.ended_clean and pump.ended_clean != run_id:
             pump.ended_clean = None
+            if pump.writer is not None:
+                pump.writer.newer_run = True
             pipe_log(f"  next run {str(run_id)[:24]}... started: run {run[:24]}... ends from the transcript")
             pump.queue.put_nowait(("settled", None))
 
