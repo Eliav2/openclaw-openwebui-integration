@@ -28,11 +28,6 @@
       "count": 9
     }
   },
-  "push/web/oc-sw.js": {
-    "no-restricted-syntax": {
-      "count": 1
-    }
-  },
   "scripts/owui_live_fold.ts": {
     "no-restricted-syntax": {
       "count": 1

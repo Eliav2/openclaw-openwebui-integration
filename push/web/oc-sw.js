@@ -154,6 +154,8 @@ async function markRead(chatId, signal) {
 // page without the handler, not a guess at how long the page takes.
 const OPEN_ACK_TIMEOUT_MS = 3000;
 const OPEN_CHAT = "oc-open-chat", OPEN_CHAT_ACK = "oc-open-chat-ack";
+const PAGE_ACT = "oc-push-act";   // a page asks for an action (see the message listener)
+const CALLABLE = "function";
 const opening = new Map();   // request id -> the ack's resolve
 
 function askPage(win, url) {
@@ -239,8 +241,14 @@ self.addEventListener("notificationclick", (e) => {
 // could call the same API itself, so this grants nothing new).
 self.addEventListener("message", (e) => {
   const m = e.data || {};
-  if (m.type === OPEN_CHAT_ACK) return opening.get(m.id)?.();
-  if (m.type !== "oc-push-act" || !e.source || new URL(e.source.url).origin !== self.location.origin) return;
+  if (!e.source || new URL(e.source.url).origin !== self.location.origin) return;
+  if (m.type === OPEN_CHAT_ACK) {
+    // Only an id this worker handed out has a resolver.
+    const answered = opening.get(m.id);
+    if (typeof answered === CALLABLE) answered();
+    return;
+  }
+  if (m.type !== PAGE_ACT) return;
   e.waitUntil(act(m.action, m.data || {}, m.reply).then((result) =>
     e.source.postMessage({ type: "oc-push-action", action: m.action, result })));
 });
