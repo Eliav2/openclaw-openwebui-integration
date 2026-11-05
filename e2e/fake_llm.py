@@ -19,6 +19,12 @@ whole):
                                           label `silent helper`) that answers
                                           `E2E_SILENT_RESULT done`; the parent answers that
                                           completion `NO_REPLY` (ELI-217)
+* `E2E_SPAWN_DELETE_SILENT`            -> spawns a sub-agent (task `E2E_SILENT_DEL_CHILD`,
+                                          label `silent deleted helper`, cleanup "delete")
+                                          that answers `E2E_SILENT_DEL_RESULT done`; the parent
+                                          answers that completion `NO_REPLY`. The Gateway deletes
+                                          the child's session once the announce is delivered, so
+                                          the card must have its result from before that
 * `E2E_EMPTY_REPLY`                    -> an empty answer: OpenClaw 2026.10 fails
                                           the run ("Agent couldn't generate a
                                           response") after its one retry (ELI-217)
@@ -583,6 +589,17 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if tool_results:
             return {"text": "E2E_SPAWNED"}
         return _call_with("sessions_spawn", {"task": "E2E_SILENT_CHILD", "label": "silent helper"}, offered) or {
+            "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_SILENT_DEL_RESULT" in user_text and "[Internal task completion event]" in user_text:
+        return {"text": "NO_REPLY"}
+    if "E2E_SILENT_DEL_CHILD" in user_text and "[Subagent Task]" in user_text:
+        return {"text": "E2E_SILENT_DEL_RESULT done"}
+    if "E2E_SPAWN_DELETE_SILENT" in user_text:
+        if tool_results:
+            return {"text": "E2E_SPAWNED"}
+        return _call_with("sessions_spawn", {"task": "E2E_SILENT_DEL_CHILD", "label": "silent deleted helper",
+                                             "cleanup": "delete"}, offered) or {
             "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_TWIN" in user_text and "[Subagent Task]" in user_text:

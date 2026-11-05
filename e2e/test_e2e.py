@@ -1863,6 +1863,41 @@ def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(tok
     _assert_clean(token, chat_id, msgs)
 
 
+def test_a_silent_announce_of_a_deleted_sub_agent_still_shows_the_childs_result_as_its_card(token):
+    """The parent answers the completion of a sub-agent spawned with cleanup
+    "delete" with NO_REPLY. The Gateway deletes the child's session once the
+    announce is delivered, so the card cannot read the result from it then:
+    it must hold the result the Pipe kept before (the child's chat final, or
+    its transcript read as the announce run started)."""
+    chat_id, msg = _chat_turn(token, "E2E_SPAWN_DELETE_SILENT")
+    assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
+    key = _session_key(token, chat_id)
+
+    def card():
+        for m in _chat_messages(token, chat_id).values():
+            out = m.get("output") or []
+            calls = [o for o in out if o.get("type") == "function_call" and o.get("name") == "Sub-agent"]
+            results = [o for o in out if o.get("type") == "function_call_output"]
+            if m.get("role") == "assistant" and m.get("done") is True and calls and results:
+                return m, calls[0], results[0]
+        return None
+
+    m, call, result = _until("the silent deleted sub-agent's card", card, timeout_s=120, every_s=2)
+    assert "silent deleted helper" in call.get("arguments", ""), call
+    assert "E2E_SILENT_DEL_RESULT done" in json.dumps(result.get("output")), result
+    assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
+    # The precondition: the child's session is gone, so only a result kept
+    # earlier can be what the card shows.
+    _until("the Gateway to delete the child's session",
+           lambda: not _gw("sessions.list", {"spawnedBy": key, "limit": 10}).get("sessions"),
+           timeout_s=90, every_s=2)
+    msgs = _chat_messages(token, chat_id)
+    cards = [x for x in msgs.values() if any(
+        o.get("type") == "function_call" and o.get("name") == "Sub-agent" for o in x.get("output") or [])]
+    assert len(cards) == 1, cards
+    assert "E2E_SILENT_DEL_RESULT done" in json.dumps(cards[0].get("output")), cards[0].get("output")
+
+
 def test_a_reply_that_opens_with_no_reply_and_answers_after_shows_the_answer_once(token):
     """The agent says NO_REPLY, runs a tool, and answers after all (a
     claude-cli run whose background Agent reported, live on 2026.10.5): the
