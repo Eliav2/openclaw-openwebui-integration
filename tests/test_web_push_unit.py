@@ -128,6 +128,29 @@ class MuteTests(unittest.TestCase):
             self.assertFalse(web_push.is_muted(raw, "c1", now=1000), raw)
 
 
+class FolderMuteTests(unittest.TestCase):
+    """`folder_mutes`: {folder_id: until}; a folder's mute covers the folders inside it."""
+    PARENTS = {"qa": None, "qa-old": "qa", "qa-old-2025": "qa-old", "work": None}
+
+    def test_the_folder_itself_and_every_folder_inside_it(self):
+        raw = json.dumps({"qa": 0})
+        for folder in ("qa", "qa-old", "qa-old-2025"):
+            self.assertEqual(web_push.muted_folder(raw, folder, self.PARENTS, now=1000), "qa", folder)
+        self.assertIsNone(web_push.muted_folder(raw, "work", self.PARENTS, now=1000))
+
+    def test_until_expired_and_no_folder(self):
+        self.assertEqual(web_push.muted_folder(json.dumps({"qa-old": 2000}), "qa-old-2025", self.PARENTS, now=1000), "qa-old")
+        self.assertIsNone(web_push.muted_folder(json.dumps({"qa": 500}), "qa", self.PARENTS, now=1000))
+        self.assertIsNone(web_push.muted_folder(json.dumps({"qa": 0}), None, self.PARENTS, now=1000))
+
+    def test_a_parent_cycle_ends(self):
+        self.assertIsNone(web_push.muted_folder(json.dumps({"x": 0}), "a", {"a": "b", "b": "a"}, now=1000))
+
+    def test_malformed_folder_mutes_mute_nothing(self):
+        for raw in ("not json", "[1]", json.dumps({"qa": "soon"}), None, ""):
+            self.assertIsNone(web_push.muted_folder(raw, "qa", self.PARENTS, now=1000), raw)
+
+
 class EventTests(unittest.IsolatedAsyncioTestCase):
     """`event` with Open WebUI's Functions stubbed and the send recorded."""
 
@@ -144,9 +167,27 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
             @staticmethod
             async def update_user_valves_by_id_and_user_id(fid, user_id, valves):
                 store.update(valves)
+        # c1 is in folder "qa-old", inside "qa".
+        self.folder_reads = []
+        reads = self.folder_reads
+
+        class Chats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                reads.append(chat_id)
+                return types.SimpleNamespace(id=chat_id, folder_id="qa-old" if chat_id == "c1" else None)
+
+        class Folders:
+            @staticmethod
+            async def get_folders_by_user_id(user_id):
+                return [types.SimpleNamespace(id="qa", parent_id=None), types.SimpleNamespace(id="qa-old", parent_id="qa")]
         mods = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
-                "open_webui.models.functions": types.ModuleType("open_webui.models.functions")}
+                "open_webui.models.functions": types.ModuleType("open_webui.models.functions"),
+                "open_webui.models.chats": types.ModuleType("open_webui.models.chats"),
+                "open_webui.models.folders": types.ModuleType("open_webui.models.folders")}
         mods["open_webui.models.functions"].Functions = Functions
+        mods["open_webui.models.chats"].Chats = Chats
+        mods["open_webui.models.folders"].Folders = Folders
         p = mock.patch.dict(sys.modules, mods)
         p.start()
         self.addCleanup(p.stop)
@@ -182,6 +223,30 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
             await self.fn.event(finished(), __id__="web_push")
         self.assertEqual(self.sent, [])
         self.assertIn("muted", "\n".join(logs.output))
+
+    async def test_a_chat_in_a_muted_folder_sends_nothing(self):
+        for muted in ("qa-old", "qa"):   # its own folder, or the folder that holds it
+            self.store["folder_mutes"] = json.dumps({muted: 0})
+            with self.assertLogs("openclaw_web_push", "INFO") as logs:
+                await self.fn.event(finished(), __id__="web_push")
+            self.assertEqual(self.sent, [], muted)
+            self.assertIn(f"folder {muted[:8]} is muted", "\n".join(logs.output))
+
+    async def test_another_folder_muted_still_sends(self):
+        self.store["folder_mutes"] = json.dumps({"work": 0})
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_no_folder_mutes_reads_no_chat(self):
+        """Without a folder mute in effect, the send costs no extra read."""
+        for raw in (None, "{}", json.dumps({"qa": 500})):
+            if raw is None:
+                self.store.pop("folder_mutes", None)
+            else:
+                self.store["folder_mutes"] = raw
+            await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(self.folder_reads, [])
 
     async def test_another_chat_muted_still_sends(self):
         self.store["mutes"] = json.dumps({"c9": 0})

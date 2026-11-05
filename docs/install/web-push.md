@@ -97,7 +97,7 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 
 ## How it behaves
 
-- **One notification per chat.** A newer reply in the same chat replaces the notification that is still showing.
+- **One notification per chat.** A newer reply in the same chat replaces the notification that is still showing (its tag is `chat-<chat id>`). Two chats with the same title are two notifications.
 - **Not while you use it.** While Open WebUI is open, visible and focused on a device, whatever chat is open, that device shows nothing, as in a messaging app; Open WebUI's own sidebar shows the new reply. In the background, closed or with the screen off, it notifies. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
 - **Title, and the reply only with the preview.** The push carries the chat's title, its id, the link and the function's id. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function forwards only the [preview](#preview), and only when it is on.
 - **Tap to open.** A tap on the notification focuses an open Open WebUI window and opens the chat, or opens a new one. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
@@ -112,6 +112,7 @@ What the function did is in Open WebUI's log:
 ```
 INFO     | function_openclaw_web_push_<hash>:send_all:<line> - web push: sent to fcm.googleapis.com
 INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3c4d is muted, nothing sent
+INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3c4d: folder 5e6f7a8b is muted, nothing sent
 ```
 
 ### Preview
@@ -136,13 +137,19 @@ In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯,
 
 A mute is kept on the server, in the function's `mutes` user valve, so it applies to every device of yours, iPhone included: the function checks it before it encrypts anything, and sends nothing for a muted chat. It is per user: muting a shared chat mutes it only for you.
 
+### Mute a folder
+
+In a chat that is in a folder, the bell's menu has a second part for that folder: **Mute folder for 1 hour**, **for 8 hours**, **always**, or **Unmute folder**. A folder's mute covers the chats in it and in every folder inside it, so a folder for tests or automated chats can stay quiet while you keep your own chats. The bell of a chat muted through its folder says so, for example "Muted (folder QA)"; when the mute comes from a folder above, the menu names it and unmutes that one.
+
+Folder mutes are kept like chat mutes, in the `folder_mutes` user valve (`{folder id: until}`). Only while one is in effect does the function read the chat's folder and your folders before it sends.
+
 The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two devices changing them in the same instant can lose one change; change it again.
 
 ### iPhone and iPad
 
 - Every push shows a notification, also with Open WebUI in front (WebKit's rule).
 - No buttons: no Reply, no Mute in the notification. Mute with the bell.
-- The preview and muted chats work as on Android.
+- The preview, muted chats and muted folders work as on Android.
 
 ## Turning it off
 
