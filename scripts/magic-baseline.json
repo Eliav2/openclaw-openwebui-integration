@@ -66,19 +66,6 @@
  "scripts/media.py": {
   "stamp([a for a in argv[1:] if a not in flags], same=\"--same\" in argv[1:], manual=\"--manual\" in argv[1:])": 2
  },
- "scripts/migrate_stale_chat_models.py": {
-  "return key.split(\"/\", 1)[0] if \"/\" in key else \"\"": 1
- },
- "scripts/owui_api.py": {
-  "elif action == \"delete-all-files\":": 1,
-  "elif action == \"delete-chat\":": 1,
-  "elif action == \"get-chat\":": 1,
-  "elif action == \"list-chats\":": 1,
-  "elif action == \"list-files\":": 1,
-  "elif action == \"set-title\":": 1,
-  "if action == \"login\":": 1,
-  "if not line or line.startswith(\"#\") or \"=\" not in line:": 1
- },
  "scripts/owui_css.py": {
   "if argv[0] == \"dump\":": 1
  },

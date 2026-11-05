@@ -14475,12 +14475,6 @@ def _channel_session_key(agent_id: str, channel_id: str, root_id: str) -> str:
     return f"agent:{agent_id}:openwebui:channel:{channel_id}:thread:{root_id}"
 
 
-def _parse_channel_session_key(key) -> "tuple[str, str, str] | None":
-    """(agent id, channel id, thread root id) of a channel thread's session."""
-    m = _CHANNEL_KEY_RE.match(key or "")
-    return (m.group(1), m.group(2), m.group(3)) if m else None
-
-
 def _channel_mentions_a_model(content) -> bool:
     return any(kind == "M" for kind, _id in _CHANNEL_MENTION_RE.findall(content or ""))
 

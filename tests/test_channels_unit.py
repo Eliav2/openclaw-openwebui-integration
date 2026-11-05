@@ -35,7 +35,6 @@ from openclaw_pipe import (  # noqa: E402
     _channel_state,
     _channel_trigger,
     _ChannelWatcher,
-    _parse_channel_session_key,
     _sender_is_owner,
 )
 
@@ -113,16 +112,12 @@ class KeyTests(unittest.TestCase):
     def test_one_session_per_thread(self):
         key = _channel_session_key("main", CID, ROOT)
         self.assertEqual(key, f"agent:main:openwebui:channel:{CID}:thread:{ROOT}")
-        self.assertEqual(_parse_channel_session_key(key), ("main", CID, ROOT))
         self.assertNotEqual(key, _channel_session_key("main", CID, "other-root"))
 
     def test_the_channel_id_comes_from_open_webuis_chat_id(self):
         self.assertEqual(_channel_id_of(f"channel:{CID}"), CID)
         self.assertIsNone(_channel_id_of("22222222-2222-2222-2222-222222222222"))
         self.assertIsNone(_channel_id_of(None))
-
-    def test_a_chat_key_is_not_a_channel_key(self):
-        self.assertIsNone(_parse_channel_session_key(f"agent:main:openwebui-{ALICE}-chat"))
 
 
 class TriggerTests(unittest.TestCase):
