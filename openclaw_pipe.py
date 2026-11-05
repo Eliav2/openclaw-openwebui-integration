@@ -6972,8 +6972,13 @@ class _GatewayConnection:
                 ev.set()
             if key and _subagent_ended(payload) and self.parse_owui_session_key(parent):
                 spawn_background(self._record_child_end(parent, key, {**payload, "key": key}))
-        if _TURNS and key and payload.get("hasActiveRun") is False:
-            _TURNS.settled(self, key, payload)
+        # The run state the push says: its top-level flag, else (2026.10.10:
+        # the idle of a run the Gateway started itself, `reason: cron-binding`)
+        # the flag of its nested `session` row.
+        nested = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+        row = payload if "hasActiveRun" in payload else {**nested, **payload}
+        if _TURNS and key and row.get("hasActiveRun") is False:
+            _TURNS.settled(self, key, row)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
@@ -11875,6 +11880,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 if writer is not None:
                     writer.renderer.seed(item.get("run_text"))
                     await writer.working()
+                    pipe_log(f"  turn writer: {writer.message_id[:8]}... shows run "
+                             f"{str(item.get('run'))[:24]}... from its message's commit")
                 continue
             if kind == "steered":
                 # A later message was steered into this run: M ends with what

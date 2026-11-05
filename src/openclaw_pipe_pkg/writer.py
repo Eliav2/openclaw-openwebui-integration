@@ -2388,6 +2388,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 if writer is not None:
                     writer.renderer.seed(item.get("run_text"))
                     await writer.working()
+                    pipe_log(f"  turn writer: {writer.message_id[:8]}... shows run "
+                             f"{str(item.get('run'))[:24]}... from its message's commit")
                 continue
             if kind == "steered":
                 # A later message was steered into this run: M ends with what

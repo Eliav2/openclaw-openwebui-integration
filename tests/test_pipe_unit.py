@@ -328,6 +328,29 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
         conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
         self.assertEqual(len(seen), 1)
 
+    async def test_turn_writers_settle_on_an_idle_push_that_says_it_only_in_its_session_row(self):
+        """Sandbox e2e on #292's follow-up: a message the Gateway queued ran as
+        a run it started itself, whose idle push (2026.10.10) has no top-level
+        `hasActiveRun`, only its nested `session` row's `false` (FIELD-TABLE
+        row 33). The turn writers of the run before never got their settle
+        and stayed open."""
+        conn = _GatewayConnection(lambda: None)
+        turns = mock.Mock()
+        with mock.patch.object(openclaw_pipe, "_TURNS", turns):
+            conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done",
+                                       "session": {"status": "running", "hasActiveRun": True}})
+            turns.settled.assert_not_called()
+            conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done",
+                                       "session": {"status": "done", "hasActiveRun": False,
+                                                   "lastRunId": "R9", "activeRunIds": []}})
+            turns.settled.assert_called_once()
+            _conn, key, row = turns.settled.call_args.args
+            self.assertEqual((key, row["hasActiveRun"], row["status"], row["lastRunId"]),
+                             (self.SK, False, "done", "R9"))
+            conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": True,
+                                       "session": {"hasActiveRun": False}})
+            self.assertEqual(turns.settled.call_count, 1, "the top-level flag decides when it is there")
+
     async def test_a_reply_counts_until_its_consumer_goes_and_its_end_wakes_the_waiters(self):
         """ELI-260: the Status dialog counts a chat as running while this
         connection streams a reply for it, whose run the Gateway may not have
