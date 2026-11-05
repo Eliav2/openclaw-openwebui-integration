@@ -6320,6 +6320,21 @@ def _feeds_writer(consumer: "_Consumer") -> bool:
     return bool(consumer.queues) and all(isinstance(q, _WriterQueue) for q in consumer.queues)
 
 
+def _pump_baselines(pump) -> dict | None:
+    """The dedup baselines of what a turn writer's pump shows of its run,
+    counting the events it has not written yet: for the reply that continues
+    the run (`_GatewayConnection._steer`)."""
+    writer = pump.writer
+    renderer = writer.renderer if writer is not None else (pump.handover or {}).get("renderer")
+    if not isinstance(renderer, _TurnRenderer):
+        return None
+    shadow = copy.deepcopy(renderer)
+    for kind, item in list(pump.queue._queue):
+        if kind == "event" and item:
+            shadow.feed(item)
+    return {"received": shadow.received, "stream": shadow.received, "item": shadow.last_item}
+
+
 class _WriterQueue(_RunQueue):
     """Where a run's events go when a turn writer has the reply of the
     message steered into it (`_GatewayConnection._steer_handed_over`): into
@@ -7766,13 +7781,18 @@ class _GatewayConnection:
             earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
                                   "request_task_id": None, "span_run": run_id}
             run_text = asyncio.get_running_loop().create_future()
-            # A writer that has the steered reply (`_steer_handed_over`) gets
-            # the baselines only: M stays open, the run's events stop reaching
-            # it, and it ends when the session settles, from the transcript,
-            # which splits the run where it took the message in. Ended here,
-            # it would keep only what it streamed, which misses what an event
-            # gap (a socket drop) lost.
-            pump.queue.put_nowait(("baseline" if _feeds_writer(consumer) else "steered", run_text))
+            if _feeds_writer(consumer):
+                # A writer has the steered reply (`_steer_handed_over`). M stays
+                # open, the run's events stop reaching it, and it ends when the
+                # session settles, from the transcript, which splits the run
+                # where it took the message in. Ended here, it would keep only
+                # what it streamed, which misses what an event gap (a socket
+                # drop) lost. Its baselines are taken now: its pump may be busy
+                # (a cancel's intent query), and the steered reply streams
+                # without waiting for it.
+                run_text = _pump_baselines(pump)
+            else:
+                pump.queue.put_nowait(("steered", run_text))
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
                 session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
         else:
@@ -11849,21 +11869,11 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
-            if kind == "baseline":
-                # A message whose reply a turn writer has was steered into this
-                # run: that writer shows the rest after what M showed. M goes on
-                # and ends at the settle (`_steer`).
-                if not item.done():
-                    item.set_result(writer.steered_away() if writer is not None else None)
-                continue
             if kind == "steered_in":
                 # M's message was steered into run `item["run"]`: its events come
-                # here from now on, after what the reply before showed.
-                run_text = item.get("run_text")
-                if isinstance(run_text, asyncio.Future):
-                    run_text = await run_text
+                # here from now on, after what the reply before showed (`_steer`).
                 if writer is not None:
-                    writer.renderer.seed(run_text)
+                    writer.renderer.seed(item.get("run_text"))
                     await writer.working()
                 continue
             if kind == "steered":

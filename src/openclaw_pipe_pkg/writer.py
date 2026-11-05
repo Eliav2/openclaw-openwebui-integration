@@ -2382,21 +2382,11 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
-            if kind == "baseline":
-                # A message whose reply a turn writer has was steered into this
-                # run: that writer shows the rest after what M showed. M goes on
-                # and ends at the settle (`_steer`).
-                if not item.done():
-                    item.set_result(writer.steered_away() if writer is not None else None)
-                continue
             if kind == "steered_in":
                 # M's message was steered into run `item["run"]`: its events come
-                # here from now on, after what the reply before showed.
-                run_text = item.get("run_text")
-                if isinstance(run_text, asyncio.Future):
-                    run_text = await run_text
+                # here from now on, after what the reply before showed (`_steer`).
                 if writer is not None:
-                    writer.renderer.seed(run_text)
+                    writer.renderer.seed(item.get("run_text"))
                     await writer.working()
                 continue
             if kind == "steered":
