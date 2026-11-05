@@ -139,33 +139,22 @@ jobs:
           ./gitleaks git --redact --verbose .
 
   e2e:
+    # What the live install runs (e2e/versions.env): OpenClaw and Open WebUI.
     name: E2E
     needs: [lint, test]
     uses: ./.github/workflows/e2e.yml
     with:
       lane: pinned
 
-  e2e-next:
-    # The OpenClaw release we are moving to (OPENCLAW_NEXT_VERSION in
-    # e2e/versions.env), on the pinned Open WebUI. Blocking, so a change that
-    # works on the pinned Gateway but breaks the next one is caught in its own
-    # PR. Drop it (or point it at the following release) once the pin moves.
-    name: E2E next
+  e2e-oldest:
+    # The oldest OpenClaw release still supported (OPENCLAW_OLDEST_VERSION in
+    # e2e/versions.env), on the pinned Open WebUI. Reports, never blocks: a red
+    # lane is a fact about that release, not about the PR. Remove it when the
+    # documented minimum moves up (ELI-356).
+    name: E2E oldest
     needs: [lint, test]
     uses: ./.github/workflows/e2e.yml
     with:
-      lane: next
-      openclaw_version: next
-
-  e2e-owui-next:
-    # The Open WebUI release we are moving to (OWUI_NEXT_IMAGE in
-    # e2e/versions.env), on the pinned Gateway. Blocking, like E2E next: the
-    # pinned lane stays on what the live install runs, and this one shows the
-    # code also works on the upgrade. Drop it (or point it at the following
-    # release) once OWUI_IMAGE moves.
-    name: E2E OWUI next
-    needs: [lint, test]
-    uses: ./.github/workflows/e2e.yml
-    with:
-      lane: owui-next
-      owui_image: next
+      lane: oldest
+      openclaw_version: oldest
+      blocking: "false"
