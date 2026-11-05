@@ -13,9 +13,9 @@ Applies to: Pipe, Action, Filter
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
-The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). For Open WebUI that is two blocking lanes: the pinned release, and the next one an upgrade moves to. The minimums come from the same suite run once on each older release; the results are below.
+The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). For Open WebUI that is two blocking lanes: the pinned release, and the next one an upgrade moves to. The OpenClaw minimum, and the Open WebUI releases below 0.12.0, come from the same suite run once on each older release; the results are below. The Open WebUI minimum, 0.12.4, does not: the suite passes on 0.12.0 to 0.12.3, and 0.12.4 is the first release without the two page bugs listed under What each feature needs.
 
-Below the minimums the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, and on OpenClaw 2026.9.1 or older, cron replies never appear.
+Below the minimums the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, and on OpenClaw 2026.9.1 or older, cron replies never appear; on Open WebUI 0.12.0 to 0.12.3, a tab that was loading the chat can show a reply cut, and an approval or question dialog can lose its answer.
 
 ## What each feature needs
 
