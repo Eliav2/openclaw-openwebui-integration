@@ -169,17 +169,21 @@ What it does, request by request (only `GET` requests to your own Open WebUI; ev
 
 | Request | How |
 |---|---|
-| A page (`/`, `/c/<id>`, any route: Open WebUI is one page) | The network, for up to 3 s; after that, or with no network or a server error (5xx), the page kept from the last visit. |
+| A page (`/`, `/c/<id>`, any route: Open WebUI is one page) | The kept page, but only once your Open WebUI answers `/api/version` with the version the page was kept with. Another version: everything kept is deleted and the server's own page loads, however slow. A page answer that comes first (a new page, a login redirect) is used as it is. No network: the kept page at once. |
 | Open WebUI's hashed files (`/_app/immutable/`) | Kept on first use and then read from the device: their names change with their content. |
-| `/static/`, `/assets/`, `/_app/version.json`, `/manifest.json` | The network first, as a page. |
-| The reads that draw the app, the chat list and a chat: `/api/config`, `/api/version`, `/api/models`, `/api/v1/auths/`, your settings, banners, folders, the chat list, pinned chats, tags, and each chat you open | The network for up to 4 s, else the copy from the last time. |
+| `/static/`, `/assets/`, your settings, models, config, banners, tags, functions, skills | The kept copy at once, refreshed in the background for the next open. |
+| The chat list, pinned chats, folders, each chat you open, `/api/version`, `/_app/version.json`, `/manifest.json` | The network; the kept copy only when it fails. |
+| Profile pictures (models, users) | The kept copy at once, refreshed in the background. |
 
-- **Only clean answers are kept:** a `200` from your own site, never a redirect. A page is kept only if it is Open WebUI's (it loads `/_app/immutable/` files), so a Cloudflare Access login page or an error page never becomes the app.
-- **Per user:** the API answers are kept per signed-in user (in a cache named after a hash of the user's token). Signing in again or as someone else starts a new one and deletes the others.
-- **Updates:** a new Open WebUI build is a new page with new hashed files; when the page changes, the old build's files are deleted. Open WebUI reloads once when it sees the new version.
+A network that answers nothing at all (lie-fi) is given up on after 4.2 s (twice the slowest answer measured on Slow 3G); then the kept copy is used. If the page kept that way turns out to be from another Open WebUI version, the page reloads.
+
+- **Only clean answers are kept:** a `200` from your own site, never a redirect (a profile picture may come through one to Open WebUI's own icon). A page is kept only if it is Open WebUI's (it loads `/_app/immutable/` files), so a Cloudflare Access login page or an error page never becomes the app.
+- **Per user:** the API answers and pictures are kept per signed-in user (in a cache named after a hash of the user's token). Signing in again or as someone else starts a new one and deletes the others.
+- **Updates:** a new Open WebUI version deletes everything kept (see the page row). A new build's page also drops the old build's hashed files.
 - **Sizes:** at most 400 app files and 300 API answers per user, oldest first.
-- **Read-only:** sending, or anything else that writes, needs the network; Open WebUI shows its own error.
-- **Turning it off** (`OFFLINE` unset or not `"1"`): the next service worker that a device loads deletes everything it kept.
+- **Read-only offline:** with no network a pill says "Offline: saved chats, read-only" and the message box is locked, so nothing is typed that cannot be sent. Text already in the box stays and can be sent once the network is back.
+- **After a network change:** a change of network while Open WebUI loads (Wi-Fi to mobile) can fail one of its files, and Open WebUI then shows "500 Internal Error" for good. The page script reloads once, as soon as the server can be reached again (at once, or on the next `online` or network change). It reloads only once per tab until a load gets to the app. This works with offline open on or off.
+- **Turning it off** (`OFFLINE` unset or not `"1"`): the next service worker that a device loads deletes everything it kept, and again on the next page load.
 
 ## Known limits
 
@@ -200,7 +204,7 @@ Each part is separate:
 
 ```bash
 push/e2e/stack.sh up /tmp/web-push-e2e openclaw_pipe.py
-WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
+E2E_RUN=/tmp/web-push-e2e WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
 push/e2e/stack.sh down /tmp/web-push-e2e
 ```
 

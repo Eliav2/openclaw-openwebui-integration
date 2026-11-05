@@ -2,7 +2,7 @@
 Cloudflare Worker example under `wrangler dev`, a throwaway Open WebUI.
 
     push/e2e/stack.sh up <run_dir> <openclaw_pipe.py build>
-    WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
+    E2E_RUN=<run_dir> WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
     push/e2e/stack.sh down <run_dir>
 
 Push needs Google Chrome (Chromium builds have no push service), a persistent
@@ -10,9 +10,11 @@ profile and background networking, so this runs headed under Xvfb. Every wait
 is on state: a service worker decision (`oc-push` message), a notification,
 a saved subscription. None waits on time.
 """
+import http.server
 import json
 import os
 import subprocess
+import threading
 import time
 import tempfile
 import urllib.error
@@ -126,6 +128,20 @@ def behind(ctx, page):
         page.wait_for_function("() => !document.hasFocus()", timeout=WAIT_MS)
     front()
     return front
+
+
+STATE_POLL_S = 0.3   # a poll of a state the page holds, never a wait for time
+
+
+def settled(page, check, arg=None):
+    """Waits until an async check in the page is true. Playwright's wait_for_function does not
+    wait for a Promise (a Promise is truthy), so a check on caches is polled here instead."""
+    end = time.time() + WAIT_MS / 1000
+    while time.time() < end:
+        if page.evaluate(check, arg):
+            return
+        time.sleep(STATE_POLL_S)
+    raise AssertionError("never settled: " + check[:120])
 
 
 def ready(page):
@@ -939,10 +955,10 @@ def warm(page, chat):
     page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
     page.reload()   # the first load ran before the worker controlled the page
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-    page.wait_for_function("""(c) => caches.keys().then(async (ks) => {
+    settled(page, """(c) => caches.keys().then(async (ks) => {
         for (const k of ks.filter((k) => k.startsWith('oc-api-')))
             if (await (await caches.open(k)).match(location.origin + '/api/v1/chats/' + c)) return true;
-        return false; })""", arg=chat, timeout=WAIT_MS)
+        return false; })""", chat)
 
 
 def test_offline_open_shows_the_chat_read_last(owui, browser):
@@ -997,5 +1013,292 @@ def test_offline_keeps_no_redirect_and_drops_an_old_builds_files(owui, browser):
         await c.put('/_oc/page-files', new Response('/_app/immutable/old-build.js')); })""")
     page.reload()
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-    page.wait_for_function("""() => caches.open('oc-shell-v1').then((c) => c.match('/_app/immutable/old-build.js'))
-        .then((r) => !r)""", timeout=WAIT_MS)
+    settled(page, """() => caches.open('oc-shell-v1').then((c) => c.match('/_app/immutable/old-build.js'))
+        .then((r) => !r)""")
+
+
+# --- ELI-352 PR 2: the error page after a network change, a newer Open WebUI, the
+# offline pill, another user on the same browser, the kill switch.
+
+APP_FILE = "**/_app/immutable/nodes/0.*"   # Open WebUI's root layout: without it the app cannot start
+ERROR_PAGE = "() => !!document.querySelector('body > .error > .status')"
+RELOADED_FLAG = "() => sessionStorage.getItem('ocReloadedAfterError')"
+# The kept copy of that file (offline open on) would hide a network failure: the test drops it.
+DROP_APP_FILE = """() => caches.open('oc-shell-v1').then(async (c) => {
+    for (const k of await c.keys()) if (k.url.includes('/nodes/0.')) await c.delete(k); })"""
+SHELL_VERSION = "() => caches.open('oc-shell-v1').then((c) => c.match('/_oc/version')).then((r) => r ? r.text() : null)"
+NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-')))"
+
+
+def offline_on():
+    """The stack's Worker serves oc-sw.js with offline open on (E2E_OFFLINE, default 1)."""
+    with urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30) as r:
+        return 'OFFLINE_SETTING = "1"' in r.read().decode()
+
+
+needs_offline = pytest.mark.skipif("not offline_on()", reason="offline open is off on this stack (E2E_OFFLINE=0)")
+
+
+def opened(page, chat):
+    """The chat opened under the service worker (both modes)."""
+    page.goto(f"{BASE}/c/{chat}")
+    page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    page.reload()
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+
+
+def page_loads(page):
+    """The page's loads from here on (each navigation request of its main frame)."""
+    loads = []
+    def seen(r):
+        if r.is_navigation_request() and r.frame == page.main_frame:
+            loads.append(r.url)
+    page.on("request", seen)
+    return loads, lambda: page.remove_listener("request", seen)
+
+
+def test_the_error_page_after_a_network_change_reloads_once_into_the_chat(owui, browser):
+    """A network change while the app loads fails one of Open WebUI's files and SvelteKit shows
+    "500 Internal Error" for good. The page script reloads once, the server being reachable, and
+    the chat opens; a load that gets to the app clears the guard."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Network Change")
+    opened(page, chat)
+    failed = []
+    def fail_once(route):
+        if failed:
+            return route.continue_()
+        failed.append(route.request.url)
+        route.abort("internetdisconnected")   # what ERR_NETWORK_CHANGED does to the import
+    loads, stop = page_loads(page)
+    page.evaluate(DROP_APP_FILE)
+    ctx.route(APP_FILE, fail_once)
+    try:
+        page.reload()
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        assert failed, "Open WebUI's file never failed"
+        assert len(loads) == 2, loads   # the load that failed, the one reload
+        page.wait_for_function(f"() => ({RELOADED_FLAG})() === null", timeout=WAIT_MS)
+    finally:
+        ctx.unroute(APP_FILE, fail_once)
+        stop()
+
+
+def test_the_error_page_reloads_only_once(owui, browser):
+    """The reload fails too: the page stays on the error page, and neither 'online' nor a
+    network change reloads it again."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Error Twice")
+    opened(page, chat)
+    fail = lambda route: route.abort("internetdisconnected")
+    loads, stop = page_loads(page)
+    page.evaluate(DROP_APP_FILE)
+    ctx.route(APP_FILE, fail)
+    try:
+        page.reload()
+        # The one reload, then its error page (the first error page ends in that reload).
+        end = time.time() + WAIT_MS / 1000
+        while len(loads) < 2:
+            assert time.time() < end, "the page was never reloaded"
+            page.wait_for_timeout(STATE_POLL_S * 1000)   # a poll; Playwright delivers the page's events meanwhile
+        page.wait_for_function(f"() => ({ERROR_PAGE})() && ({RELOADED_FLAG})() === '1'", timeout=WAIT_MS)
+        page.evaluate("() => { window.ocStayed = true; dispatchEvent(new Event('online')); }")
+        assert page.evaluate("() => window.ocStayed === true")
+        assert len(loads) == 2, loads
+    finally:
+        ctx.unroute(APP_FILE, fail)
+        stop()
+    opened(page, chat)   # a load that gets to the app clears the guard
+    page.wait_for_function(f"() => ({RELOADED_FLAG})() === null", timeout=WAIT_MS)
+
+
+# Longer than the navigation's 3 s network wait before this PR: with it, the kept app
+# of the old version was used.
+UPGRADED_PAGE_DELAY_S = 5
+UPGRADED_VERSION = '{"version":"99.0.0-e2e","deployment_id":"e2e-upgrade"}'
+UPGRADED_MARK = '<meta name="oc-e2e-build" content="upgraded">'
+
+
+@needs_offline
+def test_a_newer_open_webui_never_runs_the_kept_app(owui, browser):
+    """The server is a newer Open WebUI (another /api/version) and its page is slow: the kept
+    app of the old version is not used, the caches go, and the newer page opens and is kept
+    with its version. Back on the old server, the same again the other way."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Upgrade")
+    warm(page, chat)
+    real = urllib.request.urlopen(OWUI + "/api/version", timeout=30).read().decode()
+    html = urllib.request.urlopen(OWUI + "/", timeout=30).read().decode().replace("<head>", "<head>" + UPGRADED_MARK, 1)
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(UPGRADED_PAGE_DELAY_S)   # the upgraded server's slow page
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    from_worker = []
+    def upgraded_page(route):
+        if route.request.service_worker is None:
+            return route.fallback()
+        from_worker.append(route.request.url)
+        route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}/")
+    def upgraded_version(route):
+        if route.request.service_worker is None:
+            return route.fallback()
+        route.fulfill(status=200, content_type="application/json", body=UPGRADED_VERSION)
+    ctx.route(f"**/c/{chat}", upgraded_page)
+    ctx.route("**/api/version", upgraded_version)
+    try:
+        page.goto(f"{BASE}/c/{chat}", timeout=WAIT_MS)
+        assert from_worker, "the service worker never asked the server for the page"
+        assert page.evaluate("() => !!document.querySelector('meta[name=oc-e2e-build]')"), "the kept app of the old version ran"
+        settled(page, f"() => ({SHELL_VERSION})().then((v) => v === {json.dumps(UPGRADED_VERSION)})")
+    finally:
+        ctx.unroute(f"**/c/{chat}", upgraded_page)
+        ctx.unroute("**/api/version", upgraded_version)
+        srv.shutdown()
+    # The real server again: its version differs from the kept one, so its own page.
+    page.goto(f"{BASE}/c/{chat}", timeout=WAIT_MS)
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    assert not page.evaluate("() => !!document.querySelector('meta[name=oc-e2e-build]')")
+    settled(page, f"() => ({SHELL_VERSION})().then((v) => v === {json.dumps(real)})")
+
+
+MODEL_AVATARS = "img[src*='/models/model/profile/image']"
+AVATARS_DRAWN = f"""() => {{ const i = [...document.querySelectorAll("{MODEL_AVATARS}")];
+    return i.length > 0 && i.every((x) => x.complete && x.naturalWidth > 0); }}"""
+COMPOSER_LOCKED = "() => !!document.getElementById('chat-input')?.closest('form')?.inert"
+
+
+@needs_offline
+def test_offline_is_read_only_with_a_pill_and_keeps_the_avatars(owui, browser):
+    """Opened offline, the saved chat shows a pill and a locked message box (typing does nothing,
+    so nothing is written to be lost) and the model's picture (kept), not a broken image. The
+    network going while text is in the box: the text stays, locked, and is sent once online."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Pill")
+    warm(page, chat)
+    page.wait_for_function(AVATARS_DRAWN, timeout=WAIT_MS)
+    box = page.locator("#chat-input")
+    pill = page.locator("#oc-offline")
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)
+        box.wait_for(timeout=WAIT_MS)
+        pill.wait_for(timeout=WAIT_MS)
+        assert pill.inner_text() == "Offline: saved chats, read-only"
+        page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
+        page.wait_for_function(AVATARS_DRAWN, timeout=WAIT_MS)
+        if os.environ.get("E2E_SHOTS"):
+            page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offline-pill.png"))
+        box.click(force=True)
+        page.keyboard.type("typed offline")
+        page.keyboard.press("Enter")
+        assert "typed offline" not in box.inner_text(), "the locked box took text offline"
+    finally:
+        ctx.set_offline(False)
+    pill.wait_for(state="detached", timeout=WAIT_MS)
+    page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
+    # Text in the box when the network goes.
+    text = "written before the network went"
+    box.click()
+    page.keyboard.type(text)
+    ctx.set_offline(True)
+    try:
+        pill.wait_for(timeout=WAIT_MS)
+        page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
+        page.keyboard.press("Enter")
+        assert text in box.inner_text(), "the text in the box was lost"
+        assert not any(m.get("content") == text for m in history(owui, chat)["messages"].values())
+    finally:
+        ctx.set_offline(False)
+    page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
+    box.click()
+    page.keyboard.press("Enter")
+    end = time.time() + WAIT_MS / 1000
+    while not any(m.get("content") == text for m in history(owui, chat)["messages"].values()):
+        assert time.time() < end, "the kept text was never sent"
+        time.sleep(STATE_POLL_S)
+
+
+@needs_offline
+def test_another_user_on_the_same_browser_never_sees_the_first_users_chats(owui, pw):
+    """User A's kept reads go when user B signs in on the same browser; offline, B's app shows
+    none of A's chats."""
+    a_chat, _ = new_chat(owui, "stub", "Chat Of User A " + uuid.uuid4().hex[:6])
+    a_title = api(f"/api/v1/chats/{a_chat}", token=owui)["title"]
+    b_cred = {"name": "E2E B", "email": f"b-{uuid.uuid4().hex[:8]}@e2e.example.com", "password": "e2e-pass-b"}
+    b_token = api("/api/v1/auths/signup", b_cred)["token"]
+    api("/api/v1/users/user/settings/update", {"ui": {"showChangelog": False}}, b_token)
+    ctx = chrome(pw)
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(BASE + "/auth")
+        page.evaluate("(t) => localStorage.setItem('token', t)", owui)
+        warm(page, a_chat)
+        page.get_by_text(a_title).first.wait_for(timeout=WAIT_MS)
+        a_caches = page.evaluate("() => caches.keys().then((ks) => ks.filter((k) => k.startsWith('oc-api-')))")
+        assert len(a_caches) == 1, a_caches
+        # B signs in on this browser (Open WebUI keeps the token in localStorage).
+        page.evaluate("(t) => localStorage.setItem('token', t)", b_token)
+        page.goto(BASE + "/")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        settled(page, """(a) => caches.keys().then((ks) => !ks.includes(a)
+            && ks.some((k) => k.startsWith('oc-api-')))""", a_caches[0])
+        ctx.set_offline(True)
+        page.reload(timeout=WAIT_MS)
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+        assert page.get_by_text(a_title).count() == 0
+        found = page.evaluate("""(c) => caches.keys().then(async (ks) => {
+            for (const k of ks) if (await (await caches.open(k)).match(location.origin + '/api/v1/chats/' + c)) return k;
+            return null; })""", a_chat)
+        assert found is None, found
+    finally:
+        ctx.close()
+
+
+def worker_offline(value):
+    """The stack Worker's OFFLINE var, the Worker restarted with it (stack.sh offline)."""
+    subprocess.run(["bash", os.path.join(HERE, "stack.sh"), "offline", os.environ["E2E_RUN"], value],
+                   check=True, capture_output=True, timeout=WAIT_MS / 1000)
+    assert f'OFFLINE_SETTING = "{value}"' in urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
+
+
+@needs_offline
+@pytest.mark.skipif(not os.environ.get("E2E_RUN"), reason="set E2E_RUN=<run_dir> (stack.sh up) to turn the Worker's switch")
+def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
+    """The Worker's OFFLINE turned to "0": the browser's next update of the service worker
+    deletes its caches, and it answers nothing itself (offline, Chrome's own offline page).
+    Its own browser: a request another test intercepted can keep the old worker busy, and a
+    new one waits for it."""
+    chat, _ = new_chat(owui, "stub", "Chat Kill Switch")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        warm(page, chat)
+        worker_offline("0")
+        page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.update())")
+        # The new worker takes over once the old one is idle; the next open comes after that.
+        settled(page, """() => navigator.serviceWorker.getRegistration('/').then((r) =>
+            r.active && r.active.state === 'activated' && !r.waiting && !r.installing)""")
+        page.reload()   # the next open
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        settled(page, NO_OFFLINE_CACHES)
+        ctx.set_offline(True)
+        with pytest.raises(Exception, match="ERR_INTERNET_DISCONNECTED"):
+            page.reload(timeout=WAIT_MS)
+    finally:
+        ctx.close()
+        worker_offline("1")

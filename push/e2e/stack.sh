@@ -3,6 +3,7 @@
 # under `wrangler dev`, in front of it. Usage:
 #   push/e2e/stack.sh up <run_dir> <pipe_build>    # pipe_build: an openclaw_pipe.py with _publish_chat_finished
 #   push/e2e/stack.sh down <run_dir>
+#   push/e2e/stack.sh offline <run_dir> 0|1      # the Worker's OFFLINE switch, Worker restarted
 # Ports: OWUI 18780, Worker 18787. Needs docker, bun or npx, uv.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd); push=$(dirname "$here")
@@ -15,7 +16,6 @@ if [ "$cmd" = down ]; then
   systemctl --user reset-failed "$name-wrangler" 2>/dev/null || true
   exit 0
 fi
-pipe_build=$(realpath "$3")
 # Wait for the first line matching $1 that a follower command ($2...) prints;
 # the follower is stopped then. The timeout is a safety net, never expected to
 # expire.
@@ -30,6 +30,22 @@ first_match() {
   echo "no '$pattern' from: $*" >&2
   return 1
 }
+# The Worker under wrangler dev, from the config in $run/worker; ready when it says so.
+start_worker() {
+  : > "$run/wrangler.log"
+  systemd-run --user --unit "$name-wrangler" --working-directory "$run/worker" --setenv=PATH="$PATH" \
+    -p StandardOutput="append:$run/wrangler.log" -p StandardError="append:$run/wrangler.log" \
+    bunx wrangler@4.45.0 dev --port 18787 --ip 127.0.0.1 --local-upstream 127.0.0.1:18780 >/dev/null
+  first_match "Ready on" tail -n +1 -F "$run/wrangler.log"
+}
+if [ "$cmd" = offline ]; then
+  sed -i "s/\"OFFLINE\": \"[01]\"/\"OFFLINE\": \"$3\"/" "$run/worker/wrangler.jsonc"
+  systemctl --user stop "$name-wrangler" 2>/dev/null || true
+  systemctl --user reset-failed "$name-wrangler" 2>/dev/null || true
+  start_worker
+  exit 0
+fi
+pipe_build=$(realpath "$3")
 mkdir -p "$run/data" "$run/keys" "$run/pipe" "$run/worker/src"
 cp "$pipe_build" "$run/pipe/openclaw_pipe.py"
 uv run -q --with cryptography python "$here/vapid_keys.py" "$run/keys"
@@ -51,9 +67,5 @@ cat > "$run/worker/wrangler.jsonc" <<JSON
   "rules": [{ "type": "Text", "globs": ["**/oc-sw.js", "**/oc-push.js"], "fallthrough": true }],
   "vars": { "VAPID_PUBLIC_KEY": "$(cat "$run/keys/public.b64")", "FUNCTION_ID": "web_push", "OFFLINE": "${E2E_OFFLINE:-1}" } }
 JSON
-: > "$run/wrangler.log"
-systemd-run --user --unit "$name-wrangler" --working-directory "$run/worker" --setenv=PATH="$PATH" \
-  -p StandardOutput="append:$run/wrangler.log" -p StandardError="append:$run/wrangler.log" \
-  bunx wrangler@4.45.0 dev --port 18787 --ip 127.0.0.1 --local-upstream 127.0.0.1:18780 >/dev/null
-first_match "Ready on" tail -n +1 -F "$run/wrangler.log"
+start_worker
 echo "up: owui http://127.0.0.1:18780 worker http://localhost:18787"
