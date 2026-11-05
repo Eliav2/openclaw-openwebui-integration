@@ -2014,6 +2014,9 @@ class _RunPump:
         # message steered in later can take it over (`_GatewayConnection._steer`).
         self.started = False
         self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
+        # The run its writer shows, which a later message was steered into,
+        # ended cleanly: the next run's start settles it (`_turn_next_run`).
+        self.ended_clean = False
 
 
 def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -2275,6 +2278,21 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
     for (sess, _run), pump in list(conn._turn_pumps.items()):
         if sess == session_key:
             pump.queue.put_nowait(("settled", row))
+
+
+def _turn_next_run(conn: "_GatewayConnection", session_key: str) -> None:
+    """A run of the session started, so every earlier one is over (a session
+    runs one at a time). The writers of a run a message was steered into,
+    which ended cleanly, end here from the transcript: when a message sent to
+    be steered missed the run and the Gateway ran it after (its follow-up
+    policy), the session's idle comes with no push (2026.10.10: that run's
+    last push is its `phase: end`, still `hasActiveRun: true`). As after a
+    clean own final (ELI-215), no row is waited for."""
+    for (sess, run), pump in list(conn._turn_pumps.items()):
+        if sess == session_key and pump.ended_clean:
+            pump.ended_clean = False
+            pipe_log(f"  next run started: run {run[:24]}... ends from the transcript")
+            pump.queue.put_nowait(("settled", None))
 
 
 async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
@@ -3583,6 +3601,7 @@ class _TurnHooks:
     after_hello = staticmethod(_turn_after_hello)
     resync = staticmethod(_turn_resync)
     settled = staticmethod(_turn_settled)
+    next_run = staticmethod(_turn_next_run)
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)

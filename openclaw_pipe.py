@@ -6340,7 +6340,9 @@ class _WriterQueue(_RunQueue):
     message steered into it (`_GatewayConnection._steer_handed_over`): into
     that writer's pump, which shows them live, after the baselines of the
     reply before (`steered_in`). Other markers stay here: the writer ends from
-    the transcript when the session settles."""
+    the transcript when the session settles. The pump is not `started`: the
+    run is the one it was steered into, whose end its pump never sees, so a
+    later message is no steer into it (`user_turn_run_active`)."""
 
     def __init__(self, pump):
         super().__init__()
@@ -6352,7 +6354,6 @@ class _WriterQueue(_RunQueue):
         if item.get("_steered"):
             self.pump.queue.put_nowait(("steered_in", item["_steered"]))
         elif item.get("type") == "event":
-            self.pump.started = True
             self.pump.queue.put_nowait(("event", item.get("payload") or {}))
 
 
@@ -6972,13 +6973,10 @@ class _GatewayConnection:
                 ev.set()
             if key and _subagent_ended(payload) and self.parse_owui_session_key(parent):
                 spawn_background(self._record_child_end(parent, key, {**payload, "key": key}))
-        # The run state the push says: its top-level flag, else (2026.10.10:
-        # the idle of a run the Gateway started itself, `reason: cron-binding`)
-        # the flag of its nested `session` row.
-        nested = payload.get("session") if isinstance(payload.get("session"), dict) else {}
-        row = payload if "hasActiveRun" in payload else {**nested, **payload}
-        if _TURNS and key and row.get("hasActiveRun") is False:
-            _TURNS.settled(self, key, row)
+        if _TURNS and key and payload.get("hasActiveRun") is False:
+            _TURNS.settled(self, key, payload)
+        elif _TURNS and key and payload.get("phase") == "start":
+            _TURNS.next_run(self, key)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
@@ -7707,6 +7705,11 @@ class _GatewayConnection:
             pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
             if pump is not None:
                 pump.terminal.set()
+            if payload.get("state") == "final" or (payload.get("data") or {}).get("phase") == "end":
+                # Both writers end at the next run's start if no settle comes first.
+                for p in [pump, *(q.pump for q in consumer.queues)]:
+                    if p is not None:
+                        p.ended_clean = True
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
             self.unregister_run_target(consumer.session_key, consumer.run_id)
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
@@ -11506,6 +11509,9 @@ class _RunPump:
         # message steered in later can take it over (`_GatewayConnection._steer`).
         self.started = False
         self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
+        # The run its writer shows, which a later message was steered into,
+        # ended cleanly: the next run's start settles it (`_turn_next_run`).
+        self.ended_clean = False
 
 
 def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -11767,6 +11773,21 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
     for (sess, _run), pump in list(conn._turn_pumps.items()):
         if sess == session_key:
             pump.queue.put_nowait(("settled", row))
+
+
+def _turn_next_run(conn: "_GatewayConnection", session_key: str) -> None:
+    """A run of the session started, so every earlier one is over (a session
+    runs one at a time). The writers of a run a message was steered into,
+    which ended cleanly, end here from the transcript: when a message sent to
+    be steered missed the run and the Gateway ran it after (its follow-up
+    policy), the session's idle comes with no push (2026.10.10: that run's
+    last push is its `phase: end`, still `hasActiveRun: true`). As after a
+    clean own final (ELI-215), no row is waited for."""
+    for (sess, run), pump in list(conn._turn_pumps.items()):
+        if sess == session_key and pump.ended_clean:
+            pump.ended_clean = False
+            pipe_log(f"  next run started: run {run[:24]}... ends from the transcript")
+            pump.queue.put_nowait(("settled", None))
 
 
 async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
@@ -13075,6 +13096,7 @@ class _TurnHooks:
     after_hello = staticmethod(_turn_after_hello)
     resync = staticmethod(_turn_resync)
     settled = staticmethod(_turn_settled)
+    next_run = staticmethod(_turn_next_run)
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)

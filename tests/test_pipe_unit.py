@@ -328,28 +328,23 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
         conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
         self.assertEqual(len(seen), 1)
 
-    async def test_turn_writers_settle_on_an_idle_push_that_says_it_only_in_its_session_row(self):
-        """Sandbox e2e on #292's follow-up: a message the Gateway queued ran as
-        a run it started itself, whose idle push (2026.10.10) has no top-level
-        `hasActiveRun`, only its nested `session` row's `false` (FIELD-TABLE
-        row 33). The turn writers of the run before never got their settle
-        and stayed open."""
+    async def test_a_run_start_push_tells_the_turn_writers_a_next_run_began(self):
+        """Sandbox e2e on the live steered writer: "say blue", sent to be
+        steered, missed the run, and the Gateway ran it after (follow-up
+        policy). That run's last push was its `phase: end`, still
+        `hasActiveRun: true`, and no idle push came. Its start push is the
+        event the turn writers of the run before get instead; an idle push
+        still settles them."""
         conn = _GatewayConnection(lambda: None)
         turns = mock.Mock()
         with mock.patch.object(openclaw_pipe, "_TURNS", turns):
-            conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done",
-                                       "session": {"status": "running", "hasActiveRun": True}})
+            conn._on_sessions_changed({"sessionKey": self.SK, "phase": "start", "hasActiveRun": True})
+            turns.next_run.assert_called_once_with(conn, self.SK)
+            conn._on_sessions_changed({"sessionKey": self.SK, "phase": "end", "hasActiveRun": True})
             turns.settled.assert_not_called()
-            conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done",
-                                       "session": {"status": "done", "hasActiveRun": False,
-                                                   "lastRunId": "R9", "activeRunIds": []}})
+            conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
             turns.settled.assert_called_once()
-            _conn, key, row = turns.settled.call_args.args
-            self.assertEqual((key, row["hasActiveRun"], row["status"], row["lastRunId"]),
-                             (self.SK, False, "done", "R9"))
-            conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": True,
-                                       "session": {"hasActiveRun": False}})
-            self.assertEqual(turns.settled.call_count, 1, "the top-level flag decides when it is there")
+            self.assertEqual(turns.next_run.call_count, 1)
 
     async def test_a_reply_counts_until_its_consumer_goes_and_its_end_wakes_the_waiters(self):
         """ELI-260: the Status dialog counts a chat as running while this
@@ -17350,9 +17345,23 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         conn._turn_pumps[(sk, self.R2)] = tomato
         conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
         self.assertTrue(conn.has_reply(sk), "the run still works")
+        await conn._dispatch_run_event(self._delta(self.R1, "tomato"))
         await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
         self.assertNotIn(f"{sk}:{self.R1}", conn._consumers)
         self.assertFalse(conn.has_reply(sk))
+        # Sandbox e2e on the live steered writer: the run's events reaching
+        # tomato's writer made its pump read as a run of its own that never
+        # ended, so "say blue", sent after, went to be steered into nothing.
+        self.assertFalse(conn.user_turn_run_active(sk, self.CHAT), "no run works")
+        # The same e2e: "say blue" missed the run and the Gateway ran it after,
+        # with no idle push at its end. The next run's start ends both writers.
+        while not tomato.queue.empty():
+            tomato.queue.get_nowait()
+        openclaw_pipe._turn_next_run(conn, sk)
+        self.assertEqual(host.queue.get_nowait(), ("settled", None))
+        self.assertEqual(tomato.queue.get_nowait(), ("settled", None))
+        openclaw_pipe._turn_next_run(conn, sk)
+        self.assertTrue(host.queue.empty() and tomato.queue.empty(), "once")
         # Review on #290: its `chat` final comes after its lifecycle end, and
         # reached a writer that showed the whole run in the earlier reply.
         conn._turn_pumps.pop((sk, self.R1))
@@ -17361,6 +17370,28 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             await self._spin()
         loop.assert_not_called()
         self.assertTrue(host.queue.empty())
+
+    async def test_a_run_whose_steered_reply_a_turn_writer_has_that_fails_waits_for_its_row(self):
+        """The next run's start ends only a cleanly ended run's writers: a
+        failed one waits for its settled row, which says what went wrong."""
+        self.conn.gateway_version = "2026.10.10"
+        conn = self.conn
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
+        host = openclaw_pipe._RunPump()
+        host.started = True
+        conn._turn_pumps[(sk, self.R1)] = host
+        tomato = openclaw_pipe._RunPump()
+        tomato.handover = {"message_id": "w2", "steer_pending": True,
+                           "renderer": types.SimpleNamespace(received="", output=None)}
+        conn._turn_pumps[(sk, self.R2)] = tomato
+        conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
+        await conn._dispatch_run_event(self._lifecycle(self.R1, "error"))
+        self.assertNotIn(f"{sk}:{self.R1}", conn._consumers, "its end lets the run go")
+        while not tomato.queue.empty():
+            tomato.queue.get_nowait()
+        openclaw_pipe._turn_next_run(conn, sk)
+        self.assertTrue(host.queue.empty() and tomato.queue.empty())
 
     async def test_a_queued_message_committed_while_a_run_works_is_not_steered_into_it(self):
         """Sandbox e2e on the Send-now fix: "say blue" was sent to be steered,
