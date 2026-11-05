@@ -132,6 +132,11 @@ class TheCheck(unittest.TestCase):
     def test_the_label_passes(self):
         self.assertIsNone(pr_media.check(DRAWER, "", ["bug", pr_media.SKIP_LABEL]))
 
+    def test_a_prose_only_pr_passes(self):
+        """The `prose-only` label already requires the Prose only check to prove
+        the code unchanged (.github/workflows/prose-only.yml)."""
+        self.assertIsNone(pr_media.check(DRAWER, "", ["prose-only"]))
+
     def test_a_change_with_nothing_visual_passes(self):
         self.assertIsNone(pr_media.check(["src/openclaw_pipe_pkg/gateway.py"], "", []))
 
