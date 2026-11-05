@@ -425,6 +425,86 @@
   });
   navigator.serviceWorker.startMessages?.();
 
+  // --- "Mark as read" in Open WebUI's chat menu (⋯ of a chat in the sidebar).
+  // The DOM contract with Open WebUI 0.13.0 (push/e2e tests it): a chat in the
+  // sidebar is a box whose child #sidebar-chat-item holds the chat's link, with
+  // its ⋯ (button[aria-haspopup]) further inside the box; the menu is a
+  // [role=menu] with .app-dropdown-menu holding button[role=menuitem] items,
+  // and its "Mark as unread" item carries this icon path. Found by structure and
+  // icon, not by text (the menu is translated). When a chat's menu does not match,
+  // nothing is added and the console says so once: the menu is never touched.
+  const MENU_BOX = ".app-dropdown-menu";
+  const MENU_ITEM = "button[role=menuitem]";
+  const UNREAD_ICON = "M8 12L11 15L16 10";
+  const CHAT_LINK = ':scope > #sidebar-chat-item a[href^="/c/"]';
+  const CHAT_PATH = "/c/";
+  // How far up from the ⋯ button its chat's box may be (Open WebUI 0.13: 5).
+  const TRIGGER_DEPTH = 8;
+  // A menu that opens later than this after the press is not that chat's.
+  const MENU_AFTER_MS = 2000;
+  let pressed = null, contractLogged = false;
+
+  // The chat whose ⋯ was just pressed, by a pointer or from the keyboard
+  // (the menu also opens on Enter and Space).
+  const OPEN_KEYS = new Set(["Enter", " "]);
+  function press(e) {
+    const b = e.target instanceof Element && e.target.closest("button[aria-haspopup]");
+    let box = b;
+    for (let i = 0; box && i < TRIGGER_DEPTH; i++, box = box.parentElement) {
+      const link = box.querySelector(CHAT_LINK);
+      if (link) {
+        pressed = { chat: link.getAttribute("href").slice(CHAT_PATH.length), at: Date.now() };
+        return;
+      }
+    }
+  }
+  addEventListener("pointerdown", press, true);
+  addEventListener("keydown", (e) => { if (OPEN_KEYS.has(e.key)) press(e); }, true);
+
+  // A menu just appeared: once it is drawn (next frame), the chat's menu gets the item.
+  function menuOpened(menu) {
+    if (!pressed || Date.now() - pressed.at > MENU_AFTER_MS || menu.dataset.ocPush) return;
+    const chat = pressed.chat;
+    pressed = null;
+    menu.dataset.ocPush = "seen";
+    requestAnimationFrame(() => chatMenu(menu, chat));
+  }
+
+  function chatMenu(menu, chat) {
+    if (!navigator.serviceWorker.controller) return;   // push not on for this device
+    const unreadItem = [...menu.querySelectorAll(MENU_BOX + " > " + MENU_ITEM)]
+      .find((b) => b.querySelector("path")?.getAttribute("d")?.startsWith(UNREAD_ICON));
+    // Its label: the item's last div, holding all of the item's text.
+    const native = unreadItem?.textContent.trim();
+    const nativeLabel = unreadItem && [...unreadItem.querySelectorAll("div")].pop();
+    if (!unreadItem || !native || nativeLabel?.textContent.trim() !== native) {
+      window.ocPushMenuContract = "missing";
+      if (contractLogged) return;
+      contractLogged = true;
+      console.info("oc-push: Open WebUI's chat menu is not the one this script knows (0.13.0); no Mark as read added.");
+      return;
+    }
+    window.ocPushMenuContract = "ok";
+    const item = unreadItem.cloneNode(true);
+    [...item.querySelectorAll("div")].pop().textContent = "Mark as read";
+    item.addEventListener("click", (e) => {
+      e.stopPropagation();
+      // The service worker sends Open WebUI's own read event (as the notification's button does);
+      // if that fails it opens the chat, which reads it.
+      navigator.serviceWorker.controller?.postMessage({ type: "oc-push-act", action: "read", data: { chat_id: chat, url: CHAT_PATH + chat } });
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    unreadItem.after(item);
+  }
+
+  new MutationObserver((records) => {
+    for (const r of records) for (const n of r.addedNodes) {
+      if (!(n instanceof Element)) continue;
+      const menu = n.closest("[role=menu]") || n.querySelector("[role=menu]");
+      if (menu) menuOpened(menu);
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
   window.ocPushEnable = enable;
   window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
   window.ocPushMuteFolder = (seconds, id = chatFolder.folder) => setMute(FOLDERS, id, seconds);
