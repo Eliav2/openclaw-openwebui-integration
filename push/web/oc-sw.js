@@ -36,6 +36,34 @@ const BUTTONS = {
 };
 // Where a reply that could not be sent waits for the page (oc-push.js reads it).
 const DRAFTS = "oc-push-drafts";
+const DEFAULT_TITLE = "Open WebUI", DEFAULT_BODY = "New reply";
+
+// Several replies in one chat stack in its one notification, as in a messaging
+// app: the title counts them, the body keeps the latest previews, newest last.
+// The stack lives in the shown notification's data, so whatever closes it
+// (opening the chat, Mark as read, a swipe) starts the next one from one.
+const STACK_MAX_LINES = 5;
+const STACK_LINE_CHARS = 120;
+const ELLIPSIS = "…";
+const SINGLE = 1;
+
+function stackLine(text) {
+  const line = String(text || "").replace(/\s+/g, " ").trim();
+  return line.length > STACK_LINE_CHARS ? line.slice(0, STACK_LINE_CHARS - ELLIPSIS.length).trimEnd() + ELLIPSIS : line;
+}
+
+// `prev`: the chat's notification still shown (its data), or none. Returns what to show now.
+function stacked(prev, p) {
+  const name = p.title || DEFAULT_TITLE;
+  const line = stackLine(p.body);
+  const count = (prev?.count || 0) + 1;
+  const lines = [...(prev?.lines || []), ...(line ? [line] : [])].slice(-STACK_MAX_LINES);
+  return {
+    title: count > SINGLE ? `${name} · ${count} new messages` : name,
+    body: lines.length ? lines.join("\n") : DEFAULT_BODY,
+    count, lines,
+  };
+}
 
 self.addEventListener("push", (e) => {
   let p = {};
@@ -47,13 +75,16 @@ self.addEventListener("push", (e) => {
     const inFront = wins.some((c) => c.focused && c.visibilityState === VISIBLE);
     const shown = MUST_SHOW || !inFront;
     if (shown) {
-      await self.registration.showNotification(p.title || "Open WebUI", {
-        body: p.body || "New reply",
-        tag: TAG_PREFIX + (p.chat_id || "none"),   // one per chat: a newer one replaces it (oc-push.js closes it when the chat is opened)
-        renotify: true,
+      const tag = TAG_PREFIX + (p.chat_id || "none");
+      const [prev] = p.chat_id ? await self.registration.getNotifications({ tag }) : [];
+      const s = stacked(prev?.data?.stack, p);
+      await self.registration.showNotification(s.title, {
+        body: s.body,
+        tag,   // one per chat: a newer one replaces it (oc-push.js closes it when the chat is opened)
+        renotify: true,   // each new reply sounds once
         icon: ICON,
         badge: BADGE,   // Android's small icon: only its alpha is drawn
-        data: { url: p.url || "/", chat_id: p.chat_id || "", fn: p.fn || "" },
+        data: { url: p.url || "/", chat_id: p.chat_id || "", fn: p.fn || "", stack: { count: s.count, lines: s.lines } },
         // The function's NOTIFICATION_ACTIONS, in order; a push without them gets
         // no buttons. Android Chrome shows two (Notification.maxActions) and adds
         // its own "Unsubscribe" after them.
