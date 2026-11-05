@@ -2992,6 +2992,39 @@ class NoDroppedMessagesTests(_TurnCase):
         self.assertEqual(order, ["claim", "fit"])
         await self._answer(r, first)
 
+    def _claiming(self, **claimed):
+        """A cancelled turn's leftovers, claimed by the reply that follows it."""
+        async def claim(session_key):
+            return {"run_id": None, "queue": None, "carried": [], "attachments": [],
+                    "waiting": [], **claimed}
+        self.conn.claim_cancelled_turn = claim
+
+    async def test_a_photo_carried_from_a_cancelled_reply_is_shrunk_too(self):
+        """A reply cancelled while its own fit ran leaves its photo whole in the claim: the next
+        reply, which has no photo of its own, must not send it over the cap."""
+        self.conn.gateway_max_image_bytes = 300_000
+        big = {"type": "image", "mimeType": "image/png", "fileName": "image-1.png",
+               "content": self._noise_png((1600, 1200))}
+        self._claiming(carried=["the photo question"], attachments=[big])
+        r = self._reply("and this one?", "m2")
+        first = await self._sent_or_answer(r)
+        [[(name, content)]] = self.sent_images
+        self.assertEqual(name, "image-1.jpg")
+        self.assertLessEqual(len(base64.b64decode(content)), 300_000)
+        await self._answer(r, first)
+
+    async def test_when_the_photo_cannot_be_shrunk_the_claimed_replies_are_told_not_sent(self):
+        self.conn.gateway_max_image_bytes = 300_000
+        self._claiming(waiting=["earlier reply"], carried=["earlier"])
+        with mock.patch.object(self.ocp, "_load_pil", lambda: None), \
+                mock.patch.object(self.ocp, "_end_unsent_replies") as ended:
+            out = await asyncio.wait_for(
+                self._drain(self._reply("hi", "m2", image=self._noise_png((1600, 1200)))), 30)
+        self.assertIn("Couldn't send the image", out)
+        ended.assert_called_once_with(self.conn, ["earlier reply"], sent=False,
+                                      note=self.ocp.REPLY_SEND_FAILED_NOTE)
+        self.assertEqual(self.sent, [])
+
     async def test_photos_of_different_chats_are_shrunk_one_at_a_time(self):
         """Each fit holds a whole photo decoded: two at once would hold two."""
         self.conn.gateway_max_image_bytes = 300_000
