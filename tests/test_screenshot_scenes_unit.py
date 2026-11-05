@@ -43,10 +43,13 @@ class GoalNudgeTests(unittest.TestCase):
     def test_the_nudge_is_answered_slowly_not_by_the_default(self):
         """A default answer came back at once and the Gateway ran its loop of
         nudge turns about 200 times in two minutes, which held back the scene's
-        own message (usage-goal on 10.10). A tool call makes each turn take a few seconds."""
+        own message (usage-goal on 10.10). A word a second makes a turn take
+        seconds, and with no tool call it leaves no tool result in the turn
+        of the message after it."""
         plan = self.fake.plan_reply(request(("system", "s"), ("user", NUDGE), ("user", CONTEXT)))
-        self.assertEqual(plan.get("tool"), "exec", plan)
         self.assertNotEqual(plan["text"], "Sure.")
+        self.assertGreaterEqual(plan["delay"], 1.0)
+        self.assertNotIn("tool", plan)
 
     def test_a_message_before_the_nudge_is_still_the_one_answered(self):
         """The newest part of a turn with a scripted answer wins: the nudge's
@@ -55,14 +58,6 @@ class GoalNudgeTests(unittest.TestCase):
                                             ("user", NUDGE), ("user", CONTEXT)))
         self.assertEqual(plan.get("tool"), "exec", plan)
         self.assertIn("compileall", json.dumps(plan))
-
-    def test_the_nudge_after_its_own_tool_result_ends_the_turn(self):
-        tool_call = {"role": "assistant", "content": None, "tool_calls": [{"id": "c", "type": "function"}]}
-        body = request(("system", "s"), ("user", NUDGE), ("user", CONTEXT))
-        body["messages"] += [tool_call, {"role": "tool", "content": "ok"}]
-        plan = self.fake.plan_reply(body)
-        self.assertNotIn("tool", plan)
-        self.assertTrue(plan["text"].strip())
 
 
 if __name__ == "__main__":
