@@ -7,6 +7,7 @@ stubbed.
 Run: python3 -m pytest -q tests/test_file_server_unit.py
 """
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -127,6 +128,22 @@ class StaleFileServerReapTests(unittest.TestCase):
             urllib.request.urlopen(req, timeout=30)
         self.assertEqual(err.exception.code, 400)
 
+    def test_an_upload_to_a_symlink_out_of_the_directory_is_refused(self):
+        fs._start_file_server(port=0)
+        port = getattr(self.stub_owui_socket_main, fs._STALE_FILE_SERVER_ATTR).server_address[1]
+        self.assertTrue(self._wait_up(port), "server never came up")
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = Path(outside, "target")
+        link = Path("/tmp/openclaw-pipe-media", f"unit-link-{os.getpid()}")
+        link.symlink_to(target)
+        self.addCleanup(link.unlink)
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/{link.name}", data=b"hi", method="PUT")
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(err.exception.code, 400)
+        self.assertFalse(target.exists(), "the upload followed the symlink out of the directory")
+
     def test_reap_is_noop_outside_owui(self):
         for name in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
             sys.modules.pop(name, None)
@@ -140,6 +157,8 @@ class UploadDestTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.outside, ignore_errors=True)
 
     def test_a_plain_name_lands_in_the_directory(self):
         self.assertEqual(fs._upload_dest(self.dir, "/shot.png?x=1"),
