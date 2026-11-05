@@ -1,6 +1,7 @@
 """The Gateway prunes a silently paired device when another with the same client id, mode
-and displayName pairs. Both Pipe identities use a displayName of their own so others cannot
-evict them; the main one is sent by the Pipe and the Status Action alike, which share it."""
+and displayName pairs. Both Pipe identities use a displayName of their own, ending in the start of
+the device id (two installs on one Gateway would otherwise prune each other); the main one is sent by
+the Pipe and the Status Action alike, which share it."""
 import asyncio
 import json
 import os
@@ -40,11 +41,11 @@ def connect_frame(make_conn, identity_file):
 class DisplayNameTests(unittest.TestCase):
     def test_the_restricted_identity_connects_under_its_own_display_name(self):
         frame = connect_frame(openclaw_pipe._new_restricted_connection, "identity-restricted.json")
-        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe-restricted")
+        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe-restricted-dev-fixe")
 
     def test_the_main_identity_connects_under_its_own_display_name(self):
         frame = connect_frame(openclaw_pipe._GatewayConnection, "identity.json")
-        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe")
+        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe-dev-fixe")
 
     def test_the_main_and_the_restricted_identity_never_share_a_name(self):
         main = connect_frame(openclaw_pipe._GatewayConnection, "identity.json")["params"]["client"]["displayName"]
@@ -52,10 +53,20 @@ class DisplayNameTests(unittest.TestCase):
         self.assertTrue(main and restricted)
         self.assertNotEqual(main, restricted)
 
+    def test_two_installs_on_one_gateway_get_different_names(self):
+        main = [openclaw_pipe._display_name(openclaw_pipe.MAIN_DISPLAY_NAME, {"id": i}) for i in ("e769bc48d911eb96", "3eaa000b5b1c0f21")]
+        restricted = [openclaw_pipe._display_name(openclaw_pipe.RESTRICTED_DISPLAY_NAME, {"id": i}) for i in ("e769bc48d911eb96", "3eaa000b5b1c0f21")]
+        self.assertEqual(len(set(main + restricted)), 4)
+        self.assertEqual(main[0], "owui-pipe-e769bc48")
+
+    def test_without_a_device_id_the_name_is_the_base_alone(self):
+        self.assertEqual(openclaw_pipe._display_name("owui-pipe", None), "owui-pipe")
+        self.assertEqual(openclaw_pipe._display_name("owui-pipe", {}), "owui-pipe")
+
     def test_the_status_action_sends_the_pipes_name_for_the_shared_main_identity(self):
         import openclaw_status_action
         frame = connect_frame(openclaw_status_action._GatewayConnection, "identity.json")
-        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe")
+        self.assertEqual(frame["params"]["client"]["displayName"], "owui-pipe-dev-fixe")
 
     def test_the_client_id_and_mode_stay_what_the_signature_covers(self):
         client = connect_frame(openclaw_pipe._new_restricted_connection, "identity-restricted.json")["params"]["client"]

@@ -11,11 +11,20 @@ RESTRICTED_SCOPES = ["operator.read", "operator.write"]
 # The Gateway prunes a silently paired device when another silent client with
 # the same client id, mode and displayName pairs while it has no open socket.
 # A displayName of its own keeps other local "webchat" clients from evicting it.
-# The main identity needs one too: on a local Gateway it is approved silently like
-# any other loopback client, and a connect without a name clears the stored one, so
-# the Pipe and the Status Action (same identity) must always send the same name.
+# The name carries the first characters of the device id (`_display_name`), so
+# two installs on one Gateway do not share a name either. The main identity
+# needs one too: on a local Gateway it is approved silently like any loopback
+# client, and a connect without a name clears the stored one, so the Pipe and the
+# Status Action (same identity, same device id) always send the same name.
 MAIN_DISPLAY_NAME = "owui-pipe"
 RESTRICTED_DISPLAY_NAME = "owui-pipe-restricted"
+DISPLAY_NAME_ID_CHARS = 8
+
+
+def _display_name(base: str, ident: dict | None) -> str:
+    """`base` plus the start of the device id, e.g. owui-pipe-e769bc48; `base` alone without an id."""
+    device_id = (ident or {}).get("id") or ""
+    return f"{base}-{device_id[:DISPLAY_NAME_ID_CHARS]}" if device_id else base
 
 
 def _parse_owner_users(raw: str) -> frozenset:
@@ -2917,7 +2926,7 @@ class _GatewayConnection:
                 minProtocol=4, maxProtocol=4,
                 client=dict(id="webchat", version="1",
                             platform="linux", mode="cli",
-                            displayName=self._display_name),
+                            displayName=_display_name(self._display_name, self._ident)),
                 role="operator",
                 scopes=self.scopes,
                 auth=auth,
