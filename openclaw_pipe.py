@@ -5362,6 +5362,14 @@ _ROW_MARKER_TYPE = "_pipe_row"
 # is the steered message's answer and goes to that message's reply, whose
 # queues get `{"type", "_steered"}`.
 _STEERED_MARKER_TYPE = "_pipe_steered"
+# A turn pump's queue items (`writer._turn_pump_loop`): a run event, and the
+# baselines of a reply whose message was steered into the run it shows.
+_PUMP_EVENT = "event"
+_PUMP_STEERED_IN = "steered_in"
+# A run's clean end (its `chat` final or lifecycle end) and a run's start.
+_CHAT_FINAL = "final"
+_PHASE_END = "end"
+_PHASE_START = "start"
 
 
 def steers_mid_run_messages(version) -> bool:
@@ -6330,7 +6338,7 @@ def _pump_baselines(pump) -> dict | None:
         return None
     shadow = copy.deepcopy(renderer)
     for kind, item in list(pump.queue._queue):
-        if kind == "event" and item:
+        if kind == _PUMP_EVENT and item:
             shadow.feed(item)
     return {"received": shadow.received, "stream": shadow.received, "item": shadow.last_item}
 
@@ -6352,9 +6360,9 @@ class _WriterQueue(_RunQueue):
         if not isinstance(item, dict):
             return
         if item.get("_steered"):
-            self.pump.queue.put_nowait(("steered_in", item["_steered"]))
-        elif item.get("type") == "event":
-            self.pump.queue.put_nowait(("event", item.get("payload") or {}))
+            self.pump.queue.put_nowait((_PUMP_STEERED_IN, item["_steered"]))
+        elif item.get("type") == _PUMP_EVENT:
+            self.pump.queue.put_nowait((_PUMP_EVENT, item.get("payload") or {}))
 
 
 # Open WebUI's uvicorn Server, kept while it serves (see `owui_shutting_down`).
@@ -6975,7 +6983,7 @@ class _GatewayConnection:
                 spawn_background(self._record_child_end(parent, key, {**payload, "key": key}))
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
-        elif _TURNS and key and payload.get("phase") == "start":
+        elif _TURNS and key and payload.get("phase") == _PHASE_START:
             _TURNS.next_run(self, key)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
@@ -7705,7 +7713,7 @@ class _GatewayConnection:
             pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
             if pump is not None:
                 pump.terminal.set()
-            if payload.get("state") == "final" or (payload.get("data") or {}).get("phase") == "end":
+            if payload.get("state") == _CHAT_FINAL or (payload.get("data") or {}).get("phase") == _PHASE_END:
                 # Both writers end at the next run's start if no settle comes first.
                 for p in [pump, *(q.pump for q in consumer.queues)]:
                     if p is not None:
@@ -11895,7 +11903,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
-            if kind == "steered_in":
+            if kind == _PUMP_STEERED_IN:
                 # M's message was steered into run `item["run"]`: its events come
                 # here from now on, after what the reply before showed (`_steer`).
                 if writer is not None:

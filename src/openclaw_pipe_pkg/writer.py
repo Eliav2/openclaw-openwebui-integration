@@ -2400,7 +2400,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
-            if kind == "steered_in":
+            if kind == _PUMP_STEERED_IN:
                 # M's message was steered into run `item["run"]`: its events come
                 # here from now on, after what the reply before showed (`_steer`).
                 if writer is not None:
