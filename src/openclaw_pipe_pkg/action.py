@@ -18,13 +18,20 @@ _action_fallback_connection: "_GatewayConnection | None" = None
 _action_fallback_lock = asyncio.Lock()
 
 
+def _pipe_conn_reusable(pipe_conn) -> bool:
+    """The Pipe's connection serves the Action unless it moved endpoint or is
+    older than this Action (no cron revision to follow: the Pipe deploys on
+    its own, so the two can differ)."""
+    return pipe_conn is not None and _cron_token(pipe_conn) is not None and not pipe_conn.endpoint_moved()
+
+
 def _known_action_connection():
     """The connection `_get_action_connection` would use, up or down, without
     connecting: something to wait on while the Gateway is unreachable."""
     try:
         import open_webui.socket.main as _owui_socket_main
         pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
-        if pipe_conn is not None and not pipe_conn.endpoint_moved():
+        if _pipe_conn_reusable(pipe_conn):
             return pipe_conn
     except Exception:
         pass
@@ -37,7 +44,7 @@ async def _get_action_connection(valves_getter):
         import open_webui.socket.main as _owui_socket_main
         pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
         # A connection opened for an earlier GATEWAY_URL is not reused.
-        if pipe_conn is not None and not pipe_conn.endpoint_moved():
+        if _pipe_conn_reusable(pipe_conn):
             await pipe_conn.ensure_connected()
             return pipe_conn, "pipe"
     except Exception as ex:
@@ -2299,7 +2306,10 @@ _all_jobs_cache: dict = {}
 
 
 def _cron_token(conn):
-    return getattr(conn, "cron_revision", None)
+    """The revision a page holds: the connection's own id and its count, or
+    None for a connection without them (a Pipe older than this Action)."""
+    epoch, revision = getattr(conn, "cron_epoch", None), getattr(conn, "cron_revision", None)
+    return f"{epoch}:{revision}" if isinstance(epoch, str) and isinstance(revision, int) else None
 
 
 # How a Gateway before 2026.10.5 refuses `sessionKey` (its closed schema), lowercased.
@@ -2481,7 +2491,7 @@ async def _scheduled_data(conn, jobs_task, session_key: str, user_id: str, sourc
         pipe_log(f"[status-action] cron.list (scheduled) failed: {ex}")
         jobs, error = None, f"Could not read this chat's automations: {ex}"
     return {**_scheduled_rows(jobs, session_key, user_id), "error": error, "source": source,
-            "revision": token if isinstance(token, int) else None,
+            "revision": token,
             "fetchedAt": int(time.time() * 1000)}
 
 

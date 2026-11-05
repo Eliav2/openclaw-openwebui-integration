@@ -102,7 +102,7 @@ class _Conn:
     def __init__(self, jobs, *, no_session_filter=False, unknown=False, pages=None):
         self.calls, self.jobs, self.pages = [], jobs, pages
         self.no_session_filter, self.unknown = no_session_filter, unknown
-        self.cron_revision = 0
+        self.cron_epoch, self.cron_revision = "fake", 0
         self._waiter = None
 
     def cron_event(self):
@@ -230,12 +230,12 @@ class GatewayCronEventTests(unittest.TestCase):
         self.assertEqual(conn.cron_revision, after_gap)
 
     def test_no_two_connections_share_a_revision(self):
-        a = openclaw_pipe._GatewayConnection(lambda: None)
-        b = openclaw_pipe._GatewayConnection(lambda: None)
-        self.assertNotEqual(a.cron_revision, b.cron_revision)
-        a._on_cron_changed()
-        b._on_cron_changed()
-        self.assertNotEqual(a.cron_revision, b.cron_revision)
+        # The Pipe and the Action each load their own `_GatewayConnection`.
+        pipe = openclaw_pipe._GatewayConnection(lambda: None)
+        own = action._GatewayConnection(lambda: None)
+        self.assertNotEqual(action._cron_token(pipe), action._cron_token(own))
+        pipe.cron_revision = own.cron_revision = 7      # their counts can meet
+        self.assertNotEqual(action._cron_token(pipe), action._cron_token(own))
 
 
 class GatewayCloseTests(unittest.IsolatedAsyncioTestCase):
@@ -285,7 +285,7 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
     async def test_it_waits_for_the_cron_event_then_fills(self):
         conn = _Conn([_job("mine")])
         dialog_id, _dialog = self.dialog()
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision)
+        task, emitted = await self.ask(conn, dialog_id, action._cron_token(conn))
         self.assertFalse(task.done())
         self.assertEqual(conn.calls, [])          # nothing read until something changed
         conn.jobs.append(_job("added"))
@@ -293,19 +293,19 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
         data = _fill(emitted)
         self.assertEqual([r["title"] for r in data["rows"]], ["mine", "added"])
-        self.assertEqual(data["revision"], conn.cron_revision)
+        self.assertEqual(data["revision"], action._cron_token(conn))
 
     async def test_a_change_before_the_ask_fills_at_once(self):
         conn = _Conn([_job("mine")])
         dialog_id, _dialog = self.dialog()
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision - 1)
+        task, emitted = await self.ask(conn, dialog_id, "fake:old")
         self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
         self.assertEqual([r["title"] for r in _fill(emitted)["rows"]], ["mine"])
 
     async def test_closing_the_dialog_ends_it_without_a_fill(self):
         conn = _Conn([_job("mine")])
         dialog_id, dialog = self.dialog()
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision)
+        task, emitted = await self.ask(conn, dialog_id, action._cron_token(conn))
         dialog["closed"].set()
         self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
         self.assertIsNone(_fill(emitted))
@@ -315,14 +315,14 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         conn = _Conn([_job("mine")])
         dialog_id, dialog = self.dialog()
         dialog["expires"] = 0
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision)
+        task, emitted = await self.ask(conn, dialog_id, action._cron_token(conn))
         self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
         self.assertIsNone(_fill(emitted))
 
     async def test_only_the_dialogs_own_user(self):
         conn = _Conn([_job("mine")])
         dialog_id, _dialog = self.dialog()
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision - 1,
+        task, emitted = await self.ask(conn, dialog_id, "fake:old",
                                        user="22222222-2222-2222-2222-222222222222")
         self.assertEqual((await asyncio.wait_for(task, 5))["status"], "error")
         self.assertIsNone(_fill(emitted))
@@ -334,7 +334,7 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         conn = _Conn([_job("mine")])
         dialog_id, dialog = self.dialog()
         dialog["expires"] = 0
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision - 1)
+        task, emitted = await self.ask(conn, dialog_id, "fake:old")
         self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
         self.assertIsNone(_fill(emitted))
         self.assertEqual(conn.calls, [])
@@ -347,7 +347,7 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         self.patch(mock.patch("openclaw_status_action._get_action_connection", new=connect))
         self.patch(mock.patch("openclaw_status_action._known_action_connection", return_value=conn))
         task = asyncio.ensure_future(Action().action(
-            {"chat_id": CHAT, "mode": "scheduled-rows", "dialogId": dialog_id, "revision": conn.cron_revision},
+            {"chat_id": CHAT, "mode": "scheduled-rows", "dialogId": dialog_id, "revision": action._cron_token(conn)},
             __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted)))
         for _ in range(20):
             await asyncio.sleep(0)
@@ -364,7 +364,7 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         conn = _Conn([_job("mine")])
         dialog_id, dialog = self.dialog()
         dialog["closed"].set()
-        task, emitted = await self.ask(conn, dialog_id, conn.cron_revision - 1)
+        task, emitted = await self.ask(conn, dialog_id, "fake:old")
         self.assertEqual(await asyncio.wait_for(task, 5), {"status": "ok"})
         self.assertIsNone(_fill(emitted))
         self.assertEqual(conn.calls, [])

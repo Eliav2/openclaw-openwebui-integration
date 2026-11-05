@@ -415,6 +415,7 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reuses_pipe_connection_when_stashed(self):
         fake_conn = mock.AsyncMock()
         fake_conn.endpoint_moved = mock.Mock(return_value=False)
+        fake_conn.cron_epoch, fake_conn.cron_revision = "pipe", 0
         fake_module = types.SimpleNamespace(_openclaw_gateway_connection_v1=fake_conn)
         # `import open_webui.socket.main` needs the parent packages stubbed
         # too, or it silently takes the fallback path.
@@ -428,6 +429,32 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(conn, fake_conn)
         self.assertEqual(source, "pipe")
         fake_conn.ensure_connected.assert_awaited_once()
+
+    async def test_an_older_pipe_connection_is_not_reused(self):
+        """A Pipe deployed before this Action has no cron revision: the
+        Scheduled follow could not wait on it, so the Action opens its own."""
+        import openclaw_status_action as mod
+
+        old = mock.AsyncMock(spec=["ensure_connected", "endpoint_moved", "send_request"])
+        old.endpoint_moved = mock.Mock(return_value=False)
+        old.ensure_connected = mock.AsyncMock()
+        stub_modules = {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.socket": types.ModuleType("open_webui.socket"),
+            "open_webui.socket.main": types.SimpleNamespace(_openclaw_gateway_connection_v1=old),
+        }
+        mod._action_fallback_connection = None
+        own = mock.AsyncMock()
+        try:
+            with mock.patch.dict(sys.modules, stub_modules), \
+                 mock.patch("openclaw_status_action._GatewayConnection", return_value=own):
+                conn, source = await _get_action_connection(lambda: None)
+                self.assertIs(mod._known_action_connection(), own)   # what the follow waits on
+        finally:
+            mod._action_fallback_connection = None
+        self.assertIs(conn, own)
+        self.assertEqual(source, "action-own")
+        old.ensure_connected.assert_not_awaited()
 
     async def test_falls_back_to_own_connection_when_nothing_stashed(self):
         import openclaw_status_action as mod
