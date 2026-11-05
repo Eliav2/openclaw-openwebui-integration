@@ -60,7 +60,7 @@ I checked each one's live state (2026-11-05), and for Open WebUI which release h
 
 ### 3. Compat paths for versions we don't run
 
-The documented minimums ([Versions](../versions.md)) are **Open WebUI 0.12.4** (since #307) and **OpenClaw 2026.9.3**. Live runs Open WebUI 0.12.5 and OpenClaw 2026.10.10; CI tests 0.12.5/0.13.0 and 2026.10.5/2026.10.10-beta.1. Every path below is inside the supported range today, so cutting it changes that range: **Eliav's call (phase 3 rule)**.
+The documented minimums ([Versions](../versions.md)) are **Open WebUI 0.12.4** (since #307) and **OpenClaw 2026.9.3**. Live runs Open WebUI 0.13.0 and OpenClaw 2026.10.10; CI's blocking lane is that pair, with 2026.10.5 as a non-blocking oldest lane. Every path below is inside the supported range today, so cutting it changes that range: **Eliav's call (phase 3 rule)**.
 
 | Path | Gate | Est. lines (src / tests) |
 |---|---|---:|
