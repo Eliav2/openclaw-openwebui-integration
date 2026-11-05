@@ -9,6 +9,8 @@ self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 const MUST_SHOW = /iPhone|iPad|iPod/.test(self.navigator.userAgent) ||
   (/Macintosh/.test(self.navigator.userAgent) && self.navigator.maxTouchPoints > 1);
 const MUTE_ACTION_S = 8 * 3600;
+// The notification tag is per chat (oc-push.js uses the same).
+const TAG_PREFIX = "chat-";
 // Where a reply that could not be sent waits for the page (oc-push.js reads it).
 const DRAFTS = "oc-push-drafts";
 
@@ -24,7 +26,7 @@ self.addEventListener("push", (e) => {
     if (shown) {
       await self.registration.showNotification(p.title || "Open WebUI", {
         body: p.body || "New reply",
-        tag: "chat-" + (p.chat_id || "none"),   // one per chat: a newer one replaces it
+        tag: TAG_PREFIX + (p.chat_id || "none"),   // one per chat: a newer one replaces it (oc-push.js closes it when the chat is opened)
         renotify: true,
         icon: "/static/favicon.png",
         badge: "/static/favicon.png",

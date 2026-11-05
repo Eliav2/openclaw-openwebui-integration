@@ -485,3 +485,48 @@ def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
     assert json.loads(valves(token)["folder_mutes"]) == {}
     other()
     answer_and_check(None)
+
+
+def read(page, chat_id):
+    """The page script says it closed `chat_id`'s notifications; returns the tags still showing, read
+    at once (Chrome on Linux closes notifications by itself after a while, so only an immediate read
+    tells what the page closed)."""
+    page.wait_for_function("(c) => window.ocPushRead === c", arg=chat_id, timeout=WAIT_MS)
+    return sorted(n["tag"] for n in page.evaluate(NOTES))
+
+
+def test_opening_a_chat_clears_its_notifications(owui, browser):
+    ctx, page = browser
+    token = owui
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    other = behind(ctx, page)
+    page.evaluate(CLEAR)
+    chats = {}
+    for name in ("X", "Y", "Z"):
+        chat, msg = new_chat(token, "stub", "Chat " + name)
+        reply(token, "stub", chat, msg)
+        (d,) = seen_for(page, chat)
+        assert d["shown"]
+        chats[name] = chat
+    tag = {k: f"chat-{v}" for k, v in chats.items()}
+    assert sorted(n["tag"] for n in page.evaluate(NOTES)) == sorted(tag.values())
+    # Opened by any route, not only the notification: a page load ...
+    page.bring_to_front()
+    page.goto(f"{BASE}/c/{chats['X']}")
+    assert read(page, chats["X"]) == sorted([tag["Y"], tag["Z"]])
+    # ... or Open WebUI's own navigation to another chat (SvelteKit's pushState).
+    page.evaluate("(c) => history.pushState({}, '', '/c/' + c)", chats["Y"])
+    assert read(page, chats["Y"]) == [tag["Z"]]
+    # Hidden, a chat on the page is not read; shown again on it, it is. Chrome under Xvfb does not
+    # reliably hide a page (another tab, a minimized window), so the page's visibility is set here:
+    # what the page script reads (visibilityState) and the event it listens to.
+    vis = """(v) => { Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => v});
+                      document.dispatchEvent(new Event('visibilitychange')); }"""
+    page.evaluate(vis, "hidden")
+    page.evaluate("(c) => history.replaceState({}, '', '/c/' + c)", chats["Z"])
+    assert page.evaluate("() => window.ocPushRead") == chats["Y"]
+    page.evaluate(vis, "visible")
+    assert read(page, chats["Z"]) == []
+    page.evaluate("() => delete document.visibilityState")
+    other()

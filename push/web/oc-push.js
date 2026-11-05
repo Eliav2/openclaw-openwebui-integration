@@ -131,6 +131,7 @@
 
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
+  const VISIBLE = "visible";
   const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
   // The two mute lists in the function's user valves, {id: until} (0 always):
   // chats, and folders (a folder's mute covers the folders inside it).
@@ -327,7 +328,18 @@
     window.ocPushReply = { mode, text };
   }
 
+  // A chat on screen, however it was opened: its notifications on this device
+  // are read, close them (the tag is oc-sw.js's, one per chat).
+  const TAG_PREFIX = "chat-";
+  async function seen(id) {
+    if (!id || document.visibilityState !== VISIBLE) return;
+    const reg = await navigator.serviceWorker.getRegistration("/");
+    for (const n of (await reg?.getNotifications({ tag: TAG_PREFIX + id })) || []) n.close();
+    window.ocPushRead = id;   // for tests and tools, like ocPushState
+  }
+
   async function chatPage() {
+    seen(chatIdNow()).catch(() => {});
     if (!store.get("token")) return;
     if (mutes === null) await loadMutes().catch(() => {});
     placeBell();
@@ -372,10 +384,11 @@
   // An app left open in the background picks up a new service worker when it
   // comes back to the front (install, skipWaiting, claim), without a reload.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== VISIBLE) return;
     navigator.serviceWorker.getRegistration("/").then((r) => r && r.update()).catch(() => {});
-    // Mutes may have changed on another device.
     const id = chatIdNow();
+    seen(id).catch(() => {});
+    // Mutes may have changed on another device.
     if (store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
 
