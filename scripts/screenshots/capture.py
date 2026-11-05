@@ -1268,6 +1268,8 @@ class Scenes:
             last = [(m.get("done"), (m.get("content") or "")[-60:]) for m in replies]
             if (len(replies) >= TWO_REPLIES and all(m.get("done") is True for m in replies)
                     and self._rebuild_ends_with() in (replies[0].get("content") or "")
+                    and (not self.steers or any(i.get("type") == "function_call_output"
+                                                for i in replies[0].get("output") or []))
                     and "It's on main" in (replies[-1].get("content") or "")
                     and REBUILD_DONE not in (replies[-1].get("content") or "")):
                 return
