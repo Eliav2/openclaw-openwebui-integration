@@ -15,6 +15,7 @@ import time
 import threading
 import sys
 import hashlib
+import io
 import contextlib
 import copy
 import functools

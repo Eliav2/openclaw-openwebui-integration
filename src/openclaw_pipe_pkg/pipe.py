@@ -1055,6 +1055,22 @@ class _PipeTurn:
             self.ended = True
             return
 
+        # An image over the Gateway's cap would be refused whole: shrink it
+        # here, once, so every later send of this message carries the copy
+        # that fits. A retry (`_send_texts`) already has its fitted images.
+        # Only an image over it leaves the event loop: a message with small
+        # images must not wait a thread hop behind the ones before it.
+        if not self._send_texts and _images_over_cap(
+                self.image_attachments, self.conn.gateway_max_image_bytes):
+            try:
+                self.image_attachments = await asyncio.to_thread(
+                    _fit_image_attachments, self.image_attachments,
+                    self.conn.gateway_max_image_bytes)
+            except ImageTooLargeError as e:
+                await _emit_status(self.__event_emitter__, "", done=True)
+                yield str(e)
+                self.ended = True
+                return
 
         # --- Derive stable session key ---
         if self.__metadata__:

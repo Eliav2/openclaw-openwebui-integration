@@ -137,6 +137,8 @@ An image you attach or paste reaches the Pipe as a list of content blocks, not t
 
 Only that inline base64 form is handled, because Open WebUI does not send plain HTTP(S) image URLs for attached or pasted images. An image the Pipe cannot forward produces a visible note that it could not be relayed, so you never get an answer confidently describing a picture the agent never received.
 
+The Gateway refuses an image over its size cap (6 MB on OpenClaw today, read from the Gateway when it advertises it), and a phone camera photo is often bigger. The Pipe re-encodes such an image as a smaller JPEG that fits, upright as the phone shot it, and sends that; images under the cap go as they are. Re-encoding needs Pillow, which the Open WebUI image ships. Without it, or when even a much smaller copy would not fit, the chat says so in one plain sentence instead of the Gateway's error.
+
 Always on.
 
 ## Voice calls

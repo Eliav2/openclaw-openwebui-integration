@@ -67,7 +67,7 @@ class Artifact(NamedTuple):
 PIPE = Artifact(
     frontmatter=ROOT / "src" / "frontmatter.txt",
     out=ROOT / "openclaw_pipe.py",
-    module_order=("_prelude", "identity", "state", "turns", "thinking", "media", "emit",
+    module_order=("_prelude", "identity", "state", "turns", "thinking", "media", "images", "emit",
                   "composer", "composer_watch", "askuser", "approvals", "gateway", "errors", "writer", "models",
                   "history", "slash_prompts", "channels", "pipe"),
 )

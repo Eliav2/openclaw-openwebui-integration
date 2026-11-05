@@ -15,3 +15,7 @@ pytest==9.2.0
 pytest-cov==7.1.0
 click==8.5.0
 rich==15.0.0
+# The Pipe shrinks photos over the Gateway's image cap with Pillow, which Open
+# WebUI's image ships (13.0.0 in v0.13.0); public installs without it get a
+# plain message instead.
+pillow==13.0.0
