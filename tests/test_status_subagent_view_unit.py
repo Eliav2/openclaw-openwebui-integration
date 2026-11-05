@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""The sub-agent list and drawer on a phone (ELI-155).
-
-A sub-agent whose task was a long prompt filled the whole drawer: its title
-was the task, its status line the child's whole last reply, nothing was
-clamped and the header sat outside the scroller (B1-B4, B7). For a claude-cli
-child that reply was the run's closer, every message of the run joined (B5).
-The drawer stopped refreshing after 15 minutes without a word (B6), kept
-polling after it was closed, and a closed drawer's poll filled the next one;
-in-process agents had no detail at all (B10).
-"""
+"""The sub-agent list and drawer on a phone (ELI-155): long tasks clamp (B1-B4, B7),
+no repeated closer (B5), refresh until done (B6), in-process drawers (B10)."""
 
 import asyncio
 import json
@@ -40,8 +32,7 @@ LONG_TASK = ("Repo: private GitHub repo example/trade-bot (gh: GH_CONFIG_DIR=/ho
 LONG_RESULT = "Now rewriting run.sh and the workflow into a two-phase matrix. Polling. " * 14
 IDENTITY = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
 
-# The fake page, plus what these tests need: the viewport width, a recording
-# fetch whose promise settles at once, and a token store.
+# The fake page plus the viewport width, a recording fetch and a token store.
 _PAGE_JS = _FAKE_DOM_JS + r"""
 global.innerWidth = input.width || 1280;
 global.localStorage = { getItem: () => 'tok' };
@@ -132,9 +123,8 @@ def _fill(key, task, items=(), **extra):
 
 
 class DrawerHeaderTests(unittest.TestCase):
-    """B2, B3, B4: the header is one title line with the status and time, a
-    model and "from" line, and the head of the task, two lines with "Show
-    all"; the run has the rest of the screen."""
+    """B2, B3, B4: a one-line title with status and time, a model and "from"
+    line, a two-line task head with "Show all"; the run gets the rest."""
 
     def _open(self, width):
         labelled, _ = _rows()
@@ -182,9 +172,7 @@ console.log(JSON.stringify({
         self.assertIn("×", wide["buttons"])
 
     def test_a_long_parent_name_never_clips_the_control_ui_link(self):
-        # On a phone the parent's name filled the one nowrap line and the
-        # "Open in OpenClaw" link after it was cut off: now only the model
-        # and parent shrink, and the link sits outside them at full width.
+        # Only the model and parent shrink; the "Open in OpenClaw" link keeps its full width.
         labelled, _ = _rows()
         seen = _page(r"""
 run(input.drawer);
@@ -241,8 +229,7 @@ const shown = () => stream().children.map((e) => {
 
 
 class RunTests(unittest.TestCase):
-    """The run below the header: a read-only chat of the sub-agent's turns,
-    tool cards and reply, and where it stands."""
+    """The run under the header: a read-only chat of the sub-agent's turns, cards and reply."""
 
     def _shown(self, fills, task=None, width=390):
         _, unlabelled = _rows()
@@ -360,9 +347,7 @@ console.log(JSON.stringify({before, request: fetches.slice(asked)}));
 
 
 class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
-    """B5: the run ends with the child's reply, once. A claude-cli run ends
-    with the Gateway's closer (`cli-assistant:<run>`), which repeats every
-    message of the run joined: the progress log."""
+    """B5: the run ends with the reply once, not the `cli-assistant:<run>` closer."""
 
     async def _items(self, messages):
         async def send_request(method, params, timeout=5):
@@ -405,13 +390,10 @@ class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PollTests(unittest.IsolatedAsyncioTestCase):
-    """B6, B10: the open drawer refreshes until its sub-agent ends, with no
-    15-minute stop; a closed drawer stops; a stale fill never paints another
-    sub-agent's drawer."""
+    """B6, B10: refresh until the end; stop when closed; no stale fills."""
 
     async def test_one_request_fills_once_and_returns(self):
-        """The poll is the page's: a request no longer holds open for the
-        child's run, so nothing keeps polling for a closed drawer."""
+        """The page polls, so nothing keeps polling for a closed drawer."""
         describes = []
 
         async def send_request(method, params, timeout=5):
@@ -427,7 +409,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
 
         with action_gateway(_drawer_conn(send_request)):
             result = await asyncio.wait_for(Action()._run_subagent_detail(
-                {"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter), 5)  # bounds the test only
+                {"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter), 5)
         self.assertEqual(result["status"], "ok")
         self.assertEqual(describes, [CHILD])
 
@@ -486,8 +468,7 @@ console.log(JSON.stringify({run: document.getElementById('openclaw-drawer-stream
 
 
 async def _drawer_fill(send_request, body=None, user=None):
-    """Run one drawer request against a fake Gateway; returns its fill's DATA
-    and the RPCs it made."""
+    """Run one drawer request on a fake Gateway; returns its DATA and RPCs."""
     emitted = []
     emitter = RecordingEmitter(emitted)
 
@@ -501,8 +482,7 @@ async def _drawer_fill(send_request, body=None, user=None):
 
 
 class RunReadTests(unittest.IsolatedAsyncioTestCase):
-    """How much of the run one read carries, and what a claude-cli child's
-    run can and cannot show."""
+    """How much of the run one read carries, and what a claude-cli child shows."""
 
     async def test_a_run_over_the_byte_budget_keeps_its_newest_steps(self):
         big = "x" * 7000
@@ -626,12 +606,10 @@ class RunReadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InProcessAgentDetailTests(unittest.TestCase):
-    """B10: an in-process agent opens the same sheet, from its tool card:
-    its task and its result, nothing to poll."""
+    """B10: an in-process agent opens the same sheet from its tool card."""
 
     def test_an_agent_row_opens_its_task_and_result(self):
-        """The same sheet: its task as the turn that started it, its result
-        as the reply."""
+        """Its task is the opening turn, its result the reply."""
         agent = {"id": "t2", "title": "Broker research", "state": "returned", "startedAt": NOW - 60_000,
                  "task": "Compare IBKR and Trading212 for a small account.", "result": "IBKR: lower fees."}
         seen = _page(_RUN_JS + r"""
@@ -668,10 +646,8 @@ if __name__ == "__main__":
 
 
 class SpawnMessageShapeTests(unittest.TestCase):
-    """ELI-164: on OpenClaw 2026.10.10 `chat.history` shows a child's spawn
-    message as its bare task, and keeps the wrapped prompt the model got in
-    `__openclaw.modelPromptProjection.text`. The drawer read no task from it
-    and showed the task again as a user turn in the run."""
+    """ELI-164: 2026.10.10 keeps the wrapped spawn prompt in
+    `__openclaw.modelPromptProjection.text`; the task is read from there."""
 
     WRAPPED = ("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\n[Subagent Context] You are running as a subagent "
                "(depth 1/5). Complete the current [Subagent Task]; inherited conversation is background "

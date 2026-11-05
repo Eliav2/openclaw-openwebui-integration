@@ -1,7 +1,5 @@
-"""A fake `sessions.list` that pages like the Gateway: 100 rows by default
-(recorded on 2026.10.10 and live: `{}` returns 100 of 131, `totalCount` says
-131, `limit` and `offset` page it, `search` is a substring of the key). Not a
-suite itself (pytest collects test_*.py only)."""
+"""A fake `sessions.list` that pages like the Gateway (2026.10.10): 100 rows by default,
+`totalCount`, `limit`/`offset` paging, `search` a key substring. Not a suite."""
 
 DEFAULT_LIMIT = 100
 
@@ -27,9 +25,8 @@ class PagedSessions:
 
 
 def crowd(key, *, busy, before=120, after=10):
-    """`before` idle sessions newer than `key` and `after` older ones: `key`
-    sits past the default page, like a long run whose row was last touched
-    when it started."""
+    """`before` sessions newer than `key` and `after` older ones, so `key` sits
+    past the default page, like a long run."""
     idle = lambda n, tag: [{"key": f"agent:main:openwebui-user-{tag}{i:04d}", "hasActiveRun": False,
                             "status": "done"} for i in range(n)]
     return idle(before, "new") + [{"key": key, "hasActiveRun": busy, "status": "running" if busy else "done"}] + \

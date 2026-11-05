@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""The Status Action's Subagents section and drawer (ELI-106).
-
-They used to read the Gateway's Tasks API (`tasks.list`, `tasks.get`), which
-OpenClaw removes in 2026.9.7. They now read the parent's child sessions
-(`sessions.list` with `spawnedBy`), the task text from the child's transcript
-head (`sessions.preview`), and the child session itself (`sessions.describe`,
-`chat.history`): RPCs both 2026.9.3 and 2026.10.3 serve.
-"""
+"""The Status Action's Subagents section and drawer (ELI-106), read from child
+sessions, not the Tasks API that 2026.9.7 removes."""
 
 import json
 import os
@@ -68,10 +62,7 @@ def _child(key, status, **kw):
 class SubagentListTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open(self, rows, previews, *, unfold=False):
-        """Open the dialog; `unfold`: then tap a folded Subagents section
-        open, as the page does (mode "subagent-rows"). Returns the RPCs,
-        the emitted events and the last Subagents fill's data; the In-process
-        agents fill's data is on `self.agents_data`."""
+        """Open the dialog (`unfold`: tap Subagents open); return RPCs, events, last fill."""
         calls, emitted, seen, agents = [], [], [], []
 
         emitter = RecordingEmitter(emitted)
@@ -115,7 +106,6 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         # The spawn label wins; the task is the drawer's (ELI-155).
         self.assertEqual((b["title"], b["task"], b["status"]), ("y-summary", "Summarise Y.", "queued"))
         self.assertEqual((done["status"], done["startedAt"], done["endedAt"]), ("completed", 900, 990))
-        # Rendered: the section's own fill carries the rows.
         code = next(c for c in _emitted_codes(emitted)
                     if "getElementById('openclaw-status-section-subagents')" in c)
         self.assertIn("Research X and report.", code)
@@ -136,10 +126,7 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["tasks"][0]["endedAt"], 4000)
 
     async def test_a_child_whose_last_message_is_its_spawn_shows_no_subtitle(self):
-        """Right after a spawn the child's newest message is the spawn itself,
-        so lastMessagePreview is the "[Subagent Context] ... Begin. Execute the
-        assigned task" wrapper, raw or flattened to one line. That is the task
-        again, not progress (ELI-119)."""
+        """Right after a spawn the preview is the spawn wrapper: not progress (ELI-119)."""
         flat_93, flat_103 = " ".join(WRAPPED_93.split()), " ".join(WRAPPED_103.split())
         for preview in (WRAPPED_93, WRAPPED_103, flat_93, flat_103):
             with self.subTest(preview=preview[:40]):
@@ -161,9 +148,7 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sessions.preview", [m for m, _p in calls])
 
     async def test_an_ended_child_has_its_task_as_title_and_its_last_reply_as_summary(self):
-        """Nothing runs, so the section opens folded (ELI-163) and its
-        transcripts wait for the reader's tap; the tap reads them once and
-        lists the rows the open already read, without listing again."""
+        """Nothing runs: folded (ELI-163); the tap reads transcripts once, no relisting."""
         rows = [_child(CHILD_DONE, "done", startedAt=900, endedAt=990)]
         previews = {CHILD_DONE: [{"role": "user", "text": WRAPPED_103}, {"role": "assistant", "text": "Y is fine"}]}
         calls, _emitted, data = await self._open(rows, previews)
@@ -294,9 +279,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["items"], [{"kind": "text", "text": "X is fine"}])
 
     async def test_the_task_is_the_headers_not_a_turn_of_the_run(self):
-        """The child's first user message is the Gateway's spawn wrapper: the
-        header shows the task in it, the way the Subagents row does (ELI-119),
-        and the run does not repeat it, on both versions and both shapes."""
+        """The header takes the task from the spawn wrapper (ELI-119); the run skips it."""
         for wrapped, task in ((WRAPPED_93, "Research X and report."), (WRAPPED_103, "Summarise Y.")):
             for content in (wrapped, [{"type": "text", "text": wrapped}]):
                 with self.subTest(task=task, shape=type(content).__name__):
@@ -347,9 +330,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._fill(emitted)["task"]["error"], "provider 529")
 
     async def test_a_deleted_child_opens_from_what_was_recorded(self):
-        """A child spawned with cleanup "delete" has no session once it ended
-        (ELI-276): the drawer shows the row and task the index kept, says why
-        its run is not there, and leads the error with the run's own (ELI-277)."""
+        """A deleted child's drawer shows its kept row (ELI-276) and run error (ELI-277)."""
         fresh_child_index()
         ended = _child(CHILD_A, "failed", startedAt=1, endedAt=2, lastRunError="needs a short break")
         openclaw_status_action._subagent_remember(PARENT_KEY, rows=[ended], tasks={CHILD_A: "Research X."},
@@ -383,8 +364,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Sub-agent not found.", _emitted_codes(emitted)[-1])
 
     async def test_a_legacy_task_id_is_no_longer_available(self):
-        """Messages written before ELI-100 carry a Tasks API id, which nothing
-        but the removed `tasks.get` can resolve."""
+        """Pre-ELI-100 messages carry a Tasks API id that only `tasks.get` resolves."""
         async def send_request(method, params, timeout=5):
             raise AssertionError(f"unexpected RPC: {method}")
 
@@ -394,9 +374,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NoTasksApiTests(unittest.TestCase):
-    """Sub-agents never come from the Tasks API, which 2026.10 removed. The
-    Background section reads `tasks.list` behind one adapter that degrades
-    on a Gateway without it (ELI-163)."""
+    """No Tasks API for sub-agents; Background's `tasks.list` degrades (ELI-163)."""
 
     def test_only_the_background_adapter_calls_the_tasks_api(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -409,11 +387,7 @@ class NoTasksApiTests(unittest.TestCase):
 
 
 class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-127: the dialog's ticker counts a running child up (ELI-120), and
-    the dialog filled once, so a child that finished while it stayed open
-    kept its "running" dot and counted up until the dialog was reopened.
-    The section refills when a listed child's run state changes: the
-    Gateway's pushed `sessions.changed`, no polling."""
+    """ELI-127: a child that ends while open stops its ticker (ELI-120), on `sessions.changed`."""
 
     NOW = 1_783_790_100_000
 
@@ -426,8 +400,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         waiters, emitted = {}, []
 
         def session_change_event(key):
-            # As the connection does: one Event per session, popped and set
-            # by the next pushed change to its run state.
+            # One Event per session, set by the next pushed run-state change.
             return waiters.setdefault(key, asyncio.Event())
 
         emitter = RecordingEmitter(emitted)
@@ -439,33 +412,25 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         with action_gateway(conn):
             opened = asyncio.ensure_future(Action().action(
                 {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=emitter))
-            # Until the dialog is filled and follows its child (or, without
-            # the follow, has returned).
             while not opened.done() and CHILD_A not in waiters:
                 await asyncio.sleep(0)
             rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
-            previews[CHILD_A] = previews[CHILD_A] + [{"role": "assistant", "text": "Done."}]   # its reply
+            previews[CHILD_A] = previews[CHILD_A] + [{"role": "assistant", "text": "Done."}]
             ev = waiters.pop(CHILD_A, None)
             if ev is not None:
                 ev.set()    # the Gateway pushes the child's settle
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            await asyncio.wait_for(opened, 5)
 
         fills = [c for c in _emitted_codes(emitted)
                  if "getElementById('openclaw-status-section-subagents')" in c]
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fills": fills,
                    "steps": [{"advance": 60}]}
-        # A minute later the ended child is still listed (ELI-152), with
-        # its own duration, not counting up.
+        # The ended child is still listed (ELI-152) and stops counting.
         self.assertEqual(run_page(_DIALOG_PAGE_JS, payload), [{"cells": ["1s"], "timers": 1}])
 
     async def test_a_child_opened_before_its_task_is_in_its_transcript_is_titled_once_it_is(self):
-        """ELI-253: on 2026.10 the spawn message reaches the child's transcript
-        after the spawn returns. A dialog opened in between, with no task
-        recorded from the spawn call (none is, on a claude-cli Gateway), read
-        no task and titled the running child by its session key for as long
-        as it stayed open. The transcript append is pushed (`session.message`
-        on a transcript subscription); the section refills on it."""
+        """ELI-253: a late spawn message refills the section on `session.message`."""
         import asyncio
 
         rows = [_child(CHILD_A, "running", startedAt=self.NOW - 1000)]
@@ -481,8 +446,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         real = openclaw_status_action._render_subagents_fill_js
 
         async def settle():
-            # Let the dialog run until it waits (bounded: a dialog that
-            # never waits on the append still gets checked).
+            # Bounded, so a dialog that never waits still gets checked.
             for _ in range(2000):
                 await asyncio.sleep(0)
 
@@ -501,22 +465,17 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             await settle()
             titled = [t["title"] for d in seen for t in d["tasks"] if t["status"] == "running"]
             rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
-            previews[CHILD_A] = previews[CHILD_A] + [{"role": "assistant", "text": "Done."}]   # its reply
+            previews[CHILD_A] = previews[CHILD_A] + [{"role": "assistant", "text": "Done."}]
             ev = changes.pop(CHILD_A, None)
             if ev is not None:
                 ev.set()    # the child's settle ends the follow
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            await asyncio.wait_for(opened, 5)
 
         self.assertEqual(subscribed, [CHILD_A])
         self.assertEqual(titled[-1], "Summarise Y.", titled)
 
     async def test_a_child_spawned_after_the_dialog_opened_is_listed_while_it_stays_open(self):
-        """ELI-260: the dialog followed only the children listed at its open,
-        so with none listed it stopped at once, and a child the chat's run
-        spawned after the open stayed out of it until a reopen. While the
-        chat's own session runs, the dialog follows it, and a new child's
-        row change (pushed with `spawnedBy` naming this chat's session)
-        refills the section."""
+        """ELI-260: a child spawned after the open, during the run, refills the section."""
         import asyncio
 
         rows, parent = [], {"busy": True}
@@ -560,19 +519,18 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
             following = not opened.done()
             rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
-            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "Done."}]   # its reply
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "Done."}]
             parent["busy"] = False
             push(changes, CHILD_A)
             push(changes, PARENT_KEY)
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            await asyncio.wait_for(opened, 5)
 
         self.assertEqual(listed_while_open, ["running"])
         self.assertTrue(following)
         self.assertEqual([t["status"] for t in seen[-1]["tasks"]], ["completed"])
 
     def _follow_conn(self, rows, describe, previews=None):
-        """A connection whose events are kept per session key, as the real
-        one does: (conn, {kind: {key: Event}})."""
+        """A connection with events per session key: (conn, {kind: {key: Event}})."""
         import asyncio
 
         events = {"change": {}, "message": {}, "child": {}}
@@ -605,12 +563,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
     async def test_a_dialog_opened_before_the_chats_run_starts_follows_it(self):
-        """ELI-260 reopened (1 in 5): opened 0.3 s after a send, the
-        dialog read the chat's session before the Gateway had its run
-        (`hasActiveRun` false; the Pipe's chat.send was still in flight), so
-        it stopped at once and the child the run spawned never showed. The
-        Pipe streaming the reply in this process already has its consumer
-        registered: the dialog follows that reply too."""
+        """ELI-260 reopened: opened before `hasActiveRun`, it follows the streaming reply."""
         import asyncio
 
         rows, describe, reply = [], {"key": PARENT_KEY, "hasActiveRun": False}, {"on": True}
@@ -634,20 +587,16 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             await self._settle()
             listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
             rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
-            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "SUB-51"}]   # its reply
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "SUB-51"}]
             describe["hasActiveRun"], reply["on"] = False, False
             self._push(events["change"], CHILD_A)
             self._push(events["change"], PARENT_KEY)
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            await asyncio.wait_for(opened, 5)
 
         self.assertEqual(listed_while_open, ["running"])
 
     async def test_a_folded_section_stays_folded_through_a_refill_until_the_tap(self):
-        """ELI-266: opened while the chat's run was ending, with its children
-        done, the section opened folded with its transcripts left for the tap
-        (ELI-163); the run's end refilled it as read, so the tap asked for
-        nothing (the docs' dropped-tap shot timed out on main). The refill
-        keeps it folded; the tap reads the transcripts, once."""
+        """ELI-266: the run-end refill keeps a folded section folded (ELI-163)."""
         import asyncio
 
         rows = [_child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000),
@@ -675,10 +624,9 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             fills, lists = len(seen), listed()
             describe["hasActiveRun"] = False
             self._push(events["change"], PARENT_KEY)    # the chat's run ends
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            await asyncio.wait_for(opened, 5)
             self.assertGreater(listed(), lists)     # the section was read again
-            # Unchanged and still waiting for the tap, so not sent: it would
-            # replace what the page made of it since (ELI-268).
+            # Not sent: it would replace what the page made of it (ELI-268).
             self.assertEqual(len(seen), fills)
             self.assertEqual(previews_read(), 0)
             await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows",
@@ -690,13 +638,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[-1]["tasks"][-1]["terminalSummary"], "X is fine")
 
     async def test_a_child_done_in_the_open_dialog_gets_its_result_and_the_chat_its_context(self):
-        """A child that ended while the dialog followed it showed Done
-        with no result line, and the dialog stopped there: a claude-cli
-        child's messages reach its transcript after its run settles. Context,
-        read at an open right after a send, had no data yet and never got it.
-        The dialog follows an ended child until its last message is in its
-        row (its transcript append is pushed), and refills Context on each
-        change of the chat's run."""
+        """A claude-cli child's reply lands after it settles: follow until it shows."""
         import asyncio
 
         rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
@@ -724,9 +666,9 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             self._push(events["change"], CHILD_A)
             await self._settle()
             following = not opened.done()
-            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "SUB-51: 17 x 3 = 51"}]   # its reply
-            self._push(events["message"], CHILD_A)      # the reply is appended
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "SUB-51: 17 x 3 = 51"}]
+            self._push(events["message"], CHILD_A)
+            await asyncio.wait_for(opened, 5)
 
         self.assertTrue(following, "stopped at the child's settle, before its reply")
         self.assertEqual(seen[-1]["tasks"][0]["terminalSummary"], "SUB-51: 17 x 3 = 51")
@@ -734,14 +676,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         conn.ensure_message_subscription.assert_any_await(CHILD_A)
 
     async def test_a_childs_result_reads_the_same_in_the_open_dialog_and_a_fresh_open(self):
-        """ELI-264: the Gateway gives a child's last message two ways.
-        `sessions.list` with `includeLastMessage` has it as `lastMessagePreview`,
-        markdown flattened (2026.10.5 session-transcript-title-reader:
-        flattenMarkdown); `sessions.preview` has the transcript's text as
-        written. The open dialog's refills list with the former, a fresh
-        open's list did not, so its tap showed the latter: the same result
-        read "The command cd /home/user/x ran" in place and "The command
-        `cd /home/user/x` ran" after a reopen."""
+        """ELI-264: in place and a reopen's tap show the same (unflattened) text."""
         import asyncio
 
         raw, flat = "The command `cd /home/user/x` ran.", "The command cd /home/user/x ran."
@@ -750,7 +685,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
 
         async def gateway(method, params, timeout=5):
-            # As 2026.10.5 answers: the list's preview only when asked for.
+            # As 2026.10.5: the list's preview only when asked for.
             if method == "sessions.list":
                 last = params.get("includeLastMessage") and transcript[CHILD_A][-1]["role"] == "assistant"
                 return {"sessions": [dict(r, lastMessagePreview=flat) if last else r for r in rows]}
@@ -767,7 +702,6 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         real = openclaw_status_action._render_subagents_fill_js
         spy = mock.patch("openclaw_status_action._render_subagents_fill_js",
                          side_effect=lambda d: (seen.append(d), real(d))[1])
-        # In place: open while the child runs, then it ends with its result.
         conn, events = connection()
         with action_gateway(conn), spy:
             opened = asyncio.ensure_future(Action().action(
@@ -776,10 +710,9 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             rows[0] = done
             transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": raw}]
             self._push(events["change"], CHILD_A)
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            await asyncio.wait_for(opened, 5)
         in_place = seen[-1]["tasks"][0]["terminalSummary"]
 
-        # A fresh open of the same child, then the tap that unfolds it.
         conn, _events = connection()
         emitted = []
         with action_gateway(conn), spy:
@@ -792,15 +725,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(in_place, reopened)
 
     async def test_a_claude_cli_childs_result_reads_the_same_in_place_as_after_a_reopen(self):
-        """ELI-264 on live (QA session 35, 4/4): the open dialog kept "ran
-        `cd /config` and got `SUB-51`" while every reopen read "ran cd /config
-        and got SUB-51". What the dialog gets when a claude-cli child ends:
-        its settle, with nothing in its transcript yet; then the append of its
-        reply (`session.message`), which the transcript read has at once while
-        the list's `lastMessagePreview` (read from the transcript index,
-        reconciled later, and markdown flattened) is still empty; then nothing:
-        the list catches up with no push. The in-place row was filled from the
-        transcript, a reopen from the list."""
+        """ELI-264 on live: the list's preview catches up later with no push."""
         import asyncio
 
         raw, flat = "ran `cd /config` and got `SUB-51`", "ran cd /config and got SUB-51"
@@ -831,11 +756,11 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
                 {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([])))
             await self._settle()
             rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
-            self._push(events["change"], CHILD_A)       # its settle
+            self._push(events["change"], CHILD_A)
             await self._settle()
             transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": raw}]
-            self._push(events["message"], CHILD_A)      # its reply's append
-            await asyncio.wait_for(opened, 5)   # bounds the test only
+            self._push(events["message"], CHILD_A)
+            await asyncio.wait_for(opened, 5)
         in_place = seen[-1]["tasks"][0]["terminalSummary"]
 
         indexed["text"] = flat      # the list caught up, with no push
@@ -853,9 +778,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _WindowGateway:
-    """A Gateway's session store as 2026.9.3 lists it: `spawnedBy` returns a
-    parent's children that run or ended in the last 30 minutes only
-    (`current`), `search` matches keys, and no filter returns every row."""
+    """A 2026.9.3 store: `spawnedBy` covers 30 minutes, `search` matches keys."""
 
     def __init__(self, rows, current=(), fail_spawned_by=False, runs=None):
         self.rows, self.current, self.fail = rows, set(current), fail_spawned_by
@@ -885,10 +808,7 @@ class _WindowGateway:
 
 
 class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
-    """Subagents lists the chat's children without reading every session:
-    the children the Pipe saw it spawn (its child index), the current ones
-    (`spawnedBy`), and a direct lookup of a recorded child the 30-minute
-    window dropped. Ended children stay listed (ELI-152)."""
+    """Children come from the index, `spawnedBy` and lookups; ended ones stay (ELI-152)."""
 
     def setUp(self):
         self.state = os.environ["OPENCLAW_BRIDGE_STATE_DIR"]
@@ -909,10 +829,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         return seen
 
     async def test_a_child_whose_transcript_lacks_its_spawn_yet_is_titled_by_its_task(self):
-        """On 2026.10 a child's spawn message reaches its transcript after the
-        spawn returns, so a dialog opened at once read no task and titled the
-        running child by its key until it ended (ELI-178). The task the spawn
-        call was given, which the Pipe recorded, titles it instead."""
+        """The Pipe's recorded spawn task titles a child before its transcript (ELI-178)."""
         task = "Research X and report."
         openclaw_status_action._subagent_remember(PARENT_KEY, keys=[CHILD_A], tasks={CHILD_A: task})
         for status, unfold in (("running", False), ("done", True)):
@@ -961,9 +878,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gw2.full_reads(), [])
 
     async def test_the_seed_picks_the_chats_children_by_either_parent_field(self):
-        """ELI-152's rule for the one full list: a child names its parent in
-        `spawnedBy` or `parentSessionKey`; read from the store alone (a last
-        message reads every session's transcript)."""
+        """ELI-152: a child names its parent in `spawnedBy` or `parentSessionKey`."""
         os.unlink(os.path.join(self.state, openclaw_status_action._SUBAGENT_INDEX_NAME))
         other = "agent:main:openwebui-user-1-other-chat"
         rows = [
@@ -986,11 +901,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["total"], 3)
 
     async def test_a_child_whose_session_was_deleted_stays_listed(self):
-        """A child spawned with cleanup "delete" is removed seconds after it
-        ends, and a lookup by its key finds nothing. It was dropped, so the
-        dialog listed only the children still there (ELI-276). Now its row
-        comes from its run while the Gateway holds that, else it is listed
-        as ended."""
+        """A deleted child is still listed, from its run or as ended (ELI-276)."""
         openclaw_status_action._subagent_remember(PARENT_KEY, keys=[CHILD_A, CHILD_B], runs={
             CHILD_A: {"runId": "r1", "label": "clean ok"}, CHILD_B: {"runId": "r2"}})
         gw = _WindowGateway([], runs={"r1": {"status": "ok", "startedAt": 1000, "endedAt": 1100}})
@@ -1004,8 +915,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("r1", [p.get("runId") for m, p in gw2.calls if m == "agent.wait"])
 
     async def test_a_failed_child_leads_with_its_runs_own_error(self):
-        """`lastRunError` is canned copy chosen by the error's class: a 402
-        billing error read "short break" (ELI-277)."""
+        """`lastRunError` is canned copy, so the run's own error is used (ELI-277)."""
         openclaw_status_action._subagent_remember(
             PARENT_KEY, rows=[_child(CHILD_A, "failed", startedAt=1, endedAt=2,
                                      lastRunError="The AI service needs a short break.")],
@@ -1015,8 +925,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
                          "fake returned a billing error | 402 (Gateway: The AI service needs a short break.)")
 
     def test_the_pipe_records_the_task_an_accepted_spawn_was_given(self):
-        """The receipt carries no task: the call's start event does, called
-        directly or through 2026.10's `dispatch_action` wrapper."""
+        """The task is in the call's start event, direct or via `dispatch_action`."""
         receipt = json.dumps({"status": "accepted", "childSessionKey": CHILD_A, "runId": "r1"})
         envelope = {"content": [{"type": "text", "text": json.dumps(
             {"tool": {"id": "openclaw:core:sessions_spawn"}, "result": {"content": [{"type": "text", "text": receipt}]}})}]}
@@ -1053,9 +962,7 @@ OWUI_PARENT = "agent:main:openwebui-" + "u" * 36 + "-" + "c" * 36
 
 
 class ChildEndTests(unittest.IsolatedAsyncioTestCase):
-    """The Pipe keeps a chat's child as it ended, from the Gateway's push, and
-    a failed run's own error: once a cleanup "delete" removed the session,
-    neither can be read (ELI-276, ELI-277)."""
+    """The Pipe keeps an ended child and its error from the push (ELI-276, ELI-277)."""
 
     def setUp(self):
         fresh_child_index()
@@ -1097,7 +1004,7 @@ class ChildEndTests(unittest.IsolatedAsyncioTestCase):
                          '{"status":400,"error":{"message":"not supported"}}')
         for c in self._push("failed", startedAt=1, endedAt=2):
             await c
-        self.assertEqual(self.conn.send_request.await_count, 2)   # read once
+        self.assertEqual(self.conn.send_request.await_count, 2)
 
     def test_a_json_error_body_reads_as_its_message(self):
         text = openclaw_status_action._run_error_text
@@ -1144,9 +1051,7 @@ def _agents_chat():
 
 
 class InProcessAgentTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-152: most sub-agents are Claude Code's in-process Agent calls,
-    which the Gateway never lists as child sessions. The section lists them
-    from the chat's own Agent tool cards: what the card can tell."""
+    """ELI-152: in-process Agent calls are listed from the chat's Agent tool cards."""
 
     def test_agent_cards_on_the_current_branch_newest_first(self):
         rows = openclaw_status_action._agent_call_rows(_agents_chat())
@@ -1210,10 +1115,7 @@ class InProcessAgentTests(unittest.IsolatedAsyncioTestCase):
 
 
 def _chain(n, missing_rows=()):
-    """A chat of `n` messages in one branch, m0 (oldest) to m{n-1}, each
-    assistant message with one Agent call; and readers over it as the narrow
-    read gets them: parent links of the messages with a row, the rows, and
-    the chat's own copy for the ones without."""
+    """A one-branch chat of `n` messages with an Agent call each, and its readers."""
     msgs = {}
     for i in range(n):
         role = "user" if i % 2 == 0 else "assistant"
@@ -1234,8 +1136,7 @@ def _chain(n, missing_rows=()):
 
 
 class RecentBranchTests(unittest.IsolatedAsyncioTestCase):
-    """The In-process agents and Background sections read the chat's last 40
-    messages, not the whole chat: their time stays flat as a chat grows."""
+    """The sections read only the last 40 messages, so a long chat stays fast."""
 
     async def test_a_long_chat_is_cut_to_the_recent_messages(self):
         links, rows, blob, reads = _chain(100)
@@ -1261,8 +1162,7 @@ class RecentBranchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["title"], "job 5")
 
     async def test_a_running_reply_lists_what_the_pipe_shows(self):
-        """ELI-186: Open WebUI saves a reply's calls only when it ends, so a
-        running reply's row holds none; the Pipe streaming it has them."""
+        """ELI-186: a running reply's calls come from the Pipe, not Open WebUI's row."""
         links, read_rows, blob, _reads = _chain(6)
         live = types.SimpleNamespace(output=_card("t5", "Agent", {"description": "background job"}, None))
 
@@ -1276,8 +1176,7 @@ class RecentBranchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(r["title"], r["state"], r["replyDone"])
                               for r in openclaw_status_action._agent_call_rows(chat)[:1]],
                              [("background job", "running", False)])
-            # A reply that has ended is read as Open WebUI saved it; another
-            # chat's reply is not this one.
+            # An ended reply is read as saved; another chat's reply is ignored.
             chat = await openclaw_status_action._recent_branch("m5", links, read_rows, blob, chat_id="chat-1")
             self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["title"], "job 5")
             chat = await openclaw_status_action._recent_branch("m5", links, rows_mid_reply, blob, chat_id="chat-2")
@@ -1358,8 +1257,7 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
         self.assertEqual(texts[1], "No Claude Code Agent calls in this chat's last 40 messages.")
 
     def test_a_long_dialog_scrolls_instead_of_running_off_the_screen(self):
-        """Up to 20 rows of each kind outgrow a phone screen: seen on the
-        runner, the dialog's top and bottom were cut off with no scroll."""
+        """Up to 20 rows of each kind must scroll on a phone screen."""
         from test_status_action_unit import _FAKE_DOM_JS, _render_modal_open_js
 
         page = _FAKE_DOM_JS + r"""
@@ -1372,8 +1270,7 @@ console.log(JSON.stringify({maxHeight: panel.style.maxHeight, display: panel.sty
   pinned: [head.style.flexShrink, foot.style.flexShrink]}));
 """
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
-        # The sections scroll; the title bar (with its close button) and
-        # the footer stay in view.
+        # The sections scroll; title bar and footer stay in view.
         self.assertEqual(run_page(page, {"now": self.NOW, "open": _render_modal_open_js(identity)}),
                          {"maxHeight": "88vh", "display": "flex", "bodyScroll": "auto", "bodyMin": "0",
                           "pinned": ["0", "0"]})

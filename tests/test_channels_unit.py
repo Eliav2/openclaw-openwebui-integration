@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for channel threads (src/openclaw_pipe_pkg/channels.py): one
-session per Open WebUI channel thread, the messages each turn carries, the
-watcher that follows a thread, its judge, and the one-claim-per-message rule.
-
-The Open WebUI database reads (`_channel_rows`, `_channel_message`,
-`_channel_names`) are replaced by an in-memory channel; the query itself is
-checked against a live Open WebUI in the PR's live test.
-"""
+"""Unit tests for channel threads (src/openclaw_pipe_pkg/channels.py): sessions,
+turn content, the watcher, its judge and one claim per message."""
 
 import asyncio
 import os
@@ -184,8 +178,7 @@ class ReplyTextTests(unittest.TestCase):
 
 
 class OwnerTests(unittest.IsolatedAsyncioTestCase):
-    """Every channel turn goes out restricted when OWNER_USERS is set, the
-    owner's included: one tool list per session."""
+    """With OWNER_USERS set every channel turn is restricted: one tool list per session."""
 
     def conn(self, owners):
         c = mock.MagicMock()
@@ -258,8 +251,7 @@ class MentionContextTests(ChannelCase):
 
 
 class FakeRunConn:
-    """A Gateway connection for one follow-up run: the chat.send answer, then
-    the run's events into the registered queue."""
+    """A Gateway connection for one follow-up run: the chat.send answer, then the run's events."""
 
     def __init__(self, status="started", events=(), companion=None, active=()):
         self.status, self.events, self.companion = status, list(events), companion
@@ -315,9 +307,7 @@ class FakeRunConn:
 
 
 class PushConn(FakeRunConn):
-    """FakeRunConn whose wait for the thread's idle runs on the real
-    connection's wake-up by pushes (`_on_sessions_changed`), and whose
-    `sessions.list` answers the Gateway's flag (`flag`)."""
+    """FakeRunConn waking on pushes (`_on_sessions_changed`); `sessions.list` says `flag`."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -389,11 +379,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("chat.send", [m for m, _ in conn.requests])
 
     async def test_a_thread_that_stays_busy_for_longer_than_any_bound_still_gets_its_follow_up(self):
-        """A run can legitimately take longer than half an hour (ELI-88: the
-        queue has no ceiling for this reason). The follow-up used to be dropped
-        ("the thread stayed busy; not sent") after 1800 s. Here the clock jumps
-        a million seconds at every read; the follow-up waits for the Gateway's
-        idle and is sent."""
+        """Runs can exceed half an hour (ELI-88): the follow-up waits with no limit."""
         class JumpingTime:
             def __init__(self):
                 self.now = 0.0
@@ -417,11 +403,8 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
 
     async def test_a_follow_up_behind_a_cron_wake_is_sent_on_the_push_that_announces_the_idle(self):
-        """OpenClaw 2026.10.10: the wake's last push is `phase: end` with
-        `hasActiveRun: true` (the row reads active, `endedAt` set); the idle is
-        announced by `reason: cron-binding`, `status: done` and no top-level
-        `hasActiveRun`. Waking on that push, not on a timer, sends the
-        follow-up; nothing is sent while the Gateway's flag says active."""
+        """2026.10.10 announces idle by `reason: cron-binding`, `status: done`, no
+        top-level `hasActiveRun`; the follow-up is sent on that push."""
         conn = PushConn("started", [final("Sure")])
         task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
         await _spin()
@@ -436,10 +419,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.methods(), ["chat.send"])
 
     async def test_a_follow_up_waits_for_a_busy_thread_past_the_first_hundred_sessions(self):
-        """Recorded live: an unfiltered `sessions.list` holds the newest 100 of
-        1312 sessions. A thread whose run started long ago is not among them,
-        its row was missing, and `missing=False` sent the follow-up into the
-        running turn. The read names the session."""
+        """`sessions.list` holds only 100 rows, so the read names the session."""
         conn = PushConn("started", [final("Sure")])
         conn.crowded = True
         task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
@@ -450,8 +430,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
 
     async def test_a_follow_up_is_not_sent_when_the_answer_may_hide_the_thread(self):
-        """More rows matched than came back and none is the thread: busy or
-        idle is not known, so nothing is sent."""
+        """Rows truncated without the thread: state unknown, nothing sent."""
         conn = PushConn("started", [final("Sure")])
 
         async def send_request(method, params, timeout=10):
@@ -463,9 +442,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
             _channel_run(conn, "k", "m", "chanfollow-x", owner=True), 2), ("failed", None))
 
     async def test_a_socket_gap_wakes_a_follow_up_waiting_for_the_idle(self):
-        """The idle push may be among the events a dropped socket lost
-        (`_mark_event_gap` wakes every waiter, the channel follow-up's among
-        them): the follow-up reads the flag again and is sent."""
+        """A lost idle push: `_mark_event_gap` wakes the follow-up, which sends."""
         conn = PushConn("started", [final("Sure")])
         task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
         await _spin()

@@ -1,15 +1,7 @@
 """ELI-94: a run that ended while Open WebUI was stopped leaves its reply partial.
 
-A graceful Open WebUI stop cancels the request that streams a reply and saves
-the message `done: true` with what it had so far. The run keeps going in the
-Gateway and closes while Open WebUI is down, so no event reaches the next
-process and the startup reconcile (ELI-90) only looks at `done: false`
-messages. DESIGN-agent-turns.md case 4: the session's `updatedAt` is newer
-than the chat's `updated_at`, so `chat.history` is read and a run that closed
-after the chat was last written gets its message rebuilt from the transcript.
-
-Run: python3 -m pytest -q tests/test_eli94_unit.py
-"""
+The stop saved it `done: true`, which the ELI-90 reconcile skips. DESIGN-agent-turns.md
+case 4: a session `updatedAt` newer than the chat's rebuilds it from `chat.history`."""
 import asyncio
 import copy
 import sys
@@ -52,8 +44,7 @@ class _EndedWhileDownCase(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.key = _owui_session_key("main", USER, CHAT)
-        # What Open WebUI saved when its stop cancelled the reply: the
-        # preamble streamed, the tool call had not, done:true.
+        # The cancelled reply as saved: preamble only, done:true.
         self.chat = {"history": {"currentId": M, "messages": {
             "u1": {"id": "u1", "role": "user", "content": "check the logs", "childrenIds": [M],
                    "parentId": None},
@@ -136,11 +127,7 @@ class _EndedWhileDownCase(unittest.IsolatedAsyncioTestCase):
 class EndedWhileDownTests(_EndedWhileDownCase):
 
     async def test_a_reply_the_user_stopped_stays_as_it_was(self):
-        """Gate 280c, case stop (chat 2ddcf087): Stop landed while the model
-        chose its next call; claude-cli wrote that call to its transcript
-        before the abort's kill took it down (refused, never run). The
-        stopped reply showed its one card; the next Open WebUI start made it
-        two. What the user stopped is what the reply shows."""
+        """claude-cli wrote the call Stop cut off; a restart must not add its card."""
         self.msg()["statusHistory"] = [{"description": "Stopped", "done": True}]
         self.msg()["meta"] = {openclaw_pipe.STOPPED_META: True}
         held = copy.deepcopy(self.msg())
@@ -149,14 +136,11 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(self.msg(), held)
 
     async def test_a_stopped_reply_left_unfinished_keeps_what_it_showed(self):
-        """Review on #282: a Stop whose final save failed leaves the marked
-        reply `done: false`; the next start's orphan pass must not rebuild
-        it from the transcript either."""
+        """Review on #282: a failed final save after Stop is not rebuilt either."""
         async def the_stub(prefixes):
             return [(CHAT, M)]
         original = copy.deepcopy(self.msg())
-        # A request's stub, its task dead with Open WebUI. A gone turn
-        # writer's message takes the same early way out of `_reconcile_stub`.
+        # A dead request's stub; a gone writer's message exits the same way.
         for owner in ({"task_id": "task-dead"},):
             with self.subTest(owner=owner):
                 self.chat["history"]["messages"][M] = copy.deepcopy(original)
@@ -169,9 +153,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
                 self.assertIs(self.msg()["meta"].get(openclaw_pipe.STOPPED_META), True)
 
     async def test_a_reply_open_webuis_shutdown_cancelled_is_still_completed(self):
-        """An Open WebUI stop cancels the reply as a Stop does, "Stopped"
-        status line and all, but no page says it was the user's Stop: the
-        run went on, and its reply is completed (ELI-94)."""
+        """An Open WebUI stop is not the user's Stop: the reply is completed (ELI-94)."""
         self.msg()["statusHistory"] = [{"description": "Stopped", "done": True}]
         await self.startup()
         self.assertEqual([w[0] for w in self.writes], [M])
@@ -186,9 +168,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(set(self.chat["history"]["messages"]), {"u1", M}, "no second message")
 
     async def test_a_completed_reply_publishes_chat_finished_with_the_valve(self):
-        """Review on #273: the reply this pass completes is saved whole, and
-        PUBLISH_CHAT_FINISHED publishes it (the request Open WebUI's stop
-        cancelled published nothing)."""
+        """Review on #273: saved whole and published via PUBLISH_CHAT_FINISHED."""
         published = []
 
         async def publish(chat_id, message_id, user_id, text=None):
@@ -207,8 +187,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(self.msg()["content"], "Reading them.")
 
     async def test_the_same_second_counts_as_written_after(self):
-        """Open WebUI stamps whole seconds: a run that closed inside the
-        second the chat was written is not proof the chat missed it."""
+        """Whole-second stamps: a close in the same second is no proof of a miss."""
         self.history = _closed_history(closed_ms=T0 * 1000 + 999)
         await self.startup()
         self.assertEqual(self.writes, [])
@@ -231,8 +210,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(self.writes, [])
 
     async def test_a_complete_reply_is_never_rewritten(self):
-        """Closed after the chat's write and found by identity, but the
-        message already holds everything the transcript has."""
+        """The message already holds everything the transcript has."""
         full = _closed_history()
         self.msg()["content"] = "Reading them.\n\nFound it."
         self.msg()["output"] = openclaw_pipe._history_renderer(
@@ -241,8 +219,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(self.writes, [])
 
     async def test_a_wake_closer_is_never_used(self):
-        """A cron wake's closing message is keyed by the sessionId and only
-        the first wake gets one (ELI-103): never rebuild from it."""
+        """Never rebuild from a cron wake's sessionId-keyed closing (ELI-103)."""
         wake = SESSION_ID
         self.history = _closed_history(run=wake)
         wake_m = turn_message_id(self.key, wake, CHAT)
@@ -258,8 +235,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertNotIn(M, [mid for mid, _ in self.writes], "the ELI-90 pass owns done:false")
 
     async def test_a_recovery_that_closed_while_down_lands_in_the_interrupted_reply(self):
-        """Rule E: the Gateway restarted mid-run (RUN has no closer) and its
-        recovery closed while Open WebUI was down. Both spans go into M."""
+        """Rule E: a mid-run Gateway restart; both spans go into M."""
         hist = _turn_history(run=RUN, closed=False)
         rec = "rec-1"
         hist["messages"] += [
@@ -277,10 +253,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(set(self.chat["history"]["messages"]), {"u1", M})
 
     def embedded(self, *, newer_turn=False):
-        """The run as the embedded runtime stores it (e2e 2026-10-13, run
-        38405904032): no closing key, `timestamp` is when the message began
-        (before the chat's write), the run id only in `__openclaw.runId`.
-        The settled session row is the end signal."""
+        """Embedded runtime: no closing key; the settled row ends the run."""
         msgs = [{"role": "user", "content": "check the logs", "idempotencyKey": f"{RUN}:user",
                  "timestamp": T0 * 1000 - 900},
                 {"role": "assistant", "timestamp": T0 * 1000 - 700,
@@ -308,8 +281,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(self.writes, [])
 
     async def test_a_turn_admitted_after_the_settled_run_bounds_its_span(self):
-        """A new run began between the row and the transcript read: the
-        settled run's reply stops at that run's user turn."""
+        """A newer run's user turn ends the settled run's reply."""
         self.embedded(newer_turn=True)
         await self.startup()
         self.assertEqual(self.msg()["content"], "Reading them. Found it.")
@@ -322,14 +294,8 @@ class EndedWhileDownTests(_EndedWhileDownCase):
 
 
 class AskReplyEndedWhileDownTests(_EndedWhileDownCase):
-    """#21 round, ask-rebuild (2026-10-14 07:06-07:08Z, message
-    a8351886): the question was answered Blue from the card, then Open WebUI
-    restarted during the answer run's tools. The startup reconcile rewrote the
-    reply from the transcript as 6 Bash cards and "You chose Blue ...": the
-    question and its answered Ask User card, which the user had seen, were
-    gone from both `content` and the items. Real transcript, ids mapped:
-    test_fixture_eli94_ask_rebuild.json. Each run's text is only in its
-    closing message there (the imports carry tool blocks only)."""
+    """A restart during an Ask User answer run: the rebuild keeps the question and
+    its card. Real transcript: test_fixture_eli94_ask_rebuild.json."""
 
     REAL = {"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e": CHAT,
             "a8351886-2ab5-4acf-8752-1ac1612d64c3": M,
@@ -392,8 +358,7 @@ class AskReplyEndedWhileDownTests(_EndedWhileDownCase):
 
 
 class _FakeUvicornServer:
-    """uvicorn.Server's shutdown surface (0.51): `handle_exit` is installed as
-    the SIGTERM/SIGINT handler while it serves and sets `should_exit`."""
+    """uvicorn.Server (0.51): `handle_exit` sets `should_exit` on SIGTERM/SIGINT."""
 
     def __init__(self):
         self.should_exit = False
@@ -403,12 +368,8 @@ class _FakeUvicornServer:
 
 
 class ShutdownCancelTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-94 live, 2026-10-14 05:37 (round 21, eli94 r2): `ha apps stop`
-    cancelled both open replies at 05:37:15; the page could not answer the
-    cancel intent, and the 10 s fallback aborted both runs at 05:37:25 while
-    Open WebUI was still draining its cancelled tasks. The run then "ended
-    while down" with only its first step. A shutdown cancel is not a Stop: the
-    run keeps going and the next process's startup reconcile finishes it."""
+    """ELI-94 live: on `ha apps stop` the cancel fallback aborted the runs. A shutdown
+    cancel is not a Stop: the next startup reconcile finishes the run."""
 
     def setUp(self):
         openclaw_pipe._UVICORN_SERVER = None
@@ -429,8 +390,7 @@ class ShutdownCancelTests(unittest.IsolatedAsyncioTestCase):
         return conn, calls
 
     def _serve(self):
-        """Install a server's handler the way uvicorn's capture_signals does;
-        returns the server and a callable that restores the old handler."""
+        """Install a handler as capture_signals does; returns server, restore."""
         import signal
         server = _FakeUvicornServer()
         old = signal.signal(signal.SIGTERM, server.handle_exit)

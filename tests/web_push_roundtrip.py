@@ -1,13 +1,9 @@
-"""The Web Push function against a local push service, with real encryption.
-
-Run by tests/test_web_push_unit.py in its own interpreter: the other unit
-suites stub `cryptography` in the shared one. Prints one JSON object: what the
-push service received and decrypted, and the user valves afterwards.
+"""The Web Push function against a local push service, with real encryption, in its
+own interpreter (other suites stub `cryptography`). Prints one JSON result.
 
     python tests/web_push_roundtrip.py <scenario>
 
-Scenarios: ok (two devices, both delivered), gone (one answers 410, one 500).
-"""
+Scenarios: ok (two devices, both delivered), gone (one answers 410, one 500)."""
 import asyncio
 import base64
 import importlib.util

@@ -1,9 +1,5 @@
-"""ELI-283: the Gateway's context compaction shows in the reply as a note of
-its own: "compacting" while it runs, then a collapsed "Context compacted"
-block in its place.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_compaction_note_unit.py
-"""
+"""ELI-283: context compaction shows as a reply note: "compacting", then a
+collapsed "Context compacted" block."""
 import unittest
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
@@ -81,8 +77,7 @@ class CompactionNoteTests(unittest.TestCase):
         self.assertEqual(len({i["id"] for i in r.output}), 2)
 
     def test_every_renderer_fed_the_run_names_the_note_alike(self):
-        """The live reply and a turn writer each render the run: a rebuild
-        must find the note by the same id, not add it twice."""
+        """A rebuild finds the note by the same id, not adding it twice."""
         a, b = ocp._TurnRenderer(), ocp._TurnRenderer()
         for r in (a, b):
             r.feed(compaction("start"))
@@ -101,8 +96,8 @@ class CompactionNoteTests(unittest.TestCase):
         self.assertIn("Context compacted", texts(r)[0])
 
     def test_held_text_shows_before_the_note(self):
-        """A message that opens like a silent sentinel is held (`_add_text`);
-        the note flushes it first, as a tool card does."""
+        """A held silent-sentinel-like text (`_add_text`) is flushed before the
+        note, as before a tool card."""
         r = ocp._TurnRenderer()
         r.feed({"stream": "assistant", "data": {"delta": "NO"}})
         added = r.feed(compaction("start"))

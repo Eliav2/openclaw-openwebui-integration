@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""The PR media check (scripts/pr_media.py): a PR that changes what users see
-shows an image in its description, or carries the `no-visual-change` label.
-
-AGENTS.md asked for a Before and After pair on every visual PR, and a merged
-fix to the sub-agent drawer still went in with only coordinates in its
-description. The check runs in .github/workflows/pr-media.yml.
-"""
+"""scripts/pr_media.py (.github/workflows/pr-media.yml): a visual PR shows an image or
+carries the `no-visual-change` label."""
 
 import json
 import os
@@ -133,8 +128,7 @@ class TheCheck(unittest.TestCase):
         self.assertIsNone(pr_media.check(DRAWER, "", ["bug", pr_media.SKIP_LABEL]))
 
     def test_a_prose_only_pr_passes(self):
-        """The `prose-only` label already requires the Prose only check to prove
-        the code unchanged (.github/workflows/prose-only.yml)."""
+        """`prose-only` PRs already prove the code unchanged (.github/workflows/prose-only.yml)."""
         self.assertIsNone(pr_media.check(DRAWER, "", ["prose-only"]))
 
     def test_a_change_with_nothing_visual_passes(self):

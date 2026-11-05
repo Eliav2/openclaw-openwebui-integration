@@ -1,8 +1,5 @@
-"""How the secret test reads the Gateway's session transcripts (e2e/transcript_scan.py).
-
-The Gateway writes an agent's SQLite database and checkpoints its WAL while the
-test reads it, and `main` and `title-gen` each have a file of the same name.
-"""
+"""How the secret test reads session transcripts (e2e/transcript_scan.py) while the
+Gateway checkpoints the WAL, with `main` and `title-gen` files of the same name."""
 
 import importlib.util
 import os

@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for install.py's own safety logic (not the deployed pipe).
-
-install.py imports click/rich, which aren't installed in this environment's
-system python (it's normally run via `uv run install.py`, which resolves
-them into an ephemeral env). These tests stub both modules just enough to
-import install.py directly, the same way test_file_server_unit.py stubs
-websockets/cryptography/pydantic to import pipe.py fragments in isolation.
-
-Run: python3 -m pytest -q tests/test_install_unit.py
-"""
+"""Unit tests for install.py's own safety logic, with click and rich stubbed."""
 import http.server
 import shutil
 import tempfile
@@ -66,15 +57,8 @@ import install as inst  # noqa: E402
 
 
 class FetchPipeArtifactTests(unittest.TestCase):
-    """The README advertises a no-clone install:
-
-        uv run https://raw.githubusercontent.com/.../install.py install --wizard
-
-    Under that form `__file__` is a lone temp copy, so openclaw_pipe.py is not
-    beside it and there is no src/ tree to build from. Before the fetch step the
-    deploy died on "Pipe file not found" -- and only AFTER the wizard had already
-    collected the OWUI password and the gateway token.
-    """
+    """The README's no-clone install (`uv run https://raw.githubusercontent.com/.../install.py
+    install --wizard`) fetches the artifact, before the wizard asks for credentials."""
 
     def setUp(self):
         self._orig_url = inst.ARTIFACT_URL
@@ -107,7 +91,7 @@ class FetchPipeArtifactTests(unittest.TestCase):
         self.assertEqual(inst._fetch_pipe_file(), body.decode())
 
     def test_rejects_a_200_that_is_not_the_artifact(self):
-        # A raw URL typo on GitHub can return an HTML page with status 200.
+        # A raw URL typo can return an HTML page with status 200.
         inst.ARTIFACT_URL = self._serve(b"<html>not found</html>")
         with self.assertRaises(SystemExit) as cm:
             inst._fetch_pipe_file()
@@ -122,7 +106,7 @@ class FetchPipeArtifactTests(unittest.TestCase):
         self.assertIn("git clone", msg)
 
     def test_url_is_overridable_by_env(self):
-        # Lets a fork, a pinned tag, or a local mirror drive the no-clone path.
+        # For a fork, a pinned tag or a local mirror.
         import importlib.util
         import os
         from unittest import mock
@@ -130,7 +114,7 @@ class FetchPipeArtifactTests(unittest.TestCase):
         def fresh_url(**env):
             spec = importlib.util.spec_from_file_location("install_env_probe", ROOT / "install.py")
             mod = importlib.util.module_from_spec(spec)
-            # dataclasses look their module up in sys.modules while it runs.
+            # dataclasses look their module up in sys.modules.
             with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, {spec.name: mod}):
                 if not env:
                     os.environ.pop("OPENCLAW_PIPE_ARTIFACT_URL", None)
@@ -144,10 +128,8 @@ class FetchPipeArtifactTests(unittest.TestCase):
 
 
 class MirrorPipeValvesTests(unittest.TestCase):
-    """install_action.py copies the five shared valves from the Pipe. Open WebUI
-    stores exactly the posted valve set (`Valves(**form).model_dump(exclude_unset
-    =True)`), so a post of only the shared five would reset the Action's own
-    CONTROL_UI_URL on every re-install (ELI-141)."""
+    """Open WebUI stores exactly the posted valves, so copying the five shared ones
+    must keep the Action's own CONTROL_UI_URL (ELI-141)."""
 
     def test_the_actions_own_valves_survive_a_mirror(self):
         import install_action
@@ -212,8 +194,7 @@ class _FakeOwui:
 
 
 class InstallerCoreTests(unittest.TestCase):
-    """ELI-146: the Action and the Filter install through install.py's core,
-    a FunctionSpec each, as the Pipe's own deploy does."""
+    """ELI-146: the Action and Filter install through install.py's core, a FunctionSpec each."""
 
     PIPE = {"id": "openclaw_gateway", "type": "pipe", "content": "pipe", "is_active": True, "is_global": True}
     PIPE_VALVES = {"GATEWAY_URL": "localhost:18789", "GATEWAY_TOKEN": "t", "DEVICE_IDENTITY": "",

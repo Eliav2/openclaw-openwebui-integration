@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""The Status Action's dialog and drawer only use CSS classes Open WebUI
-actually ships (ELI-118).
-
-Open WebUI's stylesheet is prebuilt: a Tailwind class its own source never
-uses (`z-[10000]`, `text-[10px]`, `shadow-2xl`) has no rule, and the element
-silently renders without it. The drawer had no z-index that way and opened
-behind the Status dialog.
-
-The shipped class list is vendored in test_fixture_owui_css_classes.txt
-(scripts/owui_css.py dump); the e2e suite checks it against the pinned image.
-"""
+"""The Status dialog and drawer use only CSS classes Open WebUI ships (ELI-118). The
+list is test_fixture_owui_css_classes.txt (scripts/owui_css.py dump)."""
 
 import os
 import sys
@@ -33,8 +24,7 @@ class ActionClassesShipped(unittest.TestCase):
         self.assertGreater(len(shipped), 1000)
 
     def test_the_action_uses_a_plausible_number_of_classes(self):
-        # Guards the extractor itself: if it stopped finding classes, the
-        # check above would pass on an empty set.
+        # Guards the extractor: an empty set would pass the check above.
         used = owui_css.action_classes()
         self.assertGreater(len(used), 80)
         self.assertIn("fixed", used)

@@ -1,11 +1,5 @@
-"""Screenshots (scripts/screenshots/capture.py): a scene selected with `--only`
-that builds on another scene gets it run first, without that scene's images.
-
-`--only drawer-long-parent` skipped `subagents-long`, which makes the chat the
-drawer shot needs, and exited 0 without writing the image (review on #238).
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_screenshot_selection_unit.py
-"""
+"""capture.py: `--only` on a scene runs the scene it builds on first, without its
+images (review on #238)."""
 import os
 import sys
 import tempfile
@@ -99,9 +93,8 @@ class PrerequisiteScenes(unittest.TestCase):
         self.assertEqual(self.ran, [])
 
     def test_every_guarded_scene_is_declared_by_the_scene_that_makes_its_input(self):
-        """Each scene run under `if scenes.<input>:` names, in `needed_by` of
-        the scene that produces <input>, so `--only` on it alone runs that
-        scene first. The producers of the inputs are listed here."""
+        """Each scene run under `if scenes.<input>:` is listed in `needed_by` of
+        the scene producing <input>."""
         with open(os.path.join(ROOT, "scripts", "screenshots", "capture.py"), encoding="utf-8") as fh:
             src = fh.read()
         main = src[src.index("scenes = Scenes(token, shooter)"):]

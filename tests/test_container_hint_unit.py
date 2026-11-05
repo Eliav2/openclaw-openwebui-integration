@@ -1,9 +1,4 @@
-"""Issue #245: an Open WebUI container cannot reach a Gateway at localhost, and
-the refused-connect error said only "is the Gateway running?". Inside a
-container it now names the cause and the fix.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_container_hint_unit.py
-"""
+"""Issue #245: in a container, a refused localhost connect names the cause and fix."""
 import asyncio
 import json
 import os
@@ -71,8 +66,8 @@ class ContainerLoopbackHintTests(unittest.TestCase):
         self.assertNotIn("gateway.bind", text)
 
     def test_the_hint_names_the_caveats_of_its_advice(self):
-        # PR #246 review: host networking shares localhost, lan listens on every
-        # interface, and tailscale serve needs the loopback bind.
+        # PR #246 review: host networking shares localhost, lan listens
+        # everywhere, tailscale serve needs the loopback bind.
         text = str(refused_message("localhost:18789", in_container=True))
         self.assertIn("--network host", text)
         self.assertIn("every interface", text)

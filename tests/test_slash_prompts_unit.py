@@ -1,11 +1,5 @@
-"""Slash commands as Open WebUI Prompts (SYNC_SLASH_COMMANDS): the Gateway's
-commands become Workspace Prompts in the `/` menu. The sync owns only the
-prompts in its ledger: it never changes or deletes a prompt someone made, a
-lost ledger deletes nothing, a failed write is retried, and turning it off
-deletes what it made.
-
-Run: python3 -m pytest -q tests/test_slash_prompts_unit.py
-"""
+"""SYNC_SLASH_COMMANDS: Gateway commands as Prompts. The sync only touches prompts
+in its ledger, retries failed writes and deletes its own when off."""
 import asyncio
 import json
 import os
@@ -50,8 +44,7 @@ class FakeStore:
     def __init__(self, rows=None):
         self.rows = dict(rows or {})
         self.fail = set()
-        # Commands whose add commits the row, then fails (as Open WebUI's
-        # insert does when its grant or first version fails).
+        # Commands whose add commits the row, then fails, as Open WebUI's insert can.
         self.half_fail = set()
         self.calls = []
         self._n = 0
@@ -497,7 +490,7 @@ class TriggerTests(unittest.TestCase):
         self.assertTrue(ocp._slash_prompts_state["pending"])
 
     def test_turned_on_forgets_that_the_ledger_was_empty(self):
-        # Another worker's sync may have filled it since this one looked.
+        # Another worker may have filled it since.
         ocp._slash_prompts_state["ledger_empty"] = True
         ocp._ensure_slash_prompts(lambda: valves())
         self.assertIsNone(ocp._slash_prompts_state["ledger_empty"])
@@ -527,8 +520,7 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def sync(v, getter, store=None):
-            # The first check finds another worker syncing (busy, pending);
-            # the second gets a push mid-check (pending); the third is quiet.
+            # Busy then pending, pending again, then quiet.
             calls.append(v)
             ocp._slash_prompts_state["pending"] = len(calls) < 3
             return "busy" if len(calls) == 1 else "synced"
@@ -547,8 +539,7 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GatewayEventTests(unittest.IsolatedAsyncioTestCase):
-    """gateway.py hands `chat.metadata.changed` to the sync, on the connection
-    that writes turns only."""
+    """gateway.py hands `chat.metadata.changed` to the sync, on the turn-writing connection only."""
 
     async def play(self, conn, frames):
         frames = list(frames)

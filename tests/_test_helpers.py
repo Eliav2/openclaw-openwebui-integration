@@ -1,5 +1,4 @@
-"""Helpers shared by the unit suites. Not a suite itself (pytest collects
-test_*.py only)."""
+"""Helpers shared by the unit suites. Not a suite itself (pytest collects test_*.py only)."""
 
 import inspect
 import json
@@ -12,16 +11,13 @@ import types
 import unittest
 from unittest import mock
 
-# Bridge state the code under test writes (the sub-agent child index) goes to
-# a scratch dir, never the machine's real /data/openclaw-bridge.
+# Bridge state goes to a scratch dir, never /data/openclaw-bridge.
 os.environ.setdefault("OPENCLAW_BRIDGE_STATE_DIR", tempfile.mkdtemp(prefix="oc-bridge-test-"))
 
 
 def run_page(js: str, payload, tz: str | None = None):
-    """Run `js` (a fake-DOM page script) under bun, else node, with `payload`
-    as JSON on stdin, and return the JSON it prints. Skips the test when
-    neither runtime is installed; a script that exits non-zero fails it with
-    its stderr. `tz` sets the page's timezone."""
+    """Run fake-DOM page script `js` under bun or node with `payload` on stdin;
+    return its JSON. Skips with neither runtime; `tz` sets the timezone."""
     runtime = shutil.which("bun") or shutil.which("node")
     if runtime is None:
         raise unittest.SkipTest("no bun or node")
@@ -39,8 +35,7 @@ def run_page(js: str, payload, tz: str | None = None):
 
 
 class RecordingEmitter:
-    """An `__event_emitter__` that keeps every event it is given, in order,
-    in `events` (the list passed in, or a new one)."""
+    """An `__event_emitter__` that appends every event to `events`."""
 
     def __init__(self, events: list | None = None):
         self.events = [] if events is None else events
@@ -50,8 +45,8 @@ class RecordingEmitter:
 
 
 def fresh_child_index():
-    """An empty sub-agent child index, already seeded (state.py), so one test's
-    children never show in another's dialog and no open seeds by surprise."""
+    """An empty, already seeded child index (state.py), so tests do not see
+    each other's children."""
     import openclaw_status_action
     path = os.path.join(os.environ["OPENCLAW_BRIDGE_STATE_DIR"], openclaw_status_action._SUBAGENT_INDEX_NAME)
     if os.path.exists(path):
@@ -60,10 +55,8 @@ def fresh_child_index():
 
 
 def action_gateway(conn, source: str = "pipe", keep_index: bool = False):
-    """Patch the Status Action's Gateway lookup to hand out `conn`, as if it
-    came from `source` (the Pipe's stashed connection by default). Starts from
-    a fresh child index unless `keep_index`. A mock `conn` streams no reply
-    unless the test says (`has_reply`)."""
+    """Make the Status Action's Gateway lookup return `conn` from `source`, with a
+    fresh child index unless `keep_index`; a mock streams no reply unless `has_reply`."""
     if not keep_index:
         fresh_child_index()
     if isinstance(conn, mock.Mock) and "has_reply" not in vars(conn):
@@ -73,9 +66,8 @@ def action_gateway(conn, source: str = "pipe", keep_index: bool = False):
 
 
 def owui_modules(**main_attrs) -> dict:
-    """sys.modules entries for a stand-in Open WebUI: `open_webui`,
-    `open_webui.socket` and `open_webui.socket.main`, the last carrying
-    `main_attrs` (sio, SESSION_POOL, ...). Add other entries to the dict."""
+    """sys.modules entries for a stand-in Open WebUI; `open_webui.socket.main`
+    carries `main_attrs`."""
     owui = types.ModuleType("open_webui")
     sock = types.ModuleType("open_webui.socket")
     main = types.ModuleType("open_webui.socket.main")
@@ -86,8 +78,8 @@ def owui_modules(**main_attrs) -> dict:
 
 
 def fake_owui(test, **main_attrs):
-    """Install `owui_modules(**main_attrs)` until `test` ends (sys.modules is
-    restored then) and return the `open_webui.socket.main` stand-in."""
+    """Install `owui_modules(**main_attrs)` for the test; return the
+    `open_webui.socket.main` stand-in."""
     modules = owui_modules(**main_attrs)
     patch = mock.patch.dict(sys.modules, modules)
     patch.start()
@@ -96,10 +88,8 @@ def fake_owui(test, **main_attrs):
 
 
 class FakeSio:
-    """A stand-in for Open WebUI's socket.io server. Records every `call` as
-    (event, data, to, timeout) and every `emit` as (event, data, to); a
-    `call` returns what `reply(event, data, to, timeout)` returns (awaited
-    when it is a coroutine), or None without one."""
+    """A stand-in socket.io server recording `call` and `emit`; a `call`
+    returns (awaits) `reply(event, data, to, timeout)`, or None."""
 
     def __init__(self, reply=None):
         self.calls, self.emits = [], []

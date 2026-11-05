@@ -1,8 +1,5 @@
-"""The E2E shards cover every E2E test once (ELI-246, e2e/shards.py).
-
-The E2E job runs one stack per shard. A test missing from every shard would
-never run in CI and nothing would say so; this is what says so.
-"""
+"""The E2E shards cover every E2E test once (ELI-246, e2e/shards.py), so no test
+silently never runs in CI."""
 
 import importlib.util
 import os

@@ -1,10 +1,6 @@
-"""Which vendored Open WebUI copy CI checks against which ref
-(scripts/check_owui_fixture.py, scripts/check_owui_frontend_fixture.py).
-
-The tests run only the unversioned copy, so CI must check that one against
-the pinned ref: a stale unversioned copy must fail even when a versioned copy
-matches. A `_v<tag>` copy left behind for the pinned ref (the pin moved, the
-copy was never promoted) fails too."""
+"""CI checks the unversioned vendored Open WebUI copy against the pinned ref
+(scripts/check_owui_fixture.py, scripts/check_owui_frontend_fixture.py), and fails
+on a `_v<tag>` copy left for the pinned ref."""
 
 import importlib.util
 import sys

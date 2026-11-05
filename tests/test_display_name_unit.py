@@ -1,8 +1,6 @@
-"""The Gateway prunes a silently paired device when another silent client with the same client id, mode and
-displayName pairs while the first has no open socket (device pairing prune). The Pipe's restricted identity
-therefore connects under a displayName of its own, so another local client's pairing (wlsync, a harness) cannot
-evict it. The main identity is a legacy, explicitly approved record and keeps sending no displayName.
-"""
+"""The Gateway prunes a silently paired device when another with the same client id, mode
+and displayName pairs. The restricted identity uses its own displayName so others cannot
+evict it; the main identity (a legacy approved record) sends none."""
 import asyncio
 import json
 import os

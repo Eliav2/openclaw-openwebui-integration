@@ -1,9 +1,5 @@
-"""A change to the GATEWAY_URL valve (host, port, or ws to wss) takes effect on the
-next message. `ensure_connected` keeps a live socket, so a valve change used to
-be ignored until something else dropped the connection.
-
-Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_gateway_endpoint_move_unit.py
-"""
+"""A GATEWAY_URL change (host, port, ws to wss) applies on the next message, though
+`ensure_connected` keeps a live socket."""
 import asyncio
 import json
 import os
@@ -23,8 +19,7 @@ import openclaw_status_action as action  # noqa: E402
 
 
 class _Endpoints(unittest.IsolatedAsyncioTestCase):
-    """Real `_GatewayConnection`s whose socket is a stand-in: connecting
-    records the endpoint the valve names, as the real connect does."""
+    """Real `_GatewayConnection`s with a stand-in socket that records the endpoint connected to."""
 
     def setUp(self):
         self.valves = types.SimpleNamespace(GATEWAY_URL="localhost:18789")
