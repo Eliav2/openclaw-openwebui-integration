@@ -43,10 +43,10 @@ self.addEventListener("push", (e) => {
         icon: "/static/favicon.png",
         badge: "/static/favicon.png",
         data: { url: p.url || "/", chat_id: p.chat_id || "", fn: p.fn || "" },
-        // The function's NOTIFICATION_ACTIONS, in order (a v2 push has none: Reply
-        // and Mute). Android Chrome shows two (Notification.maxActions) and adds
+        // The function's NOTIFICATION_ACTIONS, in order; a push without them gets
+        // no buttons. Android Chrome shows two (Notification.maxActions) and adds
         // its own "Unsubscribe" after them.
-        actions: p.chat_id ? (p.actions || [ACTION.REPLY, ...(p.fn ? [ACTION.MUTE] : [])]).filter((a) => BUTTONS[a]).map((a) => BUTTONS[a]) : [],
+        actions: p.chat_id ? (p.actions || []).filter((a) => BUTTONS[a]).map((a) => BUTTONS[a]) : [],
       });
     }
     // Each decision, once acted on, to the open pages (`oc-push` messages), for tests and tools.
@@ -56,9 +56,9 @@ self.addEventListener("push", (e) => {
 
 // Open WebUI's own API with the session cookie (same origin; Open WebUI reads
 // its `token` cookie when there is no Authorization header).
-async function api(path, body) {
+async function api(path, body, signal) {
   const r = await fetch(path, {
-    method: body ? "POST" : "GET", credentials: "same-origin", redirect: "error",
+    method: body ? "POST" : "GET", credentials: "same-origin", redirect: "error", signal,
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -90,13 +90,13 @@ async function sendReply(chatId, text) {
 
 // Mute a chat in the function's user valves: read, merge, write the whole set
 // (Open WebUI's update replaces every user valve).
-async function mute(fn, chatId, seconds) {
+async function mute(fn, chatId, seconds, signal) {
   const path = "/api/v1/functions/id/" + fn + "/valves/user";
-  const valves = (await api(path)) || {};
+  const valves = (await api(path, undefined, signal)) || {};
   let mutes = {};
   try { mutes = JSON.parse(valves.mutes || "{}") || {}; } catch (_) {}
   mutes[chatId] = seconds ? Math.floor(Date.now() / MS_PER_S) + seconds : 0;
-  await api(path + "/update", { ...valves, mutes: JSON.stringify(mutes) });
+  await api(path + "/update", { ...valves, mutes: JSON.stringify(mutes) }, signal);
 }
 
 // Mark a chat read, as opening it does: Open WebUI 0.13 keeps the sidebar's
@@ -104,7 +104,6 @@ async function mute(fn, chatId, seconds) {
 // through its Socket.IO event `events:chat` {type: "last_read_at"}; it then
 // tells every open window of the user (`chat:list`), so the dot goes at once.
 // The token comes from the session cookie (GET /api/v1/auths/), and is not kept.
-const READ_TIMEOUT_MS = 15000;   // a safety net for a socket that never answers
 // Engine.IO 4 packets (open, ping, pong) and Socket.IO's on the default namespace
 // (connect, connect error, event): the first characters of each frame.
 const EIO = Object.freeze({ OPEN: "0", PING: "2", PONG: "3" });
@@ -113,16 +112,18 @@ const SECURE_PROTOCOL = "https:";
 // Open WebUI 0.13's read event, and its answer to the user's windows.
 const READ_EVENT = "events:chat", READ_TYPE = "last_read_at";
 const ANSWER_EVENT = "events", ANSWER_TYPE = "chat:list";
-async function markRead(chatId) {
-  const { token } = await api("/api/v1/auths/");
+async function markRead(chatId, signal) {
+  const { token } = await api("/api/v1/auths/", undefined, signal);
   if (!token) throw new Error("no session");
   const url = new URL("/ws/socket.io/?EIO=4&transport=websocket", self.location.origin);
   url.protocol = url.protocol === SECURE_PROTOCOL ? "wss:" : "ws:";
   const ws = new WebSocket(url);
   try {
     await new Promise((ok, fail) => {
-      const timer = setTimeout(() => fail(new Error("socket timeout")), READ_TIMEOUT_MS);
-      const done = (f, v) => { clearTimeout(timer); f(v); };
+      const timeout = () => done(fail, new Error("socket timeout"));
+      const done = (f, v) => { signal.removeEventListener("abort", timeout); f(v); };
+      if (signal.aborted) return timeout();
+      signal.addEventListener("abort", timeout);
       ws.onerror = () => done(fail, new Error("socket error"));
       ws.onclose = () => done(fail, new Error("socket closed"));
       ws.onmessage = ({ data }) => { try { onFrame(String(data)); } catch (e) { done(fail, e); } };
@@ -141,7 +142,7 @@ async function markRead(chatId) {
       };
     });
   } finally {
-    // Every path ends here (answered, refused, error, closed, timed out): no socket is left open.
+    // Every path ends here (answered, refused, error, closed, out of time): no socket is left open.
     ws.onclose = ws.onerror = ws.onmessage = null;
     ws.close();
   }
@@ -158,12 +159,17 @@ async function openChat(url) {
   return self.clients.openWindow(url);
 }
 
+// Mute and Mark as read get this long, token fetch and socket included; past it
+// the chat opens instead. Chrome lets a notification click open or focus a
+// window for about 10 s, so the fallback must start well inside that.
+const ACTION_DEADLINE_MS = 6000;
+
 // What a tap does. `action`: "" (the notification), "reply" or "mute".
 async function act(action, data, reply) {
   const url = new URL(data.url || "/", self.location.origin).href;
   if (action === ACTION.MUTE && data.fn && data.chat_id) {
     try {
-      await mute(data.fn, data.chat_id, MUTE_ACTION_S);
+      await mute(data.fn, data.chat_id, MUTE_ACTION_S, AbortSignal.timeout(ACTION_DEADLINE_MS));
       return "muted";
     } catch (_) {
       await openChat(url);
@@ -172,7 +178,7 @@ async function act(action, data, reply) {
   }
   if (action === ACTION.READ && data.chat_id) {
     try {
-      await markRead(data.chat_id);
+      await markRead(data.chat_id, AbortSignal.timeout(ACTION_DEADLINE_MS));
       return "read";
     } catch (_) {
       // Not marked: opening the chat marks it read.

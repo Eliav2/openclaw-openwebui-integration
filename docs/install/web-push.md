@@ -43,12 +43,13 @@ Its valves:
 
 | Valve | Default | What it does |
 |---|---|---|
-| `VAPID_PRIVATE_KEY_FILE` | `$DATA_DIR/web-push/vapid_private.pem` (`/app/backend/data/web-push/vapid_private.pem` in the image) | The private key, as the container sees it. |
-| `VAPID_SUBJECT` | Open WebUI's `WEBUI_URL` | A `mailto:` or `https:` contact for the push services. Apple rejects pushes without a real one. |
-| `TTL_SECONDS` | `3600` | How long a push service keeps a notification for a device that is offline. |
-| `URGENCY` | `normal` | RFC 8030 urgency: `very-low`, `low`, `normal` or `high`. |
-| `PIPE_MODEL_PREFIXES` | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
-| `PREVIEW_CHARS` | `0` (off) | Up to this many characters of the reply, as plain text, in the notification. Read the [privacy note](#preview) first. |
+| [`VAPID_PRIVATE_KEY_FILE`](../configuration.md#vapid_private_key_file) | `$DATA_DIR/web-push/vapid_private.pem` (`/app/backend/data/web-push/vapid_private.pem` in the image) | The private key, as the container sees it. |
+| [`VAPID_SUBJECT`](../configuration.md#vapid_subject) | Open WebUI's `WEBUI_URL` | A `mailto:` or `https:` contact for the push services. Apple rejects pushes without a real one. |
+| [`TTL_SECONDS`](../configuration.md#ttl_seconds) | `3600` | How long a push service keeps a notification for a device that is offline. |
+| [`URGENCY`](../configuration.md#urgency) | `normal` | RFC 8030 urgency: `very-low`, `low`, `normal` or `high`. |
+| [`PIPE_MODEL_PREFIXES`](../configuration.md#pipe_model_prefixes) | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
+| [`PREVIEW_CHARS`](../configuration.md#preview_chars) | `0` (off) | Up to this many characters of the reply, as plain text, in the notification. Read the [privacy note](#preview) first. |
+| [`NOTIFICATION_ACTIONS`](../configuration.md#notification_actions) | `reply,mute` | The notification's buttons, in order, from `reply`, `read`, `mute`; see [Buttons](#buttons). |
 
 Its user valves are written by the page script and the service worker, not by hand: `subscriptions` (one entry per device) and `mutes` (muted chats).
 
@@ -118,13 +119,13 @@ INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3
 
 ### Preview
 
-With `PREVIEW_CHARS` above 0 the notification shows the start of the reply instead of "New reply": plain text, tool and status blocks, images and files left out, a code block as "[code]", cut on a word. Expanded, Android shows the whole preview. A push holds about 4 KB, so a long preview is shortened to fit.
+With [`PREVIEW_CHARS`](../configuration.md#preview_chars) above 0 the notification shows the start of the reply instead of "New reply": plain text, tool and status blocks, images and files left out, a code block as "[code]", cut on a word. Expanded, Android shows the whole preview. A push holds about 4 KB, so a long preview is shortened to fit.
 
 Privacy: the text is on the lock screen and in the notification shade of every device you enabled, where anyone holding the phone can read it. It passes through the browser's push service (Google, Apple or Mozilla) encrypted end to end (`aes128gcm`); the push service cannot read it. Android can hide notification text on the lock screen: Settings > Notifications > "Sensitive notifications" off. That is why the preview is off by default.
 
 ### Buttons
 
-Android Chrome shows two buttons under a notification (`Notification.maxActions` is 2), and adds a third of its own. The function's `NOTIFICATION_ACTIONS` valve picks them, in order (default `reply,mute`; `reply,read` swaps Mute for Mark as read):
+Android Chrome shows two buttons under a notification (`Notification.maxActions` is 2), and adds a third of its own. The function's [`NOTIFICATION_ACTIONS`](../configuration.md#notification_actions) valve picks them, in order (default `reply,mute`; `reply,read` swaps Mute for Mark as read):
 
 - **Reply** (`reply`) opens a text field in the notification. What you type is sent to the chat as your message, and the agent answers as if you had typed it in the app. It is sent the way Open WebUI 0.13.0's chat page sends a message (one `/api/chat/completions` with the new message under the chat's last one), with the session cookie of your sign-in. While the chat's reply is still running, the message reaches it like one sent from another tab: the OpenClaw Pipe steers it into the run, or queues it until the run ends (see [Messages sent while the agent works](../features/reliability.md#messages-sent-while-the-agent-works)). If it cannot be sent (signed out, Access session expired, offline, an Open WebUI that answers differently), the chat opens with your text in the message box and a line saying it was not sent. It depends on Open WebUI 0.13.0's chat API; with another version, check that a reply from the notification appears in the chat.
 - **Mute 8 h** (`mute`): no notifications from this chat for 8 hours, on any of your devices (see below).

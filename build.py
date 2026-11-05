@@ -166,13 +166,18 @@ def _check(out_path: Path, built: str, rebuild_flag: str) -> bool:
 
 
 CONFIG_DOC = ROOT / "docs" / "configuration.md"
-# (heading, fragment, file a user installs): the three functions' Valves, in
-# the order a user meets them.
+# (heading, source of its Valves, file a user installs): the functions' Valves,
+# in the order a user meets them. A bare name is a fragment of the Pipe package.
 _VALVE_SOURCES = (
     ("Pipe", "pipe", "openclaw_pipe.py"),
     ("Status Action", "action", "openclaw_status_action.py"),
     ("Thinking filter", "thinking_filter", "openclaw_thinking_filter.py"),
+    ("Web Push", "push/openclaw_web_push.py", "push/openclaw_web_push.py"),
 )
+
+
+def _source(fragment: str) -> Path:
+    return ROOT / fragment if fragment.endswith(".py") else PKG / f"{fragment}.py"
 
 
 def _valves(fragment: str) -> list:
@@ -180,14 +185,20 @@ def _valves(fragment: str) -> list:
     fragment, read from its source: the docs cannot list a valve the code
     doesn't have, or miss one it has."""
     import ast
-    tree = ast.parse((PKG / f"{fragment}.py").read_text())
+    tree = ast.parse(_source(fragment).read_text())
     cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "Valves")
     out = []
     for node in cls.body:
         if not (isinstance(node, ast.AnnAssign) and isinstance(node.value, ast.Call)):
             continue
         kw = {k.arg: k.value for k in node.value.keywords}
-        default = ast.literal_eval(kw["default"]) if "default" in kw else None
+        try:
+            default = ast.literal_eval(kw["default"]) if "default" in kw else None
+        except ValueError:   # a module constant (e.g. a path built at import): its expression
+            consts = {t.id: n.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets
+                      if isinstance(t, ast.Name)}
+            expr = kw["default"]
+            default = ast.unparse(consts.get(expr.id, expr) if isinstance(expr, ast.Name) else expr)
         out.append((node.target.id, ast.unparse(node.annotation), default,
                     ast.literal_eval(kw["description"]) if "description" in kw else ""))
     return out
@@ -222,7 +233,7 @@ def _user_valves(fragment: str) -> list:
         return ast.literal_eval(ast.fix_missing_locations(_Inline().visit(expr)))
 
     out = []
-    for call in ast.walk(ast.parse((PKG / f"{fragment}.py").read_text())):
+    for call in ast.walk(ast.parse(_source(fragment).read_text())):
         if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "create_model"
                 and call.args and isinstance(call.args[0], ast.Constant)
                 and call.args[0].value == "UserValves"):
@@ -250,14 +261,14 @@ def _valve_lines(valves: list, per_user: bool = False) -> list:
 
 
 def render_configuration() -> str:
-    """docs/configuration.md, generated from the three Valves classes."""
+    """docs/configuration.md, generated from the functions' Valves classes."""
     lines = [
         "# Configuration",
         "",
-        "Every setting (valve) of the three functions, with its type, default and what it does. "
+        "Every setting (valve) of the functions, with its type, default and what it does. "
         "Generated from the code by `python3 build.py --all`; do not edit by hand.",
         "",
-        "Applies to: Pipe, Action, Filter",
+        "Applies to: Pipe, Action, Filter, Web Push (event function)",
         "",
         "Set them in Open WebUI: **Admin Panel > Functions >** the function **> Valves** (the gear). "
         "The installer rewrites the connection valves on every run "
@@ -269,6 +280,10 @@ def render_configuration() -> str:
     ]
     for heading, fragment, filename in _VALVE_SOURCES:
         lines += ["", f"## {heading}", "", f"File: `{filename}`."]
+        if fragment.endswith(".py"):
+            lines += ["", "The Web Push event function ([Push notifications](./install/web-push.md)). "
+                      "Its per-user valves (each device's subscription, muted chats and folders) are written "
+                      "by its page script and service worker, not by hand."]
         if fragment == "action":
             lines += ["", "The Action reuses the Pipe's Gateway connection when the Pipe has one. "
                       "These valves are its own connection's settings, for when it has to open one: "
