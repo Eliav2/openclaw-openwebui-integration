@@ -148,15 +148,33 @@ async function markRead(chatId, signal) {
   }
 }
 
+// The page script answers "oc-open-chat" with an ack and opens the chat inside
+// the app. An older page script never answers: after this long the window is
+// navigated instead (a full load), and the console says why. A safety net for a
+// page without the handler, not a guess at how long the page takes.
+const OPEN_ACK_TIMEOUT_MS = 3000;
+const OPEN_CHAT = "oc-open-chat", OPEN_CHAT_ACK = "oc-open-chat-ack";
+const opening = new Map();   // request id -> the ack's resolve
+
+function askPage(win, url) {
+  const id = crypto.randomUUID();
+  return new Promise((ok) => {
+    const timer = setTimeout(() => { opening.delete(id); ok(false); }, OPEN_ACK_TIMEOUT_MS);
+    opening.set(id, () => { clearTimeout(timer); opening.delete(id); ok(true); });
+    win.postMessage({ type: OPEN_CHAT, id, url });
+  });
+}
+
 async function openChat(url) {
   const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   const win = wins.find((c) => new URL(c.url).origin === self.location.origin);
-  if (win) {
-    // focus() is allowed only during a notification click (a user's tap).
-    await win.focus().catch(() => {});
-    return win.navigate(url);
-  }
-  return self.clients.openWindow(url);
+  if (!win) return self.clients.openWindow(url);   // nothing open: a full load is the only way
+  // focus() is allowed only during a notification click (a user's tap).
+  await win.focus().catch(() => {});
+  // In the app, as a click in its sidebar would: no new document.
+  if (await askPage(win, url)) return win;
+  console.warn("oc-push: the page did not answer " + OPEN_CHAT + " within " + OPEN_ACK_TIMEOUT_MS + " ms; loading the chat");
+  return win.navigate(url);
 }
 
 // Mute and Mark as read get this long, token fetch and socket included; past it
@@ -219,6 +237,7 @@ self.addEventListener("notificationclick", (e) => {
 // could call the same API itself, so this grants nothing new).
 self.addEventListener("message", (e) => {
   const m = e.data || {};
+  if (m.type === OPEN_CHAT_ACK) return opening.get(m.id)?.();
   if (m.type !== "oc-push-act" || !e.source || new URL(e.source.url).origin !== self.location.origin) return;
   e.waitUntil(act(m.action, m.data || {}, m.reply).then((result) =>
     e.source.postMessage({ type: "oc-push-action", action: m.action, result })));

@@ -392,6 +392,32 @@
     if (store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
 
+  // A tap on a notification while this page is open: the service worker asks
+  // the page to open the chat (oc-sw.js "oc-open-chat"). It opens like a link in
+  // the sidebar: SvelteKit handles a click on any same-origin link in the
+  // document, so the page stays (no reload). Already on it: nothing to do.
+  const OPEN_CHAT = "oc-open-chat", OPEN_CHAT_ACK = "oc-open-chat-ack";
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const m = e.data || {};
+    if (m.type !== OPEN_CHAT) return;
+    navigator.serviceWorker.controller?.postMessage({ type: OPEN_CHAT_ACK, id: m.id });
+    const to = new URL(m.url, location.origin);
+    if (to.origin !== location.origin) return;
+    if (to.pathname === location.pathname && !to.search) {
+      window.ocPushOpenedSame = true;
+      seen(chatIdNow()).catch(() => {});
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = to.pathname + to.search;
+    a.hidden = true;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.ocPushOpened = to.pathname.slice("/c/".length);
+  });
+  navigator.serviceWorker.startMessages?.();
+
   window.ocPushEnable = enable;
   window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
   window.ocPushMuteFolder = (seconds, id = chatFolder.folder) => setMute(FOLDERS, id, seconds);

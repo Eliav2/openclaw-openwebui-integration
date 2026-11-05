@@ -575,3 +575,39 @@ def test_mark_as_read_from_the_notification(owui, browser):
     finally:
         api("/api/v1/functions/id/web_push/valves/update",
             {**api("/api/v1/functions/id/web_push/valves", token=token), "NOTIFICATION_ACTIONS": "reply,mute"}, token)
+
+
+def tap(page, action, data, reply=None):
+    """A tap on the notification (or one of its buttons), as the service worker handles it; returns at once."""
+    page.evaluate("(m) => navigator.serviceWorker.controller.postMessage(m)",
+                  {"type": "oc-push-act", "action": action, "data": data, "reply": reply})
+
+
+def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
+    """An open Open WebUI window goes to the chat in the app (no document load): timeOrigin is the page's identity."""
+    ctx, page = browser
+    token = owui
+    a_chat, _ = new_chat(token, "stub", "Chat TA")
+    b_chat, _ = new_chat(token, "stub", "Chat TB")
+    page.goto(f"{BASE}/c/{b_chat}")
+    assert ready(page) in ("kept", "saved")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    origin = page.evaluate("() => performance.timeOrigin")
+    # On chat B, the notification for chat A.
+    tap(page, "", {"chat_id": a_chat, "url": f"/c/{a_chat}"})
+    page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=a_chat, timeout=WAIT_MS)
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+    assert page.evaluate("() => window.ocPushOpened") == a_chat
+    # The same chat's notification: nothing to do.
+    tap(page, "", {"chat_id": a_chat, "url": f"/c/{a_chat}"})
+    page.wait_for_function("() => window.ocPushOpenedSame === true", timeout=WAIT_MS)
+    assert page.evaluate("() => performance.timeOrigin") == origin
+    # Reply that cannot be sent: the chat opens in the app, the text in the message box.
+    f_chat, _ = new_chat(token, "stub", "Chat TF")
+    api(f"/api/v1/chats/{f_chat}", {"chat": {"models": ["no-such-model"]}}, token)
+    tap(page, "reply", {"chat_id": f_chat, "url": f"/c/{f_chat}", "fn": "web_push"}, "kept, not reloaded")
+    page.wait_for_function("() => window.ocPushReply && window.ocPushReply.text === 'kept, not reloaded'", timeout=WAIT_MS)
+    assert "/c/" + f_chat in page.url and "oc-reply" not in page.url
+    assert "kept, not reloaded" in page.locator("#chat-input").inner_text()
+    assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
