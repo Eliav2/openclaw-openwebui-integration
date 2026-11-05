@@ -2994,7 +2994,7 @@ class _GatewayConnection:
             # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
             # Its writer's pump, which its events no longer reach, learns it ended: a
             # message committed before the settle is no steer into it (`_steer`).
-            pump = getattr(self, "_turn_pumps", {}).get((consumer.session_key, consumer.run_id))
+            pump = self._turn_pumps.get((consumer.session_key, consumer.run_id))
             if pump is not None:
                 pump.terminal.set()
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
