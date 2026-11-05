@@ -132,30 +132,51 @@
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
   const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
+  // The two mute lists in the function's user valves, {id: until} (0 always):
+  // chats, and folders (a folder's mute covers the folders inside it).
+  const CHATS = "mutes", FOLDERS = "folder_mutes";
+  const HOUR_S = 3600;
+  const MUTE_FOR = [["for 1 hour", HOUR_S], ["for 8 hours", 8 * HOUR_S], ["always", 0]];
   let mutes = null, hasDevices = false;
-  const muteUntil = (id) => {
-    const until = mutes?.[id];
-    if (typeof until !== "number") return null;
-    return until === 0 || until * 1000 > Date.now() ? until : null;
+  // This chat's folder and the user's folders, read when the bell is placed.
+  let chatFolder = { chat: "", folder: null }, folders = {};
+  const until = (list, id) => {
+    const u = mutes?.[list]?.[id];
+    if (typeof u !== "number") return null;
+    return u === 0 || u * 1000 > Date.now() ? u : null;
   };
+  // The muted folder holding this chat's folder (itself or one above it).
+  function mutedFolder(id) {
+    for (const seen = new Set(); id && !seen.has(id); id = folders[id]?.parent_id) {
+      if (until(FOLDERS, id) !== null) return id;
+      seen.add(id);
+    }
+    return null;
+  }
 
   async function loadMutes() {
     const v = (await valves("")) || {};
-    mutes = parse(v.mutes, "{}");
+    mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
     hasDevices = parse(v.subscriptions, "[]").length > 0;
   }
 
+  async function loadFolder(id) {
+    const folder = (await call("/api/v1/chats/" + id))?.folder_id || null;
+    if (folder) folders = Object.fromEntries(((await call("/api/v1/folders/")) || []).map((f) => [f.id, f]));
+    chatFolder = { chat: id, folder };
+  }
+
   // seconds: 0 always, null unmute.
-  async function setMute(id, seconds) {
+  async function setMute(list, id, seconds) {
     const next = await updateValves((now) => {
-      const m = parse(now.mutes, "{}");
+      const m = parse(now[list], "{}");
       const nowS = Math.floor(Date.now() / 1000);
       for (const k of Object.keys(m)) if (m[k] !== 0 && m[k] <= nowS) delete m[k];   // expired
       if (seconds === null) delete m[id];
       else m[id] = seconds ? nowS + seconds : 0;
-      return { mutes: JSON.stringify(m) };
+      return { [list]: JSON.stringify(m) };
     });
-    mutes = parse(next.mutes, "{}");
+    mutes = { ...mutes, [list]: parse(next[list], "{}") };
     drawBell();
   }
 
@@ -164,15 +185,24 @@
   const fmt = (until) => until === 0 ? "Muted" :
     "Muted until " + new Date(until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+  const folderName = (id) => folders[id]?.name || "this folder";
+  // What the bell says: the chat's own mute first, else its folder's.
+  function bellState(id) {
+    const own = until(CHATS, id);
+    if (own !== null) return { muted: own, label: fmt(own) };
+    const f = chatFolder.chat === id ? mutedFolder(chatFolder.folder) : null;
+    if (f) return { muted: until(FOLDERS, f), label: fmt(until(FOLDERS, f)) + " (folder " + folderName(f) + ")" };
+    return { muted: null, label: "Notifications on" };
+  }
+
   function drawBell() {
     const b = document.getElementById("oc-push-bell");
     if (!b) return;
-    const until = muteUntil(b.dataset.chat);
-    const label = until === null ? "Notifications on" : fmt(until);
+    const { muted, label } = bellState(b.dataset.chat);
     b.setAttribute("aria-label", label + ": change");
     b.title = label;
-    b.dataset.muted = until === null ? "" : String(until);
-    b.querySelector("svg").innerHTML = BELL + (until === null ? "" : SLASH);
+    b.dataset.muted = muted === null ? "" : String(muted);
+    b.querySelector("svg").innerHTML = BELL + (muted === null ? "" : SLASH);
   }
 
   function menu(b) {
@@ -189,26 +219,39 @@
       `font:14px system-ui,sans-serif;background:${dark ? "#222" : "#fff"};color:${dark ? "#eee" : "#111"};` +
       "box-shadow:0 4px 16px #0003;" + `top:${Math.round(r.bottom + 6)}px;` +
       (rtl ? `left:${Math.round(r.left)}px` : `right:${Math.round(innerWidth - r.right)}px`);
-    const until = muteUntil(id);
-    const head = document.createElement("div");
-    head.textContent = until === null ? "Notifications on" : fmt(until);
-    head.style.cssText = "padding:6px 10px;opacity:.6;font-size:12px";
-    m.appendChild(head);
-    const item = (text, seconds) => {
+    const head = (text) => {
+      const h = document.createElement("div");
+      h.textContent = text;
+      h.style.cssText = "padding:6px 10px;opacity:.6;font-size:12px";
+      m.appendChild(h);
+    };
+    const item = (text, list, target, seconds) => {
       const i = document.createElement("button");
       i.setAttribute("role", "menuitem");
       i.textContent = text;
       i.style.cssText = "display:block;width:100%;text-align:start;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:8px;cursor:pointer";
       i.onclick = async () => {
         close();
-        await setMute(id, seconds).catch(() => notice("Could not change notifications for this chat."));
+        await setMute(list, target, seconds).catch(() => notice("Could not change notifications."));
       };
       m.appendChild(i);
     };
-    item("Mute for 1 hour", 3600);
-    item("Mute for 8 hours", 8 * 3600);
-    item("Mute always", 0);
-    if (until !== null) item("Unmute", null);
+    const own = until(CHATS, id);
+    head(own === null ? "This chat: notifications on" : "This chat: " + fmt(own));
+    for (const [text, s] of MUTE_FOR) item("Mute " + text, CHATS, id, s);
+    if (own !== null) item("Unmute", CHATS, id, null);
+    // The chat's folder: mute it (and the folders inside it), or unmute the
+    // folder that mutes it, which may be one above.
+    const folder = chatFolder.chat === id ? chatFolder.folder : null;
+    if (folder) {
+      const by = mutedFolder(folder);
+      const sep = document.createElement("hr");
+      sep.style.cssText = "margin:4px 0;border:0;border-top:1px solid currentColor;opacity:.15";
+      m.appendChild(sep);
+      head("Folder " + folderName(folder) + ": " + (by ? fmt(until(FOLDERS, by)) + (by === folder ? "" : " (by " + folderName(by) + ")") : "notifications on"));
+      for (const [text, s] of MUTE_FOR) item("Mute folder " + text, FOLDERS, folder, s);
+      if (by) item("Unmute folder " + folderName(by), FOLDERS, by, null);
+    }
     const away = (e) => {
       if (e.type === "keydown" ? e.key === "Escape" : !m.contains(e.target) && !b.contains(e.target)) close();
     };
@@ -241,7 +284,8 @@
     b.dataset.chat = id;
     b.className = menuButton?.className || HEADER_BUTTON;
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" style="width:1.125rem;height:1.125rem"></svg>';
-    b.onclick = (e) => { e.stopPropagation(); menu(b); };
+    // The chat may have moved to another folder since: read it again first.
+    b.onclick = (e) => { e.stopPropagation(); loadFolder(id).catch(() => {}).then(() => menu(b)); };
     box.prepend(b);
     drawBell();
   }
@@ -288,6 +332,8 @@
     if (mutes === null) await loadMutes().catch(() => {});
     placeBell();
     pendingReply();
+    const id = chatIdNow();
+    if (id && chatFolder.chat !== id) loadFolder(id).then(drawBell).catch(() => {});
   }
 
   // One run at a time; each run is for the token it started with.
@@ -329,10 +375,12 @@
     if (document.visibilityState !== "visible") return;
     navigator.serviceWorker.getRegistration("/").then((r) => r && r.update()).catch(() => {});
     // Mutes may have changed on another device.
-    if (store.get("token") && chatIdNow()) loadMutes().then(drawBell).catch(() => {});
+    const id = chatIdNow();
+    if (store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
 
   window.ocPushEnable = enable;
-  window.ocPushMute = (seconds, id = chatIdNow()) => setMute(id, seconds);
+  window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
+  window.ocPushMuteFolder = (seconds, id = chatFolder.folder) => setMute(FOLDERS, id, seconds);
   window.ocPushReady = run();
 })();

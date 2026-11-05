@@ -404,3 +404,84 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
     ocp = valves(token)
     api("/api/v1/functions/id/web_push/valves/user/update", {**ocp, "mutes": "{}"}, token)
     other()
+
+
+def muted_log(since, text):
+    end = time.time() + WAIT_MS / 1000
+    while text not in owui_log(since):
+        assert time.time() < end, f"the function never logged {text!r}"
+        time.sleep(0.3)   # a poll of the container's log, never a wait for time
+
+
+def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
+    ctx, page = browser
+    token = owui
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    other = behind(ctx, page)
+    page.evaluate(CLEAR)
+
+    # A. Two replies in one chat leave one notification (the tag is the chat's).
+    o_chat, o_msg = new_chat(token, "stub", "Chat O")
+    reply(token, "stub", o_chat, o_msg)
+    seen_for(page, o_chat)
+    o2 = str(uuid.uuid4())
+    leaf = history(token, o_chat)["currentId"]
+    api("/api/chat/completions", {"model": "stub", "chat_id": o_chat, "id": o2, "parent_id": leaf, "stream": True,
+                                  "user_message": {"id": str(uuid.uuid4()), "parentId": leaf, "childrenIds": [], "role": "user",
+                                                   "content": "again", "models": ["stub"]},
+                                  "message_ids": [{"model_id": "stub", "message_id": o2, "modelIdx": 0}], "session_id": "e2e"}, token)
+    assert all(d["shown"] for d in seen_for(page, o_chat, 2))
+    assert [n["tag"] for n in page.evaluate(NOTES) if n["tag"] == f"chat-{o_chat}"] == [f"chat-{o_chat}"]
+    page.evaluate(CLEAR)
+
+    # B. Folder mute. A chat in folder Child, which is inside folder Parent.
+    parent = api("/api/v1/folders/", {"name": "Parent"}, token)["id"]
+    child = api("/api/v1/folders/", {"name": "Child", "parent_id": parent}, token)["id"]
+    q_chat, _ = new_chat(token, "stub", "Chat Q")
+    api(f"/api/v1/chats/{q_chat}/folder", {"folder_id": child}, token)
+    before = valves(token)["subscriptions"]
+
+    def answer_and_check(muted_by):
+        t = time.time()
+        msg = str(uuid.uuid4())
+        leaf = history(token, q_chat)["currentId"]
+        api("/api/chat/completions", {"model": "stub", "chat_id": q_chat, "id": msg, "parent_id": leaf, "stream": True,
+                                      "user_message": {"id": str(uuid.uuid4()), "parentId": leaf, "childrenIds": [], "role": "user",
+                                                       "content": "folder?", "models": ["stub"]},
+                                      "message_ids": [{"model_id": "stub", "message_id": msg, "modelIdx": 0}], "session_id": "e2e"}, token)
+        if muted_by:
+            wait_done(token, q_chat, msg)
+            muted_log(t, f"chat {q_chat[:8]}: folder {muted_by[:8]} is muted")
+            assert not [x for x in page.evaluate("() => window.ocPushSeen") if x["payload"].get("message_id") == msg]
+        else:
+            page.wait_for_function("(m) => window.ocPushSeen.some(d => d.payload.message_id === m && d.shown)", arg=msg, timeout=WAIT_MS)
+
+    # The bell's menu mutes the chat's own folder; the bell says so.
+    page.bring_to_front()
+    page.goto(f"{BASE}/c/{q_chat}")
+    bell = page.locator("#oc-push-bell")
+    bell.wait_for(timeout=WAIT_MS)
+    bell.click()
+    page.get_by_role("menuitem", name="Mute folder always").click()
+    page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Muted (folder Child)'", timeout=WAIT_MS)
+    v = valves(token)
+    assert json.loads(v["folder_mutes"]) == {child: 0} and v["subscriptions"] == before
+    other()
+    answer_and_check(child)
+
+    # A mute of the folder above covers it; the menu offers to unmute that folder.
+    api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "folder_mutes": json.dumps({parent: 0})}, token)
+    answer_and_check(parent)
+    page.bring_to_front()
+    page.goto(f"{BASE}/c/{q_chat}")
+    page.wait_for_function("() => document.getElementById('oc-push-bell')?.title === 'Muted (folder Parent)'", timeout=WAIT_MS)
+    bell.click()
+    assert "(by Parent)" in page.locator("#oc-push-mute-menu").inner_text()
+    if os.environ.get("E2E_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-folder-mute.png"))
+    page.get_by_role("menuitem", name="Unmute folder Parent").click()
+    page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Notifications on'", timeout=WAIT_MS)
+    assert json.loads(valves(token)["folder_mutes"]) == {}
+    other()
+    answer_and_check(None)

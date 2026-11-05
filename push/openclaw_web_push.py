@@ -2,9 +2,9 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.2.0
+version: 0.3.0
 requirements: pywebpush==2.0.3
-description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats send nothing.
+description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
 # Docs: docs/install/web-push.md. The page script (push/web/oc-push.js) keeps
 # each device's subscription in this function's user valves; the service
@@ -105,19 +105,36 @@ def encode_payload(payload: dict) -> str:
     return body
 
 
-def is_muted(raw, chat_id: str, now: float | None = None) -> bool:
-    """`mutes` user valve: {chat_id: until} in epoch seconds, 0 for always.
-    Anything unreadable mutes nothing."""
+def active_mutes(raw, now: float | None = None) -> dict:
+    """A mutes user valve, {id: until} in epoch seconds with 0 for always, as
+    the entries still in effect. Anything unreadable mutes nothing."""
     try:
         mutes = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
-        return False
-    if not isinstance(mutes, dict) or chat_id not in mutes:
-        return False
-    until = mutes[chat_id]
-    if isinstance(until, bool) or not isinstance(until, (int, float)):
-        return False
-    return until == 0 or until > (time.time() if now is None else now)
+        return {}
+    if not isinstance(mutes, dict):
+        return {}
+    now = time.time() if now is None else now
+    return {k: v for k, v in mutes.items()
+            if not isinstance(v, bool) and isinstance(v, (int, float)) and (v == 0 or v > now)}
+
+
+def is_muted(raw, chat_id: str, now: float | None = None) -> bool:
+    """`mutes` user valve: {chat_id: until}."""
+    return chat_id in active_mutes(raw, now)
+
+
+def muted_folder(raw, folder_id, parent_by_id: dict, now: float | None = None):
+    """`folder_mutes` user valve: {folder_id: until}. The muted folder that
+    holds `folder_id` (itself or a folder above it), or None."""
+    mutes = active_mutes(raw, now)
+    seen = set()
+    while mutes and folder_id and folder_id not in seen:
+        if folder_id in mutes:
+            return folder_id
+        seen.add(folder_id)
+        folder_id = parent_by_id.get(folder_id)
+    return None
 
 
 def topic_for(chat_id: str) -> str:
@@ -182,6 +199,10 @@ class Event:
             default="{}",
             description="Written by the page script and the service worker: chats that send no "
                         "notification, {chat_id: until} in epoch seconds, 0 for always.")
+        folder_mutes: str = Field(
+            default="{}",
+            description="Written by the page script: folders whose chats send no notification, "
+                        "folders inside them included, {folder_id: until} as in mutes.")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -206,6 +227,10 @@ class Event:
         if is_muted(valves.get("mutes"), chat_id):
             log.info("web push: chat %s is muted, nothing sent", chat_id[:8])
             return
+        folder = await self._muted_folder(valves.get("folder_mutes"), chat_id, user_id)
+        if folder:
+            log.info("web push: chat %s: folder %s is muted, nothing sent", chat_id[:8], folder[:8])
+            return
         key = self._private_key()
         if key is None:
             return
@@ -215,6 +240,21 @@ class Event:
                                        key, subject)
         if gone:
             await self._drop(Functions, fid, user_id, gone)
+
+    @staticmethod
+    async def _muted_folder(raw, chat_id: str, user_id: str):
+        """The muted folder that holds the chat, or None. Reads the chat and the
+        user's folders only while a folder mute is in effect."""
+        if not chat_id or not active_mutes(raw):
+            return None
+        from open_webui.models.chats import Chats
+        from open_webui.models.folders import Folders
+
+        chat = await Chats.get_chat_by_id(chat_id)
+        if not chat or not chat.folder_id:
+            return None
+        parents = {f.id: f.parent_id for f in await Folders.get_folders_by_user_id(user_id)}
+        return muted_folder(raw, chat.folder_id, parents)
 
     def _private_key(self):
         path = self.valves.VAPID_PRIVATE_KEY_FILE
