@@ -623,3 +623,71 @@ def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
     assert page.evaluate("(c) => caches.open('oc-push-drafts').then(d => d.match('/oc-push/draft/' + c)).then(r => !r)", f_chat), \
         "the cached reply was kept after it was put in the box"
     assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+
+
+def chat_menu(page, chat_id):
+    """Open WebUI's own chat menu (⋯) for a chat in the sidebar; returns the menu."""
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)   # Open WebUI drawn
+    if not page.locator(f'a[href="/c/{chat_id}"]').is_visible():
+        page.locator("#sidebar-toggle-button").first.click()
+    item = page.locator(f'a[href="/c/{chat_id}"]')
+    item.wait_for(timeout=WAIT_MS)
+    # The chat's ⋯ (in the DOM, shown on hover), pressed as a pointer does.
+    item.evaluate("""(a) => { let box = a, b = null;
+        while (box && !(b = box.querySelector('button[aria-haspopup]'))) box = box.parentElement;
+        for (const t of ['pointerdown', 'pointerup']) b.dispatchEvent(new PointerEvent(t, {bubbles: true}));
+        b.click(); }""")
+    menu = page.locator("[role=menu]")
+    menu.wait_for(timeout=WAIT_MS)
+    return menu
+
+
+def test_mark_as_read_from_the_chat_menu(owui, browser):
+    """The DOM contract with Open WebUI 0.13.0's chat menu: an upgrade that moves it fails here."""
+    ctx, page = browser
+    token = owui
+    m_chat, m_msg = new_chat(token, "stub", "Chat M")
+    reply(token, "stub", m_chat, m_msg)
+    wait_done(token, m_chat, m_msg)
+    api(f"/api/v1/chats/{m_chat}/unread", {}, token)
+    assert unread(token, m_chat)
+    page.bring_to_front()
+    page.set_viewport_size({"width": 1280, "height": 844})   # the sidebar open beside the chat
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    menu = chat_menu(page, m_chat)
+    own = menu.locator("button[role=menuitem]")
+    item = menu.get_by_role("menuitem", name="Mark as read")
+    item.wait_for(timeout=WAIT_MS)
+    # Beside Open WebUI's own "Mark as unread", styled as its items.
+    assert item.evaluate("(b) => b.previousElementSibling.querySelector('path').getAttribute('d').startsWith('M8 12L11 15L16 10')")
+    assert item.evaluate("(b) => b.className === b.previousElementSibling.className")
+    if os.environ.get("E2E_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-menu-mark-read.png"))
+    item.click()
+    end = time.time() + WAIT_MS / 1000
+    while unread(token, m_chat):
+        assert time.time() < end, "the chat was not marked read"
+        time.sleep(0.3)   # a poll of the chat list, never a wait for time
+    assert page.locator("[role=menu]").count() == 0, "the menu stayed open"
+    assert f"/c/{m_chat}" not in page.url, "the chat was opened"
+    assert own.count() == 0
+
+    # Fail safe: a menu without Open WebUI 0.13's structure gets nothing, and one console line.
+    logs = []
+    page.on("console", lambda m: logs.append(m.text))
+    # A chat item whose ⋯ opens a menu Open WebUI 0.13 would not draw (twice: still one line).
+    page.evaluate("""(c) => { const item = document.createElement('div'); item.id = 'fake-item';
+        item.innerHTML = `<div id="sidebar-chat-item"><a href="/c/${c}">x</a></div><button aria-haspopup="true">⋯</button>`;
+        document.body.appendChild(item);
+        for (const id of ['not-owui', 'not-owui-2']) {
+          item.querySelector('button').dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+          const m = document.createElement('div'); m.setAttribute('role', 'menu'); m.id = id;
+          m.innerHTML = '<button role="menuitem">Something</button>'; document.body.appendChild(m);
+        } }""", m_chat)
+    page.wait_for_function("() => document.querySelectorAll('#not-owui, #not-owui-2').length === 2", timeout=WAIT_MS)
+    page.wait_for_function("() => window.ocPushMenuContract === 'missing'", timeout=WAIT_MS)
+    assert page.locator("#not-owui [role=menuitem], #not-owui-2 [role=menuitem]").count() == 2
+    assert len([l for l in logs if "chat menu" in l]) == 1, logs
+    page.evaluate("() => document.querySelectorAll('#not-owui, #not-owui-2, #fake-item').forEach(e => e.remove())")
+    page.set_viewport_size({"width": 390, "height": 844})

@@ -134,6 +134,10 @@ Android Chrome shows two buttons under a notification (`Notification.maxActions`
 
 Other browsers show the buttons differently or not at all; a browser without a text field opens the chat with the message box focused. iOS shows no buttons: a tap opens the chat.
 
+### Mark a chat read from the chat list
+
+On a device with notifications on, the ⋯ menu of a chat in Open WebUI's sidebar has **Mark as read**, right after Open WebUI's own "Mark as unread": the dot goes without opening the chat, through the same event as the notification's button. It is added by the page script to Open WebUI 0.13.0's menu, recognised by its structure and the "Mark as unread" icon, not by text (the menu is translated). If a later Open WebUI draws the menu differently, nothing is added and the browser console says once "Open WebUI's chat menu is not the one this script knows"; the menu itself is never changed. `push/e2e` tests this contract against the pinned Open WebUI, so an upgrade that moves the menu fails there.
+
 ### Mute a chat
 
 In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯, when you have one) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. The bell shows only once a device of yours is enabled.
