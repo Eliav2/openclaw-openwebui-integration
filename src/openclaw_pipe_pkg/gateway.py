@@ -10,7 +10,7 @@ GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 RESTRICTED_SCOPES = ["operator.read", "operator.write"]
 # The Gateway prunes a silently paired device when another silent client with
 # the same client id, mode and displayName pairs while it has no open socket.
-# A displayName of its own keeps other local "webchat" clients from evicting it.
+# A displayName of its own (throwaway comment) keeps other local "webchat" clients from evicting it.
 # The name carries the first characters of the device id (`_display_name`), so
 # two installs on one Gateway do not share a name either. The main identity
 # needs one too: on a local Gateway it is approved silently like any loopback

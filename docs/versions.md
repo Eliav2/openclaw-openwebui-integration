@@ -63,3 +63,4 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 
 - A unit test fails when the "Tested in CI" row here or in the README differs from `e2e/versions.env`.
 - To re-measure, run the end-to-end workflow by hand (**Actions > E2E > Run workflow**) with the `owui_image` or `openclaw_version` input set to the release, and update the tables. Do it when an upgrade touches one of the features above.
+
