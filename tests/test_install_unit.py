@@ -254,5 +254,53 @@ class InstallerCoreTests(unittest.TestCase):
         self.assertFalse(inst.function_status(owui, self.filter))
 
 
+class _OwuiChatCompletions:
+    """Open WebUI's /api/chat/completions as measured on 0.13.0: a `metadata` field in the
+    request is dropped, a top-level `chat_id` must name a chat row (404 otherwise), and a
+    top-level `session_id` reaches the Pipe as metadata.session_id, which the Pipe uses
+    as its session when there is no chat id. A request with neither gets a random one."""
+
+    def __init__(self):
+        self.bodies = []
+        self.sessions = []
+
+    def request(self, method, path, body=None, timeout=30):
+        if path == "/api/v1/models":
+            return 200, {"data": [{"id": f"{inst.FUNCTION_ID}.default"}, {"id": f"{inst.FUNCTION_ID}.other"}]}
+        self.bodies.append(body)
+        if body.get("chat_id"):
+            return 404, {"detail": "not found"}
+        self.sessions.append(body.get("session_id") or f"owui-random-{len(self.sessions)}")
+        return 200, {"choices": [{"message": {"content": "OK_CONFIG_TEST other"}}]}
+
+
+class SmokeSessionTests(unittest.TestCase):
+    """The smokes name their Gateway session in the field Open WebUI passes on, so a deploy
+    reuses one session per smoke instead of starting a new Opus session each time."""
+
+    def run_smokes(self, runs=2):
+        owui = _OwuiChatCompletions()
+        for _ in range(runs):
+            self.assertTrue(inst.smoke_test(owui))
+            self.assertTrue(inst.route_smoke_test(owui))
+        return owui
+
+    def test_repeated_deploys_reuse_one_session_per_smoke(self):
+        owui = self.run_smokes()
+        smoke, route = owui.sessions[0::2], owui.sessions[1::2]
+        self.assertEqual(len(set(smoke)), 1, smoke)
+        self.assertEqual(len(set(route)), 1, route)
+
+    def test_the_two_smokes_do_not_share_a_session(self):
+        owui = self.run_smokes(runs=1)
+        self.assertEqual(len(set(owui.sessions)), 2, owui.sessions)
+
+    def test_no_request_carries_the_field_open_webui_drops(self):
+        owui = self.run_smokes(runs=1)
+        for body in owui.bodies:
+            self.assertNotIn("metadata", body)
+            self.assertNotIn("chat_id", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,12 @@ from rich.prompt import Prompt
 
 FUNCTION_ID = "openclaw_gateway"
 DEFAULT_MODEL_ID = f"{FUNCTION_ID}.default"
+# The Gateway session each smoke test runs in. Open WebUI drops a `metadata` field from the
+# request and answers 404 to a top-level `chat_id` that names no chat, but passes a top-level
+# `session_id` on to the Pipe, which uses it as its session when there is no chat id. A fixed
+# id per smoke reuses one session; without one the Pipe starts a new session on every deploy.
+SMOKE_SESSION_ID = "install-smoke"
+ROUTE_SMOKE_SESSION_ID = "install-route-smoke"
 ROOT = Path(__file__).resolve().parent
 PIPE_FILE = ROOT / "openclaw_pipe.py"
 LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
@@ -821,10 +827,7 @@ def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
                 }
             ],
             "stream": False,
-            "metadata": {
-                "chat_id": f"install-smoke-{int(time.time())}",
-                "user_id": "install-smoke",
-            },
+            "session_id": SMOKE_SESSION_ID,
         },
         timeout=90,
     )
@@ -884,10 +887,7 @@ def route_smoke_test(client: OwuiClient) -> bool:
                 }
             ],
             "stream": False,
-            "metadata": {
-                "chat_id": f"install-route-smoke-{int(time.time())}",
-                "user_id": "install-route-smoke",
-            },
+            "session_id": ROUTE_SMOKE_SESSION_ID,
         },
         timeout=120,
     )
