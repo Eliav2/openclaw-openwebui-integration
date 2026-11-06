@@ -16388,6 +16388,30 @@ class UnpublishedInputResendTests(_TurnCase):
         self.assertEqual(self.conn._consumers.get(f"{self.SK}:{refused}"), None,
                          "the refused key's consumer is gone")
 
+    async def test_the_resend_takes_the_same_route_and_wait_budget(self):
+        """Both sends go through the owner router (`_run_request`), and the
+        resend's wait budget is what the first one left, not a fresh one."""
+        self._refuse_sends(self._error(self.ocp.UNPUBLISHED_INPUT_ERROR))
+        routed = []
+        plain = self.ocp._run_request
+
+        async def run_request(conn, method, params, **kw):
+            routed.append((method, params.get("idempotencyKey"), kw.get("started")))
+            return await plain(conn, method, params, **kw)
+        with mock.patch.object(self.ocp, "_run_request", run_request):
+            gen, first = await self._turn()
+            await self._until_registered("run-1")
+        sends = [r for r in routed if r[0] == "chat.send"]
+        self.assertEqual([key for _m, key, _s in sends], self.keys)
+        (_, _, started), (_, _, resent_started) = sends
+        self.assertIsNotNone(started)
+        self.assertEqual(resent_started, started)
+        q = self._queue("run-1")
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for(first, 2)
+        async for _chunk in gen:
+            pass
+
     async def test_the_same_refusal_twice_is_shown_not_sent_a_third_time(self):
         self._refuse_sends(self._error(self.ocp.UNPUBLISHED_INPUT_ERROR),
                            self._error(self.ocp.UNPUBLISHED_INPUT_ERROR))

@@ -1283,20 +1283,24 @@ class _PipeTurn:
                     self.turn.attachments, combined=len(self.turn.unsent) > 1),
                 thinking=self.resolved_thinking,
             )
+            # One wait budget for the send and its resend, which take one route.
+            send_started = time.monotonic()
             try:
-                try:
-                    send_resp = await _run_request(self.conn, RUN_SEND, send_params, timeout=30)
-                except GatewayError as ex:
-                    if not is_unpublished_input(ex):
-                        raise
-                    # Committed but never published, and its key is spent (ELI-359): once
-                    # more under a new key, which runs it once. A second refusal is shown.
-                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
-                    idempotency_key = new_run_key()
-                    self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
-                    pipe_log(f"  chat.send: {ex}; sending once more as {idempotency_key}")
-                    send_params = {**send_params, "idempotencyKey": idempotency_key}
-                    send_resp = await _run_request(self.conn, RUN_SEND, send_params, timeout=30)
+                for resend in (False, True):
+                    try:
+                        send_resp = await _run_request(self.conn, RUN_SEND, send_params,
+                                                       timeout=30, started=send_started)
+                        break
+                    except GatewayError as ex:
+                        if resend or not is_unpublished_input(ex):
+                            raise
+                        # Committed but never published, and its key is spent (ELI-359): once
+                        # more under a new key, which runs it once. A second refusal is shown.
+                        self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                        idempotency_key = new_run_key()
+                        self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
+                        pipe_log(f"  chat.send: {ex}; sending once more as {idempotency_key}")
+                        send_params = {**send_params, "idempotencyKey": idempotency_key}
             except asyncio.TimeoutError:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)

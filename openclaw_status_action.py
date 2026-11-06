@@ -4659,9 +4659,11 @@ def _non_owner_send_params(params: dict) -> dict:
 
 
 async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
-                       owner: "bool | None" = None, wait: bool = True):
+                       owner: "bool | None" = None, wait: bool = True,
+                       started: "float | None" = None):
     """Send a run request on `conn` for an owner, else on the restricted
-    connection. `owner` overrides the session-key decision."""
+    connection. `owner` overrides the session-key decision; `started`
+    (monotonic) is an earlier send's, whose wait budget this one shares."""
     if owner is None:
         owner = await _sender_is_owner(conn, params.get("sessionKey") or params.get("key") or "")
     target = conn if owner else await _get_restricted_connection(conn._valves)
@@ -4672,15 +4674,16 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
                                               else f"run-{uuid.uuid4().hex[:8]}",
                                               method=method, params=params)))
         return None
-    return await _send_when_prepared(target, method, params, timeout=timeout)
+    return await _send_when_prepared(target, method, params, timeout=timeout, started=started)
 
 
-async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float = 10):
+async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float = 10,
+                              started: "float | None" = None):
     """`conn.send_request`, resent while the Gateway is still preparing the
     agent (up to STARTUP_REFUSAL_WAIT_S), or on any other retryable refusal
     (up to RETRYABLE_REFUSAL_WAIT_S): 2026.10.5 refuses sessions.patch that
     way right after preparation, naming no reason."""
-    started = time.monotonic()
+    started = time.monotonic() if started is None else started
     deadline = started + STARTUP_REFUSAL_WAIT_S
     told = set()
     while True:

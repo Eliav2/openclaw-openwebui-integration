@@ -111,6 +111,14 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
                     ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True), 5)
         self.assertIn("startup inspection", str(caught.exception))
 
+    async def test_a_send_given_a_spent_budget_is_not_sent_again(self):
+        """A resend shares its first send's budget (ELI-359): `started` is that send's."""
+        conn = FakeConn([refusal(), {"runId": "never"}])
+        spent = ocp.time.monotonic() - ocp.STARTUP_REFUSAL_WAIT_S
+        with self.assertRaises(ocp.GatewayError):
+            await ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True, started=spent)
+        self.assertEqual(len(conn.sent), 1)
+
     async def test_a_refused_response_frame_keeps_its_error_shape(self):
         """The caller gets the `res` frame's error shape: the retry reads
         `retryable`, `retryAfterMs` and details.code."""
