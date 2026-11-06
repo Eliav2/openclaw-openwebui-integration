@@ -3601,13 +3601,38 @@ def _orphaned_gateway_connections(current) -> list:
 
 
 def _pin_shut(stale) -> None:
-    """Keep an older build's connection from connecting again: its open
-    socket is read until it drops, then its event loop ends."""
-    async def _refuse(*_a, **_k):
-        raise GatewayError("gateway connection retired by a newer deploy")
-    stale._stopped = True
-    stale.ensure_connected = _refuse
-    stale._connect_and_start = _refuse
+    """Keep an older build's connection from connecting again, but keep its
+    open socket read. The connection's own event loop is that socket's only
+    reader: it answers the Gateway's pings and carries the runs the connection
+    still serves. It ends when the socket drops (a dial is then the only thing
+    left to do) or when the connection closes itself once idle
+    (`_close_if_retired_and_idle`). Setting `_stopped` here would end the old
+    loop after its current `recv()` and leave the socket open and unread, a
+    CLOSE-WAIT socket per pin (ELI-369). The old code cannot be changed, so its
+    entry points are replaced from this side."""
+    def _gone() -> GatewayError:
+        stale._stopped = True       # a dial was wanted: nothing is left to read
+        answer = getattr(stale, "_answer_reconnect_waiters", None)
+        error = GatewayError("gateway connection retired by a newer deploy")
+        if answer is not None:
+            answer(error)
+        return error
+
+    async def _ensure_connected(*_a, **_k):
+        ws, task = getattr(stale, "_ws", None), getattr(stale, "_event_loop_task", None)
+        if ws is not None and task is not None and not task.done():
+            return
+        raise _gone()
+
+    async def _connect_and_start(*_a, **_k):
+        raise _gone()
+
+    async def _reconnect(*_a, **_k):
+        _gone()
+
+    stale.ensure_connected = _ensure_connected
+    stale._connect_and_start = _connect_and_start
+    stale._reconnect = _reconnect
 
 
 async def _retire_stale_connection(stale) -> None:
@@ -3619,7 +3644,9 @@ async def _retire_stale_connection(stale) -> None:
             # connect nameless on the shared device and wipe the stored name.
             _pin_shut(stale)
         return
-    # Pre-`retire()` build: pin its entry points shut so it can't revive.
+    # Pre-`retire()` build: it serves no run past this, so it closes now; pin
+    # its entry points shut so it can't revive.
+    stale._stopped = True
     _pin_shut(stale)
     await asyncio.wait_for(stale.disconnect(), timeout=5)
 
