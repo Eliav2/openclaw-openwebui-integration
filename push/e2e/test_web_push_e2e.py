@@ -566,9 +566,14 @@ def test_opening_a_chat_clears_its_notifications(owui, browser):
     page.bring_to_front()
     page.goto(f"{BASE}/c/{chats['X']}")
     assert read(page, chats["X"]) == sorted([tag["Y"], tag["Z"]])
-    # ... or Open WebUI's own navigation to another chat (SvelteKit's pushState).
+    # ... or Open WebUI's own navigation to another chat (SvelteKit's pushState); closed even when
+    # Cache Storage refuses (the page script marks its closes there first, oc-sw.js swipe = read).
+    page.evaluate("() => { window.ocOpen = CacheStorage.prototype.open; CacheStorage.prototype.open = () => Promise.reject(new Error('no storage')); }")
     page.evaluate("(c) => history.pushState({}, '', '/c/' + c)", chats["Y"])
-    assert read(page, chats["Y"]) == [tag["Z"]]
+    try:
+        assert read(page, chats["Y"]) == [tag["Z"]]
+    finally:
+        page.evaluate("() => { CacheStorage.prototype.open = window.ocOpen; }")
     # Hidden, a chat on the page is not read; shown again on it, it is. Chrome under Xvfb does not
     # reliably hide a page (another tab, a minimized window), so the page's visibility is set here:
     # what the page script reads (visibilityState) and the event it listens to.

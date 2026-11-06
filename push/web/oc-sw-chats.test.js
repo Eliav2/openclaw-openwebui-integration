@@ -22,6 +22,13 @@ class SiteResponse extends Response {
   clone() { return Object.setPrototypeOf(super.clone(), SiteResponse.prototype); }
 }
 
+// The worker reached a fake (a cache lookup, a network request): what the tests wait
+// on, never a count of event-loop turns (the token's hash runs off the main thread,
+// a slow machine takes longer than any fixed number of turns).
+let waiters = [];
+function reached() { const w = waiters; waiters = []; for (const ok of w) ok(); }
+const nextReach = () => new Promise((ok) => waiters.push(ok));
+
 // Cache Storage as Chrome keeps it: a copy per match, keys in the order they were
 // (last) put.
 function cacheStorage() {
@@ -35,6 +42,7 @@ function cacheStorage() {
     return {
       async match(k) {
         matched.set(url(k), (matched.get(url(k)) || 0) + 1);
+        reached();
         const e = m.get(url(k));
         return e && new SiteResponse(e.body, { status: e.status, headers: e.headers });
       },
@@ -65,6 +73,7 @@ function network() {
   const fetch = (input, init) => new Promise((resolve, reject) => {
     const url = new URL(typeof input === "string" ? input : input.url, ORIGIN).href;
     asked.push({ url, init, resolve, reject });
+    reached();
   });
   const waiting = (url) => asked.filter((a) => a.url === url && !a.done);
   return {
@@ -135,21 +144,16 @@ const text = async (res) => JSON.parse(await (await res).text()).chat.history.te
 // The network gets the request, or the test waits for nothing: a microtask turn
 // for the worker's own awaits (opening the cache, the token's hash).
 const asked = async (w, url, n) => {
-  for (let i = 0; w.net.count(url) < n; i++) {
-    await turn();
-    assert.ok(i < 1000, `never asked ${url} ${n} times (${w.net.count(url)})`);
-  }
+  while (w.net.count(url) < n) await nextReach();
+  await turn();
 };
 
 // A turn of the event loop: every microtask the worker queued has run.
 const turn = () => new Promise((r) => setImmediate(r));
 
-// Turns until `ready()`, and one more (the worker's code after that point has run).
+// Until `ready()` (checked each time the worker reaches a fake), and one turn more (its code after that point has run).
 async function turnsUntil(ready) {
-  for (let i = 0; !ready(); i++) {
-    await turn();
-    assert.ok(i < 1000, "the worker never got there");
-  }
+  while (!ready()) await nextReach();
   await turn();
 }
 
@@ -157,10 +161,9 @@ async function turnsUntil(ready) {
 async function until(answer, act) {
   let done = false;
   answer.finally(() => { done = true; });
-  for (let i = 0; !done; i++) {
+  while (!done) {
     act();
-    await turn();
-    assert.ok(i < 1000, "the worker never answered");
+    await Promise.race([answer.catch(() => {}), nextReach()]);
   }
   return answer;
 }
@@ -458,10 +461,9 @@ test("two reads of the tasks before the chat's network copy came (the socket's o
   await w.read(chatUrl(CHAT), { open: true });
   for (const who of ["the socket's", "loadChat's"]) {
     const tasks = w.read(tasksUrl(CHAT));
-    // Answered, or sent to the network (where it would wait: the network is slow).
-    let answered = false;
-    tasks.then(() => { answered = true; }, () => { answered = true; });
-    await turnsUntil(() => answered || w.net.count(tasksUrl(CHAT)) > 0);
+    // Answered, or sent to the network (where it would wait: the network is slow). An
+    // answer from the worker alone reaches no fake, so the answer itself is raced.
+    await Promise.race([tasks, turnsUntil(() => w.net.count(tasksUrl(CHAT)) > 0)]);
     assert.equal(w.net.count(tasksUrl(CHAT)), 0, `${who}: the network not asked`);
     assert.deepEqual(JSON.parse(await (await tasks).text()), { task_ids: [] }, who);
   }

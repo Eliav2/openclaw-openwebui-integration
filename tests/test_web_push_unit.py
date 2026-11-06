@@ -219,6 +219,20 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((key, subject), (b"PEM", "mailto:a@example.com"))
         self.assertNotIn("SECRET-REPLY-TEXT", body)
 
+    async def test_swipe_read_is_on_unless_the_user_turned_it_off(self):
+        """The user's swipe_read valve reaches the device: unset (default on) sends nothing
+        extra, off sends swipe_read: false (the service worker then only hides a swiped one)."""
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertNotIn("swipe_read", json.loads(self.sent[-1][1]))
+        for off in (False, "false"):
+            self.store["swipe_read"] = off
+            await self.fn.event(finished(), __id__="web_push")
+            self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
+        self.store["swipe_read"] = True
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertNotIn("swipe_read", json.loads(self.sent[-1][1]))
+        self.assertTrue(web_push.Event.UserValves().swipe_read)
+
     async def test_no_send_without_the_key_file(self):
         self.fn.valves.VAPID_PRIVATE_KEY_FILE = "/nonexistent/vapid.pem"
         with self.assertLogs("openclaw_web_push", "ERROR"):

@@ -72,6 +72,15 @@ def snippet(text: str, limit: int) -> str:
     return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:") + "…"
 
 
+def is_on(raw, default: bool) -> bool:
+    """A stored boolean valve: Open WebUI keeps it as JSON (true/false), an older or hand
+    edit may be a string; unset or unreadable is the default."""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw or "").strip().lower()
+    return {"true": True, "1": True, "on": True, "false": False, "0": False, "off": False}.get(text, default)
+
+
 def parse_actions(raw: str) -> list:
     """NOTIFICATION_ACTIONS as a list: known names, in order, each once."""
     out = []
@@ -81,7 +90,8 @@ def parse_actions(raw: str) -> list:
     return out
 
 
-def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: list | None = None) -> dict:
+def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: list | None = None,
+                  swipe_read: bool = True) -> dict:
     """What the device gets: the chat's title and where to open it, the id of
     this function (the service worker's Mute writes its user valves), and, only
     with `preview_chars`, the start of the reply. `data.message` holds the whole
@@ -94,6 +104,8 @@ def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: li
                "url": f"/c/{chat_id}" if chat_id else "/"}
     if fn:
         payload["fn"] = fn
+    if not swipe_read:
+        payload["swipe_read"] = False
     names = parse_actions(Event.Valves.model_fields["NOTIFICATION_ACTIONS"].default) if actions is None else actions
     names = [a for a in names if fn or a not in NEEDS_FUNCTION_ID]
     if chat_id and names:
@@ -226,6 +238,10 @@ class Event:
             default="{}",
             description="Written by the page script: folders whose chats send no notification, "
                         "folders inside them included, {folder_id: until} as in mutes.")
+        swipe_read: bool = Field(
+            default=True,
+            description="A notification swiped away marks its chat read (Android Chrome; "
+                        "'Clear all' marks every chat in it read). Off: a swipe only hides it.")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -259,7 +275,8 @@ class Event:
             return
         subject = await self._subject()
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
-                                            parse_actions(self.valves.NOTIFICATION_ACTIONS)))
+                                            parse_actions(self.valves.NOTIFICATION_ACTIONS),
+                                            swipe_read=is_on(valves.get("swipe_read"), True)))
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject, chat_id)
         if gone:

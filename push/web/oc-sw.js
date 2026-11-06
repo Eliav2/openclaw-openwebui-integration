@@ -36,6 +36,15 @@ const BUTTONS = {
 };
 // Where a reply that could not be sent waits for the page (oc-push.js reads it).
 const DRAFTS = "oc-push-drafts";
+// Notifications this code closed itself (a tap, the chat opened: oc-push.js), so a
+// close event for one is not taken for a swipe. Keyed by the notification's tag and
+// time: one shown later with the same tag is another notification.
+const OWN_CLOSES = "oc-push-own-closes";
+const ownCloseKey = (n) => "/oc-push/closed/" + n.tag + "/" + n.timestamp;
+async function closeOwn(n) {
+  await (await caches.open(OWN_CLOSES)).put(ownCloseKey(n), new Response(""));
+  n.close();
+}
 const DEFAULT_TITLE = "Open WebUI", DEFAULT_BODY = "New reply";
 
 // Several replies in one chat stack in its one notification, as in a messaging
@@ -77,6 +86,11 @@ self.addEventListener("push", (e) => {
     if (shown) {
       const tag = TAG_PREFIX + (p.chat_id || "none");
       const [prev] = p.chat_id ? await self.registration.getNotifications({ tag }) : [];
+      // The marks of this tag's earlier notifications: no close of theirs is coming any more.
+      const own = await caches.open(OWN_CLOSES);
+      for (const k of await own.keys()) if (new URL(k.url).pathname.startsWith("/oc-push/closed/" + tag + "/")) await own.delete(k);
+      // The one showing is replaced by this one: this code's close, not a swipe.
+      if (prev) await own.put(ownCloseKey(prev), new Response(""));
       const s = stacked(prev?.data?.stack, p);
       await self.registration.showNotification(s.title, {
         body: s.body,
@@ -84,7 +98,9 @@ self.addEventListener("push", (e) => {
         renotify: true,   // each new reply sounds once
         icon: ICON,
         badge: BADGE,   // Android's small icon: only its alpha is drawn
-        data: { url: p.url || "/", chat_id: p.chat_id || "", fn: p.fn || "", stack: { count: s.count, lines: s.lines } },
+        data: { url: p.url || "/", chat_id: p.chat_id || "", fn: p.fn || "", stack: { count: s.count, lines: s.lines },
+                // The user's swipe_read valve (an older function sends none: on).
+                swipe_read: p.swipe_read !== false },
         // The function's NOTIFICATION_ACTIONS, in order; a push without them gets
         // no buttons. Android Chrome shows two (Notification.maxActions) and adds
         // its own "Unsubscribe" after them.
@@ -271,10 +287,34 @@ async function act(action, data, reply) {
 }
 
 self.addEventListener("notificationclick", (e) => {
-  e.notification.close();
+  e.waitUntil(closeOwn(e.notification).catch(() => e.notification.close()));
   e.waitUntil(act(e.action, e.notification.data || {}, e.reply).then(async (result) => {
     for (const c of await self.clients.matchAll({ type: "window", includeUncontrolled: true })) {
       c.postMessage({ type: "oc-push-action", action: e.action, result });
+    }
+  }));
+});
+
+// A notification swiped away (or "Clear all"): Android tells Chrome with a broadcast,
+// so the shade stays open (a button's tap always collapses it, Chrome 149). With the
+// user's swipe_read valve on, its chat is marked read, as the button would (marking
+// a read chat read again changes nothing). Not when this code closed it: closeOwn,
+// oc-push.js on the chat opened, or the push handler replacing it with a newer one
+// (each marks that very notification; a newer one shown after a swipe does not
+// make the swipe a replacement).
+async function swiped(n) {
+  const data = n.data || {};
+  if (!data.chat_id || data.swipe_read === false) return "off";
+  const own = await caches.open(OWN_CLOSES);
+  if (await own.delete(ownCloseKey(n))) return "own";
+  await markRead(data.chat_id, AbortSignal.timeout(ACTION_DEADLINE_MS));
+  return "read";
+}
+
+self.addEventListener("notificationclose", (e) => {
+  e.waitUntil(swiped(e.notification).catch(() => "read-failed").then(async (result) => {
+    for (const c of await self.clients.matchAll({ type: "window", includeUncontrolled: true })) {
+      c.postMessage({ type: "oc-push-action", action: "swipe", result });
     }
   }));
 });

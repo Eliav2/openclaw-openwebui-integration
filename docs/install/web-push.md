@@ -98,7 +98,7 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 
 ## How it behaves
 
-- **One notification per chat, stacked.** A newer reply in the same chat joins the notification that is still showing (its tag is `chat-<chat id>`), as in a messaging app: the title counts the replies (`Trip plan · 3 new messages`) and, with previews on, the body keeps the latest 5 previews, one line each, newest last. Each new reply sounds once. Opening the chat, Mark as read or swiping the notification away closes it, and the next reply starts again from one. Two chats with the same title are two notifications.
+- **One notification per chat, stacked.** A newer reply in the same chat joins the notification that is still showing (its tag is `chat-<chat id>`), as in a messaging app: the title counts the replies (`Trip plan · 3 new messages`) and, with previews on, the body keeps the latest 5 previews, one line each, newest last. Each new reply sounds once. Opening the chat, Mark as read or swiping the notification away (which also [marks the chat read](#swipe-to-read)) closes it, and the next reply starts again from one. Two chats with the same title are two notifications.
 - **Not while you use it.** While Open WebUI is open, visible and focused on a device, whatever chat is open, that device shows nothing, as in a messaging app; Open WebUI's own sidebar shows the new reply. In the background, closed or with the screen off, it notifies. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
 - **Title, and the reply only with the preview.** The push carries the chat's title, its id, the link and the function's id. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function forwards only the [preview](#preview), and only when it is on.
 - **A crab claw in the status bar.** Android draws a notification's small icon (the `badge`) from its transparency only, so the service worker sends a white claw on a transparent background; the picture beside the text is the same claw in colour. Both are inside `oc-sw.js` (drawn from `push/web/icons/*.svg` by `make_icons.py`), so they need no file of their own in `/static` and no Access bypass.
@@ -134,6 +134,14 @@ Android Chrome shows two buttons under a notification (`Notification.maxActions`
 - **Unsubscribe** is Chrome's own: it turns notifications off for the whole site on that device. To turn them on again, allow notifications for the site in Chrome's site settings and open Open WebUI.
 
 Other browsers show the buttons differently or not at all; a browser without a text field opens the chat with the message box focused. iOS shows no buttons: a tap opens the chat.
+
+### Swipe to read
+
+On Android, a notification you swipe away marks its chat read, as **Mark as read** does (Open WebUI's sidebar dot goes, on every device), and the notification shade stays open. **Clear all** marks every chat in it read. One notification per chat, so one swipe reads one chat. Marking a chat that is read already changes nothing.
+
+Why a swipe and not only the button: on current Chrome for Android (149 and later), tapping any button of a site's notification closes the shade, whatever the site does. A swipe reaches the browser without that (Android sends it as a broadcast), so the shade stays open for the next one.
+
+It is the `swipe_read` user valve of the Web Push function, on by default; turn it off in your own valves of the function (Settings, Functions) and a swipe only hides the notification. A notification the app closes itself (you opened the chat, you tapped it, a newer reply replaced it) never marks anything read.
 
 ### Mark a chat read from the chat list
 
