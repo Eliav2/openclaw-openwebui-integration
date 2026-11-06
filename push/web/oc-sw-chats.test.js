@@ -26,16 +26,20 @@ class SiteResponse extends Response {
 // (last) put.
 function cacheStorage() {
   const stores = new Map();
+  const matched = new Map();   // url -> how many times a cache was asked for it
+  const full = { on: false };  // storage full: every put fails
   const open = async (name) => {
     if (!stores.has(name)) stores.set(name, new Map());
     const m = stores.get(name);
     const url = (k) => new URL(typeof k === "string" ? k : k.url, ORIGIN).href;
     return {
       async match(k) {
+        matched.set(url(k), (matched.get(url(k)) || 0) + 1);
         const e = m.get(url(k));
         return e && new SiteResponse(e.body, { status: e.status, headers: e.headers });
       },
       async put(k, res) {
+        if (full.on) throw new Error("QuotaExceededError");
         const body = await res.blob();
         m.delete(url(k));
         m.set(url(k), { body, status: res.status, headers: [...res.headers] });
@@ -46,6 +50,8 @@ function cacheStorage() {
   };
   return {
     stores,
+    matches: (u) => matched.get(u) || 0,
+    full,
     open,
     has: async (name) => stores.has(name),
     keys: async () => [...stores.keys()],
@@ -83,11 +89,13 @@ function worker({ chats = "1", offline = "1" } = {}) {
   const caches = cacheStorage();
   const net = network();
   const pending = new Set();
+  const told = [];   // what the worker posted to the page
+  const page = { postMessage: (m) => told.push(m) };
   const self = {
     navigator: { userAgent: "Mozilla/5.0 (Linux; Android 14) Chrome/140", maxTouchPoints: 0 },
     location: { origin: ORIGIN },
     registration: { getNotifications: async () => [], showNotification: async () => {} },
-    clients: { matchAll: async () => [], claim: async () => {}, get: async () => null },
+    clients: { matchAll: async () => [page], claim: async () => {}, get: async () => null },
     addEventListener: (type, fn) => { listeners[type] = fn; },
   };
   const source = fs.readFileSync(SW, "utf8").replaceAll("__OC_OFFLINE__", offline).replaceAll("__OC_CHAT_CACHE__", chats);
@@ -97,9 +105,13 @@ function worker({ chats = "1", offline = "1" } = {}) {
   });
   // A request of the page `client`; resolves to the worker's answer (null: not answered by it).
   // `open`: Open WebUI's first read after the page went to the chat (oc-push.js marks it).
+  // `decided`: the worker has looked for its kept copy (a kept chat's read does that
+  // once) or asked the network, and done what follows up to its next wait: answered, asked the network, or
+  // joined a request on its way. Answer the network after it, not before.
   function read(url, { auth = TOKEN_A, method = "GET", own = false, open = false } = {}) {
     let answer = null;
-    const headers = { ...(auth ? { authorization: auth } : {}), ...(own ? { "x-oc-own": "1" } : {}),
+    const before = caches.matches(url), asked = net.count(url);
+    const headers = { ...(auth ? { authorization: auth } : {}), ...(own ? { "x-oc-own": own === true ? "1" : own } : {}),
       ...(open ? { "x-oc-open": "1" } : {}) };
     const request = new Request(url, { method, headers });
     listeners.fetch({
@@ -107,13 +119,15 @@ function worker({ chats = "1", offline = "1" } = {}) {
       respondWith: (p) => { answer = p; },
       waitUntil: (p) => { pending.add(p); p.finally(() => pending.delete(p)); },
     });
+    // (With kept chats off a read asks the network before it looks in a cache.)
+    if (answer) answer.decided = turnsUntil(() => caches.matches(url) > before || net.count(url) > asked);
     return answer;
   }
   // Every piece of work the worker started is done (its cache writes included).
   async function settled() {
     while (pending.size) await Promise.allSettled([...pending]);
   }
-  return { read, net, caches, settled };
+  return { read, net, caches, settled, told };
 }
 
 const chat = (id, text, size = 0) => JSON.stringify({ id, chat: { history: { text, pad: "x".repeat(size) } } });
@@ -122,10 +136,22 @@ const text = async (res) => JSON.parse(await (await res).text()).chat.history.te
 // for the worker's own awaits (opening the cache, the token's hash).
 const asked = async (w, url, n) => {
   for (let i = 0; w.net.count(url) < n; i++) {
-    await new Promise((r) => setImmediate(r));
+    await turn();
     assert.ok(i < 1000, `never asked ${url} ${n} times (${w.net.count(url)})`);
   }
 };
+
+// A turn of the event loop: every microtask the worker queued has run.
+const turn = () => new Promise((r) => setImmediate(r));
+
+// Turns until `ready()`, and one more (the worker's code after that point has run).
+async function turnsUntil(ready) {
+  for (let i = 0; !ready(); i++) {
+    await turn();
+    assert.ok(i < 1000, "the worker never got there");
+  }
+  await turn();
+}
 
 // Does `act` to the network (answer or fail what is waiting) until `answer` is in.
 async function until(answer, act) {
@@ -133,7 +159,7 @@ async function until(answer, act) {
   answer.finally(() => { done = true; });
   for (let i = 0; !done; i++) {
     act();
-    await new Promise((r) => setImmediate(r));
+    await turn();
     assert.ok(i < 1000, "the worker never answered");
   }
   return answer;
@@ -142,7 +168,7 @@ async function until(answer, act) {
 // The first open of a chat: the network; kept for the next.
 async function opened(w, id, body, opts) {
   const res = w.read(chatUrl(id), opts);
-  await asked(w, chatUrl(id), w.net.count(chatUrl(id)) + 1);
+  await res.decided;
   w.net.answer(chatUrl(id), body);
   const r = await res;
   await w.settled();
@@ -156,7 +182,7 @@ test("a chat opened before: the kept copy at once, marked; the next read waits f
   assert.equal(first.headers.get(KEPT), "1");
   assert.equal(await text(first), "old");
   const refresh = w.read(chatUrl(CHAT));                     // refreshChat, on the socket's join
-  await asked(w, chatUrl(CHAT), 2);
+  await refresh.decided;
   w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
   const fresh = await refresh;
   assert.equal(fresh.headers.get(KEPT), null);
@@ -182,7 +208,7 @@ test("a read that is not an open (Open WebUI reloading the chat) never gets the 
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
   const reload = w.read(chatUrl(CHAT));
-  await asked(w, chatUrl(CHAT), 2);
+  await reload.decided;
   w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
   const res = await reload;
   assert.equal(res.headers.get(KEPT), null);
@@ -194,6 +220,7 @@ test("an open while the page script's own read is fetching the chat: that fetch,
   const own = w.read(chatUrl(CHAT), { own: true });
   await asked(w, chatUrl(CHAT), 1);
   const open = w.read(chatUrl(CHAT), { open: true });
+  await open.decided;
   w.net.answer(chatUrl(CHAT), chat(CHAT, "first"));
   assert.equal(await text(own), "first");
   const res = await open;
@@ -206,7 +233,6 @@ test("the network's copy came before the page's next read: that read gets it, no
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
   await w.read(chatUrl(CHAT), { open: true });
-  await asked(w, chatUrl(CHAT), 2);
   w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
   await w.settled();
   const refresh = await w.read(chatUrl(CHAT));
@@ -243,12 +269,12 @@ test("a chat deleted or no longer the user's (404): the answer as it is, and the
   await opened(w, CHAT, chat(CHAT, "old"));
   await w.read(chatUrl(CHAT), { open: true });
   const refresh = w.read(chatUrl(CHAT));
-  await asked(w, chatUrl(CHAT), 2);
+  await refresh.decided;
   w.net.answer(chatUrl(CHAT), JSON.stringify({ detail: "not found" }), NOT_FOUND);
   assert.equal((await refresh).status, NOT_FOUND);
   await w.settled();
   const next = w.read(chatUrl(CHAT), { open: true });
-  await asked(w, chatUrl(CHAT), 3);
+  await next.decided;
   w.net.answer(chatUrl(CHAT), JSON.stringify({ detail: "not found" }), NOT_FOUND);
   assert.equal((await next).status, NOT_FOUND, "not opened from a kept copy");
 });
@@ -257,7 +283,7 @@ test("a chat bigger than the per-chat limit is not kept", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "big", 33 * MIB));
   const next = w.read(chatUrl(CHAT), { open: true });
-  await asked(w, chatUrl(CHAT), 2);
+  await next.decided;
   w.net.answer(chatUrl(CHAT), chat(CHAT, "big again"));
   const res = await next;
   assert.equal(res.headers.get(KEPT), null);
@@ -275,7 +301,6 @@ test("over the total limit, the chat opened longest ago goes first", async () =>
   // Opening one again makes it the most recent: the next one in goes past it.
   const again = await w.read(chatUrl(ids[1]), { open: true });
   assert.equal(again.headers.get(KEPT), "1");
-  await asked(w, chatUrl(ids[1]), 2);
   w.net.answer(chatUrl(ids[1]), chat(ids[1], "c" + ids[1], 30 * MIB));
   await w.settled();
   const extra = "f0000000-0000-4000-8000-000000000000";
@@ -288,7 +313,7 @@ test("another user on the same browser: never the first user's kept chat", async
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "a's chat"));
   const asB = w.read(chatUrl(CHAT), { auth: TOKEN_B, open: true });
-  await asked(w, chatUrl(CHAT), 2);
+  await asB.decided;
   w.net.answer(chatUrl(CHAT), JSON.stringify({ detail: "not found" }), NOT_FOUND);
   const res = await asB;
   assert.equal(res.status, NOT_FOUND);
@@ -317,3 +342,72 @@ test("the switch off (CHAT_CACHE unset): a chat opened before waits for the netw
   assert.equal(res.headers.get(KEPT), null);
   assert.equal(await text(res), "new");
 });
+
+test("storage full: the read still gets the network's answer, and the old copy is not taken for it", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "old"));
+  await w.read(chatUrl(CHAT), { open: true });
+  w.caches.full.on = true;
+  const refresh = w.read(chatUrl(CHAT));
+  await refresh.decided;
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
+  assert.equal(await text(refresh), "new");
+  await w.settled();
+  const reload = w.read(chatUrl(CHAT));
+  await reload.decided;
+  assert.equal(w.net.count(chatUrl(CHAT)), 3, "asked the network: the kept copy is not the new one");
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "newer"));
+  assert.equal(await text(reload), "newer");
+});
+
+test("a sign-out while a read is on its way: nothing of it is kept", async () => {
+  const w = worker();
+  const res = w.read(chatUrl(CHAT), { open: true });
+  w.read(ORIGIN + "/api/v1/auths/signout", { method: "POST" });   // before the read found its user's cache
+  await until(res, () => w.net.answer(chatUrl(CHAT), chat(CHAT, "mine")));
+  await w.settled();
+  assert.ok(!(await w.caches.keys()).some((k) => k.startsWith("oc-api-")), await w.caches.keys());
+});
+
+test("chats an older worker kept (offline open, unmarked) are not opened from, and go with the first kept chat", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "kept"));
+  const store = [...w.caches.stores.entries()].find(([n]) => n.startsWith("oc-api-"))[1];
+  store.set(chatUrl(OTHER), { body: new Blob([chat(OTHER, "legacy")]), status: OK, headers: [] });
+  const open = w.read(chatUrl(OTHER), { open: true });
+  await open.decided;
+  assert.equal(w.net.count(chatUrl(OTHER)), 1, "the network, not the unmarked copy");
+  w.net.answer(chatUrl(OTHER), chat(OTHER, "fresh"));
+  assert.equal(await text(open), "fresh");
+  await w.settled();
+  const index = JSON.parse(await (await (await w.caches.open([...w.caches.stores.keys()].find((n) => n.startsWith("oc-api-")))).match(ORIGIN + "/_oc/chats")).text());
+  assert.deepEqual(Object.keys(index).sort(), [chatUrl(CHAT), chatUrl(OTHER)].sort());
+});
+
+test("the page script's folder read before a mute (OWN fresh): the network's copy, not the kept one", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "in folder A"));
+  const own = w.read(chatUrl(CHAT), { own: "fresh" });
+  await own.decided;
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "moved to folder B"));
+  assert.equal(await text(own), "moved to folder B");
+});
+
+test("an open of a kept chat while its network copy is on its way: the kept copy at once, not a wait", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "old"));
+  await w.read(chatUrl(CHAT), { open: true });   // its network copy now on its way (slow)
+  const again = await w.read(chatUrl(CHAT), { open: true });   // the chat left and opened again
+  assert.equal(again.headers.get(KEPT), "1");
+  assert.equal(await text(again), "old");
+});
+
+test("the network's copy kept: the pages are told which chat (oc-push.js reloads into it if its socket is down)", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "old"));
+  await w.read(chatUrl(CHAT), { open: true });
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
+  await w.settled();
+  assert.deepEqual(w.told.filter((m) => m.type === "oc-chat-fresh").map((m) => m.path).slice(-1), ["/api/v1/chats/" + CHAT]);
+});
+

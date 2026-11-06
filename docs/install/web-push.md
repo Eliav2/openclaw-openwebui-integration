@@ -189,7 +189,7 @@ A network that answers nothing at all (lie-fi) is given up on after 4.2 s (twice
 
 ### A chat opened before, at once
 
-Off by default; it needs offline open on. Turn it on with the Worker's `CHAT_CACHE` variable set to `"1"`, or, with nginx, by replacing `__OC_CHAT_CACHE__` with `1` in your copy of `oc-sw.js`. Open WebUI reads a whole chat (every message, as JSON: megabytes for a long chat) on every open and shows none of it before the last byte, so on a slow network a long chat takes as long to open as its size takes to download.
+Off by default; it needs offline open on. Turn it on with the Cloudflare Worker's `CHAT_CACHE` variable set to `"1"`, or, with nginx, by replacing `__OC_CHAT_CACHE__` with `1` in your copy of `oc-sw.js`. Open WebUI reads a whole chat (every message, as JSON: megabytes for a long chat) on every open and shows none of it before the last byte, so on a slow network a long chat takes as long to open as its size takes to download.
 
 With it on, a chat you opened before on that device opens from the copy kept of it, at once, and the network's copy is fetched behind it:
 
