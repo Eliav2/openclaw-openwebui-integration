@@ -461,10 +461,9 @@ test("two reads of the tasks before the chat's network copy came (the socket's o
   await w.read(chatUrl(CHAT), { open: true });
   for (const who of ["the socket's", "loadChat's"]) {
     const tasks = w.read(tasksUrl(CHAT));
-    // Answered, or sent to the network (where it would wait: the network is slow).
-    let answered = false;
-    tasks.then(() => { answered = true; }, () => { answered = true; });
-    await turnsUntil(() => answered || w.net.count(tasksUrl(CHAT)) > 0);
+    // Answered, or sent to the network (where it would wait: the network is slow). An
+    // answer from the worker alone reaches no fake, so the answer itself is raced.
+    await Promise.race([tasks, turnsUntil(() => w.net.count(tasksUrl(CHAT)) > 0)]);
     assert.equal(w.net.count(tasksUrl(CHAT)), 0, `${who}: the network not asked`);
     assert.deepEqual(JSON.parse(await (await tasks).text()), { task_ids: [] }, who);
   }
