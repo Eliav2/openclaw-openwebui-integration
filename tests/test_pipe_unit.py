@@ -8041,6 +8041,25 @@ class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await self.conn._subscribe_all()
         self.assertEqual(self.conn.active_run_snapshot, {"k": ["r"]})
 
+    async def test_a_failed_subscribe_still_runs_the_turn_resync(self):
+        """ELI-369: a resync skipped while the socket came back is owed by this
+        hello; it reads rows with sessions.list, so a failed subscribe must not drop it."""
+        hellos = []
+
+        class Turns:
+            @staticmethod
+            async def after_hello(conn):
+                hellos.append(conn)
+
+        async def failing(method, params, timeout=10):
+            raise GatewayError("UNAVAILABLE", "closing")
+        self.conn.send_request = failing
+        with mock.patch.object(openclaw_pipe, "_TURNS", Turns):
+            await self.conn._subscribe_all()
+            for _ in range(3):
+                await asyncio.sleep(0)
+        self.assertEqual(hellos, [self.conn])
+
 
 class RecoveryLinkTests(unittest.TestCase):
     """ELI-100 rule E and the active run behind a snapshot without ids."""
@@ -11297,6 +11316,23 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
         await _turn_resync(self.conn)
         text = await self.ended()
         self.assertIn("After it.", text)
+
+    async def test_a_resync_while_the_socket_comes_back_waits_for_its_hello(self):
+        """ELI-369: a handover at the drop asked for the row while the socket was
+        down, which can only fail. It reads nothing; the reconnect's hello reads it."""
+        await self.delta("Before the drop.")
+        self.history = {"messages": self.closed_run("Before the drop. After it.")}
+        self.rows = [{"key": self.sk, "hasActiveRun": False, "status": "done",
+                      "lastRunId": "a-later-run"}]
+        self.conn._event_loop_task = self.loop_task
+        ws, self.conn._ws = self.conn._ws, None   # the read loop is reconnecting
+        self.assertTrue(self.conn.reconnecting)
+        reads = len([c for c in self.calls if c[0] == "sessions.list"])
+        await _turn_resync(self.conn)
+        self.assertEqual(len([c for c in self.calls if c[0] == "sessions.list"]), reads)
+        self.conn._ws = ws                         # back: its hello resyncs
+        await _turn_after_hello(self.conn)
+        self.assertIn("After it.", await self.ended())
 
     async def test_after_a_gap_a_later_runs_settle_ends_the_reply(self):
         """Final and settle lost in a gap: the first idle row after it ends the reply."""

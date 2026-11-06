@@ -5787,8 +5787,11 @@ class _GatewayConnection:
             self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
             self._stop_notice_seen = False
             self._shutdown_seen = False
-            if _TURNS:
-                spawn_background(_TURNS.after_hello(self))
+        # Also after a failed subscribe: the turn resync reads rows with sessions.list,
+        # and the reads it skipped while the socket was coming back are owed now
+        # (ELI-369). A socket that dropped again leaves it to that reconnect's hello.
+        if _TURNS:
+            spawn_background(_TURNS.after_hello(self))
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
         # A waiter that read state before subscribing could miss a settle.
@@ -10634,7 +10637,10 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
     """Re-read rows of sessions with a pump or inline reply and end the idle
     ones. Inline replies get the row even when busy: one may have lost its
-    final in the gap while a later run runs."""
+    final in the gap while a later run runs. While the socket is coming back
+    it reads nothing: that reconnect's hello runs this again (ELI-369)."""
+    if conn.reconnecting:
+        return
     idle = {sess for (sess, _run) in [*conn._turn_pumps, *conn._turn_unkinded] if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
@@ -10643,7 +10649,7 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
                                           timeout=15)
         except Exception as ex:
-            pipe_log(f"  turn writer: row read after hello failed: {ex!r}")
+            pipe_log(f"  turn writer: row read for a resync failed: {ex!r}")
             continue
         row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
         if row is None:
