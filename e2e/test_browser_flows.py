@@ -1074,8 +1074,10 @@ def _open_status(page) -> None:
 
 def _fake_llm_requests() -> list:
     """The scripted model's request log (the stack's E2E_FAKE_LLM_LOG)."""
+    # The fake model may be writing its next line right now: a last line without its newline is
+    # not finished yet and is left for the next read.
     with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh if line.strip()]
+        return [json.loads(line) for line in fh if line.endswith("\n") and line.strip()]
 
 
 def test_the_status_dialog_compacts_the_chat(page):
