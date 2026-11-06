@@ -92,6 +92,7 @@ import sys
 import hashlib
 import io
 import contextlib
+import contextvars
 import copy
 import functools
 import re
@@ -112,9 +113,59 @@ from cryptography.hazmat.backends import default_backend
 
 from pydantic import BaseModel, Field
 
+# The chat and run a log line belongs to (ELI-368). Each reply opens a
+# log_scope with its chat (Pipe.pipe) and each run inside it another with no
+# run yet (_PipeTurn.run); the run id is set once known (_PipeTurn.our_run_id).
+# The scope's end puts the caller's ids back, so a task that consumes replies
+# one after another never logs one reply's ids on the next. asyncio copies the
+# context into every task a reply starts, so the turn writer and other
+# background work log under the reply's ids, and two replies at once (two
+# tasks) never see each other's.
+_LOG_CHAT = contextvars.ContextVar("pipe_log_chat", default=None)
+_LOG_RUN = contextvars.ContextVar("pipe_log_run", default=None)
+
+
+@contextlib.contextmanager
+def log_scope(chat_id=None, run_id=None):
+    """pipe_log lines inside carry these ids (None: no tag); the caller's ids
+    come back when the block ends."""
+    tokens = ((_LOG_CHAT, _LOG_CHAT.set(chat_id)), (_LOG_RUN, _LOG_RUN.set(run_id)))
+    try:
+        yield
+    finally:
+        for var, token in tokens:
+            try:
+                var.reset(token)
+            except ValueError:
+                # Closed from another context (an async generator finalized by
+                # another task): our values were never set there, so nothing
+                # to undo.
+                pass
+
+
+def log_run(run_id):
+    """The run this scope's lines belong to from now on (None: no run)."""
+    _LOG_RUN.set(run_id)
+
+
 def pipe_log(*args):
-    """Log to stdout so it appears in OWUI's backend logs."""
-    print(f"[openclaw-pipe] {' '.join(str(a) for a in args)}", flush=True)
+    """Log to stdout so it appears in OWUI's backend logs.
+
+    A line logged inside a reply ends with `chat_id=<id> runId=<id>` (a run id
+    the line already names is not repeated): central logs index both, so
+    `logtrace <chat id>` finds the whole turn.
+    """
+    msg = ' '.join(str(a) for a in args)
+    chat, run = _LOG_CHAT.get(), _LOG_RUN.get()
+    tags = []
+    # Only the tag itself counts as already there for the chat: a run id like
+    # msg-<chat id>-... contains the chat id, and a search for chat_id=<id>
+    # must still find its line.
+    if chat and f"chat_id={chat}" not in msg:
+        tags.append(f"chat_id={chat}")
+    if run and run not in msg:
+        tags.append(f"runId={run}")
+    print(f"[openclaw-pipe] {' '.join([msg, *tags])}", flush=True)
 
 
 
@@ -5543,6 +5594,12 @@ class _GatewayConnection:
     """Persistent WebSocket connection to the Gateway: dispatches events to
     per-run queues and reconnects with backoff."""
 
+    # Every connect names the device (`_display_name`). A build without this
+    # flag connects nameless, which wipes the name the Gateway stored (a
+    # nameless silent record can be pruned); `_retire_stale_connection` keeps
+    # such a build from reconnecting.
+    sends_display_name = True
+
     def __init__(self, valves_ref, writes_turns: bool = True, scopes: list | None = None,
                  identity_name: str = "identity", requests_only: bool = False,
                  display_name: str = MAIN_DISPLAY_NAME):
@@ -7721,17 +7778,27 @@ def _orphaned_gateway_connections(current) -> list:
     return found
 
 
-async def _retire_stale_connection(stale) -> None:
-    retire = getattr(stale, "retire", None)
-    if retire is not None:
-        await asyncio.wait_for(retire(), timeout=5)
-        return
-    # Pre-`retire()` build: pin its entry points shut so it can't revive.
+def _pin_shut(stale) -> None:
+    """Keep an older build's connection from connecting again: its open
+    socket is read until it drops, then its event loop ends."""
     async def _refuse(*_a, **_k):
         raise GatewayError("gateway connection retired by a newer deploy")
     stale._stopped = True
     stale.ensure_connected = _refuse
     stale._connect_and_start = _refuse
+
+
+async def _retire_stale_connection(stale) -> None:
+    retire = getattr(stale, "retire", None)
+    if retire is not None:
+        await asyncio.wait_for(retire(), timeout=5)
+        if not getattr(stale, "sends_display_name", False):
+            # It still serves its runs, but a reconnect by its old code would
+            # connect nameless on the shared device and wipe the stored name.
+            _pin_shut(stale)
+        return
+    # Pre-`retire()` build: pin its entry points shut so it can't revive.
+    _pin_shut(stale)
     await asyncio.wait_for(stale.disconnect(), timeout=5)
 
 
@@ -13499,30 +13566,31 @@ class Pipe:
         """Main entry point: hands a turn admitted by a superseded load of this
         Function to the current load.
         """
-        remember_owui_server()
-        current = await _current_load(self, __request__)
-        if current is not None:
-            pipe_log("Turn admitted by a superseded load of this Function: the current "
-                     f"load ({type(current).__module__}) serves it")
-            async with contextlib.aclosing(current.pipe(
+        with log_scope(chat_id=(__metadata__ or {}).get("chat_id")):
+            remember_owui_server()
+            current = await _current_load(self, __request__)
+            if current is not None:
+                pipe_log("Turn admitted by a superseded load of this Function: the current "
+                         f"load ({type(current).__module__}) serves it")
+                async with contextlib.aclosing(current.pipe(
+                    body, __event_emitter__, __event_call__=__event_call__,
+                    __user__=__user__, __metadata__=__metadata__, __request__=__request__,
+                    __task__=__task__, __task_body__=__task_body__,
+                )) as turn_gen:
+                    async for item in turn_gen:
+                        yield item
+                return
+            # Compares a timestamp; a due check runs in the background.
+            _ensure_slash_prompts(lambda: self.valves)
+            # aclosing: close the inner generator now, so its cancel handling runs
+            # before the next message arrives.
+            async with contextlib.aclosing(self._pipe_impl(
                 body, __event_emitter__, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__, __request__=__request__,
                 __task__=__task__, __task_body__=__task_body__,
             )) as turn_gen:
                 async for item in turn_gen:
                     yield item
-            return
-        # Compares a timestamp; a due check runs in the background.
-        _ensure_slash_prompts(lambda: self.valves)
-        # aclosing: close the inner generator now, so its cancel handling runs
-        # before the next message arrives.
-        async with contextlib.aclosing(self._pipe_impl(
-            body, __event_emitter__, __event_call__=__event_call__,
-            __user__=__user__, __metadata__=__metadata__, __request__=__request__,
-            __task__=__task__, __task_body__=__task_body__,
-        )) as turn_gen:
-            async for item in turn_gen:
-                yield item
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
@@ -13636,17 +13704,33 @@ class _PipeTurn:
         self._send_attachments = _send_attachments
         self.turn = turn
         self.ended = False
+        self._our_run_id = None
+
+    @property
+    def our_run_id(self):
+        return getattr(self, "_our_run_id", None)
+
+    @our_run_id.setter
+    def our_run_id(self, run_id):
+        # Every way this reply gets a run (send, adopt, steer, resume, answer)
+        # names it on the log lines from here on (ELI-368).
+        self._our_run_id = run_id
+        log_run(run_id)
 
     async def run(self):
-        try:
-            for phase in (self.prepare, self.admit, self.consume, self.finish):
-                async with contextlib.aclosing(phase()) as items:
-                    async for item in items:
-                        yield item
-                if self.ended:
-                    return
-        finally:
-            _secret_asker_leave(self)
+        # A run of its own: a retry or resend inside the same reply never logs
+        # the previous run's id before its own is known, and the caller's run
+        # id comes back after.
+        with log_scope(chat_id=_LOG_CHAT.get()):
+            try:
+                for phase in (self.prepare, self.admit, self.consume, self.finish):
+                    async with contextlib.aclosing(phase()) as items:
+                        async for item in items:
+                            yield item
+                    if self.ended:
+                        return
+            finally:
+                _secret_asker_leave(self)
 
     async def prepare(self):
         """The message, connection, session key, a cancelled run to take over,

@@ -645,30 +645,31 @@ class Pipe:
         """Main entry point: hands a turn admitted by a superseded load of this
         Function to the current load.
         """
-        remember_owui_server()
-        current = await _current_load(self, __request__)
-        if current is not None:
-            pipe_log("Turn admitted by a superseded load of this Function: the current "
-                     f"load ({type(current).__module__}) serves it")
-            async with contextlib.aclosing(current.pipe(
+        with log_scope(chat_id=(__metadata__ or {}).get("chat_id")):
+            remember_owui_server()
+            current = await _current_load(self, __request__)
+            if current is not None:
+                pipe_log("Turn admitted by a superseded load of this Function: the current "
+                         f"load ({type(current).__module__}) serves it")
+                async with contextlib.aclosing(current.pipe(
+                    body, __event_emitter__, __event_call__=__event_call__,
+                    __user__=__user__, __metadata__=__metadata__, __request__=__request__,
+                    __task__=__task__, __task_body__=__task_body__,
+                )) as turn_gen:
+                    async for item in turn_gen:
+                        yield item
+                return
+            # Compares a timestamp; a due check runs in the background.
+            _ensure_slash_prompts(lambda: self.valves)
+            # aclosing: close the inner generator now, so its cancel handling runs
+            # before the next message arrives.
+            async with contextlib.aclosing(self._pipe_impl(
                 body, __event_emitter__, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__, __request__=__request__,
                 __task__=__task__, __task_body__=__task_body__,
             )) as turn_gen:
                 async for item in turn_gen:
                     yield item
-            return
-        # Compares a timestamp; a due check runs in the background.
-        _ensure_slash_prompts(lambda: self.valves)
-        # aclosing: close the inner generator now, so its cancel handling runs
-        # before the next message arrives.
-        async with contextlib.aclosing(self._pipe_impl(
-            body, __event_emitter__, __event_call__=__event_call__,
-            __user__=__user__, __metadata__=__metadata__, __request__=__request__,
-            __task__=__task__, __task_body__=__task_body__,
-        )) as turn_gen:
-            async for item in turn_gen:
-                yield item
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
@@ -782,17 +783,33 @@ class _PipeTurn:
         self._send_attachments = _send_attachments
         self.turn = turn
         self.ended = False
+        self._our_run_id = None
+
+    @property
+    def our_run_id(self):
+        return getattr(self, "_our_run_id", None)
+
+    @our_run_id.setter
+    def our_run_id(self, run_id):
+        # Every way this reply gets a run (send, adopt, steer, resume, answer)
+        # names it on the log lines from here on (ELI-368).
+        self._our_run_id = run_id
+        log_run(run_id)
 
     async def run(self):
-        try:
-            for phase in (self.prepare, self.admit, self.consume, self.finish):
-                async with contextlib.aclosing(phase()) as items:
-                    async for item in items:
-                        yield item
-                if self.ended:
-                    return
-        finally:
-            _secret_asker_leave(self)
+        # A run of its own: a retry or resend inside the same reply never logs
+        # the previous run's id before its own is known, and the caller's run
+        # id comes back after.
+        with log_scope(chat_id=_LOG_CHAT.get()):
+            try:
+                for phase in (self.prepare, self.admit, self.consume, self.finish):
+                    async with contextlib.aclosing(phase()) as items:
+                        async for item in items:
+                            yield item
+                    if self.ended:
+                        return
+            finally:
+                _secret_asker_leave(self)
 
     async def prepare(self):
         """The message, connection, session key, a cancelled run to take over,

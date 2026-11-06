@@ -2,7 +2,7 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.4.0
+version: 0.4.1
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
@@ -264,11 +264,11 @@ class Event:
         chat_id = str(data.get("chat_id") or "")
         # Before anything is encrypted or sent: a muted chat sends nothing, to any device.
         if is_muted(valves.get("mutes"), chat_id):
-            log.info("web push: chat %s is muted, nothing sent", chat_id[:8])
+            log.info("web push: chat is muted, nothing sent chat_id=%s", chat_id)
             return
         folder = await self._muted_folder(valves.get("folder_mutes"), chat_id, user_id)
         if folder:
-            log.info("web push: chat %s: folder %s is muted, nothing sent", chat_id[:8], folder[:8])
+            log.info("web push: folder %s is muted, nothing sent chat_id=%s", folder[:8], chat_id)
             return
         key = self._private_key()
         if key is None:
@@ -278,7 +278,7 @@ class Event:
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
                                             swipe_read=is_on(valves.get("swipe_read"), True)))
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
-                                       key, subject)
+                                       key, subject, chat_id)
         if gone:
             await self._drop(Functions, fid, user_id, gone)
 
@@ -316,9 +316,10 @@ class Event:
             url = ""
         return url or "mailto:webmaster@localhost"
 
-    def send_all(self, subs: list, body: str, topic: str, key: bytes, subject: str) -> set:
+    def send_all(self, subs: list, body: str, topic: str, key: bytes, subject: str, chat_id: str) -> set:
         """Send `body` to each subscription; returns the endpoints the push
-        service says are gone. `key`: the VAPID private key, PEM."""
+        service says are gone. `key`: the VAPID private key, PEM. Each line
+        ends with `chat_id=<id>`, which central logs index (ELI-368)."""
         from py_vapid import Vapid
         from pywebpush import WebPushException, webpush
 
@@ -335,16 +336,16 @@ class Event:
                         vapid_claims={"sub": subject}, ttl=self.valves.TTL_SECONDS,
                         headers={"Urgency": self.valves.URGENCY, "Topic": topic},
                         content_encoding="aes128gcm", timeout=PUSH_REQUEST_TIMEOUT_S)
-                log.info("web push: sent to %s", _host(sub))
+                log.info("web push: sent to %s chat_id=%s", _host(sub), chat_id)
             except WebPushException as ex:
                 status = getattr(ex.response, "status_code", None)
                 if status in GONE_STATUSES:
                     gone.add(sub["endpoint"])
-                    log.info("web push: subscription gone (%s), dropping %s", status, _host(sub))
+                    log.info("web push: subscription gone (%s), dropping %s chat_id=%s", status, _host(sub), chat_id)
                 else:
-                    log.warning("web push: %s answered %s: %s", _host(sub), status, str(ex)[:200])
+                    log.warning("web push: %s answered %s: %s chat_id=%s", _host(sub), status, str(ex)[:200], chat_id)
             except Exception as ex:
-                log.warning("web push: sending to %s failed: %r", _host(sub), ex)
+                log.warning("web push: sending to %s failed: %r chat_id=%s", _host(sub), ex, chat_id)
         return gone
 
     async def _drop(self, Functions, fid: str, user_id: str, gone: set) -> None:
