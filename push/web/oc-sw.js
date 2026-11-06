@@ -568,6 +568,150 @@ async function apiCacheFor(auth) {
   return name;
 }
 
+// --- Kept chats: a chat opened before shows at once ------------------------
+// Open WebUI reads the whole chat (every message, as JSON: megabytes for a long
+// chat) on every open, and draws nothing of it before the last byte. A chat this
+// user opened before is answered from the copy kept of it, at once, marked
+// (KEPT_HEADER), and the network's copy is fetched behind it. Open WebUI reads an
+// opened chat twice: to draw it (loadChat) and again once it has joined the chat's
+// room on the socket (refreshChat, also after a reconnect), merging what that read
+// gets into the chat on screen. A page that was given the kept copy waits for the
+// network's on its next read of that chat, so that second read swaps the fresh
+// copy in: Open WebUI's own refresh, no timer. If the network's copy came before
+// that read, the read gets it from the cache, not a second download. The page
+// script (oc-push.js) shows "Updating…" and locks the message box while a chat on
+// screen is the kept copy: a message sent on it could branch off an old point.
+// The proxy replaces __OC_CHAT_CACHE__ with its CHAT_CACHE setting ("1" = on);
+// it works with offline open on (the kept chats are in the user's offline cache).
+const CHAT_CACHE_SETTING = "__OC_CHAT_CACHE__";
+const CHATS_KEPT = OFFLINE && CHAT_CACHE_SETTING === ON;
+const CHAT_READ = /^\/api\/v1\/chats\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const KEPT_HEADER = "x-oc-kept";      // on a chat answered from the kept copy (oc-push.js)
+// On the page script's own reads (oc-push.js reads a chat for its folder): the kept
+// copy is fine for that, and it is not the page's read of the chat on screen.
+const OWN_READ = "x-oc-own";
+const MIB = 1048576;
+// A chat bigger than this is not kept (the network on every open): keeping it
+// takes the whole chat through the worker's memory on every open. The biggest real
+// chats (2026-11-06) are 31, 20 and 16 MB: each one is kept.
+const CHAT_MAX_MIB = 32;
+const CHAT_MAX_BYTES = CHAT_MAX_MIB * MIB;
+// All the kept chats of a user; the least recently opened go first. Room for the
+// three biggest real chats (67 MB) and as much again of ordinary ones (tens of KB
+// to a few MB each), far under the storage Chrome gives a site on a phone.
+const CHATS_MAX_MIB = 128;
+const CHATS_MAX_BYTES = CHATS_MAX_MIB * MIB;
+const CHATS_INDEX = "/_oc/chats";     // in the user's cache: {url: [bytes, last opened]}
+const SIGNOUT_PATH = "/api/v1/auths/signout";
+// Headers of the network's answer that do not hold for the kept body (decoded, its own length).
+const NOT_KEPT_HEADERS = ["content-encoding", "content-length"];
+
+const chatFetches = new Map();   // cache + url -> {res: the network's answer (a promise), joined}
+const chatFresh = new Set();     // cache + url: the kept copy is the network's, fetched after the last read
+const givenKept = new Map();     // cache + url -> the pages (client ids) shown the kept copy
+
+// The index is read and written one change at a time.
+let indexing = Promise.resolve();
+function withIndex(cache, change) {
+  indexing = indexing.then(async () => {
+    const index = (await (await cache.match(CHATS_INDEX))?.json().catch(() => null)) || {};
+    await change(index);
+    await cache.put(CHATS_INDEX, new Response(JSON.stringify(index), { headers: JSON_TYPE }));
+  }).catch(() => {});
+  return indexing;
+}
+
+async function keepChat(cache, url, res) {
+  const body = await res.blob();
+  if (body.size > CHAT_MAX_BYTES) return forgetChat(cache, url);
+  const headers = new Headers(res.headers);
+  for (const h of NOT_KEPT_HEADERS) headers.delete(h);
+  headers.set(KEPT_HEADER, ON);
+  await cache.put(url, new Response(body, { status: res.status, statusText: res.statusText, headers }));
+  return withIndex(cache, async (index) => {
+    index[url] = [body.size, Date.now()];
+    const oldestFirst = Object.entries(index).sort((a, b) => a[1][1] - b[1][1]);
+    let total = oldestFirst.reduce((n, [, [bytes]]) => n + bytes, 0);
+    for (const [old, [bytes]] of oldestFirst) {
+      if (total <= CHATS_MAX_BYTES) break;
+      await cache.delete(old);
+      delete index[old];
+      total -= bytes;
+    }
+  });
+}
+
+async function forgetChat(cache, url) {
+  await cache.delete(url);
+  return withIndex(cache, (index) => { delete index[url]; });
+}
+
+// The kept copy, told apart from the network's by nothing: it is the network's.
+function asFresh(res) {
+  const headers = new Headers(res.headers);
+  headers.delete(KEPT_HEADER);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+// The network's copy of a chat, one request however many reads wait for it.
+function fetchChat(e, req, cache, key) {
+  let f = chatFetches.get(key);
+  if (!f) {
+    f = { joined: false };
+    const mine = f;
+    f.res = shared(req).then(async (res) => {
+      if (keepable(res)) await keepChat(cache, req.url, res.clone());
+      // Deleted, or no longer this user's: not opened from the kept copy again.
+      else if (!down(res) && !res.redirected) await forgetChat(cache, req.url);
+      if (keepable(res) && !mine.joined) chatFresh.add(key);
+      return res;
+    }, () => null).finally(() => chatFetches.delete(key));
+    chatFetches.set(key, f);
+  }
+  e.waitUntil(f.res);
+  return f;
+}
+
+async function chatRead(e, req, name) {
+  const cache = await caches.open(name);
+  const key = name + "\n" + req.url;
+  // A copy an older worker kept (offline open) has no mark: not shown as a kept chat.
+  const saved = (await cache.match(req.url)) ?? null;
+  const shown = givenKept.get(key) || new Set();
+  // The network's copy. When it does not come (no network, the server down), the
+  // kept copy: Open WebUI empties the chat and goes home on a failed read.
+  const waited = async (f) => {
+    f.joined = true;
+    const res = (await f.res)?.clone();
+    if (!down(res)) {
+      shown.delete(e.clientId);
+      return res;
+    }
+    return saved || res || Response.error();
+  };
+  if (!saved?.headers.has(KEPT_HEADER)) return waited(fetchChat(e, req, cache, key));
+  if (req.headers.has(OWN_READ)) return saved;
+  if (chatFresh.delete(key)) {
+    shown.delete(e.clientId);
+    return asFresh(saved);
+  }
+  if (chatFetches.has(key) || shown.has(e.clientId)) return waited(fetchChat(e, req, cache, key));
+  shown.add(e.clientId);
+  givenKept.set(key, shown);
+  fetchChat(e, req, cache, key);
+  e.waitUntil(withIndex(cache, (index) => { if (index[req.url]) index[req.url][1] = Date.now(); }));
+  return saved;
+}
+
+// A sign-out: nothing of that user's stays on the device.
+async function signedOut() {
+  apiCache = "";
+  chatFetches.clear();
+  chatFresh.clear();
+  givenKept.clear();
+  await dropCaches((n) => n.startsWith(API_PREFIX));
+}
+
 self.addEventListener("fetch", (e) => {
   const req = e.request;
   if (!OFFLINE) {
@@ -576,10 +720,11 @@ self.addEventListener("fetch", (e) => {
     if (req.mode === NAVIGATE) e.waitUntil(dropCaches(() => true));
     return;
   }
-  if (req.method !== GET) return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
   const path = url.pathname;
+  if (path === SIGNOUT_PATH) e.waitUntil(signedOut());
+  if (req.method !== GET) return;
   if (req.mode === NAVIGATE) {
     e.respondWith(navigate(e, req));
   } else if (path.startsWith(IMMUTABLE)) {
@@ -603,6 +748,10 @@ self.addEventListener("fetch", (e) => {
     const fresh = FRESH_READS.some((r) => r.test(path));
     if (!fresh && !SHELL_READS.some((r) => r.test(path))) return;
     const auth = req.headers.get("authorization");
+    if (CHATS_KEPT && auth && CHAT_READ.test(path) && !url.search) {
+      e.respondWith(apiCacheFor(auth).then((name) => chatRead(e, req, name)));
+      return;
+    }
     const read = (name, onFresh) => (fresh
       ? freshFirst(e, req, name, req.url, LIE_FI_MS, onFresh)
       : savedFirst(e, req, name, req.url, onFresh));

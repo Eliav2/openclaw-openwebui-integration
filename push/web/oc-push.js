@@ -26,9 +26,12 @@
     const a = new Uint8Array(buf), b = keyBytes(VAPID);
     return a.length === b.length && a.every((x, i) => x === b[i]);
   };
+  // OWN_READ marks this script's own reads: a chat read for its folder is not one of
+  // Open WebUI's (oc-sw.js kept chats; the kept-chat mark below).
+  const OWN_READ = "x-oc-own";
   const call = (path, body) => fetch(path, {
     method: body ? "POST" : "GET",
-    headers: { Authorization: "Bearer " + store.get("token"), "Content-Type": "application/json" },
+    headers: { Authorization: "Bearer " + store.get("token"), "Content-Type": "application/json", [OWN_READ]: "1" },
     body: body ? JSON.stringify(body) : undefined,
   }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(path + " " + r.status))));
   const valves = (suffix, body) => call("/api/v1/functions/id/" + FN + "/valves/user" + suffix, body);
@@ -129,12 +132,17 @@
     setTimeout(() => n.remove(), 8000);
   }
 
+  const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
+
   // With no network, while the service worker opens the app from what it kept
   // (offline open on: its app cache is there), the chats are read-only: a pill
   // says so and the message box is locked (inert: no typing, no keyboard, no
   // send), so nothing typed offline is lost on a send that cannot go. Text already
   // in the box stays there and can be sent once the network is back.
-  const OFFLINE_PILL = "oc-offline";
+  // A chat on screen from the copy the worker kept of it (oc-sw.js, kept chats)
+  // gets the same lock and an "Updating…" pill until Open WebUI has the network's
+  // copy: a message sent on an old copy could branch off an old point of the chat.
+  const OFFLINE_PILL = "oc-offline", UPDATING_PILL = "oc-updating";
   const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
   const LOCKED = "ocOfflineLocked";   // data-oc-offline-locked on the locked composer
   const LOCKED_OPACITY = "0.5";
@@ -152,36 +160,74 @@
     f.style.opacity = LOCKED_OPACITY;
     f.dataset[LOCKED] = "1";
   }
+  let offline = false;
+  const keptChats = new Set();   // chats whose kept copy Open WebUI has, not yet the network's
+  const updating = () => keptChats.has(chatIdNow());
   // Open WebUI draws a new message box on each chat, and its first render can
-  // replace what is in the page: both again while offline.
-  const relock = new MutationObserver(() => { lockComposer(true); showPill(); });
+  // replace what is in the page: both again while locked.
+  const relock = new MutationObserver(() => { lockComposer(true); showPills(); });
   async function offlinePill() {
-    const offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
-    lockComposer(offline);
-    if (!offline) {
-      relock.disconnect();
-      return document.getElementById(OFFLINE_PILL)?.remove();
-    }
-    relock.observe(document.documentElement, { childList: true, subtree: true });
-    showPill();
+    offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
+    readOnly();
   }
-  function showPill() {
-    if (document.getElementById(OFFLINE_PILL) || !document.body) return;
+  function readOnly() {
+    const on = offline || updating();
+    lockComposer(on);
+    if (on) relock.observe(document.documentElement, { childList: true, subtree: true });
+    else relock.disconnect();
+    showPills();
+  }
+  function showPills() {
+    statusPill(OFFLINE_PILL, offline, "Offline: saved chats, read-only");
+    statusPill(UPDATING_PILL, !offline && updating(), "Updating…");
+  }
+  function statusPill(id, on, text) {
+    const shown = document.getElementById(id);
+    if (!on) return shown?.remove();
+    if (shown || !document.body) return;
     const p = document.createElement("div");
-    p.id = OFFLINE_PILL;
+    p.id = id;
     p.setAttribute("role", "status");
     p.style.cssText = pill + ";padding:6px 14px;pointer-events:none";
-    p.textContent = "Offline: saved chats, read-only";
+    p.textContent = text;
     document.body.appendChild(p);
   }
   addEventListener("online", offlinePill);
   addEventListener("offline", offlinePill);
   offlinePill();
 
+  // Open WebUI reads a chat with GET /api/v1/chats/<id>. An answer from the kept
+  // copy carries KEPT_HEADER; the chat stays marked until a read of it gets the
+  // network's answer (Open WebUI's refresh once it joins the chat's room) and Open
+  // WebUI has read its body: it merges it into the chat on screen right then.
+  const CHAT_READ = /^\/api\/v1\/chats\/([0-9a-f-]+)$/;
+  const KEPT_HEADER = "x-oc-kept";   // oc-sw.js
+  const GET = "GET";
+  const pageFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const sent = pageFetch.call(this, input, init);
+    const req = input instanceof Request ? input : null;
+    if ((init?.method || req?.method || GET).toUpperCase() !== GET) return sent;
+    const url = new URL(req ? req.url : String(input), location.href);
+    const id = url.origin === location.origin && !url.search && (url.pathname.match(CHAT_READ) || [])[1];
+    if (!id || new Headers(init?.headers || req?.headers).has(OWN_READ)) return sent;
+    return sent.then((res) => {
+      if (res.headers.has(KEPT_HEADER)) {
+        keptChats.add(id);
+        readOnly();
+      } else if (keptChats.has(id)) {
+        const body = res.json;
+        res.json = function () {
+          return body.call(this).finally(() => { keptChats.delete(id); readOnly(); });
+        };
+      }
+      return res;
+    });
+  };
+
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
   const VISIBLE = "visible";
-  const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
   // The two mute lists in the function's user valves, {id: until} (0 always):
   // chats, and folders (a folder's mute covers the folders inside it).
   const CHATS = "mutes", FOLDERS = "folder_mutes";
@@ -477,6 +523,7 @@
   // or replaceState). Each navigation checks whether the token changed since the
   // last run, and runs again if so.
   const navigated = () => {
+    readOnly();
     const t = store.get("token");
     if (t && t !== ranFor) run();
     else chatPage();

@@ -1546,6 +1546,11 @@ def test_another_user_on_the_same_browser_never_sees_the_first_users_chats(owui,
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         settled(page, """(a) => caches.keys().then((ks) => !ks.includes(a)
             && ks.some((k) => k.startsWith('oc-api-')))""", a_caches[0])
+        # B asks for A's chat by its address, as Open WebUI would: the server's answer, never A's kept copy.
+        got = page.evaluate("""([c, t]) => fetch('/api/v1/chats/' + c, {headers: {authorization: 'Bearer ' + t}})
+            .then(async (r) => ({status: r.status, kept: r.headers.get('x-oc-kept'), body: await r.text()}))""",
+                            [a_chat, b_token])
+        assert got["status"] != 200 and not got["kept"] and a_title not in got["body"], got
         ctx.set_offline(True)
         page.reload(timeout=WAIT_MS)
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
@@ -1555,6 +1560,104 @@ def test_another_user_on_the_same_browser_never_sees_the_first_users_chats(owui,
             for (const k of ks) if (await (await caches.open(k)).match(location.origin + '/api/v1/chats/' + c)) return k;
             return null; })""", a_chat)
         assert found is None, found
+    finally:
+        ctx.close()
+
+
+UPDATING_PILL = "#oc-updating"
+
+
+def say(token, chat_id, message_id, text):
+    """The chat's assistant message says `text` on the server (a reply that came in elsewhere)."""
+    c = api(f"/api/v1/chats/{chat_id}", token=token)["chat"]
+    c["history"]["messages"][message_id].update({"content": text, "done": True})
+    c["messages"] = list(c["history"]["messages"].values())
+    api(f"/api/v1/chats/{chat_id}", {"chat": {"history": c["history"], "messages": c["messages"]}}, token)
+
+
+def held_chat_reads(ctx, token, chat_id):
+    """The worker's network reads of the chat wait at a gate (a slow network: nothing yet),
+    then get the server's answer. Returns the gate and a function that undoes it."""
+    gate = threading.Event()
+    def answer(path):
+        req = urllib.request.Request(OWUI + path, headers={"Authorization": "Bearer " + token})
+        return urllib.request.urlopen(req, timeout=30).read(), "application/json"
+    srv = slow_server(answer, gate=gate)
+    def held(route):
+        if route.request.service_worker is None:
+            return route.fallback()
+        route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}{urllib.parse.urlsplit(route.request.url).path}")
+    ctx.route(f"**/api/v1/chats/{chat_id}", held)
+    def undo():
+        ctx.unroute(f"**/api/v1/chats/{chat_id}", held)
+        gate.set()
+        srv.shutdown()
+    return gate, undo
+
+
+def kept_then_fresh(page, gate, old, new):
+    """The chat shows `old` (the kept copy) while the network has nothing, marked and read-only;
+    once the network's copy comes, `new`, unmarked and writable."""
+    page.get_by_text(old).first.wait_for(timeout=WAIT_MS)
+    page.locator(UPDATING_PILL).wait_for(timeout=WAIT_MS)
+    page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
+    assert page.get_by_text(new).count() == 0
+    gate.set()
+    page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
+    page.locator(UPDATING_PILL).wait_for(state="detached", timeout=WAIT_MS)
+    page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
+
+
+@needs_offline
+def test_a_chat_opened_before_shows_at_once_and_the_fresh_copy_replaces_it(owui, pw):
+    """Opened again with the network slow, a chat shows the copy kept of it at once, with
+    "Updating…" and the message box locked; Open WebUI's own refresh then puts the network's copy
+    in its place. The same from a notification's tap while another chat is open. Its own browser."""
+    tag = uuid.uuid4().hex[:6]
+    chat, answer = new_chat(owui, "stub", "Chat Kept " + tag)
+    other, _ = new_chat(owui, "stub", "Chat Other " + tag)
+    say(owui, chat, answer, "Kept reply " + tag)
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        warm(page, chat)
+        say(owui, chat, answer, "Fresh reply " + tag)   # came in while the chat was closed
+        gate, undo = held_chat_reads(ctx, owui, chat)
+        try:
+            page.reload()
+            kept_then_fresh(page, gate, "Kept reply " + tag, "Fresh reply " + tag)
+        finally:
+            undo()
+        # Another chat open; a notification for this one, a newer reply on the server.
+        page.goto(f"{BASE}/c/{other}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        say(owui, chat, answer, "Newest reply " + tag)
+        gate, undo = held_chat_reads(ctx, owui, chat)
+        try:
+            tap(page, "", {"chat_id": chat, "url": f"/c/{chat}"})
+            page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=chat, timeout=WAIT_MS)
+            kept_then_fresh(page, gate, "Fresh reply " + tag, "Newest reply " + tag)
+        finally:
+            undo()
+    finally:
+        ctx.close()
+
+
+@needs_offline
+def test_a_sign_out_drops_the_kept_chats(owui, pw):
+    """Open WebUI's sign-out (POST /api/v1/auths/signout): nothing of the user's reads stays."""
+    cred = {"name": "E2E Out", "email": f"out-{uuid.uuid4().hex[:8]}@e2e.example.com", "password": "e2e-pass-out"}
+    token = api("/api/v1/auths/signup", cred)["token"]
+    api("/api/v1/users/user/settings/update", {"ui": {"showChangelog": False}}, token)
+    chat, _ = new_chat(token, "stub", "Chat Signed Out")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(token)})")
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        warm(page, chat)
+        page.evaluate("() => fetch('/api/v1/auths/signout', {method: 'POST', credentials: 'include'})")
+        settled(page, "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-api-')))")
     finally:
         ctx.close()
 
