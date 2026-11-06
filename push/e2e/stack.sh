@@ -5,7 +5,7 @@
 #   push/e2e/stack.sh down <run_dir>
 #   push/e2e/stack.sh offline <run_dir> 0|1      # the Worker's OFFLINE switch, Worker restarted
 #   push/e2e/stack.sh chats <run_dir> 0|1        # its CHAT_CACHE switch (kept chats), the same way
-# Ports: OWUI 18780, Worker 18787. Needs docker, bun or npx, uv.
+# Ports: OWUI 18780, Worker 18787 (its inspector 18797: wrangler's default 9229 may be another stack's). Needs docker, bun or npx, uv.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd); push=$(dirname "$here")
 cmd=$1; run=$2
@@ -36,7 +36,7 @@ start_worker() {
   : > "$run/wrangler.log"
   systemd-run --user --unit "$name-wrangler" --working-directory "$run/worker" --setenv=PATH="$PATH" \
     -p StandardOutput="append:$run/wrangler.log" -p StandardError="append:$run/wrangler.log" \
-    bunx wrangler@4.45.0 dev --port 18787 --ip 127.0.0.1 --local-upstream 127.0.0.1:18780 >/dev/null
+    bunx wrangler@4.45.0 dev --port 18787 --inspector-port 18797 --ip 127.0.0.1 --local-upstream 127.0.0.1:18780 >/dev/null
   first_match "Ready on" tail -n +1 -F "$run/wrangler.log"
 }
 if [ "$cmd" = offline ] || [ "$cmd" = chats ]; then
