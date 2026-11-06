@@ -676,14 +676,17 @@ async function toPages(message) {
 function fetchChat(e, req, cache, key, session) {
   let f = chatFetches.get(key);
   if (!f) {
-    f = { joined: false };
+    // forOpen: it is the copy behind an open's kept answer; joined: a read waited for it.
+    f = { joined: false, forOpen: false };
     const mine = f;
     f.res = shared(req).then(async (res) => {
       if (session !== signOuts) return res;
       try {
         if (keepable(res)) {
           await keepChat(cache, req.url, res.clone());
-          if (!mine.joined) chatFresh.add(key);
+          // Only behind an open: an own read's fetch is not what the page's next read
+          // may take without asking (a reply since would be missed).
+          if (mine.forOpen && !mine.joined) chatFresh.add(key);
           await toPages({ type: CHAT_FRESH, path: new URL(req.url).pathname });
         // Deleted, or no longer this user's: not opened from the kept copy again.
         } else if (!down(res) && !res.redirected) await forgetChat(cache, req.url);
@@ -727,7 +730,7 @@ async function chatRead(e, req, name, session) {
     chatFresh.delete(key);
     // Not kept: the network's (the copy on its way, if the page script's own read asked first).
     if (!kept) return waited(fetchChat(e, req, cache, key, session));
-    fetchChat(e, req, cache, key, session);
+    fetchChat(e, req, cache, key, session).forOpen = true;
     e.waitUntil(withIndex(cache, (index) => { if (index[req.url]) index[req.url][1] = Date.now(); }));
     return kept;
   }

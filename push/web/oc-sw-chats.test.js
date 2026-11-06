@@ -393,6 +393,22 @@ test("the page script's folder read before a mute (OWN fresh): the network's cop
   assert.equal(await text(own), "moved to folder B");
 });
 
+test("the page script's fresh folder read, then Open WebUI's next read: the network again, not that copy", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "old"));
+  const own = w.read(chatUrl(CHAT), { own: "fresh" });
+  await own.decided;
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "at the folder read"));
+  await own;
+  await w.settled();
+  const asked = w.net.count(chatUrl(CHAT));
+  const refresh = w.read(chatUrl(CHAT));   // a reconnect's refresh, a reply since
+  await refresh.decided;
+  assert.equal(w.net.count(chatUrl(CHAT)), asked + 1, "it asked the network");
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "with the reply since"));
+  assert.equal(await text(await refresh), "with the reply since");
+});
+
 test("an open of a kept chat while its network copy is on its way: the kept copy at once, not a wait", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
