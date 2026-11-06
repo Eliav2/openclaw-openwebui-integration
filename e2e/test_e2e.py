@@ -3265,8 +3265,8 @@ def test_a_pipe_model_next_to_another_provider_keeps_the_chats_session(token):
 
 
 def _fake_llm_arrivals(marker: str) -> list:
-    """(arrival time, model) of every request the fake model got whose newest
-    turn holds `marker`, oldest first."""
+    """(arrival time, model, completion id) of every request the fake model got
+    whose newest turn holds `marker`, oldest first."""
     out = []
     with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
         for line in f:
@@ -3278,25 +3278,36 @@ def _fake_llm_arrivals(marker: str) -> list:
             text = "\n".join(_content_text(m.get("content")) for m in messages[last + 1:]
                              if m.get("role") == "user")
             if marker in text:
-                out.append((rec["ts"], req.get("model")))
+                out.append((rec["ts"], req.get("model"), rec.get("id")))
     return out
+
+
+def _fake_llm_ends() -> dict:
+    """{completion id: time the fake model finished streaming it}."""
+    path = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-llm-ends.jsonl")
+    with open(path, encoding="utf-8") as f:
+        return {rec["id"]: rec["ts"] for rec in map(json.loads, filter(str.strip, f))}
 
 
 def test_two_pipe_models_side_by_side_run_at_the_same_time(token):
     """Each model's run takes ~12 s (one word a second). Run one after the
-    other, the second would reach the model about 12 s after the first."""
+    other, the second would reach the model about 12 s after the first, once
+    the first had finished. Measured at the fake model, so a slow Gateway write
+    after the runs does not count (ELI-372: an 8 s session-SQLite write pushed
+    a wall-time bound over)."""
     first, second = _model_ids(token)
     marker = f"E2E_PAR_{uuid.uuid4().hex[:6]}"
-    t0 = time.time()
     chat_id, uid, done = _side_by_side(token, f"E2E_SLOW:12 {marker}", [first, second])
-    elapsed = time.time() - t0
     assert all(marker in done[i]["content"] for i in (0, 1)), done
     arrivals = _fake_llm_arrivals(marker)
-    assert len(arrivals) == 2 and {m for _, m in arrivals} == {"e2e-default", "e2e-echo"}, arrivals
+    assert len(arrivals) == 2 and {m for _, m, _ in arrivals} == {"e2e-default", "e2e-echo"}, arrivals
     gap = abs(arrivals[0][0] - arrivals[1][0])
     assert gap < 6, f"the second model reached the fake {gap:.1f}s after the first: they ran one after the other"
-    # Both ran inside one run's time, not two.
-    assert elapsed < 24, f"both replies took {elapsed:.0f}s"
+    ends = _fake_llm_ends()
+    assert all(cid in ends for _, _, cid in arrivals), f"a reply never finished at the fake: {arrivals}"
+    started, first_end = max(ts for ts, _, _ in arrivals), min(ends[cid] for _, _, cid in arrivals)
+    assert started < first_end, (
+        f"the second run started {started - first_end:.1f}s after the first finished: they did not overlap")
     _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
 
 

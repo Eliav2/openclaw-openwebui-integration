@@ -151,7 +151,10 @@ no reply, and a run the Gateway resumes after a restart gets its own
 
 Replies stream word by word so the streaming path sees several deltas.
 
-Every request is appended to $FAKE_LLM_LOG (JSON lines) for the CI artifact.
+Every request is appended to $FAKE_LLM_LOG (JSON lines) for the CI artifact,
+with its completion `id`. When a streamed reply ends, `{"ts", "id"}` goes to
+ENDS_LOG next to it: when each reply finished, for tests that need runs to
+overlap (ELI-372).
 Standard library only.
 """
 
@@ -167,6 +170,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL_ID = os.environ.get("FAKE_LLM_MODEL_ID", "e2e-echo")
 LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
+ENDS_LOG = os.path.join(os.path.dirname(LOG_PATH), "fake-llm-ends.jsonl") if LOG_PATH else ""
 DEFAULT_REPLY = os.environ.get("FAKE_LLM_DEFAULT", "E2E fake model reply.")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 # The tool that calls a deferred one by id or name: `tool_call` on 2026.10.1 to
@@ -716,16 +720,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         plan = plan_reply(body)
+        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         if LOG_PATH:
             with open(LOG_PATH, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"ts": time.time(), "path": self.path,
+                fh.write(json.dumps({"ts": time.time(), "id": cid, "path": self.path,
                                      "request": body, "reply": plan}) + "\n")
 
         if plan.get("http_error"):
             self._json(plan["http_error"], {"error": {"message": plan["text"], "type": "invalid_request_error"}})
             return
 
-        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         model = body.get("model") or MODEL_ID
         usage = _usage(body, plan)
@@ -779,6 +783,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self.close_connection = True
+        if ENDS_LOG:
+            with open(ENDS_LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), "id": cid}) + "\n")
 
 
 def main() -> None:
