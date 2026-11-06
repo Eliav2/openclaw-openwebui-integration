@@ -4806,6 +4806,24 @@ def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# ELI-359: OpenClaw 2026.10.5 commits a `chat.send` to the session's pending
+# inputs, then refuses to publish it when another write lands on the agent
+# database in between (session-accessor-BHpQ2Hsr.mjs:542, e.g. the startup
+# sub-agent recovery). UNAVAILABLE, not retryable, and the input never runs:
+# its key is refused from then on ("Pending input ownership ended; submit a new
+# turn"), a new key runs once. Checked with a forced fault on 2026.10.5.
+UNPUBLISHED_INPUT_ERROR = "Pending input authority changed before publication"
+# The Gateway's error code for a request it could not serve now.
+UNAVAILABLE_CODE = "UNAVAILABLE"
+
+
+def is_unpublished_input(ex: Exception) -> bool:
+    """A `chat.send` refused as committed but never published (ELI-359)."""
+    err = getattr(ex, "error", None) or {}
+    return (isinstance(ex, GatewayError) and err.get("code") == UNAVAILABLE_CODE
+            and UNPUBLISHED_INPUT_ERROR in str(err.get("message") or ex))
+
+
 # `sessions.list` returns at most 100 rows without a `limit`, and has no
 # filter by key: `search` is a substring match.
 _SESSIONS_PAGE = 500          # rows asked for per page of a full read

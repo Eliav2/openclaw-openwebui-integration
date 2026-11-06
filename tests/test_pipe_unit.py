@@ -16332,3 +16332,78 @@ class MidRunSteeringTests(_TurnCase):
         self.assertNotIn("Stop and say banana", self.sent)
         first.cancel()
         await self._spin()
+
+
+class UnpublishedInputResendTests(_TurnCase):
+    """ELI-359: OpenClaw 2026.10.5 commits a `chat.send` and then refuses to
+    publish it when another write lands on the agent database in between
+    (`Pending input authority changed before publication`, UNAVAILABLE, not
+    retryable). The input never runs: the same key is then refused for good
+    ("Pending input ownership ended; submit a new turn"), a new key runs once.
+    So the Pipe sends it once more under a new key, on that error only."""
+
+    SK = None
+
+    def _refuse_sends(self, *errors):
+        """The next `chat.send`s raise these, in order; later ones go through."""
+        plain = self.conn.send_request
+        left = list(errors)
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.send" and left:
+                self.rpc.append(method)
+                self.keys.append(params.get("idempotencyKey"))
+                raise left.pop(0)
+            return await plain(method, params, timeout=timeout)
+        self.conn.send_request = send_request
+
+    @staticmethod
+    def _error(message, retryable=False):
+        return GatewayError(f"Error: {message}", error={
+            "code": "UNAVAILABLE", "message": f"Error: {message}", "retryable": retryable})
+
+    async def _turn(self):
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        return gen, first
+
+    async def test_an_unpublished_input_is_sent_once_more_under_a_new_key(self):
+        self._refuse_sends(self._error(self.ocp.UNPUBLISHED_INPUT_ERROR))
+        gen, first = await self._turn()
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["hello"])
+        self.assertEqual(self.rpc.count("chat.send"), 2)
+        refused, resent = self.keys
+        self.assertNotEqual(refused, resent)
+        self.assertEqual(parse_pipe_run_id(resent), parse_pipe_run_id(refused),
+                         "the new key still ties the run to this chat and reply")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi there"))
+        q.put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("hi there", out)
+        self.assertNotIn("Error sending message", out)
+        self.assertEqual(self.conn._consumers.get(f"{self.SK}:{refused}"), None,
+                         "the refused key's consumer is gone")
+
+    async def test_the_same_refusal_twice_is_shown_not_sent_a_third_time(self):
+        self._refuse_sends(self._error(self.ocp.UNPUBLISHED_INPUT_ERROR),
+                           self._error(self.ocp.UNPUBLISHED_INPUT_ERROR))
+        gen, first = await self._turn()
+        out = await asyncio.wait_for(first, 5)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("Error sending message", out)
+        self.assertEqual(self.rpc.count("chat.send"), 2)
+        self.assertEqual(self.sent, [])
+
+    async def test_another_refusal_is_not_sent_again(self):
+        self._refuse_sends(self._error("Pending input ownership ended; submit a new turn to continue"))
+        gen, first = await self._turn()
+        out = await asyncio.wait_for(first, 5)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("Error sending message", out)
+        self.assertEqual(self.rpc.count("chat.send"), 1)

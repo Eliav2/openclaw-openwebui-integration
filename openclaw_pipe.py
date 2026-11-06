@@ -8077,6 +8077,24 @@ def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# ELI-359: OpenClaw 2026.10.5 commits a `chat.send` to the session's pending
+# inputs, then refuses to publish it when another write lands on the agent
+# database in between (session-accessor-BHpQ2Hsr.mjs:542, e.g. the startup
+# sub-agent recovery). UNAVAILABLE, not retryable, and the input never runs:
+# its key is refused from then on ("Pending input ownership ended; submit a new
+# turn"), a new key runs once. Checked with a forced fault on 2026.10.5.
+UNPUBLISHED_INPUT_ERROR = "Pending input authority changed before publication"
+# The Gateway's error code for a request it could not serve now.
+UNAVAILABLE_CODE = "UNAVAILABLE"
+
+
+def is_unpublished_input(ex: Exception) -> bool:
+    """A `chat.send` refused as committed but never published (ELI-359)."""
+    err = getattr(ex, "error", None) or {}
+    return (isinstance(ex, GatewayError) and err.get("code") == UNAVAILABLE_CODE
+            and UNPUBLISHED_INPUT_ERROR in str(err.get("message") or ex))
+
+
 # `sessions.list` returns at most 100 rows without a `limit`, and has no
 # filter by key: `search` is a substring match.
 _SESSIONS_PAGE = 500          # rows asked for per page of a full read
@@ -14079,8 +14097,10 @@ class _PipeTurn:
 
             # The OWUI message id in the run id ties a reply orphaned by a
             # restart to its run (ELI-90, `_stub_turn`).
-            idempotency_key = (pipe_run_id(self.chat_id, reply_id) if reply_id
-                               else f"msg-{self.chat_id}-{time.time()}")
+            def new_run_key():
+                return (pipe_run_id(self.chat_id, reply_id) if reply_id
+                        else f"msg-{self.chat_id}-{time.time()}")
+            idempotency_key = new_run_key()
             # Clamp the level down to what this model supports, with a note.
             # A ladder the Gateway stated by a rejection beats describe's, which
             # overreports for catalog-gated models. Look up by `model_override`
@@ -14104,21 +14124,30 @@ class _PipeTurn:
             # the turn writer, which would take over the message mid-stream.
             self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
             self.conn.sent_settings[self.session_key] = (self.model_override, self.requested_thinking)
+            send_params = _owui_chat_send_params(
+                session_key=self.session_key,
+                message="\n\n".join(t for t in self.turn.unsent if t),
+                idempotency_key=idempotency_key,
+                owui_chat_id=self.owui_origin_chat_id,
+                owui_user_id=self.owui_origin_user_id,
+                attachments=_numbered_attachments(
+                    self.turn.attachments, combined=len(self.turn.unsent) > 1),
+                thinking=self.resolved_thinking,
+            )
             try:
-                send_resp = await _run_request(
-                    self.conn, RUN_SEND,
-                    _owui_chat_send_params(
-                        session_key=self.session_key,
-                        message="\n\n".join(t for t in self.turn.unsent if t),
-                        idempotency_key=idempotency_key,
-                        owui_chat_id=self.owui_origin_chat_id,
-                        owui_user_id=self.owui_origin_user_id,
-                        attachments=_numbered_attachments(
-                            self.turn.attachments, combined=len(self.turn.unsent) > 1),
-                        thinking=self.resolved_thinking,
-                    ),
-                    timeout=30
-                )
+                try:
+                    send_resp = await _run_request(self.conn, RUN_SEND, send_params, timeout=30)
+                except GatewayError as ex:
+                    if not is_unpublished_input(ex):
+                        raise
+                    # Committed but never published, and its key is spent (ELI-359): once
+                    # more under a new key, which runs it once. A second refusal is shown.
+                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                    idempotency_key = new_run_key()
+                    self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
+                    pipe_log(f"  chat.send: {ex}; sending once more as {idempotency_key}")
+                    send_params = {**send_params, "idempotencyKey": idempotency_key}
+                    send_resp = await _run_request(self.conn, RUN_SEND, send_params, timeout=30)
             except asyncio.TimeoutError:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
