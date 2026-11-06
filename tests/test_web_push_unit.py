@@ -211,7 +211,7 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(os.unlink, key.name)
         self.fn.valves = self.fn.Valves(VAPID_PRIVATE_KEY_FILE=key.name, VAPID_SUBJECT="mailto:a@example.com")
         self.sent = []
-        self.fn.send_all = lambda subs, body, topic, key, subject: self.sent.append((subs, body, key, subject)) or set()
+        self.fn.send_all = lambda subs, body, topic, key, subject, chat_id: self.sent.append((subs, body, key, subject)) or set()
 
     async def test_a_reply_is_sent_with_the_key_from_the_file(self):
         await self.fn.event(finished(), __id__="web_push")
@@ -235,7 +235,7 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("openclaw_web_push", "INFO") as logs:
             await self.fn.event(finished(), __id__="web_push")
         self.assertEqual(self.sent, [])
-        self.assertIn("muted", "\n".join(logs.output))
+        self.assertIn("muted, nothing sent chat_id=c1", "\n".join(logs.output))
 
     async def test_a_chat_in_a_muted_folder_sends_nothing(self):
         for muted in ("qa-old", "qa"):   # its own folder, or the folder that holds it
@@ -243,7 +243,7 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs("openclaw_web_push", "INFO") as logs:
                 await self.fn.event(finished(), __id__="web_push")
             self.assertEqual(self.sent, [], muted)
-            self.assertIn(f"folder {muted[:8]} is muted", "\n".join(logs.output))
+            self.assertIn(f"folder {muted[:8]} is muted, nothing sent chat_id=c1", "\n".join(logs.output))
 
     async def test_another_folder_muted_still_sends(self):
         self.store["folder_mutes"] = json.dumps({"work": 0})
@@ -368,3 +368,32 @@ class NotificationImageTests(unittest.TestCase):
         self.assertEqual((w, h), (192, 192))
         px = {r[i:i + 3] for r in rows for i in range(0, len(r), 4)}
         self.assertTrue(any(p[0] > 180 and p[1] < 110 and p[2] < 110 for p in px), "the red claw")
+
+
+class LogIdsTests(unittest.TestCase):
+    """Every log line names the full chat id as `chat_id=<id>` (ELI-368): central logs index it, so
+    `logtrace <chat id>` shows the push next to the Pipe's lines of the same reply."""
+
+    CHAT = "0a4c8821-8252-4141-a3e5-e6beafa16082"
+
+    def send(self, outcome):
+        class WebPushException(Exception):
+            def __init__(self, status):
+                super().__init__(f"HTTP {status}")
+                self.response = types.SimpleNamespace(status_code=status)
+
+        def webpush(**kw):
+            if outcome != "ok":
+                raise WebPushException(outcome)
+
+        mods = {"py_vapid": types.SimpleNamespace(Vapid=types.SimpleNamespace(from_pem=lambda key: object())),
+                "pywebpush": types.SimpleNamespace(WebPushException=WebPushException, webpush=webpush)}
+        fn = web_push.Event()
+        sub = {"endpoint": "https://push.example/1", "keys": {"p256dh": "k", "auth": "a"}}
+        with mock.patch.dict(sys.modules, mods), self.assertLogs("openclaw_web_push", "INFO") as logs:
+            fn.send_all([sub], "{}", "t", b"PEM", "mailto:a@example.com", self.CHAT)
+        return "\n".join(logs.output)
+
+    def test_sent_gone_and_failed_lines_name_the_chat(self):
+        for outcome in ("ok", 410, 500):
+            self.assertIn(f"chat_id={self.CHAT}", self.send(outcome), outcome)
