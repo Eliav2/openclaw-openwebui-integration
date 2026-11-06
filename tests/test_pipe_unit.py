@@ -8347,7 +8347,7 @@ class TurnWriterChatFinishedTests(_TurnWriterCase):
     async def test_a_failed_final_save_publishes_nothing(self):
         w = self.writer()
         await w.feed(_delta("Hello"))
-        w._persist_final = mock.AsyncMock(return_value=([], False))
+        w._persist_final = mock.AsyncMock(return_value=([], [], False))
         await w.finalize()
         self.assertEqual(self.published, [])
 
@@ -8555,6 +8555,28 @@ class TurnWriterLoadAcrossTheSaveTests(_TurnWriterCase):
         async def fail():
             return None          # Open WebUI's upsert when its write failed (ELI-90)
         await self.failed_final_save(fail)
+
+    async def test_m_is_never_shown_finished_without_its_final_status_lines(self):
+        """ELI-371: the push and the completion that show M finished carry, or come after, its final
+        status lines (the context meter). Sent after them, a tab showed M done without the meter for a
+        moment, and differently after a reload (the E2E 'the chat changed on a reload' flake)."""
+        meter = "🧠 10/200k (0%)"
+        shown = _TurnRenderer()
+        shown.feed(_delta("slow-1"))
+        await self.owui.end_request("m1", copy.deepcopy(shown.output))
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="agent-run-1", message_id="m1", takeover=True, renderer=shown)
+        await w.feed(None)
+        with mock.patch.object(openclaw_pipe, "_build_usage_status_lines", mock.AsyncMock(return_value=[meter])):
+            await w.finalize()
+        events = [d["data"] for e, d, room in self.owui.emits if e == "events"]
+        kinds = [d["type"] for d in events]
+        done = kinds.index("chat:completion")
+        meters = [i for i, d in enumerate(events) if d["type"] == "status" and d["data"].get("description") == meter]
+        self.assertTrue(meters and all(i < done for i in meters), f"the meter after the completion: {kinds}")
+        push = [d for d in events if d["type"] == "chat:messages"][-1]
+        history = push["data"]["messages"]["m1"].get("statusHistory") or []
+        self.assertIn(meter, [h.get("description") for h in history], "M pushed finished without its meter")
 
 
 class MediaDirectiveKindTests(unittest.TestCase):
