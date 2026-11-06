@@ -7,7 +7,9 @@ terminated the socket, and the Pipe never closed its end: one fd and ~0.8 MB of 
 per pin, ELI-369)."""
 import asyncio
 import time
+import types
 import unittest
+import uuid
 from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
@@ -20,6 +22,9 @@ install_stubs()
 import openclaw_pipe as ocp  # noqa: E402
 
 KEY = "agent:main:openwebui-u-c"
+USER, CHAT, MSG = (str(uuid.UUID(int=n)) for n in (1, 2, 3))
+OWUI_KEY = ocp._owui_session_key("main", USER, CHAT)
+OWUI_RUN = f"msg-{CHAT}-{MSG}-1792100000.5"
 
 
 class _ReadingWS:
@@ -45,7 +50,8 @@ class PinnedConnectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         for patch in (mock.patch.object(ocp, "pipe_log", lambda *a, **k: None),
-                      mock.patch.object(ocp, "_gateway_connection", None)):
+                      mock.patch.object(ocp, "_gateway_connection", None),
+                      mock.patch.object(ocp, "_retired_connections", [])):
             patch.start()
             self.addCleanup(patch.stop)
         self.conn = ocp._GatewayConnection(lambda: None)
@@ -113,9 +119,15 @@ class PinnedConnectionTests(unittest.IsolatedAsyncioTestCase):
             await self.conn.ensure_connected()
         self.assertEqual(self.connects, [])
 
-    async def test_a_pinned_connection_with_an_open_socket_is_still_usable_for_its_requests(self):
+    async def test_a_pinned_connection_admits_no_new_work_but_keeps_its_socket(self):
+        """A retired background producer of the old generation (channel watcher, announce paths) asks
+        for the connection to send a new run: refused, while the socket stays read for what it has."""
         await self._reap()
-        await self.conn.ensure_connected()       # connected: nothing to dial, so no refusal
+        with self.assertRaises(ocp.GatewayError):
+            await self.conn.ensure_connected()
+        self.assertFalse(self.conn._stopped)
+        self.assertFalse(self.loop_task.done(), "refusing new work does not stop the reading")
+        self.assertEqual(self.ws.close_calls, 0)
         self.assertEqual(self.connects, [])
 
     async def test_a_pinned_connection_never_reconnects_when_asked_to(self):
@@ -126,6 +138,67 @@ class PinnedConnectionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ocp.GatewayError):
             await self.conn._connect_and_start()
         self.assertEqual(self.connects, [])
+
+
+class PinnedSocketDropsMidReplyTests(unittest.IsolatedAsyncioTestCase):
+    """The pinned socket dropped while a reply still reads it. The retired connection cannot hand the
+    run to a turn writer (it has none) and cannot reconnect, so no event would ever reach that reply,
+    and the successor leaves a run alone while a retired connection serves it: the reply would stay
+    generating for good. The reaper ends the reply and unregisters it, which is the case ELI-150 covers:
+    the new connection's turn writer then writes the rest of the run into the same message."""
+
+    async def asyncSetUp(self):
+        for patch in (mock.patch.object(ocp, "pipe_log", lambda *a, **k: None),
+                      mock.patch.object(ocp, "_gateway_connection", None),
+                      mock.patch.object(ocp, "_retired_connections", [])):
+            patch.start()
+            self.addCleanup(patch.stop)
+        valves = lambda: types.SimpleNamespace(AGENT_ID="main")   # noqa: E731
+        self.old, self.new = ocp._GatewayConnection(valves), ocp._GatewayConnection(valves)
+        self.old.sends_display_name = False
+        self.ws = _ReadingWS()
+        self.old._ws = self.ws
+        self.loop_task = self.old._event_loop_task = asyncio.ensure_future(self.old._event_loop())
+        self.addCleanup(self.loop_task.cancel)
+        self.queue = self.old.register_consumer(OWUI_KEY, OWUI_RUN)    # the reply the old load streams
+        with mock.patch.dict("sys.modules", owui_modules(_openclaw_gateway_connection_v1=self.old)):
+            await ocp._reap_stale_gateway_connection()
+        self.event = {"sessionKey": OWUI_KEY, "runId": OWUI_RUN, "stream": "assistant", "data": {"delta": "more"}}
+        self.spawned = []
+
+        def spawn(coro):
+            self.spawned.append(coro.__qualname__)
+            coro.close()
+        patch = mock.patch.object(ocp, "spawn_background", spawn)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def _drop(self):
+        self.ws.frames.put_nowait(ocp.websockets.exceptions.ConnectionClosed(None, None))
+        end = time.monotonic() + 5
+        while not self.loop_task.done():
+            self.assertLess(time.monotonic(), end, "the loop never ended")
+            await asyncio.sleep(0)
+
+    async def test_the_successor_leaves_the_run_alone_while_the_pinned_socket_is_up(self):
+        self.assertFalse(ocp._turn_route_now(self.new, self.event))
+        self.assertEqual(self.new._turn_pumps, {})
+
+    async def test_a_drop_ends_the_reply_it_was_serving(self):
+        await self._drop()
+        sent = self.queue.take_all()
+        ends = [m for m in sent if m.get("type") == "event"
+                and (m["payload"].get("stream"), (m["payload"].get("data") or {}).get("phase")) == ("lifecycle", "end")
+                and m["payload"].get("runId") == OWUI_RUN]
+        self.assertEqual(len(ends), 1, "the reply is told its run ended, so it finishes instead of waiting")
+        self.assertEqual(self.old._consumers, {}, "and it is no longer registered on the retired connection")
+
+    async def test_after_the_drop_the_successors_turn_writer_takes_the_run(self):
+        await self._drop()
+        self.assertFalse(ocp._served_by_retired(self.event))
+        self.assertTrue(ocp._turn_route_now(self.new, self.event))
+        self.assertIn((OWUI_KEY, OWUI_RUN), self.new._turn_pumps)
+        self.assertIn("_turn_pump_loop", self.spawned)
 
 
 class PreRetireBuildTests(unittest.IsolatedAsyncioTestCase):

@@ -4507,6 +4507,23 @@ def _orphaned_gateway_connections(current) -> list:
     return found
 
 
+def _end_replies_of(stale) -> None:
+    """A pinned connection's socket is gone while replies still read it. No
+    event can reach them now, it has no turn writer to hand them to
+    (`_hand_over_run` refuses a retired connection) and the successor leaves a
+    run alone while `_served_by_retired` finds its consumer, so each would stay
+    generating for good. Each reply gets its run's own end signal and its
+    consumer is unregistered: it finishes with what it showed, and this load's
+    turn writer writes the rest of the run into the same message (ELI-150)."""
+    for consumer in list(getattr(stale, "_consumers", {}).values()):
+        end = _event_frame({"sessionKey": consumer.session_key, "runId": consumer.run_id,
+                            "stream": "lifecycle", "data": {"phase": "end"}})
+        for queue in list(consumer.queues):
+            put = getattr(queue, "put_control", queue.put_nowait)
+            put(end)
+            stale.unregister_consumer(consumer.session_key, consumer.run_id, queue=queue)
+
+
 def _pin_shut(stale) -> None:
     """Keep an older build's connection from connecting again, but keep its
     open socket read. The connection's own event loop is that socket's only
@@ -4516,11 +4533,20 @@ def _pin_shut(stale) -> None:
     (`_close_if_retired_and_idle`). Setting `_stopped` here would end the old
     loop after its current `recv()` and leave the socket open and unread, a
     CLOSE-WAIT socket per pin (ELI-369). The old code cannot be changed, so its
-    entry points are replaced from this side."""
+    entry points are replaced from this side.
+
+    It admits no new work: `ensure_connected` refuses even with the socket
+    open (a retired producer of the old build, such as its channel watcher,
+    would otherwise start a run here). When the socket is gone the replies
+    still reading it are ended (`_end_replies_of`)."""
+    def _refusal() -> GatewayError:
+        return GatewayError("gateway connection retired by a newer deploy")
+
     def _gone() -> GatewayError:
         stale._stopped = True       # a dial was wanted: nothing is left to read
+        _end_replies_of(stale)
         answer = getattr(stale, "_answer_reconnect_waiters", None)
-        error = GatewayError("gateway connection retired by a newer deploy")
+        error = _refusal()
         if answer is not None:
             answer(error)
         return error
@@ -4528,7 +4554,7 @@ def _pin_shut(stale) -> None:
     async def _ensure_connected(*_a, **_k):
         ws, task = getattr(stale, "_ws", None), getattr(stale, "_event_loop_task", None)
         if ws is not None and task is not None and not task.done():
-            return
+            raise _refusal()
         raise _gone()
 
     async def _connect_and_start(*_a, **_k):
