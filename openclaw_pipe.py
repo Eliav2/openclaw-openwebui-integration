@@ -9218,10 +9218,11 @@ class _TurnWriter:
         return True
 
     async def _persist_final(self, output: list, text: str, stopped: bool,
-                             run_usage: dict | None = None) -> tuple[list, bool]:
+                             run_usage: dict | None = None) -> tuple[list, list, bool]:
         """M's `done: true` write with its final status lines (ELI-210), after
-        the handed-over request ends. Returns the new lines and whether the row
-        reads back finished. `run_usage`: for a row with no totals (ELI-177)."""
+        the handed-over request ends. Returns M's whole status history, the new
+        lines and whether the row reads back finished. `run_usage`: for a row
+        with no totals (ELI-177)."""
         from open_webui.models.chats import Chats
 
         if self.request_task is not None and not self.request_task.done():
@@ -9247,15 +9248,19 @@ class _TurnWriter:
                 except Exception as ex:
                     whole = False
                     pipe_log(f"  turn writer: reading M back failed: {ex!r}")
-        return new, whole
+        return history, new, whole
 
-    async def _push_final(self, text: str, output: list) -> None:
-        """Push M finished to the chat's room. Only an inserted M carries the
-        parent link and moves the view: a taken-over M can have later messages."""
+    async def _push_final(self, text: str, output: list, status_history: list) -> bool:
+        """Push M finished to the chat's room with its whole status history,
+        the one source of its final lines in a tab: a tab never shows M done
+        without them (ELI-371), and a tab replaces M's history with the push's
+        while it appends each status event. Only an inserted M carries the
+        parent link and moves the view: a taken-over M can have later
+        messages. Returns whether the push went out."""
         if not self._claim or self.message_id not in self._claim["messages"]:
-            return
+            return False
         message = {**self._claim["messages"][self.message_id],
-                    "content": text, "output": output, "done": True}
+                    "content": text, "output": output, "done": True, "statusHistory": status_history}
         new = self._introduced()
         try:
             await _introduce_turn_message(
@@ -9264,6 +9269,8 @@ class _TurnWriter:
                 self.message_id if new else None, self.message_id)
         except Exception as ex:
             pipe_log(f"  turn writer: final push failed: {ex!r}")
+            return False
+        return True
 
     def adopt(self, run_id: str) -> None:
         """Write a run that continues M (resume or recovery) into M."""
@@ -9554,23 +9561,27 @@ class _TurnWriter:
                 output.append(_turn_note_item(note))
             run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
                              None) if hist else None
-            status, saved = await self._persist_final(output, text, stopped, run_usage)
+            history, status, saved = await self._persist_final(output, text, stopped, run_usage)
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
+            pushed = False
             if saved:
                 await _clear_response_stream(self.task_id)
-                await self._push_final(text, output)
+                pushed = await self._push_final(text, output, history)
                 if not stopped and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
                 pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
                          f"FINAL SAVE FAILED; keeping the mid-turn copy, M is not sent finished")
             emit = await self._emitter()
+            # Without the push, the final status lines go as status events,
+            # before the completion that shows M done (ELI-371). With it, a tab
+            # already has them: a status event would add each one again.
+            for line in status if not pushed else ():
+                await emit({"type": "status", "data": line})
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})
-            for line in status:
-                await emit({"type": "status", "data": line})
             if not self.newer_run:
                 await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")

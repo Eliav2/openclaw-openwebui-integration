@@ -829,32 +829,38 @@
   window.ocPushReady = run();
 })();
 
-// --- Open WebUI's error page after a network change (ELI-352). A network change
-// while the app loads fails Open WebUI's own files ("Failed to fetch dynamically
-// imported module"), and SvelteKit then puts its "500 Internal Error" page in
-// place of the app, which stays there. This reloads the app once, when the server
-// can be reached again: at once, or on the next 'online' or network change.
-// A guard in sessionStorage, cleared by a load that gets to the app, keeps it to
-// one reload: a page that fails again stays on the error page. Apart from the
-// push part above, so it also runs where push is not offered. The service worker
-// also asks for a reload when the app it gave from its cache turns out to be from
-// another Open WebUI version (oc-sw.js "oc-new-version").
+// --- Open WebUI's start after a network change (ELI-352, ELI-360). A network
+// change while the app loads fails Open WebUI's own files, and the app never comes
+// up: the import of SvelteKit itself fails (a blank page), or a part of the page
+// fails and SvelteKit draws Open WebUI's error page ("500: Internal Error") in
+// place of the app. Nothing retries either. Both failures are events, read here
+// instead of the page: Vite's import wrapper dispatches "vite:preloadError" for a
+// part that does not come, and index.html imports SvelteKit with no catch, so that
+// failure is an "unhandledrejection". After one of them, and before the app is up,
+// this reloads the app once, when the server can be reached again: at once, or on
+// the next 'online' or network change. A guard in sessionStorage, cleared by a load
+// that gets to the app, keeps it to one reload: a page that fails again stays as it
+// is. A part that fails once the app is up (a dialog opened offline) reloads
+// nothing. Apart from the push part above, so it also runs where push is not
+// offered. The service worker also asks for a reload when the app it gave from its
+// cache turns out to be from another Open WebUI version (oc-sw.js "oc-new-version").
 (() => {
   const RELOADED = "ocReloadedAfterError";
+  const VERSION_RELOADED = "ocReloadedForVersion";
   const NEW_VERSION = "oc-new-version";
   const PROBE = "/_app/version.json";   // HEAD: the service worker leaves it to the network
+  const SPLASH = "splash-screen";       // Open WebUI's, gone once its layout is drawn
+  // A browser's message for an import that did not come (Chromium, Firefox, Safari).
+  const LOST_IMPORT = /dynamically imported module|Importing a module script failed/;
   const session = {
     get: (k) => { try { return sessionStorage.getItem(k); } catch (_) { return null; } },
     set: (k, v) => { try { sessionStorage.setItem(k, v); } catch (_) {} },
     drop: (k) => { try { sessionStorage.removeItem(k); } catch (_) {} },
   };
-  // SvelteKit's own error page (its error.html), not one of Open WebUI's.
-  const errorPage = () => !!document.querySelector("body > .error > .status");
-  const appUp = () => !document.getElementById("splash-screen") && !errorPage();
 
-  let probing = false;
+  let failed = false, up = false, probing = false;
   async function recover() {
-    if (probing || !errorPage() || session.get(RELOADED)) return;
+    if (probing || !failed || session.get(RELOADED)) return;
     probing = true;
     try {
       const r = await fetch(PROBE, { method: "HEAD", cache: "no-store" });
@@ -867,22 +873,30 @@
     session.set(RELOADED, "1");
     location.reload();
   }
+  const lost = () => {
+    if (up) return;
+    failed = true;
+    recover();
+  };
+  // Never preventDefault: Vite then rethrows, and SvelteKit still shows its page.
+  addEventListener("vite:preloadError", lost);
+  addEventListener("unhandledrejection", (e) => {
+    if (LOST_IMPORT.test(String(e.reason?.message ?? e.reason))) lost();
+  });
 
   const watch = new MutationObserver(() => {
-    if (errorPage()) { watch.disconnect(); recover(); } else if (appUp()) {
-      watch.disconnect();
-      session.drop(RELOADED);
-      session.drop(VERSION_RELOADED);
-    }
+    if (failed || document.getElementById(SPLASH)) return;
+    watch.disconnect();
+    up = true;
+    session.drop(RELOADED);
+    session.drop(VERSION_RELOADED);
   });
   watch.observe(document.documentElement, { childList: true, subtree: true });
-  recover();
   addEventListener("online", recover);
   navigator.connection?.addEventListener?.("change", recover);
   // The kept app turned out to be another Open WebUI version: reload once onto the
   // server's own (the service worker dropped what it kept). Its own guard, cleared
   // the same way, so a version reload and an error-page reload never block each other.
-  const VERSION_RELOADED = "ocReloadedForVersion";
   navigator.serviceWorker?.addEventListener("message", (e) => {
     if (e.data?.type !== NEW_VERSION || session.get(VERSION_RELOADED)) return;
     session.set(VERSION_RELOADED, "1");

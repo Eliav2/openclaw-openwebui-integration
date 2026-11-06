@@ -715,8 +715,10 @@ function answered(chat) {
 // (loadChat's getTaskIdsByChatId, after the chat and its tags). The answer counts only
 // when the last message is not a finished reply (loadChat keeps the tasks then); for
 // a chat opened from a kept copy that ends with one, it changes nothing, and waiting
-// for it on a slow network is what kept the chat from drawing: "none", at once. Only
-// for that open's read: the next ones (on a reconnect) go to the network.
+// for it on a slow network is what kept the chat from drawing: "none", at once. Every
+// read of them until the network has answered for the chat: Open WebUI also reads
+// them when its socket connects, before or after loadChat's (only the first getting
+// "none" left loadChat waiting). After that, the network's (a reconnect's).
 const TASKS_READ = /^\/api\/tasks\/chat\/([0-9a-f-]+)$/;
 const NO_TASKS = '{"task_ids":[]}';
 const tasksMoot = new Set();   // cache name + chat id: opened from a kept copy that ends answered
@@ -743,6 +745,8 @@ function fetchChat(e, req, cache, key, session) {
     const mine = f;
     f.res = shared(req).then(async (res) => {
       if (session !== signOuts) return res;
+      // The network answered for the chat: from now on its tasks are the network's too.
+      if (!down(res)) tasksMoot.delete(key.split("\n")[0] + "\n" + new URL(req.url).pathname.split("/").pop());
       try {
         if (keepable(res)) {
           await keepChat(cache, req.url, res.clone());
@@ -846,7 +850,7 @@ self.addEventListener("fetch", (e) => {
       : new Response(v, { headers: JSON_TYPE }))));
   } else if (CHATS_KEPT && TASKS_READ.test(path) && req.headers.get("authorization")) {
     const id = path.match(TASKS_READ)[1];
-    e.respondWith(apiCacheFor(req.headers.get("authorization")).then((name) => (tasksMoot.delete(name + "\n" + id)
+    e.respondWith(apiCacheFor(req.headers.get("authorization")).then((name) => (tasksMoot.has(name + "\n" + id)
       ? new Response(NO_TASKS, { headers: JSON_TYPE }) : again(req))));
   } else {
     const fresh = FRESH_READS.some((r) => r.test(path));
