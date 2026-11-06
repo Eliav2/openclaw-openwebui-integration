@@ -69,23 +69,20 @@ When a message can't be sent, the Gateway doesn't answer, or a run ends in an er
 
 Every turn logs to the Open WebUI backend log (its standard output), each line prefixed with `[openclaw-pipe]`. The Status Action logs with the same prefix. The thinking filter does not log.
 
+A line logged during a reply ends with the chat's id, `chat_id=<chat id>`, and once the run has started also its `runId=...`. An id the line already names is not repeated. So one search for a chat id, or for a run id, finds every line of that reply, background work included. Lines outside a reply (connecting to the Gateway, startup) have no ids.
+
 One reply in the Pipe's log (an excerpt):
 
 ```text
-[openclaw-pipe] Messages: 1, last role: user
+[openclaw-pipe] Messages: 1, last role: user chat_id=<chat id>
 [openclaw-pipe] Session key: agent:main:openwebui-<user id>-<chat id>
-[openclaw-pipe] Cleared model override; using agent default
+[openclaw-pipe] Cleared model override; using agent default chat_id=<chat id>
 [openclaw-pipe] Captured runId: msg-<chat id>-<message id>-1792018617.1007752
-[openclaw-pipe]   Tool start: exec
-[openclaw-pipe]   Item: kind=tool status=running title=exec Commits from the last week
-[openclaw-pipe]   Tool result: exec (200 chars)
-[openclaw-pipe]   Item: kind=tool status=completed title=exec Commits from the last week
-[openclaw-pipe]   Tool start: read
-[openclaw-pipe]   Item: kind=tool status=running title=read from forecast/CHANGELOG.md
-[openclaw-pipe]   Tool result: read (273 chars)
-[openclaw-pipe]   Item: kind=tool status=completed title=read from forecast/CHANGELOG.md
-[openclaw-pipe]   lifecycle end -> done
-[openclaw-pipe] DONE -- 129 events processed, text yielded: True
+[openclaw-pipe]   Tool start: exec chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
+[openclaw-pipe]   Item: kind=tool status=running title=exec Commits from the last week chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
+[openclaw-pipe]   Tool result: exec (200 chars) chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
+[openclaw-pipe]   lifecycle end -> done chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
+[openclaw-pipe] DONE -- 129 events processed, text yielded: True chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
 ```
 
 On the Open WebUI host, with Docker (the container name depends on your deployment):

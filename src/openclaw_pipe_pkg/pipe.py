@@ -645,6 +645,7 @@ class Pipe:
         """Main entry point: hands a turn admitted by a superseded load of this
         Function to the current load.
         """
+        log_context(chat_id=(__metadata__ or {}).get("chat_id"))
         remember_owui_server()
         current = await _current_load(self, __request__)
         if current is not None:
@@ -1316,6 +1317,7 @@ class _PipeTurn:
                 self.ended = True
                 return
             self.our_run_id = send_resp.get("runId") or idempotency_key
+            log_context(run_id=self.our_run_id)
             pipe_log(f"Captured runId: {self.our_run_id}")
             if self.our_run_id != idempotency_key:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
