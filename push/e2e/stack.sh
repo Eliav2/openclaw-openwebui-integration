@@ -5,15 +5,16 @@
 #   push/e2e/stack.sh down <run_dir>
 #   push/e2e/stack.sh offline <run_dir> 0|1      # the Worker's OFFLINE switch, Worker restarted
 #   push/e2e/stack.sh chats <run_dir> 0|1        # its CHAT_CACHE switch (kept chats), the same way
-# Ports: OWUI 18780, Worker 18787 (E2E_OWUI_PORT / E2E_WORKER_PORT, with E2E_NAME for the container and
-# unit, give a second stack that can run beside another; the test reads E2E_OWUI and E2E_BASE the same
-# way). Needs docker, bun or npx, uv.
+# Ports: OWUI 18780, Worker 18787, its inspector 18797 (wrangler's default 9229 may be another stack's).
+# E2E_OWUI_PORT / E2E_WORKER_PORT / E2E_INSPECTOR_PORT, with E2E_NAME for the container and unit, give a
+# second stack that can run beside another; the test reads E2E_OWUI and E2E_BASE the same way.
+# Needs docker, bun or npx, uv.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd); push=$(dirname "$here")
 cmd=$1; run=$2
 OWUI_IMAGE=${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.13.0}
 name=${E2E_NAME:-owui-webpush-e2e}
-owui_port=${E2E_OWUI_PORT:-18780}; worker_port=${E2E_WORKER_PORT:-18787}
+owui_port=${E2E_OWUI_PORT:-18780}; worker_port=${E2E_WORKER_PORT:-18787}; inspector_port=${E2E_INSPECTOR_PORT:-18797}
 if [ "$cmd" = down ]; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   systemctl --user stop "$name-wrangler" 2>/dev/null || true
@@ -39,7 +40,7 @@ start_worker() {
   : > "$run/wrangler.log"
   systemd-run --user --unit "$name-wrangler" --working-directory "$run/worker" --setenv=PATH="$PATH" \
     -p StandardOutput="append:$run/wrangler.log" -p StandardError="append:$run/wrangler.log" \
-    bunx wrangler@4.45.0 dev --port "$worker_port" --ip 127.0.0.1 --local-upstream "127.0.0.1:$owui_port" >/dev/null
+    bunx wrangler@4.45.0 dev --port "$worker_port" --inspector-port "$inspector_port" --ip 127.0.0.1 --local-upstream "127.0.0.1:$owui_port" >/dev/null
   first_match "Ready on" tail -n +1 -F "$run/wrangler.log"
 }
 if [ "$cmd" = offline ] || [ "$cmd" = chats ]; then

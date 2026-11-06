@@ -1616,26 +1616,59 @@ def say(token, chat_id, message_id, text):
     api(f"/api/v1/chats/{chat_id}", {"chat": {"history": c["history"], "messages": c["messages"]}}, token)
 
 
-def held_chat_reads(ctx, token, chat_id):
-    """The worker's network reads of the chat for the page (they carry the page's Authorization)
-    wait at a gate (a slow network: nothing yet), then get the server's answer. The worker's own
-    read for a notification's reply (its cookie) goes at once. Returns the gate and a function
-    that undoes it."""
+def slow_network(ctx, token, chat_id):
+    """A slow network: every read of Open WebUI's API for the page (with the page's
+    Authorization; the worker's or the page's own) waits at a gate, then gets the server's
+    answer as it is. Not only the chat's: Open WebUI draws a chat once its other reads are in too (its tags, its running tasks,
+    the tools), so a test that slows only the chat's read misses what a slow phone sees. The
+    worker's own reads (its cookie, a notification's reply) go at once. Returns the gate and a
+    function that undoes it."""
     gate = threading.Event()
-    def answer(path):
-        req = urllib.request.Request(OWUI + path, headers={"Authorization": "Bearer " + token})
-        return urllib.request.urlopen(req, timeout=30).read(), "application/json"
-    srv = slow_server(answer, gate=gate)
+
+    class Held(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            gate.wait(WAIT_MS / 1000)
+            req = urllib.request.Request(OWUI + self.path, headers={"Authorization": "Bearer " + token})
+            try:
+                r = urllib.request.urlopen(req, timeout=30)
+                status, kind, body = r.status, r.headers.get("Content-Type", "application/json"), r.read()
+            except urllib.error.HTTPError as err:
+                status, kind, body = err.code, err.headers.get("Content-Type", "application/json"), err.read()
+            self.send_response(status)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Held)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
     def held(route):
-        if route.request.service_worker is None or "authorization" not in route.request.headers:
+        # The page's own reads too (those the worker lets through go from the page).
+        if route.request.method != "GET" or "authorization" not in route.request.headers:
             return route.fallback()
-        route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}{urllib.parse.urlsplit(route.request.url).path}")
-    ctx.route(f"**/api/v1/chats/{chat_id}", held)
+        u = urllib.parse.urlsplit(route.request.url)
+        route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}{u.path}" + (f"?{u.query}" if u.query else ""))
+    ctx.route("**/api/**", held)
+
     def undo():
-        ctx.unroute(f"**/api/v1/chats/{chat_id}", held)
+        ctx.unroute("**/api/**", held)
         gate.set()
         srv.shutdown()
     return gate, undo
+
+
+def warm_kept(page, chat):
+    """warm(), and the tools list kept too: Open WebUI waits for it before it draws a chat after a
+    load, and a person who opened the chat before has it (warm() waits for the chat only).
+    For the worker with kept chats: main's never keeps the tools list."""
+    warm(page, chat)
+    settled(page, """() => caches.keys().then(async (ks) => {
+        for (const k of ks.filter((k) => k.startsWith('oc-api-')))
+            if (await (await caches.open(k)).match(location.origin + '/api/v1/tools/?')) return true;
+        return false; })""")
 
 
 def kept_then_fresh(page, gate, old, new):
@@ -1664,9 +1697,9 @@ def test_a_chat_opened_before_shows_at_once_and_the_fresh_copy_replaces_it(owui,
     ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        warm(page, chat)
+        warm_kept(page, chat)
         say(owui, chat, answer, "Fresh reply " + tag)   # came in while the chat was closed
-        gate, undo = held_chat_reads(ctx, owui, chat)
+        gate, undo = slow_network(ctx, owui, chat)
         try:
             page.reload()
             kept_then_fresh(page, gate, "Kept reply " + tag, "Fresh reply " + tag)
@@ -1676,7 +1709,7 @@ def test_a_chat_opened_before_shows_at_once_and_the_fresh_copy_replaces_it(owui,
         page.goto(f"{BASE}/c/{other}")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         say(owui, chat, answer, "Newest reply " + tag)
-        gate, undo = held_chat_reads(ctx, owui, chat)
+        gate, undo = slow_network(ctx, owui, chat)
         try:
             tap(page, "", {"chat_id": chat, "url": f"/c/{chat}"})
             page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=chat, timeout=WAIT_MS)
@@ -1698,10 +1731,10 @@ def test_the_kept_chat_is_replaced_even_with_no_socket(owui, pw):
     ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        warm(page, chat)
+        warm_kept(page, chat)
         say(owui, chat, answer, "Fresh reply " + tag)
         ctx.route_web_socket("**/ws/socket.io/**", lambda ws: None)   # connects, the server never speaks
-        gate, undo = held_chat_reads(ctx, owui, chat)
+        gate, undo = slow_network(ctx, owui, chat)
         try:
             page.reload()
             kept_then_fresh(page, gate, "Kept reply " + tag, "Fresh reply " + tag)
@@ -1725,10 +1758,10 @@ def test_an_unsent_reply_waiting_for_a_kept_chat_stays_if_the_page_goes_elsewher
     ctx.add_cookies([{"name": "token", "value": owui, "url": BASE}])
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        warm(page, chat)
+        warm_kept(page, chat)
         page.goto(f"{BASE}/c/{other}")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        gate, undo = held_chat_reads(ctx, owui, chat)
+        gate, undo = slow_network(ctx, owui, chat)
         try:
             text = "unsent " + tag
             tap(page, "reply", {"chat_id": chat, "url": f"/c/{chat}", "fn": "web_push"}, text)
@@ -1738,7 +1771,8 @@ def test_an_unsent_reply_waiting_for_a_kept_chat_stays_if_the_page_goes_elsewher
             page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=other, timeout=WAIT_MS)
             page.wait_for_function("() => !!window.ocPushReply", timeout=WAIT_MS)
             assert page.evaluate("() => window.ocPushReply.put") is False
-            assert text not in page.locator("#chat-input").inner_text()
+            # Not in the other chat's box (the network slow, it may not be drawn yet: then no box at all).
+            assert text not in page.evaluate("() => document.querySelector('#chat-input')?.innerText ?? ''")
             assert page.evaluate("(c) => caches.open('oc-push-drafts').then((d) => d.match('/oc-push/draft/' + c)).then((r) => !!r)", chat)
         finally:
             undo()
@@ -1757,7 +1791,7 @@ def test_a_sign_out_drops_the_kept_chats(owui, pw):
     ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(token)})")
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        warm(page, chat)
+        warm_kept(page, chat)
         page.evaluate("() => fetch('/api/v1/auths/signout', {method: 'POST', credentials: 'include'})")
         settled(page, "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-api-')))")
     finally:
@@ -1783,7 +1817,7 @@ def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
     ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        warm(page, chat)
+        warm_kept(page, chat)
         worker_offline("0")
         page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.update())")
         # The new worker takes over once the old one is idle; the next open comes after that.
