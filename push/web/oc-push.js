@@ -565,10 +565,11 @@
   async function seen(id) {
     if (!id || document.visibilityState !== VISIBLE) return;
     const reg = await navigator.serviceWorker.getRegistration("/");
-    // Marked as this code's own close first (oc-sw.js OWN_CLOSES): not a swipe.
-    const own = await caches.open("oc-push-own-closes");
+    // Marked as this code's own close first (oc-sw.js OWN_CLOSES): not a swipe. Without
+    // Cache Storage the mark is skipped, never the close.
+    const own = await caches.open("oc-push-own-closes").catch(() => null);
     for (const n of (await reg?.getNotifications({ tag: TAG_PREFIX + id })) || []) {
-      await own.put("/oc-push/closed/" + n.tag + "/" + n.timestamp, new Response("")).catch(() => {});
+      await own?.put("/oc-push/closed/" + n.tag + "/" + n.timestamp, new Response("")).catch(() => {});
       n.close();
     }
     window.ocPushRead = id;   // for tests and tools, like ocPushState

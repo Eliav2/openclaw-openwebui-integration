@@ -195,3 +195,13 @@ test("an own close of an earlier notification does not hide a swipe of the chat'
   await w.swipe(w.tag("a"));
   assert.deepEqual(w.reads, ["a"]);
 });
+
+test("a swipe, then the chat's next notification before the worker handles the close: still read", async () => {
+  const w = worker();
+  await w.push(reply("a", "one"));
+  const swiped = w.tag("a");
+  swiped.close();                      // gone from the shade
+  await w.push(reply("a", "two"));     // the next reply's notification, first
+  await w.fire("notificationclose", swiped);
+  assert.deepEqual(w.reads, ["a"]);
+});

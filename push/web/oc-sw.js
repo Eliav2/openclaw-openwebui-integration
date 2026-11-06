@@ -89,6 +89,8 @@ self.addEventListener("push", (e) => {
       // The marks of this tag's earlier notifications: no close of theirs is coming any more.
       const own = await caches.open(OWN_CLOSES);
       for (const k of await own.keys()) if (new URL(k.url).pathname.startsWith("/oc-push/closed/" + tag + "/")) await own.delete(k);
+      // The one showing is replaced by this one: this code's close, not a swipe.
+      if (prev) await own.put(ownCloseKey(prev), new Response(""));
       const s = stacked(prev?.data?.stack, p);
       await self.registration.showNotification(s.title, {
         body: s.body,
@@ -296,14 +298,15 @@ self.addEventListener("notificationclick", (e) => {
 // A notification swiped away (or "Clear all"): Android tells Chrome with a broadcast,
 // so the shade stays open (a button's tap always collapses it, Chrome 149). With the
 // user's swipe_read valve on, its chat is marked read, as the button would (marking
-// a read chat read again changes nothing). Not when this code closed it (closeOwn)
-// or a newer notification of the chat replaced it.
+// a read chat read again changes nothing). Not when this code closed it: closeOwn,
+// oc-push.js on the chat opened, or the push handler replacing it with a newer one
+// (each marks that very notification; a newer one shown after a swipe does not
+// make the swipe a replacement).
 async function swiped(n) {
   const data = n.data || {};
   if (!data.chat_id || data.swipe_read === false) return "off";
   const own = await caches.open(OWN_CLOSES);
   if (await own.delete(ownCloseKey(n))) return "own";
-  if ((await self.registration.getNotifications({ tag: n.tag })).length) return "replaced";
   await markRead(data.chat_id, AbortSignal.timeout(ACTION_DEADLINE_MS));
   return "read";
 }
