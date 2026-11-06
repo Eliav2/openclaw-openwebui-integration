@@ -8041,6 +8041,25 @@ class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await self.conn._subscribe_all()
         self.assertEqual(self.conn.active_run_snapshot, {"k": ["r"]})
 
+    async def test_a_failed_subscribe_still_runs_the_turn_resync(self):
+        """ELI-369: a resync skipped while the socket came back is owed by this
+        hello; it reads rows with sessions.list, so a failed subscribe must not drop it."""
+        hellos = []
+
+        class Turns:
+            @staticmethod
+            async def after_hello(conn):
+                hellos.append(conn)
+
+        async def failing(method, params, timeout=10):
+            raise GatewayError("UNAVAILABLE", "closing")
+        self.conn.send_request = failing
+        with mock.patch.object(openclaw_pipe, "_TURNS", Turns):
+            await self.conn._subscribe_all()
+            for _ in range(3):
+                await asyncio.sleep(0)
+        self.assertEqual(hellos, [self.conn])
+
 
 class RecoveryLinkTests(unittest.TestCase):
     """ELI-100 rule E and the active run behind a snapshot without ids."""

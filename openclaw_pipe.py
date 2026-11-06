@@ -5787,8 +5787,11 @@ class _GatewayConnection:
             self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
             self._stop_notice_seen = False
             self._shutdown_seen = False
-            if _TURNS:
-                spawn_background(_TURNS.after_hello(self))
+        # Also after a failed subscribe: the turn resync reads rows with sessions.list,
+        # and the reads it skipped while the socket was coming back are owed now
+        # (ELI-369). A socket that dropped again leaves it to that reconnect's hello.
+        if _TURNS:
+            spawn_background(_TURNS.after_hello(self))
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
         # A waiter that read state before subscribing could miss a settle.
