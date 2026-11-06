@@ -5543,6 +5543,12 @@ class _GatewayConnection:
     """Persistent WebSocket connection to the Gateway: dispatches events to
     per-run queues and reconnects with backoff."""
 
+    # Every connect names the device (`_display_name`). A build without this
+    # flag connects nameless, which wipes the name the Gateway stored (a
+    # nameless silent record can be pruned); `_retire_stale_connection` keeps
+    # such a build from reconnecting.
+    sends_display_name = True
+
     def __init__(self, valves_ref, writes_turns: bool = True, scopes: list | None = None,
                  identity_name: str = "identity", requests_only: bool = False,
                  display_name: str = MAIN_DISPLAY_NAME):
@@ -7721,17 +7727,27 @@ def _orphaned_gateway_connections(current) -> list:
     return found
 
 
-async def _retire_stale_connection(stale) -> None:
-    retire = getattr(stale, "retire", None)
-    if retire is not None:
-        await asyncio.wait_for(retire(), timeout=5)
-        return
-    # Pre-`retire()` build: pin its entry points shut so it can't revive.
+def _pin_shut(stale) -> None:
+    """Keep an older build's connection from connecting again: its open
+    socket is read until it drops, then its event loop ends."""
     async def _refuse(*_a, **_k):
         raise GatewayError("gateway connection retired by a newer deploy")
     stale._stopped = True
     stale.ensure_connected = _refuse
     stale._connect_and_start = _refuse
+
+
+async def _retire_stale_connection(stale) -> None:
+    retire = getattr(stale, "retire", None)
+    if retire is not None:
+        await asyncio.wait_for(retire(), timeout=5)
+        if not getattr(stale, "sends_display_name", False):
+            # It still serves its runs, but a reconnect by its old code would
+            # connect nameless on the shared device and wipe the stored name.
+            _pin_shut(stale)
+        return
+    # Pre-`retire()` build: pin its entry points shut so it can't revive.
+    _pin_shut(stale)
     await asyncio.wait_for(stale.disconnect(), timeout=5)
 
 
