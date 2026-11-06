@@ -6,6 +6,7 @@ reads. Stopping that loop left the socket open and unread (the Gateway's pings w
 terminated the socket, and the Pipe never closed its end: one fd and ~0.8 MB of buffer in CLOSE-WAIT
 per pin, ELI-369)."""
 import asyncio
+import time
 import unittest
 from unittest import mock
 
@@ -69,8 +70,11 @@ class PinnedConnectionTests(unittest.IsolatedAsyncioTestCase):
             await ocp._reap_stale_gateway_connection()
         self.assertTrue(self.conn._retired and self.conn._serving(), "it still serves its run")
 
-    async def _settle(self):
-        for _ in range(5):
+    async def _until(self, what, done):
+        """Let the loop run until `done()`; the bound only turns a hang into a failure."""
+        end = time.monotonic() + 5
+        while not done():
+            self.assertLess(time.monotonic(), end, f"never happened: {what}")
             await asyncio.sleep(0)
 
     async def test_a_pinned_connection_keeps_reading_its_socket_for_the_runs_it_serves(self):
@@ -79,7 +83,8 @@ class PinnedConnectionTests(unittest.IsolatedAsyncioTestCase):
         fut = asyncio.get_running_loop().create_future()
         self.conn._pending_reqs["r1"] = fut
         self.ws.frames.put_nowait('{"type": "res", "id": "r1", "ok": true, "payload": {"n": 1}}')
-        await self._settle()
+        await self._until("the frame is read", fut.done)
+        await self._until("recv() is called again", lambda: self.ws.reads > reads)
         self.assertEqual(fut.result(), {"n": 1}, "a frame pushed after the pin is still read")
         self.assertGreater(self.ws.reads, reads, "recv() is called again")
         self.assertFalse(self.loop_task.done(), "the loop is still running")
@@ -87,22 +92,22 @@ class PinnedConnectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_when_its_runs_finish_the_pinned_socket_is_closed_cleanly(self):
         await self._reap()
+        reads = self.ws.reads
         self.ws.frames.put_nowait('{"type": "event", "event": "tick"}')
-        await self._settle()
+        await self._until("the tick is read and recv() is called again", lambda: self.ws.reads > reads)
         self.assertFalse(self.loop_task.done(), "still reading after a frame, so still answering pings")
         self.assertEqual(self.ws.close_calls, 0)
         self.conn.unregister_consumer(KEY, "run-1", queue=self.queue)
-        await self._settle()
+        await self._until("ws.close() runs", lambda: self.ws.close_calls)
+        await self._until("the loop ends", self.loop_task.done)
         self.assertEqual(self.ws.close_calls, 1, "ws.close() sends the close frame")
-        self.assertTrue(self.loop_task.done())
         self.assertIsNone(self.conn._ws)
         self.assertEqual(self.connects, [])
 
     async def test_a_pinned_connection_whose_socket_drops_ends_without_reconnecting(self):
         await self._reap()
         self.ws.frames.put_nowait(ocp.websockets.exceptions.ConnectionClosed(None, None))
-        await self._settle()
-        self.assertTrue(self.loop_task.done(), "the loop ends instead of dialling again")
+        await self._until("the loop ends instead of dialling again", self.loop_task.done)
         self.assertEqual(self.connects, [], "no socket is opened, so no nameless connect")
         with self.assertRaises(ocp.GatewayError):
             await self.conn.ensure_connected()
