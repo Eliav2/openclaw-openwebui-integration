@@ -427,3 +427,44 @@ test("the network's copy kept: the pages are told which chat (oc-push.js reloads
   assert.deepEqual(w.told.filter((m) => m.type === "oc-chat-fresh").map((m) => m.path).slice(-1), ["/api/v1/chats/" + CHAT]);
 });
 
+
+// A chat as Open WebUI sends it, its last message `last` (done or still running).
+const ending = (id, text, last) => JSON.stringify({ id, chat: { history: { text, currentId: "m2", messages: {
+  m1: { id: "m1", role: "user", content: "q" }, m2: { id: "m2", role: last.role, done: last.done, content: text } } } } });
+const tasksUrl = (id) => ORIGIN + "/api/tasks/chat/" + id;
+
+test("a kept chat that ends with a finished reply: its running tasks are none at once (Open WebUI draws it without the network)", async () => {
+  const w = worker();
+  await opened(w, CHAT, ending(CHAT, "old", { role: "assistant", done: true }));
+  await w.read(chatUrl(CHAT), { open: true });
+  const tasks = await w.read(tasksUrl(CHAT));
+  assert.deepEqual(JSON.parse(await tasks.text()), { task_ids: [] });
+  assert.equal(w.net.count(tasksUrl(CHAT)), 0, "not asked");
+  const again = w.read(tasksUrl(CHAT));   // a reconnect's: the network's
+  await again.decided;
+  assert.equal(w.net.count(tasksUrl(CHAT)), 1);
+  w.net.answer(tasksUrl(CHAT), '{"task_ids":["t1"]}');
+  assert.deepEqual(JSON.parse(await (await again).text()), { task_ids: ["t1"] });
+});
+
+test("a kept chat whose last reply was still running: its tasks are the network's (they decide what Open WebUI shows)", async () => {
+  const w = worker();
+  await opened(w, CHAT, ending(CHAT, "old", { role: "assistant", done: false }));
+  await w.read(chatUrl(CHAT), { open: true });
+  const tasks = w.read(tasksUrl(CHAT));
+  await tasks.decided;
+  assert.equal(w.net.count(tasksUrl(CHAT)), 1);
+  w.net.answer(tasksUrl(CHAT), '{"task_ids":["t1"]}');
+  assert.deepEqual(JSON.parse(await (await tasks).text()), { task_ids: ["t1"] });
+});
+
+test("a chat opened from the network (nothing kept): its tasks are the network's", async () => {
+  const w = worker();
+  const open = w.read(chatUrl(CHAT), { open: true });
+  await open.decided;
+  w.net.answer(chatUrl(CHAT), ending(CHAT, "new", { role: "assistant", done: true }));
+  await open;
+  const tasks = w.read(tasksUrl(CHAT));
+  await tasks.decided;
+  assert.equal(w.net.count(tasksUrl(CHAT)), 1);
+});

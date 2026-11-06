@@ -346,7 +346,7 @@ const SHELL_READS = [
   /^\/api\/config$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
   /^\/api\/v1\/users\/user\/settings$/, /^\/api\/v1\/configs\/banners$/,
   /^\/api\/v1\/chats\/all\/tags$/, /^\/api\/v1\/chats\/[\w-]+\/tags$/,
-  /^\/api\/v1\/functions\/$/, /^\/api\/v1\/skills\/$/,
+  /^\/api\/v1\/functions\/$/, /^\/api\/v1\/skills\/$/, /^\/api\/v1\/tools\/$/,
 ];
 // The chat list and an opened chat: what a notification is opened for, so the
 // network's answer, the kept copy only offline. /api/version too: Open WebUI
@@ -589,6 +589,7 @@ const CHAT_CACHE_SETTING = "__OC_CHAT_CACHE__";
 const CHATS_KEPT = OFFLINE && CHAT_CACHE_SETTING === ON;
 const CHAT_READ = /^\/api\/v1\/chats\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const KEPT_HEADER = "x-oc-kept";      // on a chat answered from the kept copy (oc-push.js)
+const ANSWERED_HEADER = "x-oc-answered";   // on a kept copy whose last message is a finished reply
 // From the page script (oc-push.js): OPEN_READ on Open WebUI's first read of a chat
 // after the page went to it; OWN_READ on the script's own reads (a chat's folder).
 const OPEN_READ = "x-oc-open";
@@ -635,6 +636,7 @@ async function keepChat(cache, url, res) {
   const headers = new Headers(res.headers);
   for (const h of NOT_KEPT_HEADERS) headers.delete(h);
   headers.set(KEPT_HEADER, ON);
+  if (answered(JSON.parse(await body.text()))) headers.set(ANSWERED_HEADER, ON);
   await cache.put(url, new Response(body, { status: res.status, statusText: res.statusText, headers }));
   return withIndex(cache, async (index) => {
     index[url] = [body.size, Date.now()];
@@ -658,6 +660,26 @@ async function forgetChat(cache, url) {
   await cache.delete(url);
   return withIndex(cache, (index) => { delete index[url]; });
 }
+
+// The chat's last message is a finished reply: the one Open WebUI 0.13's loadChat
+// goes to (current_message_id, or the history's currentId).
+const ASSISTANT = "assistant";
+function answered(chat) {
+  const history = chat?.chat?.history;
+  const id = history?.messages?.[chat.current_message_id] ? chat.current_message_id : history?.currentId;
+  const last = history?.messages?.[id];
+  return last?.role === ASSISTANT && last.done === true;
+}
+
+// Open WebUI draws an opened chat only once it also has the chat's running tasks
+// (loadChat's getTaskIdsByChatId, after the chat and its tags). The answer counts only
+// when the last message is not a finished reply (loadChat keeps the tasks then); for
+// a chat opened from a kept copy that ends with one, it changes nothing, and waiting
+// for it on a slow network is what kept the chat from drawing: "none", at once. Only
+// for that open's read: the next ones (on a reconnect) go to the network.
+const TASKS_READ = /^\/api\/tasks\/chat\/([0-9a-f-]+)$/;
+const NO_TASKS = '{"task_ids":[]}';
+const tasksMoot = new Set();   // cache name + chat id: opened from a kept copy that ends answered
 
 // The kept copy, told apart from the network's by nothing: it is the network's.
 function asFresh(res) {
@@ -731,6 +753,7 @@ async function chatRead(e, req, name, session) {
     // Not kept: the network's (the copy on its way, if the page script's own read asked first).
     if (!kept) return waited(fetchChat(e, req, cache, key, session));
     fetchChat(e, req, cache, key, session).forOpen = true;
+    if (kept.headers.has(ANSWERED_HEADER)) tasksMoot.add(name + "\n" + new URL(req.url).pathname.split("/").pop());
     e.waitUntil(withIndex(cache, (index) => { if (index[req.url]) index[req.url][1] = Date.now(); }));
     return kept;
   }
@@ -745,6 +768,7 @@ async function signedOut() {
   apiCache = "";
   chatFetches.clear();
   chatFresh.clear();
+  tasksMoot.clear();
   await dropCaches((n) => n.startsWith(API_PREFIX));
 }
 
@@ -780,6 +804,10 @@ self.addEventListener("fetch", (e) => {
     bootVersion.delete(e.clientId);
     e.respondWith(asked.then((v) => (v === null ? freshFirst(e, req, SHELL, req.url, LIE_FI_MS)
       : new Response(v, { headers: JSON_TYPE }))));
+  } else if (CHATS_KEPT && TASKS_READ.test(path) && req.headers.get("authorization")) {
+    const id = path.match(TASKS_READ)[1];
+    e.respondWith(apiCacheFor(req.headers.get("authorization")).then((name) => (tasksMoot.delete(name + "\n" + id)
+      ? new Response(NO_TASKS, { headers: JSON_TYPE }) : again(req))));
   } else {
     const fresh = FRESH_READS.some((r) => r.test(path));
     if (!fresh && !SHELL_READS.some((r) => r.test(path))) return;
