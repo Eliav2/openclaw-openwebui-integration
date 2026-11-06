@@ -150,6 +150,35 @@ def ready(page):
     return page.evaluate("() => window.ocPushState")
 
 
+# chrome://gcm-internals is Chrome's own view of its push connection. A fresh profile checks in with
+# Google, then its first connection is often refused (LOGIN_FAILURE) and retried after a backoff of about
+# 20 s, so a push sent right after `subscribe()` resolves can find no live connection. The page shows the
+# connection state, the apps registered with it and a newest-first connection log; a push can arrive once
+# the state is CONNECTED, this origin's app is registered, and the newest log entry is a success (the log
+# only holds events from after this tab opened: an empty one means the connection was already up).
+GCM_LIVE = r"""(origin) => {
+  const t = document.body.innerText;
+  const log = (t.split(/Connection Log\s+Time\s+Event\s+Details\s+/)[1] || '').split('\n')[0];
+  return /Connection State\s+CONNECTED/.test(t) && ((t.match(/Registered App Ids\t([^\n]*)/) || [])[1] || '').includes('wp:' + origin + '/') && (log === '' || log.startsWith('Registration Log') || /Connection succeeded/.test(log));
+}"""
+
+
+def push_connection_live(ctx, origin):
+    """Waits until Chrome can receive a push for `origin`. Call it after every new subscription,
+    before the server sends: FCM keeps a message for a registered device, but only a connected one
+    receives it, and the first connection of a new profile can take a backoff to come up."""
+    tab = ctx.new_page()
+    try:
+        tab.goto("chrome://gcm-internals")
+        try:
+            settled(tab, GCM_LIVE, origin)
+        except AssertionError:
+            print("Chrome's push connection never came up:", tab.evaluate("() => document.body.innerText")[:2500])
+            raise
+    finally:
+        tab.close()
+
+
 @pytest.fixture(scope="module")
 def pw():
     with sync_playwright() as p:
@@ -219,6 +248,7 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     (sub,) = subscriptions(token, page)
     assert sub["endpoint"].startswith("https://fcm.googleapis.com/"), sub["endpoint"][:40]
     assert sub["keys"]["p256dh"] and sub["device"]
+    push_connection_live(ctx, BASE)
 
     # 2. A plain model's reply, while Open WebUI is in the background: Open WebUI's own chat.finished -> a notification.
     other = behind(ctx, page)
@@ -266,6 +296,7 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     assert ready(page) == "saved"
     (sub2,) = subscriptions(token, page)
     assert sub2["endpoint"] != sub["endpoint"] and sub2["device"] == sub["device"]
+    push_connection_live(ctx, BASE)
     other()
     d_chat, d_msg = new_chat(token, "stub", "Chat D")
     reply(token, "stub", d_chat, d_msg)
