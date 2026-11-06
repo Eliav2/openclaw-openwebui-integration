@@ -69,7 +69,7 @@ When a message can't be sent, the Gateway doesn't answer, or a run ends in an er
 
 Every turn logs to the Open WebUI backend log (its standard output), each line prefixed with `[openclaw-pipe]`. The Status Action logs with the same prefix. The thinking filter does not log.
 
-A line logged during a reply ends with the chat's id, `chat_id=<chat id>`, and once the run has started also its `runId=...`. An id the line already names is not repeated. So one search for a chat id, or for a run id, finds every line of that reply, background work included. Lines outside a reply (connecting to the Gateway, startup) have no ids.
+A line logged during a reply ends with the chat's id, `chat_id=<chat id>`, and once the run has started also its `runId=...`. A run id the line already names is not repeated. The chat tag is always there, even when the run id contains the chat id. So one search for `chat_id=<chat id>`, or for a run id, finds every line of that reply, background work included. Each reply has only its own ids: lines outside a reply (connecting to the Gateway, startup) have none, and a retry shows no run id until its own run starts.
 
 One reply in the Pipe's log (an excerpt):
 
@@ -77,7 +77,7 @@ One reply in the Pipe's log (an excerpt):
 [openclaw-pipe] Messages: 1, last role: user chat_id=<chat id>
 [openclaw-pipe] Session key: agent:main:openwebui-<user id>-<chat id>
 [openclaw-pipe] Cleared model override; using agent default chat_id=<chat id>
-[openclaw-pipe] Captured runId: msg-<chat id>-<message id>-1792018617.1007752
+[openclaw-pipe] Captured runId: msg-<chat id>-<message id>-1792018617.1007752 chat_id=<chat id>
 [openclaw-pipe]   Tool start: exec chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
 [openclaw-pipe]   Item: kind=tool status=running title=exec Commits from the last week chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
 [openclaw-pipe]   Tool result: exec (200 chars) chat_id=<chat id> runId=msg-<chat id>-<message id>-1792018617.1007752
