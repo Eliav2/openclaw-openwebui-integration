@@ -12,12 +12,43 @@ const MAX_LINES = 5;
 function worker() {
   const listeners = {};
   const shown = new Map();   // tag -> notification
+  let clock = 0;             // each notification's timestamp
+  // Cache Storage: one store per name, urls as keys.
+  const stores = new Map();
+  const caches = {
+    async open(name) {
+      if (!stores.has(name)) stores.set(name, new Map());
+      const m = stores.get(name);
+      const key = (k) => new URL(typeof k === "string" ? k : k.url, "https://chat.example").href;
+      return {
+        async put(k, r) { m.set(key(k), r); },
+        async match(k) { return m.get(key(k)); },
+        async delete(k) { return m.delete(key(k)); },
+        async keys() { return [...m.keys()].map((url) => ({ url })); },
+      };
+    },
+  };
+  // Open WebUI's socket as markRead uses it: each read event is recorded and answered.
+  const reads = [];
+  class WebSocket {
+    constructor() { queueMicrotask(() => this.onmessage?.({ data: "0{}" })); }
+    send(f) {
+      if (f.startsWith("40")) return queueMicrotask(() => this.onmessage?.({ data: "40{}" }));
+      if (f.startsWith("42")) {
+        const [, ev] = JSON.parse(f.slice(2));
+        reads.push(ev.chat_id);
+        queueMicrotask(() => this.onmessage?.({ data: "42" + JSON.stringify(["events", { chat_id: ev.chat_id, data: { type: "chat:list" } }]) }));
+      }
+    }
+    close() {}
+  }
+  const fetch = async () => new Response(JSON.stringify({ token: "t" }), { status: 200 });
   const registration = {
     async getNotifications({ tag } = {}) {
       return [...shown.values()].filter((n) => !tag || n.tag === tag);
     },
     async showNotification(title, options) {
-      const n = { title, ...options, close: () => shown.delete(options.tag) };
+      const n = { title, ...options, timestamp: ++clock, close: () => shown.delete(options.tag) };
       shown.set(options.tag, n);
     },
   };
@@ -28,13 +59,22 @@ function worker() {
     clients: { matchAll: async () => [], claim: async () => {} },
     addEventListener: (type, fn) => { listeners[type] = fn; },
   };
-  vm.runInNewContext(fs.readFileSync(SW, "utf8"), { self, URL, console, setTimeout, clearTimeout });
+  vm.runInNewContext(fs.readFileSync(SW, "utf8"), { self, URL, console, setTimeout, clearTimeout, caches, WebSocket, fetch,
+    Response, AbortSignal, queueMicrotask });
   async function push(payload) {
     let done;
     listeners.push({ data: { json: () => payload }, waitUntil: (pr) => { done = pr; } });
     await done;
   }
-  return { push, shown, tag: (id) => shown.get("chat-" + id) };
+  // A notification event as Chrome sends it; resolves once the worker is done with it.
+  async function fire(type, n, extra = {}) {
+    const work = [];
+    listeners[type]({ notification: n, action: "", ...extra, waitUntil: (pr) => work.push(pr) });
+    await Promise.allSettled(work);
+  }
+  // A swipe: Android removes the notification, then Chrome fires notificationclose.
+  const swipe = (n) => { n.close(); return fire("notificationclose", n); };
+  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches };
 }
 
 const reply = (chat, body, title = "Trip plan") => ({ chat_id: chat, title, body, url: "/c/" + chat });
@@ -101,4 +141,57 @@ test("without previews the body stays 'New reply' and the title still counts", a
   await w.push({ chat_id: "a", title: "Trip plan", url: "/c/a" });
   assert.equal(w.tag("a").body, "New reply");
   assert.equal(w.tag("a").title, "Trip plan · 2 new messages");
+});
+
+test("a swiped notification marks its chat read (once, however many replies it stacked)", async () => {
+  const w = worker();
+  await w.push(reply("a", "one"));
+  await w.push(reply("a", "two"));
+  await w.swipe(w.tag("a"));
+  assert.deepEqual(w.reads, ["a"]);
+});
+
+test("swipe_read off (the user's valve): a swipe only hides it", async () => {
+  const w = worker();
+  await w.push({ ...reply("a", "one"), swipe_read: false });
+  await w.swipe(w.tag("a"));
+  assert.deepEqual(w.reads, []);
+});
+
+test("a notification this code closed (a tap; the chat opened, as oc-push.js does) is not a swipe", async () => {
+  const w = worker();
+  await w.push(reply("a", "one"));
+  const tapped = w.tag("a");
+  await w.fire("notificationclick", tapped, { action: "mute" });   // its own close; the mute's fetch is not the point
+  await w.fire("notificationclose", tapped);   // should Chrome send a close for it
+  await w.push(reply("b", "one"));
+  const opened = w.tag("b");
+  const own = await w.caches.open("oc-push-own-closes");   // oc-push.js's mark, then its close()
+  await own.put("/oc-push/closed/" + opened.tag + "/" + opened.timestamp, new Response(""));
+  opened.close();
+  await w.fire("notificationclose", opened);
+  assert.deepEqual(w.reads, []);
+});
+
+test("a notification replaced by the chat's next one is not a swipe; a later swipe of the new one is", async () => {
+  const w = worker();
+  await w.push(reply("a", "one"));
+  const old = w.tag("a");
+  await w.push(reply("a", "two"));   // same tag: Chrome replaces it
+  await w.fire("notificationclose", old);
+  assert.deepEqual(w.reads, []);
+  await w.swipe(w.tag("a"));
+  assert.deepEqual(w.reads, ["a"]);
+});
+
+test("an own close of an earlier notification does not hide a swipe of the chat's next one", async () => {
+  const w = worker();
+  await w.push(reply("a", "one"));
+  const first = w.tag("a");
+  const own = await w.caches.open("oc-push-own-closes");
+  await own.put("/oc-push/closed/" + first.tag + "/" + first.timestamp, new Response(""));
+  first.close();   // Chrome sent no close for it: its mark stays
+  await w.push(reply("a", "two"));
+  await w.swipe(w.tag("a"));
+  assert.deepEqual(w.reads, ["a"]);
 });
