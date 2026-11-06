@@ -440,11 +440,39 @@ test("a kept chat that ends with a finished reply: its running tasks are none at
   const tasks = await w.read(tasksUrl(CHAT));
   assert.deepEqual(JSON.parse(await tasks.text()), { task_ids: [] });
   assert.equal(w.net.count(tasksUrl(CHAT)), 0, "not asked");
-  const again = w.read(tasksUrl(CHAT));   // a reconnect's: the network's
+  w.net.answer(chatUrl(CHAT), ending(CHAT, "new", { role: "assistant", done: true }));
+  await w.settled();
+  const again = w.read(tasksUrl(CHAT));   // once the network's copy came: the network's
   await again.decided;
   assert.equal(w.net.count(tasksUrl(CHAT)), 1);
   w.net.answer(tasksUrl(CHAT), '{"task_ids":["t1"]}');
   assert.deepEqual(JSON.parse(await (await again).text()), { task_ids: ["t1"] });
+});
+
+test("two reads of the tasks before the chat's network copy came (the socket's on connect, then Open WebUI's open): none to both, the network not asked", async () => {
+  // Open WebUI reads a chat's tasks when its socket connects, and again in loadChat, in
+  // either order. Only the first getting the kept answer left loadChat waiting on a
+  // slow network, the chat never drawn (e2e: reload with the network slow, 7/20 runs).
+  const w = worker();
+  await opened(w, CHAT, ending(CHAT, "old", { role: "assistant", done: true }));
+  await w.read(chatUrl(CHAT), { open: true });
+  for (const who of ["the socket's", "loadChat's"]) {
+    const tasks = w.read(tasksUrl(CHAT));
+    // Answered, or sent to the network (where it would wait: the network is slow).
+    let answered = false;
+    tasks.then(() => { answered = true; }, () => { answered = true; });
+    await turnsUntil(() => answered || w.net.count(tasksUrl(CHAT)) > 0);
+    assert.equal(w.net.count(tasksUrl(CHAT)), 0, `${who}: the network not asked`);
+    assert.deepEqual(JSON.parse(await (await tasks).text()), { task_ids: [] }, who);
+  }
+  // The network answered for the chat: a later read (a reconnect's) is the network's.
+  w.net.answer(chatUrl(CHAT), ending(CHAT, "new", { role: "assistant", done: true }));
+  await w.settled();
+  const later = w.read(tasksUrl(CHAT));
+  await later.decided;
+  assert.equal(w.net.count(tasksUrl(CHAT)), 1);
+  w.net.answer(tasksUrl(CHAT), '{"task_ids":["t1"]}');
+  assert.deepEqual(JSON.parse(await (await later).text()), { task_ids: ["t1"] });
 });
 
 test("a kept chat whose last reply was still running: its tasks are the network's (they decide what Open WebUI shows)", async () => {
