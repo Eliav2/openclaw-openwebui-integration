@@ -96,12 +96,14 @@ function worker({ chats = "1", offline = "1" } = {}) {
     Response: SiteResponse, Request, Headers, Blob, TextEncoder, crypto, JSON, Promise, Map, Set, Math, Date, Object,
   });
   // A request of the page `client`; resolves to the worker's answer (null: not answered by it).
-  function read(url, { auth = TOKEN_A, client = "page-1", method = "GET", own = false } = {}) {
+  // `open`: Open WebUI's first read after the page went to the chat (oc-push.js marks it).
+  function read(url, { auth = TOKEN_A, method = "GET", own = false, open = false } = {}) {
     let answer = null;
-    const headers = { ...(auth ? { authorization: auth } : {}), ...(own ? { "x-oc-own": "1" } : {}) };
+    const headers = { ...(auth ? { authorization: auth } : {}), ...(own ? { "x-oc-own": "1" } : {}),
+      ...(open ? { "x-oc-open": "1" } : {}) };
     const request = new Request(url, { method, headers });
     listeners.fetch({
-      request, clientId: client,
+      request, clientId: "page",
       respondWith: (p) => { answer = p; },
       waitUntil: (p) => { pending.add(p); p.finally(() => pending.delete(p)); },
     });
@@ -150,7 +152,7 @@ async function opened(w, id, body, opts) {
 test("a chat opened before: the kept copy at once, marked; the next read waits for the network's", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
-  const first = await w.read(chatUrl(CHAT));               // loadChat: no network yet
+  const first = await w.read(chatUrl(CHAT), { open: true });   // loadChat: no network yet
   assert.equal(first.headers.get(KEPT), "1");
   assert.equal(await text(first), "old");
   const refresh = w.read(chatUrl(CHAT));                     // refreshChat, on the socket's join
@@ -161,7 +163,7 @@ test("a chat opened before: the kept copy at once, marked; the next read waits f
   assert.equal(await text(fresh), "new");
   assert.equal(w.net.count(chatUrl(CHAT)), 2, "one download behind the kept copy");
   await w.settled();
-  const again = await w.read(chatUrl(CHAT), { client: "page-2" });
+  const again = await w.read(chatUrl(CHAT), { open: true });
   assert.equal(await text(again), "new", "the network's copy is kept for the next open");
 });
 
@@ -171,15 +173,39 @@ test("the page script's own read (for the chat's folder) is not the page's: Open
   const own = await w.read(chatUrl(CHAT), { own: true });
   assert.equal(await text(own), "old");
   assert.equal(w.net.count(chatUrl(CHAT)), 1, "no download for it");
-  const load = await w.read(chatUrl(CHAT));
+  const load = await w.read(chatUrl(CHAT), { open: true });
   assert.equal(load.headers.get(KEPT), "1");
   assert.equal(await text(load), "old");
+});
+
+test("a read that is not an open (Open WebUI reloading the chat) never gets the kept copy: the network's", async () => {
+  const w = worker();
+  await opened(w, CHAT, chat(CHAT, "old"));
+  const reload = w.read(chatUrl(CHAT));
+  await asked(w, chatUrl(CHAT), 2);
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
+  const res = await reload;
+  assert.equal(res.headers.get(KEPT), null);
+  assert.equal(await text(res), "new");
+});
+
+test("an open while the page script's own read is fetching the chat: that fetch, one download", async () => {
+  const w = worker();
+  const own = w.read(chatUrl(CHAT), { own: true });
+  await asked(w, chatUrl(CHAT), 1);
+  const open = w.read(chatUrl(CHAT), { open: true });
+  w.net.answer(chatUrl(CHAT), chat(CHAT, "first"));
+  assert.equal(await text(own), "first");
+  const res = await open;
+  assert.equal(res.headers.get(KEPT), null);
+  assert.equal(await text(res), "first");
+  assert.equal(w.net.count(chatUrl(CHAT)), 1);
 });
 
 test("the network's copy came before the page's next read: that read gets it, no second download", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
-  await w.read(chatUrl(CHAT));
+  await w.read(chatUrl(CHAT), { open: true });
   await asked(w, chatUrl(CHAT), 2);
   w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
   await w.settled();
@@ -192,7 +218,7 @@ test("the network's copy came before the page's next read: that read gets it, no
 test("no network for the refresh: the kept copy again, never an error (Open WebUI would leave the chat)", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
-  await w.read(chatUrl(CHAT));
+  await w.read(chatUrl(CHAT), { open: true });
   // Every attempt fails (the worker asks a failed read once more at once).
   const res = await until(w.read(chatUrl(CHAT)), () => w.net.fail(chatUrl(CHAT)));
   assert.equal(res.status, OK);
@@ -203,7 +229,7 @@ test("no network for the refresh: the kept copy again, never an error (Open WebU
 test("the server down for the refresh (502): the kept copy; back up, the page's next read gets the network's", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
-  await w.read(chatUrl(CHAT));
+  await w.read(chatUrl(CHAT), { open: true });
   const refresh = until(w.read(chatUrl(CHAT)), () => w.net.answer(chatUrl(CHAT), "bad gateway", BAD_GATEWAY));
   assert.equal(await text(refresh), "old");
   await w.settled();
@@ -215,13 +241,13 @@ test("the server down for the refresh (502): the kept copy; back up, the page's 
 test("a chat deleted or no longer the user's (404): the answer as it is, and the kept copy goes", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "old"));
-  await w.read(chatUrl(CHAT));
+  await w.read(chatUrl(CHAT), { open: true });
   const refresh = w.read(chatUrl(CHAT));
   await asked(w, chatUrl(CHAT), 2);
   w.net.answer(chatUrl(CHAT), JSON.stringify({ detail: "not found" }), NOT_FOUND);
   assert.equal((await refresh).status, NOT_FOUND);
   await w.settled();
-  const next = w.read(chatUrl(CHAT), { client: "page-2" });
+  const next = w.read(chatUrl(CHAT), { open: true });
   await asked(w, chatUrl(CHAT), 3);
   w.net.answer(chatUrl(CHAT), JSON.stringify({ detail: "not found" }), NOT_FOUND);
   assert.equal((await next).status, NOT_FOUND, "not opened from a kept copy");
@@ -230,7 +256,7 @@ test("a chat deleted or no longer the user's (404): the answer as it is, and the
 test("a chat bigger than the per-chat limit is not kept", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "big", 33 * MIB));
-  const next = w.read(chatUrl(CHAT), { client: "page-2" });
+  const next = w.read(chatUrl(CHAT), { open: true });
   await asked(w, chatUrl(CHAT), 2);
   w.net.answer(chatUrl(CHAT), chat(CHAT, "big again"));
   const res = await next;
@@ -247,7 +273,7 @@ test("over the total limit, the chat opened longest ago goes first", async () =>
   const kept = ids.filter((id) => store.has(chatUrl(id)));
   assert.deepEqual(kept, ids.slice(1));
   // Opening one again makes it the most recent: the next one in goes past it.
-  const again = await w.read(chatUrl(ids[1]));
+  const again = await w.read(chatUrl(ids[1]), { open: true });
   assert.equal(again.headers.get(KEPT), "1");
   await asked(w, chatUrl(ids[1]), 2);
   w.net.answer(chatUrl(ids[1]), chat(ids[1], "c" + ids[1], 30 * MIB));
@@ -261,7 +287,7 @@ test("over the total limit, the chat opened longest ago goes first", async () =>
 test("another user on the same browser: never the first user's kept chat", async () => {
   const w = worker();
   await opened(w, CHAT, chat(CHAT, "a's chat"));
-  const asB = w.read(chatUrl(CHAT), { auth: TOKEN_B });
+  const asB = w.read(chatUrl(CHAT), { auth: TOKEN_B, open: true });
   await asked(w, chatUrl(CHAT), 2);
   w.net.answer(chatUrl(CHAT), JSON.stringify({ detail: "not found" }), NOT_FOUND);
   const res = await asB;
@@ -284,7 +310,7 @@ test("a sign-out drops every kept chat of the user", async () => {
 test("the switch off (CHAT_CACHE unset): a chat opened before waits for the network, as before", async () => {
   const w = worker({ chats: "0" });
   await opened(w, CHAT, chat(CHAT, "old"));
-  const next = w.read(chatUrl(CHAT));
+  const next = w.read(chatUrl(CHAT), { open: true });
   await asked(w, chatUrl(CHAT), 2);
   w.net.answer(chatUrl(CHAT), chat(CHAT, "new"));
   const res = await next;

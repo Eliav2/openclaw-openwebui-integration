@@ -170,9 +170,15 @@
     offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
     readOnly();
   }
+  let unlocked = [];   // waiting for the message box to take text
+  const writable = () => (offline || updating() ? new Promise((ok) => unlocked.push(ok)) : Promise.resolve());
   function readOnly() {
     const on = offline || updating();
     lockComposer(on);
+    if (!on) {
+      for (const ok of unlocked) ok();
+      unlocked = [];
+    }
     if (on) relock.observe(document.documentElement, { childList: true, subtree: true });
     else relock.disconnect();
     showPills();
@@ -196,22 +202,36 @@
   addEventListener("offline", offlinePill);
   offlinePill();
 
-  // Open WebUI reads a chat with GET /api/v1/chats/<id>. An answer from the kept
-  // copy carries KEPT_HEADER; the chat stays marked until a read of it gets the
-  // network's answer (Open WebUI's refresh once it joins the chat's room) and Open
-  // WebUI has read its body: it merges it into the chat on screen right then.
+  // Open WebUI reads a chat with GET /api/v1/chats/<id>. Its first read after the
+  // page went to the chat is the open: marked OPEN_READ, the service worker may
+  // answer it from the kept copy (oc-sw.js kept chats), with KEPT_HEADER. Its later
+  // reads (its refresh once it joins the chat's room) get the network's. The chat
+  // stays marked until such a read comes and Open WebUI has read its body: it
+  // merges it into the chat on screen right then.
   const CHAT_READ = /^\/api\/v1\/chats\/([0-9a-f-]+)$/;
-  const KEPT_HEADER = "x-oc-kept";   // oc-sw.js
+  const KEPT_HEADER = "x-oc-kept", OPEN_READ = "x-oc-open";   // oc-sw.js
   const GET = "GET";
+  let onChat = chatIdNow();    // the chat the page is on
+  let opening = onChat;        // the chat the page went to, its open read not yet sent
+  // A change of route within the same chat (a query changed) is no new open.
+  function wentTo() {
+    if (chatIdNow() === onChat) return;
+    onChat = opening = chatIdNow();
+  }
   const pageFetch = window.fetch;
   window.fetch = function (input, init) {
-    const sent = pageFetch.call(this, input, init);
     const req = input instanceof Request ? input : null;
-    if ((init?.method || req?.method || GET).toUpperCase() !== GET) return sent;
     const url = new URL(req ? req.url : String(input), location.href);
-    const id = url.origin === location.origin && !url.search && (url.pathname.match(CHAT_READ) || [])[1];
-    if (!id || new Headers(init?.headers || req?.headers).has(OWN_READ)) return sent;
-    return sent.then((res) => {
+    const id = (init?.method || req?.method || GET).toUpperCase() === GET && url.origin === location.origin &&
+      !url.search && (url.pathname.match(CHAT_READ) || [])[1];
+    const headers = new Headers(init?.headers || req?.headers);
+    if (!id || headers.has(OWN_READ)) return pageFetch.call(this, input, init);
+    if (id === opening) {
+      opening = "";
+      headers.set(OPEN_READ, "1");
+      init = { ...init, headers };
+    }
+    return pageFetch.call(this, input, init).then((res) => {
       if (res.headers.has(KEPT_HEADER)) {
         keptChats.add(id);
         readOnly();
@@ -472,6 +492,8 @@
       o.observe(document.documentElement, { childList: true, subtree: true });
       setTimeout(() => { o.disconnect(); ok(find()); }, 15000);
     });
+    // A locked box (offline, or the chat still its kept copy) takes no text: wait.
+    if (box) await writable();
     if (box) {
       box.focus();
       if (text) {
@@ -523,6 +545,7 @@
   // or replaceState). Each navigation checks whether the token changed since the
   // last run, and runs again if so.
   const navigated = () => {
+    wentTo();
     readOnly();
     const t = store.get("token");
     if (t && t !== ranFor) run();
