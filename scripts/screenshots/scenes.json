@@ -363,23 +363,6 @@
       ]
     },
     {
-      "match": "Start with the build",
-      "steps": [
-        {
-          "say": "",
-          "tool": "exec",
-          "args": {
-            "command": "cd forecast && python3 -m compileall -q src && echo build ok",
-            "title": "Build the app"
-          }
-        },
-        {
-          "say": "The build is clean. Next is the staging deploy script, which doesn't exist yet.",
-          "delay": 0.03
-        }
-      ]
-    },
-    {
       "match": "What does this chart say about the afternoon?",
       "steps": [
         {

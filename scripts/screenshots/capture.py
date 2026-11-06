@@ -30,6 +30,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 
 from playwright.sync_api import Page, sync_playwright
 
@@ -320,6 +321,34 @@ def gateway_call(method: str, params: dict) -> dict:
     return json.loads(out.stdout[out.stdout.find("{"):])
 
 
+def session_row(session_key: str) -> dict | None:
+    """The session's row from the Gateway (sessions.list: its goal and hasActiveRun),
+    None when it has none. Asked by key (`search`), because a stack that has run many
+    scenes holds more sessions than one page of the plain list."""
+    rows = gateway_call("sessions.list", {"search": session_key, "limit": 200}).get("sessions") or []
+    return next((r for r in rows if r.get("key") == session_key), None)
+
+
+def end_goal(session_key: str) -> None:
+    """Clear the session's goal, if it has one, and wait until it is seen idle.
+
+    From OpenClaw 2026.10.10 an active goal queues its own "Advance the active
+    goal" turn after every clean turn, and each of those queues the next, until
+    the goal is no longer active (the Gateway checks it before it starts a
+    queued one). Nothing on the page ends that: a Stop button exists only while
+    a reply streams, and a click that misses leaves the loop running through
+    every scene after. The Gateway's own goal clear does, and `hasActiveRun`
+    says when the last turn is over: the wait is for a row that is seen with no
+    goal and no active run, never for a row that is missing."""
+    goal = (session_row(session_key) or {}).get("goal")
+    if goal:
+        gateway_call("sessions.goal.clear", {"sessionKey": session_key, "goalId": goal["id"],
+                                             "operationId": str(uuid.uuid4()), "issuedAtMs": int(time.time() * 1000)})
+    poll(lambda: session_row(session_key),
+         lambda row: row is not None and not row.get("goal") and not row.get("hasActiveRun"),
+         f"the session {session_key} with no goal and no run", TURN_TIMEOUT_MS / 1000)
+
+
 def gateway_release() -> tuple:
     """(year, month, patch) of the stack's OpenClaw: some shots need a newer one."""
     out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
@@ -443,7 +472,7 @@ ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section
 FIRST_ASSISTANT = "document.querySelector('.chat-assistant')"
 REBUILD_SAYS = "Rebuilding the cache from the forecast API."
 REBUILD_DONE = "The cache is rebuilt"
-GOAL_ANSWER = "Next is the staging deploy script"
+GOAL_ANSWER = "Goal set: the hourly view on staging"
 # From OpenClaw 2026.10.10 the Gateway steers a message sent while a run works
 # into that run: the run ends its reply at the next step and the scripted
 # model answers the new message, so the rebuild's closing line is never said
@@ -1108,23 +1137,27 @@ class Scenes:
         the session's goal, which the agent set with its create_goal tool.
 
         From OpenClaw 2026.10.10 an active goal keeps the session going: after
-        each turn the Gateway queues its own "Advance the active goal" turn
-        (scenes.json answers it slowly, so the loop is a turn every few
-        seconds, not a flood). The replies of those turns pile up under the
-        scene's, so the scene holds the reply that answers its message, never
-        "the last one"."""
+        each clean turn the Gateway queues its own "Advance the active goal"
+        turn, and each of those queues the next. The scene needs no second
+        message: the reply that sets the goal already carries the goal row.
+        The moment it is finished the scene clears the goal through the
+        Gateway, so no turn of the loop runs under the shot or through the
+        scenes after (a Stop click cannot do that: see `end_goal`)."""
         new_chat(page)
         chat = send(page, "Keep at it until the hourly view is on staging.")
-        wait_js(page, last_text_has("Goal set"), "the reply that sets the goal")
-        # The goal keeps the session going, and a message sent while it does is
-        # held behind the loop for minutes (steered into a follow-up turn it
-        # cannot join). Stop ends the running turn and the queued ones; the goal
-        # stays active, and the next message is an ordinary turn.
-        page.locator('button[aria-label="Stop"]').click()
-        wait_js(page, "() => !document.querySelector('button[aria-label=\"Stop\"]')", "the goal's turn stopped")
-        send(page, "Start with the build.")
+        me = api("GET", "/api/v1/auths/", token=self.token)
         answer = reply_with(GOAL_ANSWER)
-        wait_js(page, reply_done_js(answer), "the reply that answers, finished")
+        key = f"agent:main:openwebui-{me['id']}-{chat}"
+        try:
+            wait_js(page, reply_done_js(answer), "the reply that sets the goal, finished")
+        except BaseException:
+            # The goal may exist already: without this it keeps the session going through the scenes after.
+            try:
+                end_goal(key)
+            except Exception as e:
+                print(f"  could not end the goal of {key}: {e}", flush=True)
+            raise
+        end_goal(key)
         set_title(self.token, chat, "Hourly view to staging")
         # Open the status history. From Open WebUI 0.13 a transparent "Toggle status history"
         # button lies over the status line and takes the click.
@@ -1151,10 +1184,6 @@ class Scenes:
         }}"""
         self.s.shot(page, "usage-goal", clip_js=clip,
                     text_selector=f'.chat-assistant:has-text("{GOAL_ANSWER}") >> nth=-1')
-        # The goal stays active; stop its loop so it does not run through the scenes after.
-        stop = page.locator('button[aria-label="Stop"]')
-        if stop.count():
-            stop.first.click()
 
     def compaction_note(self, page: Page) -> None:
         """A context compaction in the middle of a reply (the sample plugin
