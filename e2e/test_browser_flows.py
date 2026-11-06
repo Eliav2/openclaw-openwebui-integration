@@ -1670,13 +1670,20 @@ def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, to
     try:
         with late.expect_request(lambda r: r.url.endswith(f"/api/v1/chats/{chat_id}/tags"), timeout=60_000):
             late.goto(page.url)
+        # The request is held from here on, but Playwright runs the route handler (which
+        # records it in `held`) as a task on its own loop, and a sync test turns that loop
+        # only inside a Playwright call. The driver sent the route before it answers the
+        # next call, so after one round trip the handler has run: `held` no longer depends
+        # on the poll below turning the loop (it does not when the reply's message is
+        # already in the DB at the first check).
+        late.context.cookies()
+        assert held, "the late tab's tags request was not held"
         capture.gateway_call("chat.send", {"sessionKey": key, "message": f"E2E_SLOW:15 {word}",
                                            "idempotencyKey": f"race-{word}", "deliver": False})
         deadline = time.monotonic() + 60
         while not any(m.get("role") == "assistant" for i, m in messages().items() if i not in before):
             assert time.monotonic() < deadline, "the agent's reply never got its message"
-            late.wait_for_timeout(200)  # polls the DB; the route callback runs meanwhile
-        assert held, "the late tab's tags request was not held"
+            late.wait_for_timeout(200)  # polls the DB
         for route in held:
             route.continue_()
         _wait(late, _reply_js(1, f"r.text.includes({json.dumps(word)}) && !r.done"),
