@@ -172,7 +172,7 @@ What it does, request by request (only `GET` requests to your own Open WebUI; ev
 | A page (`/`, `/c/<id>`, any route: Open WebUI is one page) | The kept page at once, when it was kept with its Open WebUI version; `/api/version` is asked alongside it. Another version: everything kept is deleted and the page reloads once onto the server's own app. A redirect instead of a version (an expired Cloudflare Access session): the kept page is deleted and the reload shows the login. No page kept yet: the network. |
 | Open WebUI's hashed files (`/_app/immutable/`) | Kept on first use and then read from the device: their names change with their content. |
 | `/static/`, `/assets/`, your settings, models, config, banners, tags, functions, skills | The kept copy at once, refreshed in the background for the next open. |
-| The chat list, pinned chats, folders, each chat you open, `/api/version`, `/_app/version.json`, `/manifest.json` | The network; the kept copy only when it fails. |
+| The chat list, pinned chats, folders, each chat you open, `/api/version`, `/_app/version.json`, `/manifest.json` | The network; the kept copy only when it fails. A chat opened before: the kept copy at once with `CHAT_CACHE` on ([below](#a-chat-opened-before-at-once)). |
 | Profile pictures (models, users) | The kept copy at once, refreshed in the background. |
 
 A network that answers nothing at all (lie-fi) is given up on after 4.2 s (twice the slowest answer measured on Slow 3G); then the kept copy is used. If the page kept that way turns out to be from another Open WebUI version, the page reloads.
@@ -186,6 +186,18 @@ A network that answers nothing at all (lie-fi) is given up on after 4.2 s (twice
 - **Start reads cut by a network change, offline open off too:** the page script asks Open WebUI's start reads (config, user, settings, models, the chat list, the chat) once more when the network cuts one on its way; Open WebUI asks them only once and would stay half drawn.
 - **After a network change:** a change of network while Open WebUI loads (Wi-Fi to mobile) can fail one of its files, and Open WebUI then shows "500 Internal Error" for good. The page script reloads once, as soon as the server can be reached again (at once, or on the next `online` or network change). It reloads only once per tab until a load gets to the app. This works with offline open on or off.
 - **Turning it off** (`OFFLINE` unset or not `"1"`): the next service worker that a device loads deletes everything it kept, and again on the next page load.
+
+### A chat opened before, at once
+
+Off by default; it needs offline open on. Turn it on with the Cloudflare Worker's `CHAT_CACHE` variable set to `"1"`, or, with nginx, by replacing `__OC_CHAT_CACHE__` with `1` in your copy of `oc-sw.js`. Open WebUI reads a whole chat (every message, as JSON: megabytes for a long chat) on every open and shows none of it before the last byte, so on a slow network a long chat takes as long to open as its size takes to download.
+
+With it on, a chat you opened before on that device opens from the copy kept of it, at once, and the network's copy is fetched behind it:
+
+- **The fresh copy replaces it by itself.** Open WebUI reads an opened chat a second time once it has joined the chat's live updates (and again after a reconnect), and merges what it gets into the chat on screen. That second read waits for the network's copy, so the newest messages, a reply that came while the app was closed included, appear as soon as it arrives. If it arrived before that read, the read gets it from the device: one download.
+- **Marked until then:** a pill says "Updating…" and the message box is locked, as offline: a message sent on an old copy could branch off an old point of the chat. No network for the second read: the kept copy stays on screen (Open WebUI would otherwise leave the chat), and the next read (the reconnect) tries again.
+- **Per user, never shared:** the kept chats are in the signed-in user's cache (named after a hash of the user's token, as above). Signing in as someone else deletes the other user's cache, and Open WebUI's sign-out (`/api/v1/auths/signout`) deletes every user's. A chat the server answers with an error (deleted, or no longer yours) is deleted from the device.
+- **Sizes:** a chat bigger than 32 MB is not kept (it would go through the service worker's memory on every open; the biggest chats we measured were 31, 20 and 16 MB). All the kept chats of a user together stay under 128 MB: the chat opened longest ago goes first.
+- **Turning it off** (`CHAT_CACHE` unset or not `"1"`): the next service worker a device loads opens chats from the network again; the copies already kept serve only offline, as any kept read.
 
 ## Known limits
 

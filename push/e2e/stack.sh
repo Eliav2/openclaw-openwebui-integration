@@ -4,6 +4,7 @@
 #   push/e2e/stack.sh up <run_dir> <pipe_build>    # pipe_build: an openclaw_pipe.py with _publish_chat_finished
 #   push/e2e/stack.sh down <run_dir>
 #   push/e2e/stack.sh offline <run_dir> 0|1      # the Worker's OFFLINE switch, Worker restarted
+#   push/e2e/stack.sh chats <run_dir> 0|1        # its CHAT_CACHE switch (kept chats), the same way
 # Ports: OWUI 18780, Worker 18787. Needs docker, bun or npx, uv.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd); push=$(dirname "$here")
@@ -38,8 +39,9 @@ start_worker() {
     bunx wrangler@4.45.0 dev --port 18787 --ip 127.0.0.1 --local-upstream 127.0.0.1:18780 >/dev/null
   first_match "Ready on" tail -n +1 -F "$run/wrangler.log"
 }
-if [ "$cmd" = offline ]; then
-  sed -i "s/\"OFFLINE\": \"[01]\"/\"OFFLINE\": \"$3\"/" "$run/worker/wrangler.jsonc"
+if [ "$cmd" = offline ] || [ "$cmd" = chats ]; then
+  var=OFFLINE; [ "$cmd" = chats ] && var=CHAT_CACHE
+  sed -i "s/\"$var\": \"[01]\"/\"$var\": \"$3\"/" "$run/worker/wrangler.jsonc"
   systemctl --user stop "$name-wrangler" 2>/dev/null || true
   systemctl --user reset-failed "$name-wrangler" 2>/dev/null || true
   start_worker
@@ -65,7 +67,8 @@ rm -rf "$run/worker/web"; mv "$run/web" "$run/worker/web"   # a second `up` on t
 cat > "$run/worker/wrangler.jsonc" <<JSON
 { "name": "web-push-e2e", "main": "src/index.js", "compatibility_date": "2025-10-01",
   "rules": [{ "type": "Text", "globs": ["**/oc-sw.js", "**/oc-push.js"], "fallthrough": true }],
-  "vars": { "VAPID_PUBLIC_KEY": "$(cat "$run/keys/public.b64")", "FUNCTION_ID": "web_push", "OFFLINE": "${E2E_OFFLINE:-1}" } }
+  "vars": { "VAPID_PUBLIC_KEY": "$(cat "$run/keys/public.b64")", "FUNCTION_ID": "web_push", "OFFLINE": "${E2E_OFFLINE:-1}",
+            "CHAT_CACHE": "${E2E_CHAT_CACHE:-1}" } }
 JSON
 start_worker
 echo "up: owui http://127.0.0.1:18780 worker http://localhost:18787"

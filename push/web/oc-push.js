@@ -26,9 +26,13 @@
     const a = new Uint8Array(buf), b = keyBytes(VAPID);
     return a.length === b.length && a.every((x, i) => x === b[i]);
   };
-  const call = (path, body) => fetch(path, {
+  // OWN_READ marks this script's own reads: a chat read for its folder is not one of
+  // Open WebUI's (oc-sw.js kept chats; the kept-chat mark below). The kept copy does
+  // for showing the bell; OWN_FRESH asks for the network's (before a mute).
+  const OWN_READ = "x-oc-own", OWN_KEPT = "1", OWN_FRESH = "fresh";
+  const call = (path, body, own = OWN_KEPT) => fetch(path, {
     method: body ? "POST" : "GET",
-    headers: { Authorization: "Bearer " + store.get("token"), "Content-Type": "application/json" },
+    headers: { Authorization: "Bearer " + store.get("token"), "Content-Type": "application/json", [OWN_READ]: own },
     body: body ? JSON.stringify(body) : undefined,
   }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(path + " " + r.status))));
   const valves = (suffix, body) => call("/api/v1/functions/id/" + FN + "/valves/user" + suffix, body);
@@ -129,12 +133,17 @@
     setTimeout(() => n.remove(), 8000);
   }
 
+  const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
+
   // With no network, while the service worker opens the app from what it kept
   // (offline open on: its app cache is there), the chats are read-only: a pill
   // says so and the message box is locked (inert: no typing, no keyboard, no
   // send), so nothing typed offline is lost on a send that cannot go. Text already
   // in the box stays there and can be sent once the network is back.
-  const OFFLINE_PILL = "oc-offline";
+  // A chat on screen from the copy the worker kept of it (oc-sw.js, kept chats)
+  // gets the same lock and an "Updating…" pill until Open WebUI has the network's
+  // copy: a message sent on an old copy could branch off an old point of the chat.
+  const OFFLINE_PILL = "oc-offline", UPDATING_PILL = "oc-updating";
   const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
   const LOCKED = "ocOfflineLocked";   // data-oc-offline-locked on the locked composer
   const LOCKED_OPACITY = "0.5";
@@ -152,36 +161,139 @@
     f.style.opacity = LOCKED_OPACITY;
     f.dataset[LOCKED] = "1";
   }
+  let offline = false;
+  const keptChats = new Set();   // chats whose kept copy Open WebUI has, not yet the network's
+  const updating = () => keptChats.has(chatIdNow());
   // Open WebUI draws a new message box on each chat, and its first render can
-  // replace what is in the page: both again while offline.
-  const relock = new MutationObserver(() => { lockComposer(true); showPill(); });
+  // replace what is in the page: both again while locked.
+  const relock = new MutationObserver(() => { lockComposer(true); showPills(); });
   async function offlinePill() {
-    const offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
-    lockComposer(offline);
-    if (!offline) {
-      relock.disconnect();
-      return document.getElementById(OFFLINE_PILL)?.remove();
-    }
-    relock.observe(document.documentElement, { childList: true, subtree: true });
-    showPill();
+    offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
+    readOnly();
   }
-  function showPill() {
-    if (document.getElementById(OFFLINE_PILL) || !document.body) return;
+  let unlocked = [];   // waiting for the message box to take text
+  const writable = () => (offline || updating() ? new Promise((ok) => unlocked.push(ok)) : Promise.resolve());
+  function readOnly() {
+    const on = offline || updating();
+    lockComposer(on);
+    if (!on) {
+      for (const ok of unlocked) ok();
+      unlocked = [];
+    }
+    if (on) relock.observe(document.documentElement, { childList: true, subtree: true });
+    else relock.disconnect();
+    showPills();
+  }
+  function showPills() {
+    statusPill(OFFLINE_PILL, offline, "Offline: saved chats, read-only");
+    statusPill(UPDATING_PILL, !offline && updating(), "Updating…");
+  }
+  function statusPill(id, on, text) {
+    const shown = document.getElementById(id);
+    if (!on) return shown?.remove();
+    if (shown || !document.body) return;
     const p = document.createElement("div");
-    p.id = OFFLINE_PILL;
+    p.id = id;
     p.setAttribute("role", "status");
     p.style.cssText = pill + ";padding:6px 14px;pointer-events:none";
-    p.textContent = "Offline: saved chats, read-only";
+    p.textContent = text;
     document.body.appendChild(p);
   }
   addEventListener("online", offlinePill);
   addEventListener("offline", offlinePill);
   offlinePill();
 
+  // Open WebUI reads a chat with GET /api/v1/chats/<id>. Its first read after the
+  // page went to the chat is the open: marked OPEN_READ, the service worker may
+  // answer it from the kept copy (oc-sw.js kept chats), with KEPT_HEADER. Its later
+  // reads (its refresh once it joins the chat's room) get the network's. The chat
+  // stays marked until such a read comes and Open WebUI has read its body: it
+  // merges it into the chat on screen right then.
+  const CHAT_READ = /^\/api\/v1\/chats\/([0-9a-f-]+)$/;
+  const KEPT_HEADER = "x-oc-kept", OPEN_READ = "x-oc-open";   // oc-sw.js
+  const GET = "GET";
+  let onChat = chatIdNow();    // the chat the page is on
+  let opening = onChat;        // the chat the page went to, its open read not yet sent
+  // Reloaded into a chat's fresh copy (below): its first read is not an open.
+  const FRESH_RELOAD = "ocReloadedForFreshChat";
+  try {
+    if (sessionStorage.getItem(FRESH_RELOAD) === onChat) opening = "";
+    sessionStorage.removeItem(FRESH_RELOAD);
+  } catch (_) {}
+  const reading = new Map();     // chat -> Open WebUI's reads of it on their way
+  const refreshedKept = new Set();   // chats whose refresh got the kept copy too (no network then)
+  // A change of route within the same chat (a query changed) is no new open.
+  function wentTo() {
+    if (chatIdNow() === onChat) return;
+    onChat = opening = chatIdNow();
+  }
+  const pageFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const req = input instanceof Request ? input : null;
+    const url = new URL(req ? req.url : String(input), location.href);
+    const id = (init?.method || req?.method || GET).toUpperCase() === GET && url.origin === location.origin &&
+      !url.search && (url.pathname.match(CHAT_READ) || [])[1];
+    const headers = new Headers(init?.headers || req?.headers);
+    if (!id || headers.has(OWN_READ)) return pageFetch.call(this, input, init);
+    const open = id === opening;
+    if (open) {
+      opening = "";
+      headers.set(OPEN_READ, "1");
+      init = { ...init, headers };
+    }
+    reading.set(id, (reading.get(id) || 0) + 1);
+    const done = () => reading.set(id, reading.get(id) - 1);
+    return pageFetch.call(this, input, init).finally(done).then((res) => {
+      if (res.headers.has(KEPT_HEADER)) {
+        keptChats.add(id);
+        if (!open) refreshedKept.add(id);
+        readOnly();
+      } else if (keptChats.has(id)) {
+        refreshedKept.delete(id);
+        const body = res.json;
+        res.json = function () {
+          return body.call(this).finally(() => { keptChats.delete(id); readOnly(); });
+        };
+      }
+      return res;
+    });
+  };
+
+  // Open WebUI's socket (socket.io, a WebSocket at /ws/socket.io): Open WebUI
+  // refreshes the chat on screen when it joins the chat's room, and again on every
+  // reconnect. With no socket open it does not: when the worker has kept the
+  // network's copy of the chat on screen (oc-sw.js tells the pages), and no read of
+  // it is on its way, the page reloads into it, once (that load's first read is not
+  // an open: the worker answers it with that copy).
+  const SOCKET_PATH = "/ws/socket.io";
+  const CHAT_FRESH = "oc-chat-fresh";   // oc-sw.js
+  let sockets = 0;
+  const PageSocket = window.WebSocket;
+  if (PageSocket) {
+    window.WebSocket = class extends PageSocket {
+      constructor(url, ...rest) {
+        super(url, ...rest);
+        if (!String(url).includes(SOCKET_PATH)) return;
+        // Up once the server speaks (socket.io's open packet), not on the bare connect.
+        let up = false;
+        this.addEventListener("message", () => { if (!up) sockets++; up = true; });
+        this.addEventListener("close", () => { if (up) sockets--; up = false; });
+      }
+    };
+  }
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const m = e.data || {};
+    if (m.type !== CHAT_FRESH) return;
+    const id = (String(m.path).match(CHAT_READ) || [])[1];
+    if (!id || id !== chatIdNow() || !keptChats.has(id) || reading.get(id) > 0) return;
+    if (sockets > 0 && !refreshedKept.has(id)) return;   // Open WebUI's refresh comes
+    try { sessionStorage.setItem(FRESH_RELOAD, id); } catch (_) { return; }
+    location.reload();
+  });
+
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
   const VISIBLE = "visible";
-  const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
   // The two mute lists in the function's user valves, {id: until} (0 always):
   // chats, and folders (a folder's mute covers the folders inside it).
   const CHATS = "mutes", FOLDERS = "folder_mutes";
@@ -219,8 +331,9 @@
     folders = Object.fromEntries(((await call("/api/v1/folders/")) || []).map((f) => [f.id, f]));
   }
 
-  async function loadFolder(id) {
-    const folder = (await call("/api/v1/chats/" + id))?.folder_id || null;
+  // fresh: the chat's folder now (a mute goes to it), not as kept on this device.
+  async function loadFolder(id, fresh = false) {
+    const folder = (await call("/api/v1/chats/" + id, undefined, fresh ? OWN_FRESH : OWN_KEPT))?.folder_id || null;
     if (folder) await loadFolders();
     chatFolder = { chat: id, folder };
   }
@@ -390,7 +503,7 @@
     b.onclick = (e) => {
       e.stopPropagation();
       if (closedBy && b.contains(closedBy)) { closedBy = null; return; }   // that press closed it
-      loadFolder(id).catch(() => {}).then(() => muteMenu(b.getBoundingClientRect(), { chat: id, folder: chatFolder.chat === id ? chatFolder.folder : null }));
+      loadFolder(id, true).catch(() => {}).then(() => muteMenu(b.getBoundingClientRect(), { chat: id, folder: chatFolder.chat === id ? chatFolder.folder : null }));
     };
     box.prepend(b);
     drawBell();
@@ -426,16 +539,24 @@
       o.observe(document.documentElement, { childList: true, subtree: true });
       setTimeout(() => { o.disconnect(); ok(find()); }, 15000);
     });
-    if (box) {
-      box.focus();
+    // A locked box (offline, or the chat still its kept copy) takes no text: wait.
+    if (box) await writable();
+    // Still this chat's box (the page may have gone to another chat meanwhile).
+    const now = chatIdNow() === id ? document.querySelector("#chat-input") : null;
+    let put = false;
+    if (now && !now.closest("form")?.inert) {
+      now.focus();
       if (text) {
         document.execCommand("insertText", false, text);
-        // Dropped only once it is in the box: with no box, the next open finds it again.
-        await drafts?.delete(key).catch(() => {});
+        put = now.innerText.includes(text);
       }
     }
-    if (text) notice("Your reply was not sent. It is in the message box.");
-    window.ocPushReply = { mode, text };
+    // Dropped only once it is in the box: otherwise it stays on the device, not lost.
+    if (put) {
+      await drafts?.delete(key).catch(() => {});
+      notice("Your reply was not sent. It is in the message box.");
+    }
+    window.ocPushReply = { mode, text, put };
   }
 
   // A chat on screen, however it was opened: its notifications on this device
@@ -477,6 +598,8 @@
   // or replaceState). Each navigation checks whether the token changed since the
   // last run, and runs again if so.
   const navigated = () => {
+    wentTo();
+    readOnly();
     const t = store.get("token");
     if (t && t !== ranFor) run();
     else chatPage();
@@ -652,7 +775,7 @@
     window[CONTRACT[chat ? "chat" : "folder"]] = "ok";
     if (!store.get("token")) return;
     if (mutes === null) await loadMutes().catch(() => {});
-    if (chat) await loadFolder(chat).catch(() => {});   // a chat can move to another folder
+    if (chat) await loadFolder(chat, true).catch(() => {});   // a chat can move to another folder
     if (!chat) await loadFolders().catch(() => {});
     const put = () => {
       if (!menu.isConnected) return;

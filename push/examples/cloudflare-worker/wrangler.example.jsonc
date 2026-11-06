@@ -11,6 +11,9 @@
   ],
   "vars": {
     "VAPID_PUBLIC_KEY": "<your VAPID public key, base64url>",
-    "FUNCTION_ID": "openclaw_web_push"
+    "FUNCTION_ID": "openclaw_web_push",
+    // Optional, "1" = on (docs/install/web-push.md): offline open, and a chat opened before shown at once.
+    "OFFLINE": "0",
+    "CHAT_CACHE": "0"
   }
 }

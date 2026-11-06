@@ -7,7 +7,7 @@
 import SW from "../../../web/oc-sw.js";
 import PAGE from "../../../web/oc-push.js";
 
-const OFFLINE_ON = "1", OFFLINE_OFF = "0";
+const ON = "1", OFF = "0";   // a switch's values (OFFLINE, CHAT_CACHE)
 const JS = { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" };
 
 export default {
@@ -15,7 +15,9 @@ export default {
     const url = new URL(req.url);
     if (url.pathname === "/oc-sw.js") {
       // OFFLINE = "1" turns on offline open (docs/install/web-push.md); unset, it is off.
-      const sw = SW.replaceAll("__OC_OFFLINE__", env.OFFLINE === OFFLINE_ON ? OFFLINE_ON : OFFLINE_OFF);
+      // CHAT_CACHE = "1" (with OFFLINE on) opens a chat opened before from its kept copy; unset, off.
+      const sw = SW.replaceAll("__OC_OFFLINE__", env.OFFLINE === ON ? ON : OFF)
+        .replaceAll("__OC_CHAT_CACHE__", env.CHAT_CACHE === ON ? ON : OFF);
       return new Response(sw, { headers: { ...JS, "service-worker-allowed": "/" } });
     }
     if (url.pathname !== "/static/loader.js") return fetch(req);
