@@ -8557,9 +8557,11 @@ class TurnWriterLoadAcrossTheSaveTests(_TurnWriterCase):
         await self.failed_final_save(fail)
 
     async def test_m_is_never_shown_finished_without_its_final_status_lines(self):
-        """ELI-371: the push and the completion that show M finished carry, or come after, its final
-        status lines (the context meter). Sent after them, a tab showed M done without the meter for a
-        moment, and differently after a reload (the E2E 'the chat changed on a reload' flake)."""
+        """ELI-371: M is never shown finished without its final status lines (the context meter), and
+        each shows once. Sent after the completion, a tab showed M done without the meter for a moment
+        (the E2E 'the chat changed on a reload' flake). A tab appends each status event to M's history
+        and takes the push's history over its own (Open WebUI 0.13.0 Chat.svelte:1582-1587, 1389-1390),
+        so a line both pushed and sent as an event shows twice."""
         meter = "🧠 10/200k (0%)"
         shown = _TurnRenderer()
         shown.feed(_delta("slow-1"))
@@ -8567,16 +8569,19 @@ class TurnWriterLoadAcrossTheSaveTests(_TurnWriterCase):
         w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
                         run_id="agent-run-1", message_id="m1", takeover=True, renderer=shown)
         await w.feed(None)
+        tab = copy.deepcopy(self.owui.msgs()["m1"])
         with mock.patch.object(openclaw_pipe, "_build_usage_status_lines", mock.AsyncMock(return_value=[meter])):
             await w.finalize()
-        events = [d["data"] for e, d, room in self.owui.emits if e == "events"]
-        kinds = [d["type"] for d in events]
-        done = kinds.index("chat:completion")
-        meters = [i for i, d in enumerate(events) if d["type"] == "status" and d["data"].get("description") == meter]
-        self.assertTrue(meters and all(i < done for i in meters), f"the meter after the completion: {kinds}")
-        push = [d for d in events if d["type"] == "chat:messages"][-1]
-        history = push["data"]["messages"]["m1"].get("statusHistory") or []
-        self.assertIn(meter, [h.get("description") for h in history], "M pushed finished without its meter")
+        meters = lambda history: [h.get("description") for h in history or []].count(meter)
+        self.assertEqual(meters(self.owui.msgs()["m1"].get("statusHistory")), 1, "the stored M")
+        for d in (d["data"] for e, d, room in self.owui.emits if e == "events"):
+            if d["type"] == "status":
+                tab["statusHistory"] = [*(tab.get("statusHistory") or []), d["data"]]
+            elif d["type"] == "chat:messages" and "m1" in d["data"]["messages"]:
+                tab = {**tab, **d["data"]["messages"]["m1"]}
+            elif d["type"] == "chat:completion":
+                self.assertEqual(meters(tab.get("statusHistory")), 1, "the tab when M shows done")
+        self.assertEqual(meters(tab.get("statusHistory")), 1, "the tab at the end")
 
 
 class MediaDirectiveKindTests(unittest.TestCase):
@@ -8998,6 +9003,10 @@ class TurnWriterEndTests(_TurnWriterCase):
     def m(self):
         return self.owui.msgs()["m1"]
 
+    def pushed_history(self):
+        """M's status history in the last push to open tabs."""
+        return self.owui.events("chat:messages")[-1]["data"]["messages"]["m1"].get("statusHistory")
+
     async def task_done(self, w):
         _, task = self.owui.tasks[w.task_id]
         await asyncio.wait_for(asyncio.shield(task), 1)
@@ -9291,11 +9300,12 @@ class TurnWriterEndTests(_TurnWriterCase):
                            request=request)
 
     async def test_a_run_the_writer_finishes_ends_with_the_usage_line(self):
-        """ELI-210: a writer-finished reply gets the usage line, saved and sent to open tabs."""
+        """ELI-210: a writer-finished reply gets the usage line, saved and sent to open tabs (in the
+        push of M finished, ELI-371)."""
         w = await self.opened_writer()
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
         self.assertEqual(self.m()["statusHistory"], [self.USAGE])
-        self.assertEqual(self.owui.events("status")[-1]["data"], self.USAGE)
+        self.assertEqual(self.pushed_history(), [self.USAGE])
 
     async def test_a_first_run_the_writer_finishes_gets_its_usage_from_the_run(self):
         """ELI-210 / ELI-177: with no row totals yet the line uses the run's usage."""
@@ -9313,7 +9323,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
         usage = {"description": "🧠 10/200k (0%)", "done": True}
         self.assertEqual(self.m()["statusHistory"], [usage])
-        self.assertEqual(self.owui.events("status")[-1]["data"], usage)
+        self.assertEqual(self.pushed_history(), [usage])
 
     async def test_a_takeover_that_finished_drops_the_cancels_stopped_line(self):
         """ELI-210: a finished takeover drops the cancel's "Stopped"."""

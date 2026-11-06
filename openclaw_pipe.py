@@ -9250,13 +9250,15 @@ class _TurnWriter:
                     pipe_log(f"  turn writer: reading M back failed: {ex!r}")
         return history, new, whole
 
-    async def _push_final(self, text: str, output: list, status_history: list) -> None:
-        """Push M finished to the chat's room, with its final status lines: a
-        tab never shows M done without them (ELI-371). Only an inserted M
-        carries the parent link and moves the view: a taken-over M can have
-        later messages."""
+    async def _push_final(self, text: str, output: list, status_history: list) -> bool:
+        """Push M finished to the chat's room with its whole status history,
+        the one source of its final lines in a tab: a tab never shows M done
+        without them (ELI-371), and a tab replaces M's history with the push's
+        while it appends each status event. Only an inserted M carries the
+        parent link and moves the view: a taken-over M can have later
+        messages. Returns whether the push went out."""
         if not self._claim or self.message_id not in self._claim["messages"]:
-            return
+            return False
         message = {**self._claim["messages"][self.message_id],
                     "content": text, "output": output, "done": True, "statusHistory": status_history}
         new = self._introduced()
@@ -9267,6 +9269,8 @@ class _TurnWriter:
                 self.message_id if new else None, self.message_id)
         except Exception as ex:
             pipe_log(f"  turn writer: final push failed: {ex!r}")
+            return False
+        return True
 
     def adopt(self, run_id: str) -> None:
         """Write a run that continues M (resume or recovery) into M."""
@@ -9561,19 +9565,20 @@ class _TurnWriter:
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
+            pushed = False
             if saved:
                 await _clear_response_stream(self.task_id)
-                await self._push_final(text, output, history)
+                pushed = await self._push_final(text, output, history)
                 if not stopped and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
                 pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
                          f"FINAL SAVE FAILED; keeping the mid-turn copy, M is not sent finished")
             emit = await self._emitter()
-            # The final status lines first, as a live reply sends them: the
-            # completion shows M done, and a tab must not show it done without
-            # them (ELI-371).
-            for line in status:
+            # Without the push, the final status lines go as status events,
+            # before the completion that shows M done (ELI-371). With it, a tab
+            # already has them: a status event would add each one again.
+            for line in status if not pushed else ():
                 await emit({"type": "status", "data": line})
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})
