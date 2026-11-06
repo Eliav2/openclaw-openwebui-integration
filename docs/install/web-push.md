@@ -110,12 +110,12 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 - **Another user on the same device.** When someone else signs in on a device, the page script drops the old subscription and makes a new one for them. Signing out alone does not: the device keeps getting the previous user's notifications until someone signs in again, or until notifications are turned off for the site.
 - **Gone subscriptions.** A device whose push service answers 404 or 410 is removed from the user's list.
 
-What the function did is in Open WebUI's log:
+What the function did is in Open WebUI's log. Each line ends with the chat's id, so a search for the chat id finds it next to the Pipe's lines for the same reply:
 
 ```
-INFO     | function_openclaw_web_push_<hash>:send_all:<line> - web push: sent to fcm.googleapis.com
-INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3c4d is muted, nothing sent
-INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat 1a2b3c4d: folder 5e6f7a8b is muted, nothing sent
+INFO     | function_openclaw_web_push_<hash>:send_all:<line> - web push: sent to fcm.googleapis.com chat_id=<chat id>
+INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: chat is muted, nothing sent chat_id=<chat id>
+INFO     | function_openclaw_web_push_<hash>:event:<line> - web push: folder 5e6f7a8b is muted, nothing sent chat_id=<chat id>
 ```
 
 ### Preview
