@@ -322,13 +322,15 @@ def gateway_call(method: str, params: dict) -> dict:
 
 
 def session_row(session_key: str) -> dict | None:
-    """The session's row from the Gateway (sessions.list): its goal, and hasActiveRun."""
-    rows = gateway_call("sessions.list", {"limit": 200}).get("sessions") or []
+    """The session's row from the Gateway (sessions.list: its goal and hasActiveRun),
+    None when it has none. Asked by key (`search`), because a stack that has run many
+    scenes holds more sessions than one page of the plain list."""
+    rows = gateway_call("sessions.list", {"search": session_key, "limit": 200}).get("sessions") or []
     return next((r for r in rows if r.get("key") == session_key), None)
 
 
 def end_goal(session_key: str) -> None:
-    """Clear the session's goal and wait until no run of it is left.
+    """Clear the session's goal, if it has one, and wait until it is seen idle.
 
     From OpenClaw 2026.10.10 an active goal queues its own "Advance the active
     goal" turn after every clean turn, and each of those queues the next, until
@@ -336,18 +338,15 @@ def end_goal(session_key: str) -> None:
     queued one). Nothing on the page ends that: a Stop button exists only while
     a reply streams, and a click that misses leaves the loop running through
     every scene after. The Gateway's own goal clear does, and `hasActiveRun`
-    says when the last turn is over."""
+    says when the last turn is over: the wait is for a row that is seen with no
+    goal and no active run, never for a row that is missing."""
     goal = (session_row(session_key) or {}).get("goal")
-    if not goal:
-        raise RuntimeError(f"{session_key} has no goal to end")
-    gateway_call("sessions.goal.clear", {"sessionKey": session_key, "goalId": goal["id"],
-                                         "operationId": str(uuid.uuid4()), "issuedAtMs": int(time.time() * 1000)})
-    deadline = time.time() + TURN_TIMEOUT_MS / 1000
-    while time.time() < deadline:
-        row = session_row(session_key) or {}
-        if not row.get("goal") and not row.get("hasActiveRun"):
-            return
-    raise TimeoutError(f"the goal of {session_key} is still running its turns after {TURN_TIMEOUT_MS / 1000:.0f}s")
+    if goal:
+        gateway_call("sessions.goal.clear", {"sessionKey": session_key, "goalId": goal["id"],
+                                             "operationId": str(uuid.uuid4()), "issuedAtMs": int(time.time() * 1000)})
+    poll(lambda: session_row(session_key),
+         lambda row: row is not None and not row.get("goal") and not row.get("hasActiveRun"),
+         f"the session {session_key} with no goal and no run", TURN_TIMEOUT_MS / 1000)
 
 
 def gateway_release() -> tuple:
@@ -1148,8 +1147,17 @@ class Scenes:
         chat = send(page, "Keep at it until the hourly view is on staging.")
         me = api("GET", "/api/v1/auths/", token=self.token)
         answer = reply_with(GOAL_ANSWER)
-        wait_js(page, reply_done_js(answer), "the reply that sets the goal, finished")
-        end_goal(f"agent:main:openwebui-{me['id']}-{chat}")
+        key = f"agent:main:openwebui-{me['id']}-{chat}"
+        try:
+            wait_js(page, reply_done_js(answer), "the reply that sets the goal, finished")
+        except BaseException:
+            # The goal may exist already: without this it keeps the session going through the scenes after.
+            try:
+                end_goal(key)
+            except Exception as e:
+                print(f"  could not end the goal of {key}: {e}", flush=True)
+            raise
+        end_goal(key)
         set_title(self.token, chat, "Hourly view to staging")
         # Open the status history. From Open WebUI 0.13 a transparent "Toggle status history"
         # button lies over the status line and takes the click.
