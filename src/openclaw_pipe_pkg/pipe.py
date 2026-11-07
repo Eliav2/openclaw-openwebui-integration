@@ -784,6 +784,7 @@ class _PipeTurn:
         self.turn = turn
         self.ended = False
         self._our_run_id = None
+        self.system_note = ""
 
     @property
     def our_run_id(self):
@@ -969,6 +970,12 @@ class _PipeTurn:
         history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
+        # The chat's system prompt (model, folder, user settings) goes first. Not in a
+        # channel: Open WebUI writes its own prompt there, not the user's. Kept out of
+        # `unsent`, so the duplicate check (ELI-82) compares only what the user sent;
+        # it is added when the message goes out, and to a resume.
+        self.system_note = "" if self.channel_id else await _system_prompt_note(
+            self.__metadata__ or {}, self.owui_origin_chat_id, self.owui_origin_user_id)
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + _voice_note(self.__metadata__) + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
@@ -1292,7 +1299,8 @@ class _PipeTurn:
             self.conn.sent_settings[self.session_key] = (self.model_override, self.requested_thinking)
             send_params = _owui_chat_send_params(
                 session_key=self.session_key,
-                message="\n\n".join(t for t in self.turn.unsent if t),
+                message=_with_system_note(self.system_note,
+                                          "\n\n".join(t for t in self.turn.unsent if t)),
                 idempotency_key=idempotency_key,
                 owui_chat_id=self.owui_origin_chat_id,
                 owui_user_id=self.owui_origin_user_id,
@@ -2247,7 +2255,8 @@ class _PipeTurn:
             resume_queue = self.conn.register_consumer(self.session_key, key)
             try:
                 resp = await _run_request(self.conn, RUN_SEND, _owui_chat_send_params(
-                    session_key=self.session_key, message=_resume_directive(self.visible_message_text, self.text),
+                    session_key=self.session_key, message=_with_system_note(
+                        self.system_note, _resume_directive(self.visible_message_text, self.text)),
                     idempotency_key=key, owui_chat_id=self.owui_origin_chat_id,
                     owui_user_id=self.owui_origin_user_id, thinking=self.resolved_thinking), timeout=30)
             except Exception as ex:

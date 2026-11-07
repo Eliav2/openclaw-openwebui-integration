@@ -79,7 +79,7 @@ def _drive_chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL) -> dic
 
 def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
                chat_id: str | None = None, extra: dict | None = None,
-               created: list | None = None) -> tuple[str, dict]:
+               created: list | None = None, folder_id: str | None = None) -> tuple[str, dict]:
     """(chat id, saved assistant message) of one turn in a new persisted chat,
     or of the next turn in `chat_id`. `extra`: more fields of the completion
     request, as the browser adds them (`filter_ids` for a filter chip turned on).
@@ -108,6 +108,10 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
     if chat_id:
         status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
         assert status == 200, f"chat update failed: {status} {saved}"
+    elif folder_id:
+        status, new = _request("POST", "/api/v1/chats/new", {"chat": chat, "folder_id": folder_id}, token)
+        assert status == 200 and new.get("folder_id") == folder_id, f"chat create failed: {status} {new}"
+        chat_id = new["id"]
     else:
         status, new = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
         assert status == 200, f"chat create failed: {status} {new}"
@@ -224,6 +228,52 @@ def test_hebrew_and_emoji_round_trip_exactly(token):
     text = 'שלום עולם! 👋🏽 "quoted" <b>not a tag</b> & 100% ✓'
     msg = _drive_chat_turn(token, f"E2E_ECHO: {text}")
     assert msg.get("content") == text, json.dumps(msg, ensure_ascii=False)[:1500]
+
+
+# An Open WebUI prompt variable (utils/task.py prompt_template): the user's name.
+OWUI_USER_NAME_VARIABLE = "{{USER_NAME}}"
+
+
+def test_the_model_folder_and_user_prompts_reach_the_agent_in_open_webui_s_order(token):
+    """The prompt set on the model, on the chat's folder and by the user (sent by the
+    browser as the request's system message) go before the message the agent gets,
+    in Open WebUI's order: model, folder, user. Open WebUI's variables in them
+    ({{USER_NAME}}) are filled in, as Open WebUI does for any model."""
+    tag = uuid.uuid4().hex[:6]
+    model_id = f"e2e-system-prompt-{tag}"
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200 and me.get("name"), f"no user name: {status} {me}"
+    addressed = f"for {OWUI_USER_NAME_VARIABLE}"
+    status, made = _request("POST", "/api/v1/models/create", {
+        "id": model_id, "name": f"E2E system prompt {tag}", "base_model_id": DEFAULT_MODEL,
+        "meta": {}, "params": {"system": f"MODEL_PROMPT_{tag} {addressed}"}}, token)
+    assert status == 200 and made, f"model create failed: {status} {made}"
+    # Open WebUI runs only models in its list, which the browser loads first.
+    status, listed = _request("GET", "/api/models", token=token)
+    assert status == 200 and model_id in [m["id"] for m in listed["data"]], f"{model_id} not listed"
+    status, folder = _request("POST", "/api/v1/folders/", {
+        "name": f"e2e-system-prompt-{tag}", "data": {"system_prompt": f"FOLDER_PROMPT_{tag} {addressed}"}}, token)
+    assert status == 200, f"folder create failed: {status} {folder}"
+    created = []
+    try:
+        prompt = f"E2E_ECHO: system prompt {tag}"
+        chat_id, msg = _chat_turn(token, prompt, model=model_id, folder_id=folder["id"], created=created,
+                                  extra={"messages": [{"role": "system", "content": f"USER_PROMPT_{tag}"},
+                                                      {"role": "user", "content": prompt}]})
+        assert msg.get("content") == f"system prompt {tag}", json.dumps(msg)[:1500]
+        sent = [m for m in _gw("chat.history", {"sessionKey": _session_key(token, chat_id), "limit": 20})
+                .get("messages") or [] if m.get("role") == "user"]
+        assert sent, "no user message in the agent's session"
+        text = _content_text(sent[-1].get("content"))
+        at = [text.find(f"{p}_PROMPT_{tag}") for p in ("MODEL", "FOLDER", "USER")] + [text.rfind(prompt)]
+        assert -1 not in at and at == sorted(at), f"model, folder, user, message at {at}: {text[:1500]}"
+        assert text.count(f"for {me['name']}") == 2 and OWUI_USER_NAME_VARIABLE not in text, \
+            f"{OWUI_USER_NAME_VARIABLE} not filled in with {me['name']!r}: {text[:1500]}"
+    finally:
+        for cid in created:
+            _request("DELETE", f"/api/v1/chats/{cid}", token=token)
+        _request("DELETE", f"/api/v1/folders/{folder['id']}", token=token)
+        _request("POST", "/api/v1/models/model/delete", {"id": model_id}, token)
 
 
 def test_the_second_exchange_titles_the_chat(token):
