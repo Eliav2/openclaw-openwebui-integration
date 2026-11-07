@@ -4786,11 +4786,13 @@ def _close_frame_text(frame) -> str:
 
 
 def _close_detail(e) -> str:
-    """Both close frames of a closed connection (ELI-369). Its `code` alone is
-    1006 whenever no frame came back, also when this side failed the connection
-    itself (1009 a frame over max_size, 1007 a text frame not UTF-8): only the
-    frame it sent names that."""
-    return (f"code {getattr(e, 'code', None)}, sent {_close_frame_text(getattr(e, 'sent', None))}, "
+    """Both close frames of a closed connection (ELI-369). websockets reports
+    code 1006 whenever no frame came back, also when this side failed the
+    connection itself (1009 a frame over max_size, 1007 a text frame not
+    UTF-8): only the frame it sent names that. The code itself is left out:
+    it is the received frame's, or 1006 when none came, and websockets 13+
+    deprecates reading it."""
+    return (f"sent {_close_frame_text(getattr(e, 'sent', None))}, "
             f"received {_close_frame_text(getattr(e, 'rcvd', None))}")
 
 

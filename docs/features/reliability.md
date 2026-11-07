@@ -14,7 +14,7 @@ It reconnects on its own with exponential backoff, from 1 second up to 30, so a 
 The Pipe's log while the Gateway restarts (an excerpt):
 
 ```text
-[openclaw-pipe] WS disconnected -- reconnecting... (code 1006, reason '')
+[openclaw-pipe] WS disconnected -- reconnecting... (sent none, received 1012 'service restart')
 [openclaw-pipe]   reconnect in 1s (attempt 1)
 [openclaw-pipe] Connecting to ws://localhost:18789
 [openclaw-pipe]   reconnect failed: Could not connect to the OpenClaw Gateway at localhost:18789 (ConnectionRefusedError: [Errno 111] Connection refused). Is the Gateway running, and is the GATEWAY_URL valve pointing at it?
@@ -105,7 +105,7 @@ If events are lost on the way (a dropped frame, a socket gap), the reply is rebu
 What the Pipe logs when the Gateway socket drops mid-reply (an excerpt):
 
 ```text
-[openclaw-pipe] WS disconnected -- reconnecting... (code 1006, reason '')
+[openclaw-pipe] WS disconnected -- reconnecting... (sent none, received none)
 [openclaw-pipe]   marked an event gap in 1 run queue(s)
 ```
 

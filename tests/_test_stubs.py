@@ -7,9 +7,17 @@ import types
 
 def install_stubs() -> None:
     if "websockets" not in sys.modules:
+        class ConnectionClosed(Exception):
+            """websockets' signature: the received and the sent Close frames."""
+
+            def __init__(self, rcvd, sent, rcvd_then_sent=None):
+                super().__init__(rcvd, sent)
+                self.rcvd, self.sent, self.rcvd_then_sent = rcvd, sent, rcvd_then_sent
+
         sys.modules["websockets"] = types.SimpleNamespace(
             WebSocketClientProtocol=object,
-            exceptions=types.SimpleNamespace(ConnectionClosed=Exception),
+            exceptions=types.SimpleNamespace(ConnectionClosed=ConnectionClosed),
+            frames=types.SimpleNamespace(Close=lambda code, reason: types.SimpleNamespace(code=code, reason=reason)),
         )
 
     if "cryptography" not in sys.modules:
