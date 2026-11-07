@@ -410,9 +410,24 @@ def _with_system_note(note: str, message: str) -> str:
     return message if not note or _is_gateway_command(message) else note + message
 
 
-def _history_seed(messages: list, side_by_side: bool = False) -> str:
+# Why a new session gets the chat's earlier messages (`_history_seed`).
+SEED_COPY = "copy"
+SEED_COLUMN = "column"
+SEED_TEMPORARY = "temporary"
+_SEED_WHY = {
+    SEED_COPY: ("this chat is a copy of another chat. You have not seen its earlier messages",
+                "copied"),
+    SEED_COLUMN: ("this chat shows answers of several models side by side, and you are one of "
+                  "them. You have not seen its earlier messages", "earlier"),
+    SEED_TEMPORARY: ("this is a temporary chat (a side chat opened from another chat, or a "
+                     "temporary chat) that starts with messages you have not seen", "earlier"),
+}
+
+
+def _history_seed(messages: list, side_by_side: bool = False, kind: str | None = None) -> str:
     """Earlier messages for a new session, newest kept first within the cap.
-    `side_by_side`: a new model column rather than a copied chat."""
+    `side_by_side`: a new model column rather than a copied chat; `kind` names
+    the reason outright (SEED_*)."""
     entries = []
     for m in messages:
         role = m.get("role")
@@ -433,12 +448,9 @@ def _history_seed(messages: list, side_by_side: bool = False) -> str:
         used += len(entry) + 2
     left_out = len(entries) - len(kept)
     cut = f"; the oldest {_messages(left_out)} are left out to fit" if left_out else ""
-    why = ("this chat shows answers of several models side by side, and you are one of them. "
-           "You have not seen its earlier messages" if side_by_side
-           else "this chat is a copy of another chat. You have not seen its earlier messages")
+    why, which = _SEED_WHY[kind or (SEED_COLUMN if side_by_side else SEED_COPY)]
     return (f"[Open WebUI: {why}, so here they are{cut}:]\n\n" + "\n\n".join(reversed(kept))
-            + f"\n\n[End of the {'earlier' if side_by_side else 'copied'} messages. "
-            "The user's new message follows.]")
+            + f"\n\n[End of the {which} messages. The user's new message follows.]")
 
 
 async def _gateway_has_session(conn, session_key: str) -> bool:
@@ -448,7 +460,95 @@ async def _gateway_has_session(conn, session_key: str) -> bool:
     except Exception as ex:
         pipe_log(f"[history] session lookup for {session_key[-12:]} failed: {ex!r}")
         return False
+    return _lists_session(lst, session_key)
+
+
+def _lists_session(lst: dict, session_key: str) -> bool:
+    """Whether a sessions.list answer has `session_key`."""
     return any(r.get("key") == session_key for r in lst.get("sessions") or [])
+
+
+# Temporary chats (Open WebUI's side chats and temporary chats) have no row, so
+# nothing tells the Pipe when one is closed: the browser drops it without a word.
+# Open WebUI forgets one TEMPORARY_CHAT_TTL after its last message (utils/chat.py)
+# and refuses it from then on, so its session can never get a message again. Each
+# session the Pipe makes for one is recorded here; on each message in a temporary
+# chat, that user's sessions whose chats Open WebUI has forgotten are deleted.
+TEMPORARY_SESSIONS_FILE = "temporary-sessions.json"
+# Open WebUI's prefixes, for a release without open_webui.utils.chat_id.
+TEMPORARY_CHAT_ID_PREFIXES = ("temporary:", "local:")
+
+
+def _is_temporary_chat(chat_id: str | None) -> bool:
+    try:
+        from open_webui.utils.chat_id import is_temporary_chat_id
+    except ImportError:
+        return bool(chat_id) and chat_id.startswith(TEMPORARY_CHAT_ID_PREFIXES)
+    return is_temporary_chat_id(chat_id)
+
+
+async def _temporary_chat_alive(request, chat_id: str) -> bool:
+    """Whether Open WebUI still keeps the temporary chat; True when it can't tell."""
+    try:
+        from open_webui.utils.chat import get_temporary_chat
+        redis = getattr(getattr(getattr(request, "app", None), "state", None), "redis", None)
+        return await get_temporary_chat(redis, chat_id) is not None
+    except Exception as ex:
+        pipe_log(f"[history] temporary chat {chat_id[:20]}: state unknown, kept: {ex!r}")
+        return True
+
+
+def _temporary_sessions_update(state_dir: str, change) -> dict:
+    """Apply `change(records)` to the record under its lock; returns the result."""
+    path = os.path.join(state_dir, TEMPORARY_SESSIONS_FILE)
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    with open(path + ".lock", "a") as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        data = _read_json_file(path)
+        records = data if isinstance(data, dict) else {}
+        change(records)
+        _write_json_file(path, records)
+        return records
+
+
+async def _delete_session(conn, session_key: str) -> bool:
+    """Gone afterwards. Archive, then delete: an operator.write connection may
+    delete only an archived session (sessions.delete `archivedOnly`)."""
+    try:
+        lst = await conn.send_request("sessions.list", {"search": session_key[-36:], "limit": 10},
+                                      timeout=15)
+        if not _lists_session(lst, session_key):
+            return True
+        await _run_request(conn, RUN_PATCH, {"key": session_key, "archived": True}, timeout=15)
+        await conn.send_request("sessions.delete", {"key": session_key, "archivedOnly": True,
+                                                    "deleteTranscript": True}, timeout=15)
+        return True
+    except Exception as ex:
+        pipe_log(f"[history] session {session_key[-24:]} not deleted: {ex!r}")
+        return False
+
+
+async def _temporary_chat_started(conn, request, state_dir: str, session_key: str, chat_id: str,
+                                  user_id: str) -> None:
+    """Record this temporary chat's session; delete the user's ones Open WebUI forgot."""
+    try:
+        records = _temporary_sessions_update(state_dir, lambda r: r.__setitem__(
+            session_key, {"chat_id": chat_id, "user_id": user_id}))
+    except Exception as ex:
+        pipe_log(f"[history] temporary session not recorded: {ex!r}")
+        return
+    gone = [key for key, rec in records.items()
+            if key != session_key and isinstance(rec, dict) and rec.get("user_id") == user_id
+            and not await _temporary_chat_alive(request, rec.get("chat_id") or "")]
+    deleted = [key for key in gone if await _delete_session(conn, key)]
+    if deleted:
+        _temporary_sessions_update(state_dir, lambda r: [r.pop(key, None) for key in deleted])
+        pipe_log(f"[history] deleted {len(deleted)} session(s) of temporary chats Open WebUI forgot")
 
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
@@ -484,6 +584,14 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
                 prefix = seed + "\n\n"
                 pipe_log(f"[history] chat {chat_id[:8]}: new model column {column}, "
                          f"seeding {len(seed)} chars")
+        elif not line["tail"] and len(messages) > 1 and _is_temporary_chat(chat_id) \
+                and not await _gateway_has_session(conn, session_key):
+            # A side chat: the earlier messages are the chat it was opened from. Its own
+            # session (the key is its own chat id), never that chat's.
+            seed = _history_seed(messages[:-1], kind=SEED_TEMPORARY)
+            if seed:
+                prefix = seed + "\n\n"
+                pipe_log(f"[history] chat {chat_id[:20]}: temporary, seeding {len(seed)} chars")
         elif not line["tail"] and len(messages) > 1 and await rows.origin() \
                 and not await _gateway_has_session(conn, session_key):
             seed = _history_seed(messages[:-1])
