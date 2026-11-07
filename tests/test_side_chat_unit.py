@@ -33,7 +33,7 @@ class SideChatTurnTests(MultiModelBase):
 
         async def started(*args):
             self.started.append(args)
-        patcher = mock.patch.object(ocp, "_temporary_chat_started", started)
+        patcher = mock.patch.object(ocp, "_temporary_sessions_tend", started)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -77,16 +77,31 @@ class SideChatTurnTests(MultiModelBase):
         send = await self.call(HAIKU, [HAIKU], "u1", "a1", "hi", earlier=PARENT[1:])
         self.assertEqual(send["message"], "hi")
 
-    async def test_each_temporary_turn_reports_its_session_and_a_saved_one_does_not(self):
+    async def test_every_turn_tends_the_user_s_temporary_sessions(self):
+        """A saved chat's turn too: a side chat's session goes even if the user
+        never opens another side chat."""
         await self.call(HAIKU, [HAIKU], "s1", "sa1", "SIDE_Q", chat=SIDE, earlier=PARENT)
         self.message("u1", "user", None, "hi")
         await self.call(HAIKU, [HAIKU], "u1", "a1", "hi")
         for _ in range(100):
-            if self.started:
+            if len(self.started) == 2:
                 break
             await asyncio.sleep(0.005)
         self.assertEqual([(a[3], a[4], a[5]) for a in self.started],
-                         [(ocp._owui_session_key("main", USER, SIDE), SIDE, USER)])
+                         [(ocp._owui_session_key("main", USER, SIDE), SIDE, USER), (_key(), CHAT, USER)])
+
+    async def test_a_failed_session_lookup_does_not_seed(self):
+        """The session may exist: seeding it again would repeat the chat. Unknown
+        is not missing."""
+        answer = self.conn.send_request
+
+        async def lookup_fails(method, params, timeout=10):
+            if method == "sessions.list":
+                raise RuntimeError("sessions.list timed out")
+            return await answer(method, params, timeout)
+        self.conn.send_request = lookup_fails
+        send = await self.call(HAIKU, [HAIKU], "s1", "sa1", "SIDE_Q", chat=SIDE, earlier=PARENT)
+        self.assertEqual(send["message"], "SIDE_Q")
 
 
 class TemporaryChatIdTests(unittest.TestCase):
@@ -103,6 +118,12 @@ class TemporaryChatIdTests(unittest.TestCase):
         key = ocp._owui_session_key("main", USER, SIDE)
         self.assertEqual(key, key.lower())
         self.assertTrue(key.endswith(SIDE.lower()))
+
+    def test_a_key_is_parsed_back_whatever_the_agent_id_s_case(self):
+        """Keys are built lower case; an AGENT_ID with upper case still names its chat."""
+        uid, cid = "2d206eab-acac-4945-bd2f-7e8b6365de8c", "66ee29bc-808d-4cbc-b0d0-e6b847b3f778"
+        conn = ocp._GatewayConnection(lambda: mock.Mock(AGENT_ID="Main"))
+        self.assertEqual(conn.parse_owui_session_key(ocp._owui_session_key("Main", uid, cid)), (uid, cid))
 
     def test_a_saved_chat_s_key_is_unchanged(self):
         self.assertEqual(ocp._owui_session_key("main", USER, CHAT), f"agent:main:openwebui-{USER}-{CHAT}")
@@ -158,7 +179,7 @@ class TemporarySessionCleanupTests(unittest.IsolatedAsyncioTestCase):
         return ocp._owui_session_key("main", user, _side(n))
 
     async def start(self, gw, n, user=USER):
-        await ocp._temporary_chat_started(gw, None, self.state, self.key(n, user), _side(n), user)
+        await ocp._temporary_sessions_tend(gw, None, self.state, self.key(n, user), _side(n), user)
 
     def records(self):
         with open(os.path.join(self.state, ocp.TEMPORARY_SESSIONS_FILE)) as fh:
@@ -172,6 +193,19 @@ class TemporarySessionCleanupTests(unittest.IsolatedAsyncioTestCase):
         methods = [m for m, p in gw.calls if p.get("key") == self.key(1)]
         self.assertEqual(methods, ["sessions.patch", "sessions.delete"])
         self.assertEqual(list(self.records()), [self.key(2)])
+
+    async def test_a_saved_chat_s_turn_deletes_them_and_records_nothing(self):
+        gw = FakeGateway([self.key(1)])
+        await self.start(gw, 1)
+        await ocp._temporary_sessions_tend(gw, None, self.state, _key(), CHAT, USER)
+        self.assertEqual(gw.keys, set())
+        self.assertEqual(self.records(), {})
+
+    async def test_a_saved_chat_s_turn_with_no_record_writes_nothing(self):
+        gw = FakeGateway([])
+        await ocp._temporary_sessions_tend(gw, None, self.state, _key(), CHAT, USER)
+        self.assertEqual(gw.calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, ocp.TEMPORARY_SESSIONS_FILE)))
 
     async def test_a_chat_open_webui_still_keeps_is_left(self):
         self.alive.add(_side(1))
@@ -220,6 +254,29 @@ class TemporaryChatAliveTests(unittest.IsolatedAsyncioTestCase):
     async def test_when_open_webui_can_t_tell_the_chat_is_kept(self):
         # The stubs have no open_webui.utils.chat.
         self.assertTrue(await ocp._temporary_chat_alive(None, _side(1)))
+
+    async def alive(self, workers, redis):
+        """`_temporary_chat_alive` on a stand-in Open WebUI that has forgotten the chat."""
+        import sys
+        import types
+        mods = {n: types.ModuleType(n) for n in ("open_webui", "open_webui.env", "open_webui.utils",
+                                                  "open_webui.utils.chat")}
+        mods["open_webui.env"].UVICORN_WORKERS = workers
+
+        async def get_temporary_chat(redis, chat_id):
+            return None
+        mods["open_webui.utils.chat"].get_temporary_chat = get_temporary_chat
+        request = types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace(redis=redis)))
+        with mock.patch.dict(sys.modules, mods):
+            return await ocp._temporary_chat_alive(request, _side(1))
+
+    async def test_a_forgotten_chat_is_gone_with_one_worker_or_with_redis(self):
+        self.assertFalse(await self.alive(1, None))
+        self.assertFalse(await self.alive(4, object()))
+
+    async def test_several_workers_without_redis_can_t_tell_so_the_chat_is_kept(self):
+        """Each worker keeps its own temporary chats: another's may be alive."""
+        self.assertTrue(await self.alive(4, None))
 
 
 if __name__ == "__main__":

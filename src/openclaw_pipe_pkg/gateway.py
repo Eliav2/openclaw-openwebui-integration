@@ -2381,7 +2381,7 @@ class _GatewayConnection:
         agent_id = getattr(self._valves(), "AGENT_ID", None)
         if not agent_id:
             return None
-        prefix = f"agent:{agent_id}:openwebui-"
+        prefix = f"agent:{agent_id}:openwebui-".lower()   # as `_owui_session_key` builds it
         if not session_key.startswith(prefix):
             return None
         after = session_key[len(prefix):]

@@ -40,7 +40,7 @@ For a clean start, open a new chat.
 
 **A side chat** (Open WebUI 0.13: `/side` or `/btw` in the composer, or Side chat in the side panel) runs in its own session, never the chat's: the chat's session gets nothing from it. Its first message carries the chat's messages once, cut like a copy's (above), so the agent answers from them; a temporary chat (Temporary Chat on) that starts from earlier messages gets them the same way.
 
-A temporary chat has no row in Open WebUI, and closing a side chat's tab tells the server nothing. Open WebUI forgets one 24 hours after its last message and refuses it from then on, so the Pipe records each temporary chat's session and, on each message in a temporary chat, archives and deletes that user's sessions whose chats Open WebUI has forgotten. Until then a closed side chat's session stays on the Gateway.
+A temporary chat has no row in Open WebUI, and closing a side chat's tab tells the server nothing. Open WebUI forgets one 24 hours after its last message and refuses it from then on, so the Pipe records each temporary chat's session and, on each of that user's messages (in any chat), archives and deletes their sessions whose chats Open WebUI has forgotten. Until then a closed side chat's session stays on the Gateway.
 
 ## Several models side by side
 
