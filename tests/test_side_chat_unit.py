@@ -45,6 +45,17 @@ class SideChatTurnTests(MultiModelBase):
         self.assertIn("Assistant: noted", send["message"])
         self.assertTrue(send["message"].endswith("The user's new message follows.]\n\nSIDE_Q what is the word?"))
 
+    async def test_open_webui_s_side_chat_instruction_comes_as_the_system_prompt(self):
+        """The side chat's system message (Open WebUI's "separate side conversation"
+        line) reaches the agent once, in the system prompt note before the seed."""
+        send = await self.call(HAIKU, [HAIKU], "s1", "sa1", "SIDE_Q", chat=SIDE, earlier=PARENT,
+                               extra_meta={"chat_context": {"messages": PARENT}})
+        side_line = PARENT[0]["content"]
+        self.assertTrue(send["message"].startswith("[Open WebUI system prompt for this chat"))
+        self.assertEqual(send["message"].count(side_line), 1)
+        self.assertLess(send["message"].index(side_line),
+                        send["message"].index("[Open WebUI: this is a temporary chat"))
+
     async def test_it_runs_in_its_own_session_never_the_parent_s(self):
         send = await self.call(HAIKU, [HAIKU], "s1", "sa1", "SIDE_Q", chat=SIDE, earlier=PARENT)
         self.assertEqual(send["session"], ocp._owui_session_key("main", USER, SIDE))
