@@ -1741,6 +1741,16 @@ FITS = """(sel) => {
   return bad.length ? bad.join('; ') : 'ok';
 }"""
 
+# FITS once the page has settled. The composer moves the Status button out of a chip
+# row that got narrower from its ResizeObserver (composer.py checkFits), and the
+# browser delivers those at its next rendering update, after the frame's rAF
+# callbacks. A plain evaluate can measure between the change and the move ("clipped
+# by DIV.flex flex-1 ... min-w-0"). Fonts first (a font that loads resizes the row),
+# then the rAF of the following frame, which runs after that frame's observers.
+FITS_SETTLED = "async (sel) => {\n  await document.fonts.ready;\n" \
+    "  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));\n" \
+    "  return (" + FITS + ")(sel);\n}"
+
 
 def test_at_phone_width_the_status_button_fits_and_opens_the_dialog(page, token):
     """On a small phone (375 x 667) the composer's Status button is fully on
@@ -1753,7 +1763,8 @@ def test_at_phone_width_the_status_button_fits_and_opens_the_dialog(page, token)
         _wait(phone, _turn_over("BROWSER_PHONE"), "the reply")
         button = 'button[aria-label="OpenClaw status"]'
         phone.wait_for_selector(button, timeout=30_000)
-        assert phone.evaluate(FITS, button) == "ok", f"the Status button: {phone.evaluate(FITS, button)}"
+        fits = phone.evaluate(FITS_SETTLED, button)
+        assert fits == "ok", f"the Status button: {fits}"
         phone.locator(button).tap()
         phone.wait_for_selector("#openclaw-status-modal-root", timeout=30_000)
         capture.wait_js(phone, "() => /via pipe/.test(document.getElementById('openclaw-status-modal-root').innerText)",
@@ -1761,7 +1772,8 @@ def test_at_phone_width_the_status_button_fits_and_opens_the_dialog(page, token)
         for what, sel in (("the dialog", "#openclaw-status-modal-root > div"),
                           ("its close button", "#openclaw-status-modal-root button"),
                           ("its footer", "#openclaw-status-modal-root > div > div:last-child")):
-            assert phone.evaluate(FITS, sel) == "ok", f"{what}: {phone.evaluate(FITS, sel)}"
+            fits = phone.evaluate(FITS_SETTLED, sel)
+            assert fits == "ok", f"{what}: {fits}"
     finally:
         phone.context.close()
 
