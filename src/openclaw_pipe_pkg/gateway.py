@@ -3856,6 +3856,16 @@ async def _sender_is_owner(conn, session_key: str) -> bool:
     return _is_owner_user(owners, user_id, await _user_email(user_id))
 
 
+# The Gateway reads a message as a command ("/stop", "/model x") when its trimmed
+# text starts with this (its chat.send handler).
+GATEWAY_COMMAND_PREFIX = "/"
+
+
+def _is_gateway_command(message: str) -> bool:
+    """Whether the Gateway reads `message` as a command rather than a prompt."""
+    return message.lstrip().startswith(GATEWAY_COMMAND_PREFIX)
+
+
 def _non_owner_send_params(params: dict) -> dict:
     """A chat.send for the restricted connection: admin-only fields dropped,
     the metadata receipt prepended to the message as the Gateway would. A
@@ -3866,7 +3876,7 @@ def _non_owner_send_params(params: dict) -> dict:
     out = {k: v for k, v in params.items() if k not in dropped}
     receipt = params.get("systemProvenanceReceipt")
     message = out.get("message") or ""
-    moved = isinstance(receipt, str) and bool(receipt) and not message.lstrip().startswith("/")
+    moved = isinstance(receipt, str) and bool(receipt) and not _is_gateway_command(message)
     if moved:
         out["message"] = "\n\n".join(p for p in (receipt, message) if p)
     pipe_log(f"  non-owner chat.send: left out admin-only fields {dropped}"

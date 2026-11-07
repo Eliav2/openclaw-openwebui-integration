@@ -404,6 +404,12 @@ async def _system_prompt_note(metadata: dict, chat_id: str | None, user_id: str 
             + "\n".join(parts) + "\n[End of the system prompt. The user's message follows.]\n\n")
 
 
+def _with_system_note(note: str, message: str) -> str:
+    """`message` as sent to the Gateway: the system prompt note first, except on a
+    command, which the Gateway reads from the message's start and would then miss."""
+    return message if not note or _is_gateway_command(message) else note + message
+
+
 def _history_seed(messages: list, side_by_side: bool = False) -> str:
     """Earlier messages for a new session, newest kept first within the cap.
     `side_by_side`: a new model column rather than a copied chat."""

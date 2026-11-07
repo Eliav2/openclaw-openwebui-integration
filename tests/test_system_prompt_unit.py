@@ -3,6 +3,8 @@ chat's folder and by the user, read from where Open WebUI keeps them and joined 
 Open WebUI's order, goes before every message as a note. Open WebUI's own
 instructions in the request's system message (voice mode, code interpreter, skills,
 knowledge) do not."""
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -14,7 +16,7 @@ install_stubs()
 
 import openclaw_pipe as ocp  # noqa: E402
 
-from test_multi_model_unit import HAIKU, MultiModelBase  # noqa: E402
+from test_multi_model_unit import HAIKU, MultiModelBase, _key  # noqa: E402
 
 MODEL = "MODEL_PROMPT be brief"
 USER = {"chat_context": {"messages": [{"role": "system", "content": "USER_PROMPT call me Eli"}]}}
@@ -94,6 +96,72 @@ class LookupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await ocp._model_system_prompt(metadata), "", metadata)
 
 
+def _owui_folder_modules(role, allowed, prompt=FOLDER, chat_folder="f1"):
+    """sys.modules entries for the Open WebUI rows `_folder_system_prompt` reads: a
+    user with `role`, a folder with `prompt`, and an access check answering `allowed`."""
+    mods = {name: types.ModuleType(name) for name in (
+        "open_webui", "open_webui.models", "open_webui.models.chats", "open_webui.models.folders",
+        "open_webui.models.users", "open_webui.utils", "open_webui.utils.access_control",
+        "open_webui.utils.access_control.folders")}
+    asked = []
+
+    class Chats:
+        @staticmethod
+        async def get_chat_folder_id(chat_id, user_id):
+            return chat_folder
+
+    class Folders:
+        @staticmethod
+        async def get_folder_by_id(folder_id):
+            return types.SimpleNamespace(id=folder_id, data={"system_prompt": prompt})
+
+    class Users:
+        @staticmethod
+        async def get_user_by_id(user_id):
+            return types.SimpleNamespace(id=user_id, role=role)
+
+    async def has_folder_access(user_id, folder, permission, db=None):
+        asked.append((user_id, folder.id, permission))
+        return allowed
+    mods["open_webui.models.chats"].Chats = Chats
+    mods["open_webui.models.folders"].Folders = Folders
+    mods["open_webui.models.users"].Users = Users
+    mods["open_webui.utils.access_control.folders"].has_folder_access = has_folder_access
+    return mods, asked
+
+
+class FolderAccessTests(unittest.IsolatedAsyncioTestCase):
+    """Open WebUI's rule (middleware.py): a non-admin gets a folder's prompt only
+    with read access to the folder; an admin always does."""
+
+    async def prompt(self, role, allowed, **kw):
+        mods, asked = _owui_folder_modules(role, allowed, **kw)
+        with mock.patch.dict(sys.modules, mods):
+            return await ocp._folder_system_prompt({}, "c1", "u1"), asked
+
+    async def test_a_user_without_read_access_gets_no_folder_prompt(self):
+        prompt, asked = await self.prompt("user", False)
+        self.assertEqual(prompt, "")
+        self.assertEqual(asked, [("u1", "f1", "read")])
+
+    async def test_a_user_with_read_access_gets_it(self):
+        prompt, _ = await self.prompt("user", True)
+        self.assertEqual(prompt, FOLDER)
+
+    async def test_an_admin_gets_it_without_the_access_check(self):
+        prompt, asked = await self.prompt("admin", False)
+        self.assertEqual(prompt, FOLDER)
+        self.assertEqual(asked, [])
+
+    async def test_a_chat_outside_any_folder_gets_none(self):
+        prompt, asked = await self.prompt("admin", True, chat_folder=None)
+        self.assertEqual(prompt, "")
+
+    async def test_a_folder_without_a_prompt_gives_none(self):
+        prompt, _ = await self.prompt("admin", True, prompt=None)
+        self.assertEqual(prompt, "")
+
+
 class SystemPromptTurnTests(MultiModelBase):
 
     def setUp(self):
@@ -135,11 +203,71 @@ class SystemPromptTurnTests(MultiModelBase):
         self.assertIn("USER_PROMPT call me Eli", send["message"])
         self.assertNotIn(OWUI_OWN, send["message"])
 
+    async def test_a_gateway_command_is_sent_without_it(self):
+        """The Gateway reads a command from the message's start: a note before it
+        would turn "/model x" into a prompt for the agent."""
+        parent = None
+        for n, command in enumerate(("/model opus", "/new", "  /status")):
+            with self.subTest(command):
+                self.message(f"u{n}", "user", parent, command)
+                with _folder(FOLDER):
+                    send = await self.call(HAIKU, [HAIKU], f"u{n}", f"a{n}", command, parent=parent)
+                self.assertEqual(send["message"], command)
+            self.message(f"a{n}", "assistant", f"u{n}", f"ok from a{n}")
+            parent = f"a{n}"
+
+    async def test_the_duplicate_check_compares_only_the_user_s_message(self):
+        """ELI-82: a repeat call for the same reply is told apart by what the user
+        sent; a folder prompt changed in between must not make it look new."""
+        self.message("u1", "user", None, "bonjour")
+        with _folder(FOLDER):
+            send = await self.call(HAIKU, [HAIKU], "u1", "a1", "bonjour")
+        self.assertIn(FOLDER, send["message"])
+        self.assertEqual(self.conn.reply_sent(_key(0), "a1")["text"], "bonjour")
+
     async def test_a_chat_without_one_is_sent_as_it_is(self):
         self.message("u1", "user", None, "hi")
         with _folder(""):
             send = await self.call(HAIKU, [HAIKU], "u1", "a1", "hi")
         self.assertEqual(send["message"], "hi")
+
+
+
+class ResumeTests(unittest.IsolatedAsyncioTestCase):
+    """A run the Gateway lost is resumed with a new message (DESIGN 2.7); it
+    carries the system prompt like any other."""
+
+    async def resume_message(self, note):
+        turn = object.__new__(ocp._PipeTurn)
+        conn = mock.Mock()
+        conn.register_consumer.return_value = object()
+        for name, value in (("conn", conn), ("session_key", "agent:main:openwebui-u1-c1"),
+                            ("chat_id", "c1"), ("owui_origin_chat_id", "c1"),
+                            ("owui_origin_user_id", "u1"), ("resolved_thinking", None),
+                            ("owner_notice_before", False), ("owner_resumes", 0),
+                            ("visible_message_text", "Step 1 done."), ("text", "check the logs"),
+                            ("system_note", note)):
+            setattr(turn, name, value)
+        sent = []
+
+        async def run_request(_conn, _route, params, timeout=None):
+            sent.append(params["message"])
+            return {"runId": "run-2"}
+        with mock.patch.object(ocp, "_run_request", run_request):
+            step = await turn.owner_step({"status": "failed", "hasActiveRun": False,
+                                          "lastRunError": "Claude Code process exited with code 137"})
+        self.assertEqual(step[0], "switch")
+        return sent[0]
+
+    async def test_the_resume_carries_the_system_prompt(self):
+        note = "[Open WebUI system prompt for this chat:]\nFOLDER_PROMPT\n[End]\n\n"
+        message = await self.resume_message(note)
+        self.assertTrue(message.startswith(note))
+        self.assertIn(ocp._resume_directive("Step 1 done.", "check the logs"), message)
+
+    async def test_without_one_the_resume_is_unchanged(self):
+        self.assertEqual(await self.resume_message(""),
+                         ocp._resume_directive("Step 1 done.", "check the logs"))
 
 
 if __name__ == "__main__":

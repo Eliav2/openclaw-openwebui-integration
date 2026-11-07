@@ -8034,6 +8034,16 @@ async def _sender_is_owner(conn, session_key: str) -> bool:
     return _is_owner_user(owners, user_id, await _user_email(user_id))
 
 
+# The Gateway reads a message as a command ("/stop", "/model x") when its trimmed
+# text starts with this (its chat.send handler).
+GATEWAY_COMMAND_PREFIX = "/"
+
+
+def _is_gateway_command(message: str) -> bool:
+    """Whether the Gateway reads `message` as a command rather than a prompt."""
+    return message.lstrip().startswith(GATEWAY_COMMAND_PREFIX)
+
+
 def _non_owner_send_params(params: dict) -> dict:
     """A chat.send for the restricted connection: admin-only fields dropped,
     the metadata receipt prepended to the message as the Gateway would. A
@@ -8044,7 +8054,7 @@ def _non_owner_send_params(params: dict) -> dict:
     out = {k: v for k, v in params.items() if k not in dropped}
     receipt = params.get("systemProvenanceReceipt")
     message = out.get("message") or ""
-    moved = isinstance(receipt, str) and bool(receipt) and not message.lstrip().startswith("/")
+    moved = isinstance(receipt, str) and bool(receipt) and not _is_gateway_command(message)
     if moved:
         out["message"] = "\n\n".join(p for p in (receipt, message) if p)
     pipe_log(f"  non-owner chat.send: left out admin-only fields {dropped}"
@@ -11949,6 +11959,12 @@ async def _system_prompt_note(metadata: dict, chat_id: str | None, user_id: str 
             + "\n".join(parts) + "\n[End of the system prompt. The user's message follows.]\n\n")
 
 
+def _with_system_note(note: str, message: str) -> str:
+    """`message` as sent to the Gateway: the system prompt note first, except on a
+    command, which the Gateway reads from the message's start and would then miss."""
+    return message if not note or _is_gateway_command(message) else note + message
+
+
 def _history_seed(messages: list, side_by_side: bool = False) -> str:
     """Earlier messages for a new session, newest kept first within the cap.
     `side_by_side`: a new model column rather than a copied chat."""
@@ -13866,6 +13882,7 @@ class _PipeTurn:
         self.turn = turn
         self.ended = False
         self._our_run_id = None
+        self.system_note = ""
 
     @property
     def our_run_id(self):
@@ -14052,12 +14069,13 @@ class _PipeTurn:
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         # The chat's system prompt (model, folder, user settings) goes first. Not in a
-        # channel: Open WebUI writes its own prompt there, not the user's.
-        system_note = "" if self._send_texts or self.channel_id else await _system_prompt_note(
+        # channel: Open WebUI writes its own prompt there, not the user's. Kept out of
+        # `unsent`, so the duplicate check (ELI-82) compares only what the user sent;
+        # it is added when the message goes out, and to a resume.
+        self.system_note = "" if self.channel_id else await _system_prompt_note(
             self.__metadata__ or {}, self.owui_origin_chat_id, self.owui_origin_user_id)
         self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [system_note + history_prefix + _voice_note(self.__metadata__)
-                                  + self.text])
+                            else [history_prefix + _voice_note(self.__metadata__) + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
                                  else list(self.image_attachments))
         meta = self.__metadata__ or {}
@@ -14379,7 +14397,8 @@ class _PipeTurn:
             self.conn.sent_settings[self.session_key] = (self.model_override, self.requested_thinking)
             send_params = _owui_chat_send_params(
                 session_key=self.session_key,
-                message="\n\n".join(t for t in self.turn.unsent if t),
+                message=_with_system_note(self.system_note,
+                                          "\n\n".join(t for t in self.turn.unsent if t)),
                 idempotency_key=idempotency_key,
                 owui_chat_id=self.owui_origin_chat_id,
                 owui_user_id=self.owui_origin_user_id,
@@ -15334,7 +15353,8 @@ class _PipeTurn:
             resume_queue = self.conn.register_consumer(self.session_key, key)
             try:
                 resp = await _run_request(self.conn, RUN_SEND, _owui_chat_send_params(
-                    session_key=self.session_key, message=_resume_directive(self.visible_message_text, self.text),
+                    session_key=self.session_key, message=_with_system_note(
+                        self.system_note, _resume_directive(self.visible_message_text, self.text)),
                     idempotency_key=key, owui_chat_id=self.owui_origin_chat_id,
                     owui_user_id=self.owui_origin_user_id, thinking=self.resolved_thinking), timeout=30)
             except Exception as ex:

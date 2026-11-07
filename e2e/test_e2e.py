@@ -230,21 +230,29 @@ def test_hebrew_and_emoji_round_trip_exactly(token):
     assert msg.get("content") == text, json.dumps(msg, ensure_ascii=False)[:1500]
 
 
+# An Open WebUI prompt variable (utils/task.py prompt_template): the user's name.
+OWUI_USER_NAME_VARIABLE = "{{USER_NAME}}"
+
+
 def test_the_model_folder_and_user_prompts_reach_the_agent_in_open_webui_s_order(token):
     """The prompt set on the model, on the chat's folder and by the user (sent by the
     browser as the request's system message) go before the message the agent gets,
-    in Open WebUI's order: model, folder, user."""
+    in Open WebUI's order: model, folder, user. Open WebUI's variables in them
+    ({{USER_NAME}}) are filled in, as Open WebUI does for any model."""
     tag = uuid.uuid4().hex[:6]
     model_id = f"e2e-system-prompt-{tag}"
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200 and me.get("name"), f"no user name: {status} {me}"
+    addressed = f"for {OWUI_USER_NAME_VARIABLE}"
     status, made = _request("POST", "/api/v1/models/create", {
         "id": model_id, "name": f"E2E system prompt {tag}", "base_model_id": DEFAULT_MODEL,
-        "meta": {}, "params": {"system": f"MODEL_PROMPT_{tag}"}}, token)
+        "meta": {}, "params": {"system": f"MODEL_PROMPT_{tag} {addressed}"}}, token)
     assert status == 200 and made, f"model create failed: {status} {made}"
     # Open WebUI runs only models in its list, which the browser loads first.
     status, listed = _request("GET", "/api/models", token=token)
     assert status == 200 and model_id in [m["id"] for m in listed["data"]], f"{model_id} not listed"
     status, folder = _request("POST", "/api/v1/folders/", {
-        "name": f"e2e-system-prompt-{tag}", "data": {"system_prompt": f"FOLDER_PROMPT_{tag}"}}, token)
+        "name": f"e2e-system-prompt-{tag}", "data": {"system_prompt": f"FOLDER_PROMPT_{tag} {addressed}"}}, token)
     assert status == 200, f"folder create failed: {status} {folder}"
     created = []
     try:
@@ -259,6 +267,8 @@ def test_the_model_folder_and_user_prompts_reach_the_agent_in_open_webui_s_order
         text = _content_text(sent[-1].get("content"))
         at = [text.find(f"{p}_PROMPT_{tag}") for p in ("MODEL", "FOLDER", "USER")] + [text.rfind(prompt)]
         assert -1 not in at and at == sorted(at), f"model, folder, user, message at {at}: {text[:1500]}"
+        assert text.count(f"for {me['name']}") == 2 and OWUI_USER_NAME_VARIABLE not in text, \
+            f"{OWUI_USER_NAME_VARIABLE} not filled in with {me['name']!r}: {text[:1500]}"
     finally:
         for cid in created:
             _request("DELETE", f"/api/v1/chats/{cid}", token=token)
