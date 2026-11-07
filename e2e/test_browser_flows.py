@@ -1368,7 +1368,7 @@ def _chat_session_key(page) -> str:
     return f"agent:main:openwebui-{me['id']}-{chat_id}"
 
 
-def _user_texts(key: str) -> list:
+def _session_user_texts(key: str) -> list:
     """The text of each user message in a session, oldest first."""
     out = []
     for m in _gateway_call("chat.history", {"sessionKey": key, "limit": 50}).get("messages") or []:
@@ -1404,7 +1404,7 @@ def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
     prefix = key.rsplit("-", 5)[0].lower() + "-temporary:"
     sides = [s["key"] for s in _gateway_call("sessions.list", {"search": "temporary:", "limit": 50})
              .get("sessions") or [] if s["key"].startswith(prefix)]
-    first = [t for k in sides for t in _user_texts(k)[:1] if "what did I ask you to say?" in t]
+    first = [t for k in sides for t in _session_user_texts(k)[:1] if "what did I ask you to say?" in t]
     assert first and f"E2E_ECHO: {tag}" in first[0], f"side sessions {sides}: {first}"
 
 
