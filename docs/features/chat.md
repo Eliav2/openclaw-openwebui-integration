@@ -157,7 +157,7 @@ OpenClaw has no system prompt per message, so the note comes with every message 
 
 Only the prompts people set are sent. Open WebUI also writes its own instructions into the request's system prompt, for features the agent does not get (voice mode, the code interpreter, skills, knowledge, tool servers); those stay out (see [What the composer toggles do](#what-the-composer-toggles-do)). A folder prompt counts only if you may read that folder, as in Open WebUI. Channel mentions carry none: Open WebUI writes its own prompt there.
 
-The note is not shown in the chat. No prompt set means nothing is added.
+The note is not shown in the chat. No prompt set means nothing is added. A command (a message starting with `/`, such as `/model` or `/new`) goes to the Gateway as typed, without the note, since the Gateway reads commands from the message's start. When the Pipe resumes a run the Gateway lost, the resume carries the note too.
 
 Always on.
 
