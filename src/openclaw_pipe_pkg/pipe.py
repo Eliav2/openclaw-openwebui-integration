@@ -967,9 +967,11 @@ class _PipeTurn:
         self.turn.chat_id = self.owui_origin_chat_id
         # When the chat no longer shows what the agent remembers (Edit,
         # Regenerate, a branch switch, a copy), the message says so (ELI-183).
+        # A Gateway command goes exactly as typed: nothing before it (ELI-376).
+        command = self.text if _is_gateway_command(self.text) else None
         history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
-            self.__metadata__ or {}, messages, self.column, self.body.get("model"))
+            self.__metadata__ or {}, messages, self.column, self.body.get("model"), command=command)
         # The chat's system prompt (model, folder, user settings) goes first. Not in a
         # channel: Open WebUI writes its own prompt there, not the user's. Kept out of
         # `unsent`, so the duplicate check (ELI-82) compares only what the user sent;
@@ -982,7 +984,8 @@ class _PipeTurn:
                 self.conn, self.__request__, state_dir, self.session_key, self.owui_origin_chat_id,
                 self.owui_origin_user_id))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [history_prefix + _voice_note(self.__metadata__) + self.text])
+                            else [history_prefix + ("" if command else _voice_note(self.__metadata__))
+                                  + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
                                  else list(self.image_attachments))
         meta = self.__metadata__ or {}
@@ -1209,9 +1212,20 @@ class _PipeTurn:
     def hand_on(self) -> bool:
         """Hand this reply's message to the session's newest waiting reply,
         which sends both as one turn (ELI-188). Not when that reply asks for
-        another thinking level: one send has one level."""
+        another thinking level: one send has one level. A command never joins:
+        glued to other text it is no longer one, and no message joins across a
+        waiting command, which would change what it applies to (ELI-376)."""
+        order = list(self.conn.send_waiters(self.session_key))
         self.conn.drop_send_waiter(self.session_key, self)
-        waiters = self.conn.send_waiters(self.session_key)
+        if _is_gateway_command(self.text) or self not in order:
+            return False
+        at = order.index(self)
+
+        def across_a_command(w) -> bool:
+            lo, hi = sorted((at, order.index(w)))
+            return any(_is_gateway_command(x.text) for x in order[lo + 1:hi])
+        waiters = [w for w in order if w is not self and not _is_gateway_command(w.text)
+                   and not across_a_command(w)]
         mine = self.turn.reply["message_id"]
         later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
         if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):

@@ -3197,10 +3197,7 @@ class _GatewayConnection:
                 self._ws = None
                 self._mark_event_gap()
             except websockets.exceptions.ConnectionClosed as e:
-                pipe_log(
-                    "WS disconnected -- reconnecting... "
-                    f"(code {getattr(e, 'code', None)}, reason {getattr(e, 'reason', '')!r})"
-                )
+                pipe_log(f"WS disconnected -- reconnecting... ({_close_detail(e)})")
                 self._ws = None
                 self._mark_event_gap()
             except asyncio.CancelledError:
@@ -3866,6 +3863,30 @@ GATEWAY_COMMAND_PREFIX = "/"
 def _is_gateway_command(message: str) -> bool:
     """Whether the Gateway reads `message` as a command rather than a prompt."""
     return message.lstrip().startswith(GATEWAY_COMMAND_PREFIX)
+
+
+# The commands that start the session afresh (the Gateway's RESET_COMMAND_RE).
+GATEWAY_RESET_COMMAND_RE = re.compile(r"^/(new|reset)(?:\s|$)", re.IGNORECASE)
+
+
+def _is_gateway_reset(message: str) -> bool:
+    """Whether `message` is a command that gives the session a fresh start."""
+    return bool(GATEWAY_RESET_COMMAND_RE.match(message.strip()))
+
+
+def _close_frame_text(frame) -> str:
+    return f"{frame.code} {frame.reason!r}" if frame is not None else "none"
+
+
+def _close_detail(e) -> str:
+    """Both close frames of a closed connection (ELI-369). websockets reports
+    code 1006 whenever no frame came back, also when this side failed the
+    connection itself (1009 a frame over max_size, 1007 a text frame not
+    UTF-8): only the frame it sent names that. The code itself is left out:
+    it is the received frame's, or 1006 when none came, and websockets 13+
+    deprecates reading it."""
+    return (f"sent {_close_frame_text(getattr(e, 'sent', None))}, "
+            f"received {_close_frame_text(getattr(e, 'rcvd', None))}")
 
 
 def _non_owner_send_params(params: dict) -> dict:

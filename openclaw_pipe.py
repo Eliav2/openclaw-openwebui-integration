@@ -7375,10 +7375,7 @@ class _GatewayConnection:
                 self._ws = None
                 self._mark_event_gap()
             except websockets.exceptions.ConnectionClosed as e:
-                pipe_log(
-                    "WS disconnected -- reconnecting... "
-                    f"(code {getattr(e, 'code', None)}, reason {getattr(e, 'reason', '')!r})"
-                )
+                pipe_log(f"WS disconnected -- reconnecting... ({_close_detail(e)})")
                 self._ws = None
                 self._mark_event_gap()
             except asyncio.CancelledError:
@@ -8044,6 +8041,30 @@ GATEWAY_COMMAND_PREFIX = "/"
 def _is_gateway_command(message: str) -> bool:
     """Whether the Gateway reads `message` as a command rather than a prompt."""
     return message.lstrip().startswith(GATEWAY_COMMAND_PREFIX)
+
+
+# The commands that start the session afresh (the Gateway's RESET_COMMAND_RE).
+GATEWAY_RESET_COMMAND_RE = re.compile(r"^/(new|reset)(?:\s|$)", re.IGNORECASE)
+
+
+def _is_gateway_reset(message: str) -> bool:
+    """Whether `message` is a command that gives the session a fresh start."""
+    return bool(GATEWAY_RESET_COMMAND_RE.match(message.strip()))
+
+
+def _close_frame_text(frame) -> str:
+    return f"{frame.code} {frame.reason!r}" if frame is not None else "none"
+
+
+def _close_detail(e) -> str:
+    """Both close frames of a closed connection (ELI-369). websockets reports
+    code 1006 whenever no frame came back, also when this side failed the
+    connection itself (1009 a frame over max_size, 1007 a text frame not
+    UTF-8): only the frame it sent names that. The code itself is left out:
+    it is the received frame's, or 1006 when none came, and websockets 13+
+    deprecates reading it."""
+    return (f"sent {_close_frame_text(getattr(e, 'sent', None))}, "
+            f"received {_close_frame_text(getattr(e, 'rcvd', None))}")
 
 
 def _non_owner_send_params(params: dict) -> dict:
@@ -9029,6 +9050,8 @@ class _TurnWriter:
         self.images_made = 0
         self._emit = None
         self._done = asyncio.Event()
+        # A running push of M never lands after its final one (`_push_running`).
+        self._push_lock = asyncio.Lock()
         # Two pumps can feed one writer; only one may claim it.
         self._open_lock = asyncio.Lock()
         self._emit_lock = asyncio.Lock()
@@ -9087,17 +9110,33 @@ class _TurnWriter:
         M now, not done, so it does not read finished and empty meanwhile."""
         if self.opened or not await self.open(takeover=self.takeover):
             return
-        if self.request_task is not None and not self.request_task.done():
-            # The request's end marks M done; M must say so after it.
-            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
-        message = {**self._claim["messages"][self.message_id], "content": self.sent_text,
-                   "output": copy.deepcopy(self.sent_output), "done": False}
-        await _introduce_turn_message(
-            self.chat_id, self.user_id,
-            _turn_message_patch(self.message_id, self._claim.get("parent"), message), self.message_id)
+        await self._push_running()
         # The DB says so once the request's own save is in (ELI-115).
         self.handover_owed = True
         await self._stream()
+
+    async def _push_running(self) -> None:
+        """Push M not done to the chat's tabs, after its request ends: that end
+        marks M done in a tab, though its run goes on here."""
+        if self.request_task is not None and not self.request_task.done():
+            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
+        async with self._push_lock:
+            if self.closed:
+                return   # being finalized: its final push shows M done, with its lines
+            message = {**self._claim["messages"][self.message_id], "content": self.sent_text,
+                       "output": copy.deepcopy(self.sent_output), "done": False}
+            await _introduce_turn_message(
+                self.chat_id, self.user_id,
+                _turn_message_patch(self.message_id, self._claim.get("parent"), message), self.message_id)
+
+    async def show_running(self) -> None:
+        """A taken-over M reads running in a tab until it is finalized, never
+        done without its final lines (ELI-371, ELI-377)."""
+        if self.opened or await self.open(takeover=self.takeover):
+            try:
+                await self._push_running()
+            except Exception as ex:
+                pipe_log(f"  turn writer: running push of {self.message_id[:8]}... failed: {ex!r}")
 
     async def working(self) -> None:
         """M's message went into the running run: show it as working."""
@@ -9636,7 +9675,8 @@ class _TurnWriter:
             pushed = False
             if saved:
                 await _clear_response_stream(self.task_id)
-                pushed = await self._push_final(text, output, history)
+                async with self._push_lock:
+                    pushed = await self._push_final(text, output, history)
                 if not stopped and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
@@ -10341,6 +10381,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             await pump.writer.feed(None)
             if handed.get("steer_pending"):
                 await pump.writer.hold_open()
+            else:
+                spawn_background(pump.writer.show_running())
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
         else:
@@ -11751,11 +11793,12 @@ class _OwuiHistoryRows:
 
 
 async def _history_change(tail: list, user_id: str, reply_id: str, rows,
-                          user_parent: str | None = None) -> dict:
+                          user_parent: str | None = None, commands=()) -> dict:
     """Compare a request with the line: {kind, replaced, shown, tail}.
 
     `kind` is None, "regenerate", "edit", "deleted" or "branch". `user_parent`
-    is used if the user message's row is not written yet.
+    is used if the user message's row is not written yet. `commands`: messages
+    that went to the Gateway as commands, which the agent never read: not shown.
     """
     if user_id in tail:
         meet, walked = tail.index(user_id), []
@@ -11773,7 +11816,7 @@ async def _history_change(tail: list, user_id: str, reply_id: str, rows,
             if not found:
                 break
     replaced = tail[meet + 1:]
-    shown = list(reversed(walked[1:]))
+    shown = [m for m in reversed(walked[1:]) if m not in commands]
     new_tail = (tail[:meet + 1] + list(reversed(walked)) + [reply_id])[-HISTORY_TAIL_MAX:]
     if not replaced:
         kind = None
@@ -12129,8 +12172,14 @@ async def _temporary_sessions_tend(conn, request, state_dir: str, session_key: s
 
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
-                          metadata: dict, messages: list, column: int = 0, model=None) -> str:
-    """Prefix that syncs the agent with the chat ("" normally); updates the line."""
+                          metadata: dict, messages: list, column: int = 0, model=None,
+                          command: str | None = None) -> str:
+    """Prefix that syncs the agent with the chat ("" normally); updates the line.
+    `command`: the message is a Gateway command, which goes as typed (the Gateway
+    reads it from the message's start): it gets no note and leaves the line where
+    the agent's memory is, so the next message's note compares the chat as it is
+    then with what the agent saw (ELI-376). A reset (/new) moves the line here:
+    the session starts afresh."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
@@ -12139,12 +12188,20 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
     line = _history_line_read(state_dir, line_id)
     if line.get("reply") == reply_id:
         return line.get("prefix") or ""   # Open WebUI's second call for this reply
+    if command is not None:
+        if _is_gateway_reset(command):
+            line = {"tail": [user_id, reply_id]}
+        else:
+            line = {**line, "commands": ((line.get("commands") or []) + [user_id, reply_id])[-HISTORY_TAIL_MAX:]}
+        _history_line_write(state_dir, line_id, {**line, "reply": reply_id, "prefix": ""})
+        return ""
     rows = _owui_history_rows(chat_id)
     um = metadata.get("user_message") if isinstance(metadata.get("user_message"), dict) else {}
     user_parent = um.get("parentId")
     prefix = ""
     try:
-        change = await _history_change(line["tail"], user_id, reply_id, rows, user_parent)
+        change = await _history_change(line["tail"], user_id, reply_id, rows, user_parent,
+                                       line.get("commands") or ())
         if change["kind"]:
             in_full = False
             if change["kind"] == "branch":
@@ -14195,9 +14252,11 @@ class _PipeTurn:
         self.turn.chat_id = self.owui_origin_chat_id
         # When the chat no longer shows what the agent remembers (Edit,
         # Regenerate, a branch switch, a copy), the message says so (ELI-183).
+        # A Gateway command goes exactly as typed: nothing before it (ELI-376).
+        command = self.text if _is_gateway_command(self.text) else None
         history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
-            self.__metadata__ or {}, messages, self.column, self.body.get("model"))
+            self.__metadata__ or {}, messages, self.column, self.body.get("model"), command=command)
         # The chat's system prompt (model, folder, user settings) goes first. Not in a
         # channel: Open WebUI writes its own prompt there, not the user's. Kept out of
         # `unsent`, so the duplicate check (ELI-82) compares only what the user sent;
@@ -14210,7 +14269,8 @@ class _PipeTurn:
                 self.conn, self.__request__, state_dir, self.session_key, self.owui_origin_chat_id,
                 self.owui_origin_user_id))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [history_prefix + _voice_note(self.__metadata__) + self.text])
+                            else [history_prefix + ("" if command else _voice_note(self.__metadata__))
+                                  + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
                                  else list(self.image_attachments))
         meta = self.__metadata__ or {}
@@ -14437,9 +14497,20 @@ class _PipeTurn:
     def hand_on(self) -> bool:
         """Hand this reply's message to the session's newest waiting reply,
         which sends both as one turn (ELI-188). Not when that reply asks for
-        another thinking level: one send has one level."""
+        another thinking level: one send has one level. A command never joins:
+        glued to other text it is no longer one, and no message joins across a
+        waiting command, which would change what it applies to (ELI-376)."""
+        order = list(self.conn.send_waiters(self.session_key))
         self.conn.drop_send_waiter(self.session_key, self)
-        waiters = self.conn.send_waiters(self.session_key)
+        if _is_gateway_command(self.text) or self not in order:
+            return False
+        at = order.index(self)
+
+        def across_a_command(w) -> bool:
+            lo, hi = sorted((at, order.index(w)))
+            return any(_is_gateway_command(x.text) for x in order[lo + 1:hi])
+        waiters = [w for w in order if w is not self and not _is_gateway_command(w.text)
+                   and not across_a_command(w)]
         mine = self.turn.reply["message_id"]
         later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
         if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):

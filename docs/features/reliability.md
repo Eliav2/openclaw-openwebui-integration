@@ -14,7 +14,7 @@ It reconnects on its own with exponential backoff, from 1 second up to 30, so a 
 The Pipe's log while the Gateway restarts (an excerpt):
 
 ```text
-[openclaw-pipe] WS disconnected -- reconnecting... (code 1006, reason '')
+[openclaw-pipe] WS disconnected -- reconnecting... (sent none, received 1012 'service restart')
 [openclaw-pipe]   reconnect in 1s (attempt 1)
 [openclaw-pipe] Connecting to ws://localhost:18789
 [openclaw-pipe]   reconnect failed: Could not connect to the OpenClaw Gateway at localhost:18789 (ConnectionRefusedError: [Errno 111] Connection refused). Is the Gateway running, and is the GATEWAY_URL valve pointing at it?
@@ -49,7 +49,7 @@ A message with images or files still waits, as on older Gateways: the Gateway wo
 
 A held message from another tab or device, or one sent during a run you did not start, waits in the Pipe's own queue the same way. The status line says "Queued: waiting for the current run to finish...".
 
-Several messages that wait behind the same run (an older Gateway, or messages with images) go out together, as one turn, when it ends: the agent reads them in the order you sent them, a blank line apart, with every image attached to any of them. The answer appears under the last one, and the replies of the earlier ones say their message was sent together with the next. A message you send once that turn has started waits for it and is answered on its own. The same holds for a message handed on by [Send now](#send-now). One message sent while the agent works, then another while it answers the first, are two turns: the first had already gone out.
+Several messages that wait behind the same run (an older Gateway, or messages with images) go out together, as one turn, when it ends: the agent reads them in the order you sent them, a blank line apart, with every image attached to any of them. The answer appears under the last one, and the replies of the earlier ones say their message was sent together with the next. A message you send once that turn has started waits for it and is answered on its own. A command (`/model`, `/new`, ...) never joins: it goes on its own, in its place, so messages sent before it go out before it and messages sent after it after it. The same holds for a message handed on by [Send now](#send-now). One message sent while the agent works, then another while it answers the first, are two turns: the first had already gone out.
 
 <img src="../img/queued-together-light.png" alt="Three messages sent while the cache rebuild ran: the first two replies say their message went with the next one, the last reply answers all three" width="320">
 
@@ -105,7 +105,7 @@ If events are lost on the way (a dropped frame, a socket gap), the reply is rebu
 What the Pipe logs when the Gateway socket drops mid-reply (an excerpt):
 
 ```text
-[openclaw-pipe] WS disconnected -- reconnecting... (code 1006, reason '')
+[openclaw-pipe] WS disconnected -- reconnecting... (sent none, received none)
 [openclaw-pipe]   marked an event gap in 1 run queue(s)
 ```
 
