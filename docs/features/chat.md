@@ -149,13 +149,25 @@ The note is not shown in the chat. Turning your speech into text and reading the
 
 Always on.
 
+## System prompts
+
+A system prompt you set in Open WebUI reaches the agent: the one on the model (Admin Settings, Models, or a workspace model built on an OpenClaw model), the one on the chat's folder (Edit folder, System prompt), and your own (the chat's Controls, else Settings, General). The Pipe joins them in Open WebUI's order, model, then folder, then yours, with Open WebUI's prompt variables such as `{{USER_NAME}}` filled in, and puts them before your message in one short note.
+
+OpenClaw has no system prompt per message, so the note comes with every message of the chat, and a change applies from the next message on. The agent's own instructions (its workspace files, OpenClaw's system prompt) still come first and win where they disagree.
+
+Only the prompts people set are sent. Open WebUI also writes its own instructions into the request's system prompt, for features the agent does not get (voice mode, the code interpreter, skills, knowledge, tool servers); those stay out (see [What the composer toggles do](#what-the-composer-toggles-do)). A folder prompt counts only if you may read that folder, as in Open WebUI. Channel mentions carry none: Open WebUI writes its own prompt there.
+
+The note is not shown in the chat. No prompt set means nothing is added.
+
+Always on.
+
 ## What the composer toggles do
 
 Open WebUI's web search, code interpreter, tools and integrations toggles do not change what the agent sees. The agent uses the tools your OpenClaw Gateway gives it, and nothing Open WebUI adds on top.
 
-Open WebUI offers those capabilities to a model as tools in the request. The Pipe forwards your last message as Open WebUI built it (including any file references or document passages Open WebUI added to it) and the images you attach, and nothing else from the request, so the offered tools never run and the agent never hears of them. The code interpreter's instructions to the model are dropped the same way, and so are the tools Open WebUI offers on every request, such as notes and calendar. A web search, code interpreter or tools toggle left on is harmless: the agent's prompt is the same with it on or off.
+Open WebUI offers those capabilities to a model as tools in the request. The Pipe forwards your last message as Open WebUI built it (including any file references or document passages Open WebUI added to it) the images you attach and the [system prompts](#system-prompts) people set, and nothing else from the request, so the offered tools never run and the agent never hears of them. The code interpreter's instructions to the model are dropped the same way, and so are the tools Open WebUI offers on every request, such as notes and calendar. A web search, code interpreter or tools toggle left on is harmless: the agent's prompt is the same with it on or off.
 
-Two settings do reach the agent: the [thinking level](#thinking-level), and voice mode (see [Voice calls](#voice-calls)).
+Three settings do reach the agent: the [thinking level](#thinking-level), voice mode (see [Voice calls](#voice-calls)), and the [system prompts](#system-prompts) people set.
 
 To give the agent web search, a shell or other tools, set them up on the Gateway, not in the composer. The agent's own tool calls then show up as [tool cards](#tool-cards).
 

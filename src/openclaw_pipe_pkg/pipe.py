@@ -969,8 +969,13 @@ class _PipeTurn:
         history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
+        # The chat's system prompt (model, folder, user settings) goes first. Not in a
+        # channel: Open WebUI writes its own prompt there, not the user's.
+        system_note = "" if self._send_texts or self.channel_id else await _system_prompt_note(
+            self.__metadata__ or {}, self.owui_origin_chat_id, self.owui_origin_user_id)
         self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [history_prefix + _voice_note(self.__metadata__) + self.text])
+                            else [system_note + history_prefix + _voice_note(self.__metadata__)
+                                  + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
                                  else list(self.image_attachments))
         meta = self.__metadata__ or {}
