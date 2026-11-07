@@ -4775,6 +4775,15 @@ def _is_gateway_command(message: str) -> bool:
     return message.lstrip().startswith(GATEWAY_COMMAND_PREFIX)
 
 
+# The commands that start the session afresh (the Gateway's RESET_COMMAND_RE).
+GATEWAY_RESET_COMMAND_RE = re.compile(r"^/(new|reset)(?:\s|$)", re.IGNORECASE)
+
+
+def _is_gateway_reset(message: str) -> bool:
+    """Whether `message` is a command that gives the session a fresh start."""
+    return bool(GATEWAY_RESET_COMMAND_RE.match(message.strip()))
+
+
 def _non_owner_send_params(params: dict) -> dict:
     """A chat.send for the restricted connection: admin-only fields dropped,
     the metadata receipt prepended to the message as the Gateway would. A

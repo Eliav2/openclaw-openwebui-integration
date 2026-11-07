@@ -572,8 +572,12 @@ async def _temporary_sessions_tend(conn, request, state_dir: str, session_key: s
 
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
-                          metadata: dict, messages: list, column: int = 0, model=None) -> str:
-    """Prefix that syncs the agent with the chat ("" normally); updates the line."""
+                          metadata: dict, messages: list, column: int = 0, model=None,
+                          command: str | None = None) -> str:
+    """Prefix that syncs the agent with the chat ("" normally); updates the line.
+    `command`: the message is a Gateway command, which goes as typed (the Gateway
+    reads it from the message's start), so the note is owed to the next message;
+    a reset (/new) drops it, the session starting afresh (ELI-376)."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
@@ -621,8 +625,14 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
     except Exception as ex:
         pipe_log(f"[history] chat {chat_id[:8]}: could not compare with the line: {ex!r}")
         return ""
+    owed = line.get("owed") or ""
+    if command is None:
+        prefix, owed = owed + prefix, ""
+    else:
+        owed = "" if _is_gateway_reset(command) else owed + prefix
+        prefix = ""
     _history_line_write(state_dir, line_id, {"tail": change["tail"], "reply": reply_id,
-                                             "prefix": prefix})
+                                             "prefix": prefix, "owed": owed})
     return prefix
 
 

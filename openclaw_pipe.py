@@ -8046,6 +8046,15 @@ def _is_gateway_command(message: str) -> bool:
     return message.lstrip().startswith(GATEWAY_COMMAND_PREFIX)
 
 
+# The commands that start the session afresh (the Gateway's RESET_COMMAND_RE).
+GATEWAY_RESET_COMMAND_RE = re.compile(r"^/(new|reset)(?:\s|$)", re.IGNORECASE)
+
+
+def _is_gateway_reset(message: str) -> bool:
+    """Whether `message` is a command that gives the session a fresh start."""
+    return bool(GATEWAY_RESET_COMMAND_RE.match(message.strip()))
+
+
 def _non_owner_send_params(params: dict) -> dict:
     """A chat.send for the restricted connection: admin-only fields dropped,
     the metadata receipt prepended to the message as the Gateway would. A
@@ -12129,8 +12138,12 @@ async def _temporary_sessions_tend(conn, request, state_dir: str, session_key: s
 
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
-                          metadata: dict, messages: list, column: int = 0, model=None) -> str:
-    """Prefix that syncs the agent with the chat ("" normally); updates the line."""
+                          metadata: dict, messages: list, column: int = 0, model=None,
+                          command: str | None = None) -> str:
+    """Prefix that syncs the agent with the chat ("" normally); updates the line.
+    `command`: the message is a Gateway command, which goes as typed (the Gateway
+    reads it from the message's start), so the note is owed to the next message;
+    a reset (/new) drops it, the session starting afresh (ELI-376)."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
@@ -12178,8 +12191,14 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
     except Exception as ex:
         pipe_log(f"[history] chat {chat_id[:8]}: could not compare with the line: {ex!r}")
         return ""
+    owed = line.get("owed") or ""
+    if command is None:
+        prefix, owed = owed + prefix, ""
+    else:
+        owed = "" if _is_gateway_reset(command) else owed + prefix
+        prefix = ""
     _history_line_write(state_dir, line_id, {"tail": change["tail"], "reply": reply_id,
-                                             "prefix": prefix})
+                                             "prefix": prefix, "owed": owed})
     return prefix
 
 
@@ -14195,9 +14214,11 @@ class _PipeTurn:
         self.turn.chat_id = self.owui_origin_chat_id
         # When the chat no longer shows what the agent remembers (Edit,
         # Regenerate, a branch switch, a copy), the message says so (ELI-183).
+        # A Gateway command goes exactly as typed: nothing before it (ELI-376).
+        command = self.text if _is_gateway_command(self.text) else None
         history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
-            self.__metadata__ or {}, messages, self.column, self.body.get("model"))
+            self.__metadata__ or {}, messages, self.column, self.body.get("model"), command=command)
         # The chat's system prompt (model, folder, user settings) goes first. Not in a
         # channel: Open WebUI writes its own prompt there, not the user's. Kept out of
         # `unsent`, so the duplicate check (ELI-82) compares only what the user sent;
@@ -14210,7 +14231,8 @@ class _PipeTurn:
                 self.conn, self.__request__, state_dir, self.session_key, self.owui_origin_chat_id,
                 self.owui_origin_user_id))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [history_prefix + _voice_note(self.__metadata__) + self.text])
+                            else [history_prefix + ("" if command else _voice_note(self.__metadata__))
+                                  + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
                                  else list(self.image_attachments))
         meta = self.__metadata__ or {}
