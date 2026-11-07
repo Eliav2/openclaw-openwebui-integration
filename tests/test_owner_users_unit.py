@@ -110,10 +110,11 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
         self.assertEqual(offenders, [], "run requests that bypass _run_request")
 
     def test_every_run_request_call_site_is_routed(self):
-        """The 11 call sites in PHASE-B-PLAN.md, the card answer (#21), channel follow-ups."""
+        """The 11 call sites in PHASE-B-PLAN.md, the card answer (#21), channel follow-ups,
+        archiving a forgotten temporary chat's session (history.py)."""
         calls = [f"{name}:{n.lineno}" for name, tree in self._trees() for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_run_request"]
-        self.assertEqual(len(calls), 13, calls)
+        self.assertEqual(len(calls), 14, calls)
 
 
 

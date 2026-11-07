@@ -976,6 +976,11 @@ class _PipeTurn:
         # it is added when the message goes out, and to a resume.
         self.system_note = "" if self.channel_id else await _system_prompt_note(
             self.__metadata__ or {}, self.owui_origin_chat_id, self.owui_origin_user_id)
+        if not self.channel_id and self.owui_origin_chat_id and self.owui_origin_user_id:
+            # A temporary chat's session is the Pipe's to delete once Open WebUI forgets the chat.
+            spawn_background(_temporary_sessions_tend(
+                self.conn, self.__request__, state_dir, self.session_key, self.owui_origin_chat_id,
+                self.owui_origin_user_id))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + _voice_note(self.__metadata__) + self.text])
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts

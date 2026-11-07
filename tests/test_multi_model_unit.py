@@ -44,8 +44,8 @@ class MultiModelBase(unittest.IsolatedAsyncioTestCase):
                                    "run": f"run-{self.n}", "key": params["idempotencyKey"]})
                 return {"runId": f"run-{self.n}"}
             if method == "sessions.patch":
-                self.patches.append((params["key"], params["model"]))
-                provider, _, model = params["model"].partition("/")
+                self.patches.append((params["key"], params.get("model")))
+                provider, _, model = (params.get("model") or "").partition("/")
                 return {"resolved": {"modelProvider": provider, "model": model}}
             if method == "sessions.describe":
                 return {"session": {"status": "done", "agentRuntime": {"id": None}}}
@@ -71,13 +71,14 @@ class MultiModelBase(unittest.IsolatedAsyncioTestCase):
         self.tree[reply_id] = (role, parent, text, model)
 
     async def call(self, model, models, user, reply, text, parent=None, extra_meta=None,
-                   request_system=None):
+                   request_system=None, chat=CHAT, earlier=None):
         """One Pipe call, answered 'ok from <reply>'; returns when it ends.
-        `request_system`: the system message Open WebUI put first in the request."""
+        `request_system`: the system message Open WebUI put first in the request.
+        `earlier`: the messages Open WebUI sends before `text` (a temporary chat sends them all)."""
         body = {"model": model, "messages": ([{"role": "system", "content": request_system}]
                                              if request_system else [])
-                + [{"role": "user", "content": text}]}
-        meta = {"chat_id": CHAT, "user_id": USER, "message_id": reply, "user_message_id": user,
+                + list(earlier or []) + [{"role": "user", "content": text}]}
+        meta = {"chat_id": chat, "user_id": USER, "message_id": reply, "user_message_id": user,
                 "user_message": {"id": user, "parentId": parent, "models": models}, **(extra_meta or {})}
 
         async def emitter(event):
@@ -87,7 +88,7 @@ class MultiModelBase(unittest.IsolatedAsyncioTestCase):
         first = asyncio.ensure_future(gen.__anext__())
         send = None
         for _ in range(600):
-            send = next((s for s in self.sends if f"msg-{CHAT}-{reply}-" in s["key"]
+            send = next((s for s in self.sends if f"msg-{chat}-{reply}-" in s["key"]
                          and f"{s['session']}:{s['run']}" in self.conn._consumers
                          and not s.get("answered")), None)
             if send:
