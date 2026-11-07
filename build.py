@@ -172,7 +172,6 @@ _VALVE_SOURCES = (
     ("Pipe", "pipe", "openclaw_pipe.py"),
     ("Status Action", "action", "openclaw_status_action.py"),
     ("Thinking filter", "thinking_filter", "openclaw_thinking_filter.py"),
-    ("Web Push", "push/openclaw_web_push.py", "push/openclaw_web_push.py"),
 )
 
 
@@ -268,7 +267,7 @@ def render_configuration() -> str:
         "Every setting (valve) of the functions, with its type, default and what it does. "
         "Generated from the code by `python3 build.py --all`; do not edit by hand.",
         "",
-        "Applies to: Pipe, Action, Filter, Web Push (event function)",
+        "Applies to: Pipe, Action, Filter",
         "",
         "Set them in Open WebUI: **Admin Panel > Functions >** the function **> Valves** (the gear). "
         "The installer rewrites the connection valves on every run "
@@ -280,10 +279,6 @@ def render_configuration() -> str:
     ]
     for heading, fragment, filename in _VALVE_SOURCES:
         lines += ["", f"## {heading}", "", f"File: `{filename}`."]
-        if fragment.endswith(".py"):
-            lines += ["", "The Web Push event function ([Push notifications](./install/web-push.md)). "
-                      "Its per-user valves (each device's subscription, muted chats and folders) are written "
-                      "by its page script and service worker, not by hand."]
         if fragment == "action":
             lines += ["", "The Action reuses the Pipe's Gateway connection when the Pipe has one. "
                       "These valves are its own connection's settings, for when it has to open one: "

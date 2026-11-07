@@ -9,7 +9,7 @@ Applies to: Pipe, Action, Filter
 Everything here works as soon as the Pipe is installed, except entries marked:
 
 - **needs agent setup:** the integration provides the mechanism, but your agent has to know the convention, see [agent skills](../install/agent-skills.md);
-- **separate function:** ships as its own file and installs separately, see [Status button](../install/status-action.md), [thinking control](../install/thinking-filter.md) and [push notifications](../install/web-push.md).
+- **separate function:** ships as its own file and installs separately, see [Status button](../install/status-action.md), and [thinking control](../install/thinking-filter.md).
 
 ## In the chat
 
@@ -30,7 +30,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Usage and goal line**](./chat.md#usage-and-goal-line): context, rate-limit and goal state under every reply
 - [**Context compaction marked**](./chat.md#context-compaction): when the Gateway compacts the session mid-reply, the reply shows a collapsed "Context compacted" block where it happened
 - [**Chat titles**](./chat.md#chat-titles): chats name themselves, on a separate agent so it never queues behind your conversation
-- [**Push notifications**](../install/web-push.md) _(separate function)_: a notification on your phone or computer when a reply finishes, agent turns included, with the chat's title only, not while you are looking at that chat
+- [**Push notifications**](../install/web-push.md) _(separate add-on, [its own repo](https://github.com/Eliav2/open-webui-pwa-push))_: a notification on your phone or computer when a reply finishes, agent turns included, with the Pipe's [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished)
 
 ## Sessions and models
 
