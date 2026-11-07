@@ -9048,6 +9048,8 @@ class _TurnWriter:
         self.images_made = 0
         self._emit = None
         self._done = asyncio.Event()
+        # A running push of M never lands after its final one (`_push_running`).
+        self._push_lock = asyncio.Lock()
         # Two pumps can feed one writer; only one may claim it.
         self._open_lock = asyncio.Lock()
         self._emit_lock = asyncio.Lock()
@@ -9106,17 +9108,33 @@ class _TurnWriter:
         M now, not done, so it does not read finished and empty meanwhile."""
         if self.opened or not await self.open(takeover=self.takeover):
             return
-        if self.request_task is not None and not self.request_task.done():
-            # The request's end marks M done; M must say so after it.
-            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
-        message = {**self._claim["messages"][self.message_id], "content": self.sent_text,
-                   "output": copy.deepcopy(self.sent_output), "done": False}
-        await _introduce_turn_message(
-            self.chat_id, self.user_id,
-            _turn_message_patch(self.message_id, self._claim.get("parent"), message), self.message_id)
+        await self._push_running()
         # The DB says so once the request's own save is in (ELI-115).
         self.handover_owed = True
         await self._stream()
+
+    async def _push_running(self) -> None:
+        """Push M not done to the chat's tabs, after its request ends: that end
+        marks M done in a tab, though its run goes on here."""
+        if self.request_task is not None and not self.request_task.done():
+            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
+        async with self._push_lock:
+            if self.closed:
+                return   # being finalized: its final push shows M done, with its lines
+            message = {**self._claim["messages"][self.message_id], "content": self.sent_text,
+                       "output": copy.deepcopy(self.sent_output), "done": False}
+            await _introduce_turn_message(
+                self.chat_id, self.user_id,
+                _turn_message_patch(self.message_id, self._claim.get("parent"), message), self.message_id)
+
+    async def show_running(self) -> None:
+        """A taken-over M reads running in a tab until it is finalized, never
+        done without its final lines (ELI-371, ELI-377)."""
+        if self.opened or await self.open(takeover=self.takeover):
+            try:
+                await self._push_running()
+            except Exception as ex:
+                pipe_log(f"  turn writer: running push of {self.message_id[:8]}... failed: {ex!r}")
 
     async def working(self) -> None:
         """M's message went into the running run: show it as working."""
@@ -9655,7 +9673,8 @@ class _TurnWriter:
             pushed = False
             if saved:
                 await _clear_response_stream(self.task_id)
-                pushed = await self._push_final(text, output, history)
+                async with self._push_lock:
+                    pushed = await self._push_final(text, output, history)
                 if not stopped and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
@@ -10360,6 +10379,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             await pump.writer.feed(None)
             if handed.get("steer_pending"):
                 await pump.writer.hold_open()
+            else:
+                spawn_background(pump.writer.show_running())
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
         else:
