@@ -32,6 +32,8 @@ The agent's memory of a chat is a single line of messages: each time you send, t
 
 The agent still remembers the replaced messages; the note tells it which ones the chat no longer shows. Editing a message and pressing Save (without sending) changes only what you see.
 
+A command (a message starting with `/`, such as `/model` or `/status`) always goes to the Gateway exactly as typed, since the Gateway reads commands from the message's start; the note then goes with your next ordinary message. After `/new` or `/reset` it is dropped: the session starts afresh.
+
 **Fork or clone a chat** (a reply's Fork chat button, or Clone in the sidebar's chat menu): the copy is a new chat with a fresh session. Its first message carries the copied messages once, so the agent continues where the copy starts. They are cut to about 8,000 tokens (32,000 characters): the newest messages are kept, the oldest left out whole (the agent is told how many), and tool-call details are left out. Background work started from a chat (scheduled jobs, sub-agents) stays tied to the original chat, never to its copy.
 
 For a clean start, open a new chat.
