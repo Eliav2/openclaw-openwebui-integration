@@ -11791,11 +11791,12 @@ class _OwuiHistoryRows:
 
 
 async def _history_change(tail: list, user_id: str, reply_id: str, rows,
-                          user_parent: str | None = None) -> dict:
+                          user_parent: str | None = None, commands=()) -> dict:
     """Compare a request with the line: {kind, replaced, shown, tail}.
 
     `kind` is None, "regenerate", "edit", "deleted" or "branch". `user_parent`
-    is used if the user message's row is not written yet.
+    is used if the user message's row is not written yet. `commands`: messages
+    that went to the Gateway as commands, which the agent never read: not shown.
     """
     if user_id in tail:
         meet, walked = tail.index(user_id), []
@@ -11813,7 +11814,7 @@ async def _history_change(tail: list, user_id: str, reply_id: str, rows,
             if not found:
                 break
     replaced = tail[meet + 1:]
-    shown = list(reversed(walked[1:]))
+    shown = [m for m in reversed(walked[1:]) if m not in commands]
     new_tail = (tail[:meet + 1] + list(reversed(walked)) + [reply_id])[-HISTORY_TAIL_MAX:]
     if not replaced:
         kind = None
@@ -12173,8 +12174,10 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
                           command: str | None = None) -> str:
     """Prefix that syncs the agent with the chat ("" normally); updates the line.
     `command`: the message is a Gateway command, which goes as typed (the Gateway
-    reads it from the message's start), so the note is owed to the next message;
-    a reset (/new) drops it, the session starting afresh (ELI-376)."""
+    reads it from the message's start): it gets no note and leaves the line where
+    the agent's memory is, so the next message's note compares the chat as it is
+    then with what the agent saw (ELI-376). A reset (/new) moves the line here:
+    the session starts afresh."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
@@ -12183,12 +12186,20 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
     line = _history_line_read(state_dir, line_id)
     if line.get("reply") == reply_id:
         return line.get("prefix") or ""   # Open WebUI's second call for this reply
+    if command is not None:
+        if _is_gateway_reset(command):
+            line = {"tail": [user_id, reply_id]}
+        else:
+            line = {**line, "commands": ((line.get("commands") or []) + [user_id, reply_id])[-HISTORY_TAIL_MAX:]}
+        _history_line_write(state_dir, line_id, {**line, "reply": reply_id, "prefix": ""})
+        return ""
     rows = _owui_history_rows(chat_id)
     um = metadata.get("user_message") if isinstance(metadata.get("user_message"), dict) else {}
     user_parent = um.get("parentId")
     prefix = ""
     try:
-        change = await _history_change(line["tail"], user_id, reply_id, rows, user_parent)
+        change = await _history_change(line["tail"], user_id, reply_id, rows, user_parent,
+                                       line.get("commands") or ())
         if change["kind"]:
             in_full = False
             if change["kind"] == "branch":
@@ -12222,14 +12233,8 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
     except Exception as ex:
         pipe_log(f"[history] chat {chat_id[:8]}: could not compare with the line: {ex!r}")
         return ""
-    owed = line.get("owed") or ""
-    if command is None:
-        prefix, owed = owed + prefix, ""
-    else:
-        owed = "" if _is_gateway_reset(command) else owed + prefix
-        prefix = ""
     _history_line_write(state_dir, line_id, {"tail": change["tail"], "reply": reply_id,
-                                             "prefix": prefix, "owed": owed})
+                                             "prefix": prefix})
     return prefix
 
 
@@ -14490,9 +14495,20 @@ class _PipeTurn:
     def hand_on(self) -> bool:
         """Hand this reply's message to the session's newest waiting reply,
         which sends both as one turn (ELI-188). Not when that reply asks for
-        another thinking level: one send has one level."""
+        another thinking level: one send has one level. A command never joins:
+        glued to other text it is no longer one, and no message joins across a
+        waiting command, which would change what it applies to (ELI-376)."""
+        order = list(self.conn.send_waiters(self.session_key))
         self.conn.drop_send_waiter(self.session_key, self)
-        waiters = self.conn.send_waiters(self.session_key)
+        if _is_gateway_command(self.text) or self not in order:
+            return False
+        at = order.index(self)
+
+        def across_a_command(w) -> bool:
+            lo, hi = sorted((at, order.index(w)))
+            return any(_is_gateway_command(x.text) for x in order[lo + 1:hi])
+        waiters = [w for w in order if w is not self and not _is_gateway_command(w.text)
+                   and not across_a_command(w)]
         mine = self.turn.reply["message_id"]
         later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
         if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):

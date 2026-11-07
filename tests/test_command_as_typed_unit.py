@@ -1,9 +1,11 @@
 """ELI-376: a Gateway command ("/model x", "/new") reaches the Gateway exactly as typed.
 The Gateway reads a command from the message's start, so nothing the Pipe adds may go
 before it: not the note about an edit or a branch switch, not the voice note. That note
-is owed to the next ordinary message instead; a reset (/new, /reset) drops it, since
-the session starts afresh."""
+goes with the next ordinary message instead, computed then against what the agent
+saw, so it describes the chat as it is by then; a reset (/new, /reset) drops it,
+since the session starts afresh."""
 import unittest
+from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
@@ -46,6 +48,40 @@ class CommandAsTypedTests(MultiModelBase):
         send = await self.next_message()
         self.assertTrue(send["message"].startswith(EDIT_NOTE), send["message"])
         self.assertTrue(send["message"].endswith("next"))
+
+    async def test_after_several_commands_one_note_describes_the_chat_as_it_is(self):
+        """Edited into one command, then another: the next message gets ONE note, which
+        compares what the agent saw ("hello") with the chat now, commands not counted."""
+        await self.edit_then("/model opus")
+        self.message("a1", "assistant", "u1", "ok from a1")
+        self.message("u1b", "user", None, "/status")
+        await self.call(HAIKU, [HAIKU], "u1b", "a1b", "/status")
+        self.message("a1b", "assistant", "u1b", "ok from a1b")
+        self.message("u2", "user", "a1b", "next")
+        send = await self.call(HAIKU, [HAIKU], "u2", "a2", "next", parent="a1b")
+        self.assertEqual(send["message"].count("[Open WebUI:"), 1, send["message"])
+        self.assertIn('"hello"', send["message"])
+        self.assertNotIn("/status", send["message"].rsplit("next", 1)[0])
+        self.assertNotIn("/model", send["message"])
+
+    async def test_a_failed_comparison_keeps_the_note_for_the_next_message(self):
+        await self.edit_then("/model opus")
+        change = ocp._history_change
+
+        async def fails(*args, **kwargs):
+            raise RuntimeError("rows unreadable")
+        with mock.patch.object(ocp, "_history_change", fails):
+            self.message("a1", "assistant", "u1", "ok from a1")
+            self.message("u2", "user", "a1", "next")
+            send = await self.call(HAIKU, [HAIKU], "u2", "a2", "next", parent="a1")
+        self.assertEqual(send["message"], "next")
+        self.assertIs(ocp._history_change, change)
+        self.message("a2", "assistant", "u2", "ok from a2")
+        self.message("u3", "user", "a2", "then")
+        send = await self.call(HAIKU, [HAIKU], "u3", "a3", "then", parent="a2")
+        # The line did not move on the failed turn, so the note also counts "next" as new.
+        self.assertTrue(send["message"].startswith("[Open WebUI:"), send["message"])
+        self.assertIn('from "hello" on are no longer shown', send["message"])
 
     async def test_a_reset_drops_the_note(self):
         for command in ("/new", "/RESET", "/new start over"):

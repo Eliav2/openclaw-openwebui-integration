@@ -3154,6 +3154,34 @@ class NoDroppedMessagesTests(_TurnCase):
         self._queue("run-2").put_nowait(self._final("run-2"))
         await asyncio.wait_for(late[0][1], 30)
 
+    async def test_a_waiting_command_goes_alone_and_nothing_joins_across_it(self):
+        """ELI-376: a command glued to other text is no longer one, and a message joined
+        across it would go before it: "a", "/new", "c" go as three sends, in order."""
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", None), ("/new", "m3", None), ("c", "m4", None))
+        for run in ("run-1", "run-2", "run-3"):
+            self._settled(False)
+            await self._until_registered(run)
+            self._queue(run).put_nowait(self._delta(run, "OK"))
+            self._queue(run).put_nowait(self._final(run))
+            self.active = True
+        self.assertEqual(self.sent, ["a", "/new", "c"])
+        for _, task in reads:
+            task.cancel()
+
+    async def test_messages_before_a_waiting_command_still_join(self):
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", None), ("b", "m3", None), ("/model opus", "m4", None))
+        for run in ("run-1", "run-2"):
+            self._settled(False)
+            await self._until_registered(run)
+            self._queue(run).put_nowait(self._delta(run, "OK"))
+            self._queue(run).put_nowait(self._final(run))
+            self.active = True
+        self.assertEqual(self.sent, ["a\n\nb", "/model opus"])
+        for _, task in reads:
+            task.cancel()
+
     async def test_waiting_messages_of_another_chat_are_not_joined(self):
         """Only one session's waiting messages are joined."""
         self.active = True

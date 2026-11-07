@@ -1212,9 +1212,20 @@ class _PipeTurn:
     def hand_on(self) -> bool:
         """Hand this reply's message to the session's newest waiting reply,
         which sends both as one turn (ELI-188). Not when that reply asks for
-        another thinking level: one send has one level."""
+        another thinking level: one send has one level. A command never joins:
+        glued to other text it is no longer one, and no message joins across a
+        waiting command, which would change what it applies to (ELI-376)."""
+        order = list(self.conn.send_waiters(self.session_key))
         self.conn.drop_send_waiter(self.session_key, self)
-        waiters = self.conn.send_waiters(self.session_key)
+        if _is_gateway_command(self.text) or self not in order:
+            return False
+        at = order.index(self)
+
+        def across_a_command(w) -> bool:
+            lo, hi = sorted((at, order.index(w)))
+            return any(_is_gateway_command(x.text) for x in order[lo + 1:hi])
+        waiters = [w for w in order if w is not self and not _is_gateway_command(w.text)
+                   and not across_a_command(w)]
         mine = self.turn.reply["message_id"]
         later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
         if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):
