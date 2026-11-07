@@ -90,6 +90,7 @@ With the Status Action installed, one click shows context used, rate limits and 
 - **[Survives reloads and restarts](https://eliav2.github.io/openclaw-openwebui-integration/features/reliability#gateway-restarts):** reload the page or restart Open WebUI or the Gateway, and the reply finishes in the same message.
 - **[Replies the agent starts](https://eliav2.github.io/openclaw-openwebui-integration/features/agent-turns):** cron jobs and sub-agent results reply in the chat, live.
 - **[Every Gateway model](https://eliav2.github.io/openclaw-openwebui-integration/features/sessions-and-models#model-picker):** the model picker lists the models your Gateway allows, one session per chat.
+- **[Push notifications and offline open](https://github.com/Eliav2/open-webui-pwa-push):** a separate add-on for any Open WebUI: a notification when a reply finishes (Reply, Mute, swipe to read), the app and your recent chats offline, and chats you opened before at once. For OpenClaw replies, agent turns included, turn on the Pipe's [`PUBLISH_CHAT_FINISHED`](https://eliav2.github.io/openclaw-openwebui-integration/configuration#publish_chat_finished).
 - **[Channels](https://eliav2.github.io/openclaw-openwebui-integration/features/channels):** mention the agent in a channel and it answers in a thread, then follows it, answering what is meant for it without a new mention.
 
 ## Docs
