@@ -284,8 +284,10 @@ async def _recover_turn_text(conn, session_key: str, user_text: str) -> str | No
 
 def _owui_session_key(agent_id: str, user_id: str, chat_id: str, column: int = 0) -> str:
     """The chat's session key. Column n > 0 is one model of a multi-model
-    chat (ELI-329)."""
-    key = f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
+    chat (ELI-329). In lower case, as the Gateway stores it and names it in its
+    events: a temporary chat's id carries its socket's id, which has upper case,
+    and a key in another case would never match its run's events."""
+    key = f"agent:{agent_id}:openwebui-{user_id}-{chat_id}".lower()
     return f"{key}-m{column}" if column else key
 
 
@@ -2379,7 +2381,7 @@ class _GatewayConnection:
         agent_id = getattr(self._valves(), "AGENT_ID", None)
         if not agent_id:
             return None
-        prefix = f"agent:{agent_id}:openwebui-"
+        prefix = f"agent:{agent_id}:openwebui-".lower()   # as `_owui_session_key` builds it
         if not session_key.startswith(prefix):
             return None
         after = session_key[len(prefix):]
