@@ -125,6 +125,15 @@ class TemporaryChatIdTests(unittest.TestCase):
         conn = ocp._GatewayConnection(lambda: mock.Mock(AGENT_ID="Main"))
         self.assertEqual(conn.parse_owui_session_key(ocp._owui_session_key("Main", uid, cid)), (uid, cid))
 
+    def test_a_side_chat_s_key_is_parsed_back_to_its_whole_id(self):
+        """A side chat's id is longer than a UUID: the key names all of it
+        (in the key's case), also for a column."""
+        uid = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+        conn = ocp._GatewayConnection(lambda: mock.Mock(AGENT_ID="main"))
+        for column in (0, 1):
+            self.assertEqual(conn.parse_owui_session_key(ocp._owui_session_key("main", uid, SIDE, column)),
+                             (uid, SIDE.lower()))
+
     def test_a_saved_chat_s_key_is_unchanged(self):
         self.assertEqual(ocp._owui_session_key("main", USER, CHAT), f"agent:main:openwebui-{USER}-{CHAT}")
 

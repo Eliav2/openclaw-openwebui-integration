@@ -961,6 +961,8 @@ ADMIN_ONLY_SEND_FIELDS = (
     "originatingThreadId",
 )
 _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
+# A temporary chat's id (a side chat's on Open WebUI 0.13.0): `temporary:<socket id>:<uuid>`.
+_OWUI_TEMPORARY_CHAT_ID = re.compile(r"temporary:[^:]+:[0-9a-f-]{36}")
 # An Open WebUI channel thread's session (channels.py).
 _CHANNEL_KEY_RE = re.compile(r"^agent:([^:]+):openwebui:channel:([^:]+):thread:([^:]+)$")
 
@@ -3294,7 +3296,8 @@ class _GatewayConnection:
         after = session_key[len(prefix):]
         if len(after) < 73 or after[36] != "-":
             return None
-        return after[0:36], after[37:73]
+        side = _OWUI_TEMPORARY_CHAT_ID.match(after, 37)
+        return after[0:36], side.group(0) if side else after[37:73]
 
     async def dispatch_run_event(self, msg: dict) -> None:
         """Route one run event (or Pipe note, ELI-197): shadow render, then
