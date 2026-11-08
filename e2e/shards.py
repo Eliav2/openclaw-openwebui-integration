@@ -146,6 +146,7 @@ SHARDS = {
         f"{BROWSER}::test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command",
         f"{BROWSER}::test_a_background_command_that_ends_shows_done_in_the_open_dialog",
         f"{BROWSER}::test_a_side_chat_answers_from_the_chat_it_was_opened_from",
+        f"{BROWSER}::test_the_claw_button_opens_the_chats_status_with_a_side_chat_open",
         f"{BROWSER}::test_an_ask_user_question_in_a_side_chat_is_answered_in_its_panel",
         f"{BROWSER}::test_the_open_status_dialog_follows_this_chats_schedule",
         f"{BROWSER}::test_a_long_task_shown_whole_keeps_the_drawer_closable",
