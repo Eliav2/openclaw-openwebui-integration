@@ -234,13 +234,15 @@ wait "$PULL_PID" || { cat "$LOG_DIR/docker-pull.log"; echo "::error::docker pull
 echo "image pulled after $(( SECONDS - PULL_START ))s, $(( SECONDS - WAIT_START ))s of it waited for here"
 # Host networking so "localhost:18789" means the same Gateway from inside the
 # container as from the installer, which is the single-host layout the README's
-# defaults assume.
+# defaults assume. From 0.13.1 a model gets a chat's file text only with the
+# File Context capability, and a Pipe model cannot declare it (docs/features/chat.md).
 docker run -d --name owui --network host \
   -e WEBUI_SECRET_KEY="e2e-$(openssl rand -hex 16)" \
   -e ENABLE_OLLAMA_API=false \
   -e ENABLE_OPENAI_API=false \
   -e OFFLINE_MODE=true \
   -e ENABLE_CHANNELS=true \
+  -e DEFAULT_MODEL_METADATA='{"capabilities":{"file_context":true}}' \
   "$OWUI_IMAGE" >"$LOG_DIR/owui.id"
 wait_for "Open WebUI" 300 curl -fsS "$OWUI_URL/health" \
   || { docker logs --tail 100 owui; exit 1; }

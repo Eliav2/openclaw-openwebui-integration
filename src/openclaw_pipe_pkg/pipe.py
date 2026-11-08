@@ -1378,12 +1378,12 @@ class _PipeTurn:
                 self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
             self.sent_texts = list(self.turn.unsent)
             self.sent_attachments = list(self.turn.attachments)
-            _file_context_commit(_state_dir(getattr(self.pipe.valves, "STATE_DIR", "")), self.session_key,
-                                 self.sent_texts)
             self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
                                  "\n\n".join(t for t in self.sent_texts if t))
             self.turn.unsent = []
             self.turn.attachments = []
+            await _file_context_commit(self.conn, _state_dir(getattr(self.pipe.valves, "STATE_DIR", "")),
+                                       self.session_key, self.sent_texts)
             if getattr(self, "to_be_steered", False):
                 await _emit_status(self.__event_emitter__, STEER_PENDING_STATUS, done=False)
             if self.channel_commit is not None:

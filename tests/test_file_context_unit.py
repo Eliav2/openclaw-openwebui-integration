@@ -59,14 +59,17 @@ class FileContextTests(unittest.IsolatedAsyncioTestCase):
         self.conn.row = {"key": self.key, "sessionId": session_id,
                          **({"compactionCount": compactions} if compactions is not None else {})}
 
-    async def turn(self, reply, *chunks, sent=True):
-        """One message's file context; committed as sent unless `sent` is False."""
+    async def turn(self, reply, *chunks, sent=True, sources=None, after_send=None):
+        """One message's file context; committed as sent unless `sent` is False.
+        `after_send` changes the session between the send and its commit."""
         context = ocp._file_context_split(wrapped(*chunks), TYPED)[0]
         text, record = await ocp._file_context_message(self.conn, self.state, self.key, reply,
-                                                       context, [source(*chunks)])
+                                                       context, sources or [source(*chunks)])
         ocp._file_context_hold(self.key, text, record)
+        if after_send:
+            after_send()
         if sent:
-            ocp._file_context_commit(self.state, self.key, [text])
+            await ocp._file_context_commit(self.conn, self.state, self.key, [text])
         return text
 
     def test_split_keeps_the_typed_text_apart(self):
@@ -77,23 +80,27 @@ class FileContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(ocp._file_context_split(wrapped(CHUNK_A), None), "no base_user_prompt")
 
     async def test_the_first_turn_goes_whole(self):
+        self.session("s1")
         self.assertIn(CHUNK_A, await self.turn("r1", CHUNK_A, CHUNK_B))
 
-    async def test_the_second_turn_collapses_to_one_line(self):
-        await self.turn("r1", CHUNK_A, CHUNK_B)
+    async def test_the_second_turn_keeps_the_tags_without_their_text(self):
+        """The [n] citations stay valid: each chunk keeps its <source> tag and number."""
         self.session("s1")
+        await self.turn("r1", CHUNK_A, CHUNK_B)
         text = await self.turn("r2", CHUNK_A, CHUNK_B)
         self.assertNotIn(CHUNK_A, text)
         self.assertNotIn(CHUNK_B, text)
+        self.assertIn('<source id="1" name="plan.md"></source>', text)
+        self.assertIn('<source id="2" name="plan.md"></source>', text)
+        self.assertIn("Respond using the context.", text, "the rest of Open WebUI's template stays")
         self.assertIn(NOTE, text)
 
     async def test_a_new_or_changed_chunk_is_sent(self):
-        await self.turn("r1", CHUNK_A)
         self.session("s1")
+        await self.turn("r1", CHUNK_A)
         text = await self.turn("r2", CHUNK_A, CHUNK_NEW)
         self.assertIn(CHUNK_NEW, text)
         self.assertNotIn(CHUNK_A, text)
-        self.assertIn("<context>", text, "Open WebUI's template stays around the new chunk")
         self.assertIn(NOTE, text)
 
     async def test_the_same_reply_builds_the_same_text(self):
@@ -101,6 +108,11 @@ class FileContextTests(unittest.IsolatedAsyncioTestCase):
         self.session("s1")
         first = await self.turn("r1", CHUNK_A)
         self.assertEqual(await self.turn("r1", CHUNK_A), first)
+
+    async def test_requests_without_a_message_id_are_different_replies(self):
+        self.session("s1")
+        await self.turn(None, CHUNK_A)
+        self.assertNotIn(CHUNK_A, await self.turn(None, CHUNK_A))
 
     async def test_a_new_session_clears_the_record(self):
         """/new, /reset or a deleted session: a new sessionId has none of the chunks."""
@@ -115,16 +127,39 @@ class FileContextTests(unittest.IsolatedAsyncioTestCase):
         self.session("s1", compactions=1)
         self.assertIn(CHUNK_A, await self.turn("r2", CHUNK_A))
 
-    async def test_a_session_this_turn_created_keeps_the_record(self):
-        """No row before the first send ([]): the next turn reads the id that send created."""
+    async def test_a_session_the_send_created_is_recorded_under_its_id(self):
+        """No row before the first send: the commit reads the id that send created."""
+        await self.turn("r1", CHUNK_A, after_send=lambda: self.session("s1"))
+        self.assertNotIn(CHUNK_A, await self.turn("r2", CHUNK_A))
+
+    async def test_a_reset_after_the_send_that_created_the_session_resends(self):
+        await self.turn("r1", CHUNK_A, after_send=lambda: self.session("s1"))
+        self.session("s2")
+        self.assertIn(CHUNK_A, await self.turn("r2", CHUNK_A))
+
+    async def test_a_send_whose_session_is_not_found_records_nothing(self):
         await self.turn("r1", CHUNK_A)
         self.session("s1")
-        self.assertNotIn(CHUNK_A, await self.turn("r2", CHUNK_A))
+        self.assertIn(CHUNK_A, await self.turn("r2", CHUNK_A))
+
+    async def test_a_chunk_missing_from_the_context_is_not_recorded(self):
+        """A custom RAG template without the context: the chunk never reached the agent."""
+        self.session("s1")
+        await self.turn("r1", CHUNK_A, sources=[source(CHUNK_A, CHUNK_NEW)])
+        text = await self.turn("r2", CHUNK_A, CHUNK_NEW)
+        self.assertIn(CHUNK_NEW, text)
+        self.assertNotIn(CHUNK_A, text)
 
     async def test_a_message_never_sent_records_nothing(self):
         self.session("s1")
         await self.turn("r1", CHUNK_A, sent=False)
         self.assertIn(CHUNK_A, await self.turn("r2", CHUNK_A))
+
+    async def test_a_message_that_was_never_sent_is_let_go_by_the_next_send(self):
+        self.session("s1")
+        await self.turn("r1", CHUNK_A, sent=False)
+        await self.turn("r2", CHUNK_A)
+        self.assertEqual(ocp._file_context_pending, {})
 
     async def test_a_failed_lookup_sends_whole(self):
         self.session("s1")
