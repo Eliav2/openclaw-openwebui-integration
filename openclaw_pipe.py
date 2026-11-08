@@ -7190,6 +7190,8 @@ class _GatewayConnection:
             except Exception:
                 pass
             self._ws = None
+        # No reply reads this connection's run messages any more.
+        self._run_messages.clear()
         # A follow waiting on this connection reads again, through a live one.
         self._on_cron_changed()
 

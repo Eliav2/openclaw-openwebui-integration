@@ -3863,6 +3863,14 @@ class RunMessagesTests(_TurnCase):
         self.assertEqual(self.conn._run_messages, {})
         del q
 
+    async def test_a_closed_connection_drops_every_runs_messages(self):
+        """A retired connection closes once its replies end; nothing reads it after."""
+        self.conn.register_consumer(self.SK, "run-1")
+        self._push({"role": "assistant", "usage": self.USAGE, "__openclaw": {"runId": "run-1"}})
+        self.conn._ws = None
+        await self.conn.disconnect()
+        self.assertEqual(self.conn._run_messages, {})
+
     async def test_a_reply_a_later_message_was_steered_into_keeps_the_runs_messages(self):
         """That message's reply continues the run and reads them."""
         def steered():
