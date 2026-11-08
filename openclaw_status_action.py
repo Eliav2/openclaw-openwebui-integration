@@ -2503,7 +2503,6 @@ class _GatewayConnection:
         self._run_messages: dict[tuple, list] = {}
         self.message_gaps = 0
         self.message_rewrites: dict[str, int] = {}
-        self.messages_dropped: dict[str, int] = {}
         # The Gateway's `cron` event (a job added, changed, removed, started
         # or finished), or a socket gap: the waiter, and a count readers keep
         # to tell a cached job list is old.
@@ -2740,26 +2739,27 @@ class _GatewayConnection:
                 return got, False
 
     def _note_run_message(self, key: str, payload: dict) -> None:
-        """Keep a pushed assistant message's digest under each run it belongs to.
-        A run nobody reads (a wake's, say) falls out with the oldest; what falls
-        out marks the session, so a reply still reading it reads `chat.history`."""
+        """Keep a pushed assistant message's digest under each run it belongs to,
+        for a run a reply follows only: one nobody reads (a wake's, say) is not kept.
+        A reply's consumer is registered before its run starts."""
         message = payload.get("message")
         if not key or not isinstance(message, dict) or message.get("role") != _ASSISTANT_ROLE:
             return
         digest = _run_message_digest(message)
         for run_id in _transcript_run_ids(message) | ({payload["runId"]} if payload.get("runId") else set()):
-            kept = self._run_messages.setdefault((key, run_id), [])
-            kept.append(digest)
-            if len(kept) > _RUN_MESSAGES_PER_RUN:
-                del kept[0]
-                self._note_messages_dropped(key)
-        while len(self._run_messages) > _RUN_MESSAGES_KEPT:
-            dropped_key, _run = next(iter(self._run_messages))
-            self._run_messages.pop((dropped_key, _run))
-            self._note_messages_dropped(dropped_key)
+            if self._reply_follows(key, run_id):
+                self._run_messages.setdefault((key, run_id), []).append(digest)
 
-    def _note_messages_dropped(self, session_key: str) -> None:
-        self.messages_dropped[session_key] = self.messages_dropped.get(session_key, 0) + 1
+    def _reply_follows(self, session_key: str, run_id: str) -> bool:
+        """A reply streams the run, or continues it (a message steered into it)."""
+        return any(c.session_key == session_key and (c.run_id == run_id or (c.steered and c.steered_into == run_id))
+                   for c in self._consumers.values())
+
+    def _drop_unfollowed_runs(self, session_key: str) -> None:
+        """The session went idle: drop what no reply reads any more (a reply
+        parked and never claimed, say)."""
+        for key in [k for k in self._run_messages if k[0] == session_key and not self._reply_follows(*k)]:
+            del self._run_messages[key]
 
     def subscribed_to_messages(self, session_key: str) -> bool:
         """Whether this connection gets the session's `session.message` pushes."""
@@ -2770,14 +2770,14 @@ class _GatewayConnection:
         return {"messages": list(self._run_messages.get((session_key, run_id), ()))}
 
     def forget_run_transcript(self, session_key: str, run_id: str) -> None:
-        self._run_messages.pop((session_key, run_id), None)
+        """A reply ended: drop its run's messages unless another reply continues the run."""
+        if not self._reply_follows(session_key, run_id):
+            self._run_messages.pop((session_key, run_id), None)
 
     def transcript_mark(self, session_key: str) -> tuple:
         """Compare marks taken before and after a run: a difference means a
-        push may be missing from its messages (a socket gap, a rewrite, or
-        messages dropped to bound what is kept)."""
-        return (self.message_gaps, self.message_rewrites.get(session_key, 0),
-                self.messages_dropped.get(session_key, 0))
+        push may be missing from its messages (a socket gap or a rewrite)."""
+        return self.message_gaps, self.message_rewrites.get(session_key, 0)
 
     def _note_run_failed(self, payload: dict) -> None:
         """Record an aborted or failed run (no answer is stored) and wake its
@@ -2821,6 +2821,8 @@ class _GatewayConnection:
             self._wake_session_waiters(key)
             if "hasActiveRun" in payload:
                 self.row_to_consumers(key, payload)
+            if payload.get("hasActiveRun") is False:
+                self._drop_unfollowed_runs(key)
         if key and payload.get("phase") == "message":
             # A rewrite, not an append: no `session.message` follows.
             self.message_rewrites[key] = self.message_rewrites.get(key, 0) + 1
@@ -4253,11 +4255,6 @@ def _idempotency_keys(message) -> tuple[str, str]:
     return str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or "")
 
 
-# Runs whose pushed messages a connection keeps; the oldest go first. A reply
-# reads its own run's when the run ends, long before this many more start.
-_RUN_MESSAGES_KEPT = 200
-# A run's messages kept (one per model call); the oldest go first.
-_RUN_MESSAGES_PER_RUN = 500
 _ASSISTANT_ROLE = "assistant"
 # What a reply reads from its run's messages: the usage, image and
 # attachment_error blocks (ELI-322, ELI-328), and the keys that name the run.

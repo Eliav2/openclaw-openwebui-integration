@@ -1660,9 +1660,8 @@ class _PipeTurn:
                         self.conn.mark_delivered_live(self.session_key, self.our_run_id)
                         self.conn.unregister_run_target(self.session_key, self.our_run_id)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                    if not self.steered_into:
-                        # A steered-in message's reply continues this run and reads its messages.
-                        self.conn.forget_run_transcript(self.session_key, self.our_run_id)
+                    # Kept while a steered-in message's reply continues the run.
+                    self.conn.forget_run_transcript(self.session_key, self.our_run_id)
                     self.turn.run_id = None
                     self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
