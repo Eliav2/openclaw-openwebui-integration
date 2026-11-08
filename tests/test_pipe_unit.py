@@ -3771,7 +3771,8 @@ class RunMessagesTests(_TurnCase):
             "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle", "data": {"phase": "end"}}})
         q.put_nowait(self._final("run-1"))
         out, _ = await self._collect(first, gen)
-        return out, self.ocp._build_usage_status_lines.await_args.kwargs.get("run_usage")
+        called = self.ocp._build_usage_status_lines.await_args
+        return out, called.kwargs.get("run_usage") if called else None
 
     async def test_the_usage_line_takes_the_runs_pushed_usage(self):
         self._push({"role": "assistant", "content": "hi", "usage": self.USAGE,
@@ -3810,6 +3811,52 @@ class RunMessagesTests(_TurnCase):
                     "__openclaw": {"runId": "run-1"}})
         await self._turn()
         self.assertEqual(self.conn.run_transcript(self.SK, "run-1"), {"messages": []})
+
+    async def test_without_a_message_subscription_the_usage_is_read_from_chat_history(self):
+        """A failed subscribe gets no pushes for the run."""
+        self.history = {"messages": [{"role": "assistant", "content": "hi", "usage": self.USAGE,
+                                      "__openclaw": {"runId": "run-1"}}]}
+
+        async def refused(session_key):
+            pass
+        self.conn.ensure_message_subscription = refused
+        _, usage = await self._turn()
+        self.assertEqual(usage, self.USAGE)
+        self.assertEqual(self.rpc.count("chat.history"), 1)
+
+    async def test_a_message_dropped_to_bound_what_is_kept_sends_the_reply_to_chat_history(self):
+        """Another session's runs push this run's messages out of the kept ones."""
+        self.history = {"messages": [{"role": "assistant", "content": "hi", "usage": self.USAGE,
+                                      "__openclaw": {"runId": "run-1"}}]}
+
+        def crowd_out():
+            self._push({"role": "assistant", "usage": {"input": 1}, "__openclaw": {"runId": "run-1"}})
+            with mock.patch.object(self.ocp, "_RUN_MESSAGES_KEPT", 1):
+                self.conn._on_session_message({"sessionKey": "other", "message": {
+                    "role": "assistant", "__openclaw": {"runId": "x"}}})
+        _, usage = await self._turn(during=crowd_out)
+        self.assertEqual(usage, self.USAGE)
+        self.assertEqual(self.rpc.count("chat.history"), 1)
+
+    async def test_a_reply_a_later_message_was_steered_into_keeps_the_runs_messages(self):
+        """That message's reply continues the run and reads them."""
+        def steered():
+            self._push({"role": "assistant", "content": [self._image()], "__openclaw": {"runId": "run-1"}})
+            self._queue("run-1").put_nowait({"type": self.ocp._STEERED_MARKER_TYPE, "into": "run-1"})
+        await self._turn(during=steered)
+        self.assertEqual(len(self.conn.run_transcript(self.SK, "run-1")["messages"]), 1)
+
+    def _image(self):
+        return {"type": "image", "url": "/api/chat/media/outgoing/x/full", "alt": "a.png"}
+
+    def test_a_kept_message_holds_only_what_a_reply_reads(self):
+        self._push({"role": "assistant", "usage": self.USAGE, "model": "m",
+                    "content": [{"type": "text", "text": "long text " * 1000},
+                                {"type": "toolCall", "arguments": {"x": 1}}, self._image()],
+                    "__openclaw": {"runId": "run-1", "seq": 4}})
+        self.assertEqual(self.conn.run_transcript(self.SK, "run-1")["messages"], [{
+            "role": "assistant", "usage": self.USAGE, "__openclaw": {"runId": "run-1"},
+            "content": [self._image()]}])
 
     def test_a_message_names_its_runs(self):
         ids = self.ocp._transcript_run_ids

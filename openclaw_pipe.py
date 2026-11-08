@@ -5834,6 +5834,7 @@ class _GatewayConnection:
         self._run_messages: dict[tuple, list] = {}
         self.message_gaps = 0
         self.message_rewrites: dict[str, int] = {}
+        self.messages_dropped: dict[str, int] = {}
         # The Gateway's `cron` event (a job added, changed, removed, started
         # or finished), or a socket gap: the waiter, and a count readers keep
         # to tell a cached job list is old.
@@ -6070,14 +6071,30 @@ class _GatewayConnection:
                 return got, False
 
     def _note_run_message(self, key: str, payload: dict) -> None:
-        """Keep a pushed assistant message under each run it belongs to."""
+        """Keep a pushed assistant message's digest under each run it belongs to.
+        A run nobody reads (a wake's, say) falls out with the oldest; what falls
+        out marks the session, so a reply still reading it reads `chat.history`."""
         message = payload.get("message")
         if not key or not isinstance(message, dict) or message.get("role") != _ASSISTANT_ROLE:
             return
+        digest = _run_message_digest(message)
         for run_id in _transcript_run_ids(message) | ({payload["runId"]} if payload.get("runId") else set()):
-            self._run_messages.setdefault((key, run_id), []).append(message)
+            kept = self._run_messages.setdefault((key, run_id), [])
+            kept.append(digest)
+            if len(kept) > _RUN_MESSAGES_PER_RUN:
+                del kept[0]
+                self._note_messages_dropped(key)
         while len(self._run_messages) > _RUN_MESSAGES_KEPT:
-            self._run_messages.pop(next(iter(self._run_messages)))
+            dropped_key, _run = next(iter(self._run_messages))
+            self._run_messages.pop((dropped_key, _run))
+            self._note_messages_dropped(dropped_key)
+
+    def _note_messages_dropped(self, session_key: str) -> None:
+        self.messages_dropped[session_key] = self.messages_dropped.get(session_key, 0) + 1
+
+    def subscribed_to_messages(self, session_key: str) -> bool:
+        """Whether this connection gets the session's `session.message` pushes."""
+        return session_key in self._message_subscriptions
 
     def run_transcript(self, session_key: str, run_id: str) -> dict:
         """The run's pushed assistant messages, shaped like `chat.history`."""
@@ -6088,8 +6105,10 @@ class _GatewayConnection:
 
     def transcript_mark(self, session_key: str) -> tuple:
         """Compare marks taken before and after a run: a difference means a
-        push may be missing from its messages (a socket gap or a rewrite)."""
-        return self.message_gaps, self.message_rewrites.get(session_key, 0)
+        push may be missing from its messages (a socket gap, a rewrite, or
+        messages dropped to bound what is kept)."""
+        return (self.message_gaps, self.message_rewrites.get(session_key, 0),
+                self.messages_dropped.get(session_key, 0))
 
     def _note_run_failed(self, payload: dict) -> None:
         """Record an aborted or failed run (no answer is stored) and wake its
@@ -7568,7 +7587,25 @@ def _idempotency_keys(message) -> tuple[str, str]:
 # Runs whose pushed messages a connection keeps; the oldest go first. A reply
 # reads its own run's when the run ends, long before this many more start.
 _RUN_MESSAGES_KEPT = 200
+# A run's messages kept (one per model call); the oldest go first.
+_RUN_MESSAGES_PER_RUN = 500
 _ASSISTANT_ROLE = "assistant"
+# What a reply reads from its run's messages: the usage, image and
+# attachment_error blocks (ELI-322, ELI-328), and the keys that name the run.
+_DIGEST_BLOCK_TYPES = ("image", "attachment_error")
+_DIGEST_FIELDS = ("role", "usage", "runId", "idempotencyKey")
+_DIGEST_META_FIELDS = ("runId", "idempotencyKey")
+
+
+def _run_message_digest(message: dict) -> dict:
+    """The part of a stored message a reply reads, not its text or tool calls."""
+    digest = {k: message[k] for k in _DIGEST_FIELDS if k in message}
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    digest["__openclaw"] = {k: meta[k] for k in _DIGEST_META_FIELDS if k in meta}
+    content = message.get("content")
+    digest["content"] = [b for b in content if isinstance(b, dict) and b.get("type") in _DIGEST_BLOCK_TYPES] \
+        if isinstance(content, list) else []
+    return digest
 _CLI_ASSISTANT_KEY_PREFIX = "cli-assistant:"
 _ASSISTANT_MEDIA_KEY_PART = ":assistant-media"
 
@@ -14711,8 +14748,10 @@ class _PipeTurn:
         # Tool cards for this session's runs whoever started them (`ensure_message_subscription`).
         await self.conn.ensure_message_subscription(self.session_key)
         # The run's messages come pushed from here on (ELI-381); a later mark that
-        # differs means a push may be missing (`run_end_messages`).
-        self.transcript_start = self.conn.transcript_mark(self.session_key)
+        # differs means a push may be missing (`run_end_messages`). A failed
+        # subscription gets none: no mark, so the reply reads `chat.history`.
+        self.transcript_start = (self.conn.transcript_mark(self.session_key)
+                                 if self.conn.subscribed_to_messages(self.session_key) else None)
 
     async def admit(self):
         """The run this reply streams: a duplicate Open WebUI call's (ELI-82), a
@@ -15248,7 +15287,9 @@ class _PipeTurn:
                         self.conn.mark_delivered_live(self.session_key, self.our_run_id)
                         self.conn.unregister_run_target(self.session_key, self.our_run_id)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                    self.conn.forget_run_transcript(self.session_key, self.our_run_id)
+                    if not self.steered_into:
+                        # A steered-in message's reply continues this run and reads its messages.
+                        self.conn.forget_run_transcript(self.session_key, self.our_run_id)
                     self.turn.run_id = None
                     self.turn.queue = None
             if self.adopted_run_id and not self.aborted:

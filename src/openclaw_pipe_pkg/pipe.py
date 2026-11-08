@@ -1121,8 +1121,10 @@ class _PipeTurn:
         # Tool cards for this session's runs whoever started them (`ensure_message_subscription`).
         await self.conn.ensure_message_subscription(self.session_key)
         # The run's messages come pushed from here on (ELI-381); a later mark that
-        # differs means a push may be missing (`run_end_messages`).
-        self.transcript_start = self.conn.transcript_mark(self.session_key)
+        # differs means a push may be missing (`run_end_messages`). A failed
+        # subscription gets none: no mark, so the reply reads `chat.history`.
+        self.transcript_start = (self.conn.transcript_mark(self.session_key)
+                                 if self.conn.subscribed_to_messages(self.session_key) else None)
 
     async def admit(self):
         """The run this reply streams: a duplicate Open WebUI call's (ELI-82), a
@@ -1658,7 +1660,9 @@ class _PipeTurn:
                         self.conn.mark_delivered_live(self.session_key, self.our_run_id)
                         self.conn.unregister_run_target(self.session_key, self.our_run_id)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                    self.conn.forget_run_transcript(self.session_key, self.our_run_id)
+                    if not self.steered_into:
+                        # A steered-in message's reply continues this run and reads its messages.
+                        self.conn.forget_run_transcript(self.session_key, self.our_run_id)
                     self.turn.run_id = None
                     self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
