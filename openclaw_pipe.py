@@ -1958,7 +1958,7 @@ async def _live_output(request, chat_id: str | None, message_id: str | None) -> 
 # code, and a user message never streams, so no reply gets clobbered.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "10"
+_COMPOSER_BUTTON_VERSION = "11"
 
 # Status Action id (install_action.py FUNCTION_ID) and the default Pipe id;
 # a Pipe under another id adds its own prefixes.
@@ -2091,9 +2091,15 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     return m ? m.id.slice('message-'.length) : null;
   }
 
+  // The chat's own messages on screen. A side chat's panel (Open WebUI 0.13.2)
+  // renders its messages after them, in its own container.
+  function chatMessages(sel) {
+    return (document.getElementById('messages-container') || document).querySelectorAll(sel);
+  }
+
   // The latest user message on screen: the current branch's, as rendered.
   function latestUserMessageId() {
-    const users = document.querySelectorAll('.chat-user');
+    const users = chatMessages('.chat-user');
     return users.length ? messageIdOf(users[users.length - 1]) : null;
   }
 
@@ -2129,7 +2135,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
   // The newest reply's model on screen.
   function latestReplyModel() {
-    const replies = document.querySelectorAll('.chat-assistant');
+    const replies = chatMessages('.chat-assistant');
     const el = replies.length ? replies[replies.length - 1].closest('[id^="message-"]') : null;
     return modelOfMessage(el);
   }
