@@ -16,7 +16,7 @@
 #
 # Inputs (env): OWUI_IMAGE, OPENCLAW_VERSION (npm spec, e.g. 2026.9.3 or latest;
 # replaced by the installed version once npm has it),
-# E2E_LOG_DIR. Writes the credentials the test suite needs to $GITHUB_ENV when
+# E2E_LOG_DIR. Local sandboxes only: E2E_NPM_INSTALLER, a script that installs and removes the OpenClaw package (see below); CI never sets it. Writes the credentials the test suite needs to $GITHUB_ENV when
 # running under Actions.
 #
 # Optional, for the screenshots workflow (scripts/screenshots): STACK_ADMIN_NAME
@@ -88,6 +88,8 @@ stack_down() {
     docker rm -f "$id" >/dev/null 2>&1 || true
   fi
   rm -f "${STACK_PID_FILES[@]}" "$LOG_DIR/owui.id"
+  # Local sandboxes only (e2e-local/run.sh sets it): release the shared, read-only OpenClaw install this stack mounted. CI leaves it unset.
+  if [[ -n "${E2E_NPM_INSTALLER:-}" ]]; then "$E2E_NPM_INSTALLER" detach "$(npm prefix --global)" || true; fi
   echo "stack down (${#pids[@]} processes stopped)"
 }
 
@@ -156,8 +158,15 @@ wait_for "fake model" 30 curl -fsS "http://127.0.0.1:$FAKE_LLM_PORT/health"
 echo "::endgroup::"
 
 echo "::group::OpenClaw Gateway (openclaw@$OPENCLAW_VERSION)"
-npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DIR/npm-install.log" 2>&1 \
-  || { cat "$LOG_DIR/npm-install.log"; exit 1; }
+# E2E_NPM_INSTALLER (set only by a local sandbox runner, never by CI) installs openclaw once per version and mounts it read-only into every stack instead of
+# one ~950 MB npm install per stack; it takes the same arguments `npm install --global openclaw@<spec>` would. Unset, this is the plain npm install.
+if [[ -n "${E2E_NPM_INSTALLER:-}" ]]; then
+  "$E2E_NPM_INSTALLER" install "$OPENCLAW_VERSION" "$(npm prefix --global)" >"$LOG_DIR/npm-install.log" 2>&1 \
+    || { cat "$LOG_DIR/npm-install.log"; exit 1; }
+else
+  npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DIR/npm-install.log" 2>&1 \
+    || { cat "$LOG_DIR/npm-install.log"; exit 1; }
+fi
 openclaw --version
 # e2e/fake_claude.py is the `claude` CLI the claude-cli runtime runs (the
 # config's agents.defaults.models routes anthropic/claude-opus-5-5 to it; the
