@@ -151,7 +151,11 @@ A new session starts the record afresh: `/new`, `/reset`, a deleted session, or 
 
 Known limit: claude-cli compacts a long session on its own, and the Gateway does not count that as a compaction. After such a compaction the agent may no longer hold a file's text while the Pipe still leaves it out. Send `/new` to have it sent again.
 
-Open WebUI 0.13.1 and later put a chat's file text into the message only for models with the **File Context** capability on. For any other chat from the browser, they offer file tools instead, and the agent can't run those tools. A Pipe model can't declare a capability itself. Turn it on for every model with `DEFAULT_MODEL_METADATA='{"capabilities":{"file_context":true}}'` in Open WebUI's environment, or per model under Admin Settings → Models. Without it, the agent never sees the files you attach.
+Open WebUI 0.13.1 and later put a chat's file text into the message only for models with the **File Context** capability on. For any other chat from the browser, they offer file tools instead, and the agent can't run those tools. A Pipe model can't declare a capability itself. Without File Context, the agent never sees the files you attach.
+
+Turn it on for every model in Open WebUI's default model settings, under Admin Panel → Settings → Models, or for one model in that model's settings. To set the default over the API, read `GET /api/v1/configs/models`, add `"DEFAULT_MODEL_METADATA": {"capabilities": {"file_context": true}}` (merged into any metadata already there), and send the whole form back with `POST /api/v1/configs/models`.
+
+The `DEFAULT_MODEL_METADATA` environment variable only helps a new install. Open WebUI saves its model settings in its database on first start, and from then on the saved value wins over the environment (`ENABLE_PERSISTENT_CONFIG`, on by default). On an existing install, setting the variable changes nothing.
 
 Always on.
 
