@@ -1065,6 +1065,19 @@ def _views_chat(session_pool, sid, user_id, chat_id) -> bool:
         "chat_ids" not in session or chat_id in (session.get("chat_ids") or []))
 
 
+def _temporary_chat_socket(session_pool, chat_id: str) -> tuple[str, str] | None:
+    """(socket, chat id) for a temporary chat whose socket is connected: its id
+    (`temporary:<socket id>[:<uuid>]`) names the socket, in mixed case. The
+    session key the id came from is in lower case (`_owui_session_key`), and a
+    side chat's panel takes events for its exact id only."""
+    for prefix in TEMPORARY_CHAT_ID_PREFIXES:
+        if chat_id.startswith(prefix):
+            named, sep, rest = chat_id[len(prefix):].partition(":")
+            sid = next((s for s in list(session_pool) if s.lower() == named.lower()), None)
+            return (sid, f"{prefix}{sid}{sep}{rest}") if sid else None
+    return None
+
+
 def _shows_chat(session_pool, sid, user_id, chat_id, parent_id=None) -> bool:
     """`sid` shows the chat: it loaded it as its page, or it is the tab that
     asked from a side chat's panel. A panel never joins its own chat, so the
@@ -1182,6 +1195,10 @@ async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadli
     except Exception as ex:
         pipe_log(f"  ask_user: no Open WebUI sockets here: {ex}")
         return None
+    temporary = _temporary_chat_socket(SESSION_POOL, chat_id)
+    if temporary is not None:
+        # Also with no live turn (a writer's reply): the chat's own socket shows it.
+        own_sid, chat_id = own_sid or temporary[0], temporary[1]
     parent_id = await _side_chat_parent(chat_id)
     while (left := deadline - time.time()) > 0:
         sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid, parent_id)
@@ -1211,11 +1228,6 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
     turn = _SECRET_ASKERS.get(key)
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
-    # The key is in lower case (`_owui_session_key`); a temporary chat's id is
-    # not, and the side panel takes events for its exact id only.
-    asked_in = (turn.__metadata__ or {}).get("chat_id") if turn is not None else None
-    if isinstance(asked_in, str) and asked_in.lower() == chat_id:
-        chat_id = asked_in
     if not message_id:
         # Open WebUI cancels a card for a message the tab lacks: left to the Control UI.
         _AGENT_QUESTIONS.pop(qid, None)

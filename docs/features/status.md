@@ -148,9 +148,9 @@ The drawer reads the sub-agent's whole transcript (`chat.history`). A very long 
 
 ## Status button in the composer
 
-The Pipe also adds a **Claw** button, with a crab claw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). When the chips leave no room for it, on a narrow phone, it sits right after the integrations button instead, so it is never scrolled out of sight. It opens the same dialog through the Status Action, so the Action must be installed.
+The Pipe also adds a **Claw** button, with a crab claw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). When the chips leave no room for it, on a narrow phone, it sits at the end of the composer's left-hand buttons instead (after the + button; on Open WebUI 0.13.0, after the integrations button), so it is never scrolled out of sight. It opens the same dialog through the Status Action, so the Action must be installed.
 
-<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a crab claw next to the integrations button" width="374">
+<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a crab claw among its buttons (Open WebUI 0.13.0)" width="374">
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 

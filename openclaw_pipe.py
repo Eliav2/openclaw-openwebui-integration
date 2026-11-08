@@ -3867,6 +3867,19 @@ def _views_chat(session_pool, sid, user_id, chat_id) -> bool:
         "chat_ids" not in session or chat_id in (session.get("chat_ids") or []))
 
 
+def _temporary_chat_socket(session_pool, chat_id: str) -> tuple[str, str] | None:
+    """(socket, chat id) for a temporary chat whose socket is connected: its id
+    (`temporary:<socket id>[:<uuid>]`) names the socket, in mixed case. The
+    session key the id came from is in lower case (`_owui_session_key`), and a
+    side chat's panel takes events for its exact id only."""
+    for prefix in TEMPORARY_CHAT_ID_PREFIXES:
+        if chat_id.startswith(prefix):
+            named, sep, rest = chat_id[len(prefix):].partition(":")
+            sid = next((s for s in list(session_pool) if s.lower() == named.lower()), None)
+            return (sid, f"{prefix}{sid}{sep}{rest}") if sid else None
+    return None
+
+
 def _shows_chat(session_pool, sid, user_id, chat_id, parent_id=None) -> bool:
     """`sid` shows the chat: it loaded it as its page, or it is the tab that
     asked from a side chat's panel. A panel never joins its own chat, so the
@@ -3984,6 +3997,10 @@ async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadli
     except Exception as ex:
         pipe_log(f"  ask_user: no Open WebUI sockets here: {ex}")
         return None
+    temporary = _temporary_chat_socket(SESSION_POOL, chat_id)
+    if temporary is not None:
+        # Also with no live turn (a writer's reply): the chat's own socket shows it.
+        own_sid, chat_id = own_sid or temporary[0], temporary[1]
     parent_id = await _side_chat_parent(chat_id)
     while (left := deadline - time.time()) > 0:
         sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid, parent_id)
@@ -4013,11 +4030,6 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
     turn = _SECRET_ASKERS.get(key)
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
-    # The key is in lower case (`_owui_session_key`); a temporary chat's id is
-    # not, and the side panel takes events for its exact id only.
-    asked_in = (turn.__metadata__ or {}).get("chat_id") if turn is not None else None
-    if isinstance(asked_in, str) and asked_in.lower() == chat_id:
-        chat_id = asked_in
     if not message_id:
         # Open WebUI cancels a card for a message the tab lacks: left to the Control UI.
         _AGENT_QUESTIONS.pop(qid, None)
@@ -4280,8 +4292,13 @@ ADMIN_ONLY_SEND_FIELDS = (
     "originatingThreadId",
 )
 _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
-# A temporary chat's id (a side chat's on Open WebUI 0.13.0): `temporary:<socket id>:<uuid>`.
-_OWUI_TEMPORARY_CHAT_ID = re.compile(r"temporary:[^:]+:[0-9a-f-]{36}")
+# A user's or a saved chat's id: a UUID, joined in the session key by a dash.
+_UUID_LEN = len("2d206eab-acac-4945-bd2f-7e8b6365de8c")
+_KEY_PART_SEP = "-"
+# A temporary chat's id in a session key (a side chat's on Open WebUI 0.13.0):
+# `temporary:<socket id>[:<uuid>]`, or the legacy `local:` one, then the
+# column's `-m<n>` if any (open_webui/utils/chat_id.py).
+_OWUI_TEMPORARY_CHAT_ID = re.compile(r"((?:temporary|local):[^:]+?(?::[0-9a-f-]{36})?)(?:-m\d+)?")
 # An Open WebUI channel thread's session (channels.py).
 _CHANNEL_KEY_RE = re.compile(r"^agent:([^:]+):openwebui:channel:([^:]+):thread:([^:]+)$")
 
@@ -6605,7 +6622,8 @@ class _GatewayConnection:
 
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """(user_id, chat_id) of a key `_owui_session_key` built, else None.
-        Split by position: both are 36-char UUIDs containing dashes."""
+        Split by position: the user's id is a UUID, containing dashes; so is a
+        saved chat's, and a temporary chat's is `temporary:<socket id>[:<uuid>]`."""
         agent_id = getattr(self._valves(), "AGENT_ID", None)
         if not agent_id:
             return None
@@ -6613,10 +6631,13 @@ class _GatewayConnection:
         if not session_key.startswith(prefix):
             return None
         after = session_key[len(prefix):]
-        if len(after) < 73 or after[36] != "-":
+        user_id, sep, chat = after[:_UUID_LEN], after[_UUID_LEN:_UUID_LEN + 1], after[_UUID_LEN + 1:]
+        if len(user_id) < _UUID_LEN or sep != _KEY_PART_SEP or not chat:
             return None
-        side = _OWUI_TEMPORARY_CHAT_ID.match(after, 37)
-        return after[0:36], side.group(0) if side else after[37:73]
+        temporary = _OWUI_TEMPORARY_CHAT_ID.fullmatch(chat)
+        if temporary:
+            return user_id, temporary.group(1)
+        return (user_id, chat[:_UUID_LEN]) if len(chat) >= _UUID_LEN else None
 
     async def dispatch_run_event(self, msg: dict) -> None:
         """Route one run event (or Pipe note, ELI-197): shadow render, then

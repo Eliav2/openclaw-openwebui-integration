@@ -436,7 +436,7 @@
         },
         {
           "do": "wait",
-          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[a.length - 1].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a.some(e => e.innerText.includes('The cache is fresh')) && a[a.length - 1].innerText.includes(\"You're on main\"); }",
           "show_ms": 3500
         },
         {
@@ -667,7 +667,7 @@
         },
         {
           "do": "wait",
-          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[a.length - 1].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a.some(e => e.innerText.includes('The cache is fresh')) && a[a.length - 1].innerText.includes(\"You're on main\"); }",
           "show_ms": 3500
         },
         {
