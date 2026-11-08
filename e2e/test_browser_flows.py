@@ -1438,6 +1438,21 @@ def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
     assert any(f"E2E_ECHO: {tag}" in t for _, t in first), f"side sessions {sides}: {first}"
 
 
+def test_the_claw_button_opens_the_chats_status_with_a_side_chat_open(page):
+    """A side chat's panel renders its own messages after the chat's (0.13.2
+    copies the chat's message ids and adds its own): the Claw button still
+    names the chat's latest message, so the dialog opens."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: claw with a side chat")
+    _wait(page, _turn_over("claw with a side chat"), "the chat's reply")
+    page.locator("#chat-input").click()
+    page.keyboard.type("/btw E2E_ECHO: side note", delay=5)
+    page.locator("#send-message-button").click()
+    side = "[...document.querySelectorAll('[id^=\"side-chat-input-\"][id$=\"-messages\"]')]"
+    _wait(page, f"() => {side}.some(e => e.innerText.includes('side note'))", "the side chat's reply")
+    _open_status(page)
+
+
 def test_an_ask_user_question_in_a_side_chat_is_answered_in_its_panel(page):
     """The side panel never joins its own chat, so no tab is on record for it:
     the card goes to the tab that asked, and shows in the panel above its

@@ -1317,12 +1317,16 @@ class Scenes:
         # Steered, the rebuild's reply ends at its tool: a closing line in it
         # means the Gateway ran the old queued way.
         no_closing = f"&& !a[0].innerText.includes({json.dumps(REBUILD_DONE)})" if self.steers else ""
+        # Steered, the model gets the tool's result and the new message in one
+        # request (2026.10.10) and answers both in the new message's reply.
+        not_in_answer = "" if self.steers else \
+            f"&& !a[a.length - 1].innerText.includes({json.dumps(REBUILD_DONE)})"
         wait_js(page, f"""() => {{ const a = [...document.querySelectorAll('.chat-assistant')];
                  return a.length >= 2 && a[0].innerText.includes({json.dumps(self._rebuild_ends_with())})
                    {no_closing}
                    && !a[0].querySelector('[role=button] .shimmer')
                    && a[a.length - 1].innerText.includes("It's on main")
-                   && !a[a.length - 1].innerText.includes({json.dumps(REBUILD_DONE)}); }}""",
+                   {not_in_answer}; }}""",
                 "the rebuild finished in its own reply, and the new message's own answer")
         wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
                 "the answer finished", 60_000)
@@ -1345,7 +1349,8 @@ class Scenes:
                     and (not self.steers or any(i.get("type") == TOOL_OUTPUT_ITEM
                                                 for i in replies[0].get("output") or []))
                     and "It's on main" in (replies[-1].get("content") or "")
-                    and REBUILD_DONE not in (replies[-1].get("content") or "")):
+                    # Steered, the answer carries the rebuild's close too (`_both_answered`).
+                    and (self.steers or REBUILD_DONE not in (replies[-1].get("content") or ""))):
                 return
             time.sleep(1)
         raise RuntimeError(f"stored replies of {chat_id} do not match the page: {last}")
@@ -1410,11 +1415,16 @@ class Scenes:
         page.wait_for_selector("#chat-input", timeout=60_000)
         wait_js(page, last_text_has("the summary is in the forecast channel"), "the answer after a reload", 60_000)
         # The rebuild runs 20 s: a tab slow enough to send after it ended
-        # gets a reply of its own, which is not this scene.
-        noted = page.evaluate("""() => [...document.querySelectorAll('.chat-assistant')].slice(-3, -1)
-          .map(a => a.innerText.includes('sent together with your next one'))""")
-        if noted != [True, True]:
-            raise RuntimeError(f"the three messages did not go out together: {noted}")
+        # gets a reply of its own, which is not this scene. The first two
+        # replies are saved when the session settles, which can be after the
+        # reload's fetch; their final push brings the notes to the page then.
+        noted_js = """() => [...document.querySelectorAll('.chat-assistant')].slice(-3, -1)
+          .map(a => a.innerText.includes('sent together with your next one'))"""
+        try:
+            wait_js(page, f"() => {{ const n = ({noted_js})(); return n.length === 2 && n.every(Boolean); }}",
+                    "the two notes", 60_000)
+        except TimeoutError:
+            raise RuntimeError(f"the three messages did not go out together: {page.evaluate(noted_js)}") from None
         # To the bottom, where Open WebUI hides its scroll-down arrow.
         page.evaluate("() => { const c = document.getElementById('messages-container'); "
                       "if (c) c.scrollTop = c.scrollHeight; }")

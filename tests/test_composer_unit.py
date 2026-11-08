@@ -1074,22 +1074,30 @@ class El {
       const f = walk(c); if (f) return f; } return null; };
     return walk(this);
   }
+  querySelectorAll(sel) {
+    const out = []; const walk = (e) => { for (const c of e.children) { if (c.matches(sel)) out.push(c); walk(c); } };
+    walk(this); return out;
+  }
   get lastElementChild() { return null; }
   set innerHTML(v) {}
 }
-const root = new El('div');
+// The chat's own messages; a side chat's panel (Open WebUI 0.13.2, argv[5] "side")
+// renders its own, after them, in its own container.
+const root = new El('div', { id: 'messages-container' });
 const userMsg = new El('div', { id: 'message-u1' }, root);
 new El('div', { class: 'chat-user' }, userMsg);
 const asstMsg = new El('div', { id: 'message-a1' }, root);
 if (process.argv[4]) new El('img', { src: '/api/v1/models/model/profile/image?id=' + process.argv[4] + '&lang=en-US' }, asstMsg);
 const toolbar = new El('button', { 'aria-label': 'OpenClaw Status' }, asstMsg);
 const icon = new El('svg', {}, toolbar);
+const side = process.argv[5] === 'side' ? new El('div', { id: 'side-chat-input-x-messages' }) : null;
+if (side) new El('div', { class: 'chat-user' }, new El('div', { id: 'message-s1' }, side));
 let owuiHandled = 0;
 globalThis.document = {
   body: { appendChild: function () {} },
   documentElement: { classList: { contains: function () { return false; } } },
-  getElementById: function () { return null; },
-  querySelectorAll: function (sel) { return sel === '.chat-user' ? [userMsg.children[0]] : []; },
+  getElementById: function (id) { return id === 'messages-container' ? root : null; },
+  querySelectorAll: function (sel) { return root.querySelectorAll(sel).concat(side ? side.querySelectorAll(sel) : []); },
   createElement: function (t) { return new El(t); },
   addEventListener: function (t, f, capture) { listeners.push({ t: t, f: f, capture: capture }); },
   removeEventListener: function () {},
@@ -1123,7 +1131,7 @@ function click(target) {
 class ClickWithoutTheChatTests(unittest.TestCase):
     """Opening the dialog sends a small body: no chat download, upload or save."""
 
-    def _click(self, which, avatar_model="", **cfg):
+    def _click(self, which, avatar_model="", layout="", **cfg):
         paths = []
         for text, suffix in ((_render_composer_button_js(**cfg), ".js"), (_NODE_CLICK_HARNESS, ".cjs")):
             fd, path = tempfile.mkstemp(suffix=suffix)
@@ -1131,7 +1139,7 @@ class ClickWithoutTheChatTests(unittest.TestCase):
                 fh.write(text)
             self.addCleanup(os.unlink, path)
             paths.append(path)
-        proc = subprocess.run(["node", paths[1], paths[0], which, avatar_model],
+        proc = subprocess.run(["node", paths[1], paths[0], which, avatar_model, layout],
                               capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -1142,6 +1150,13 @@ class ClickWithoutTheChatTests(unittest.TestCase):
             "url": "/api/chat/actions/openclaw_status_action", "method": "POST",
             "body": {"model": "openclaw_gateway.default", "chat_id": "chat-1", "id": "u1", "session_id": "sock1"},
         }])
+
+    def test_a_side_chats_messages_are_not_the_chats(self):
+        """Open WebUI 0.13.2: a side chat's panel renders its own messages, after
+        the chat's. The dialog is the chat's, for its latest user message."""
+        out = self._click("composer", layout="side", chat_id="chat-1",
+                          chat_model="openclaw_gateway.default", session_id="sock1")
+        self.assertEqual([r["body"]["id"] for r in out["requests"]], ["u1"])
 
     def test_the_toolbar_button_is_taken_over_with_a_small_body(self):
         out = self._click("toolbar", chat_id="chat-1", chat_model="openclaw_gateway.default", session_id="sock1")
