@@ -3391,7 +3391,7 @@ def test_a_chat_file_reaches_the_agent_once_over_three_turns(token):
     item = {"type": "text", "name": "plan.md", "context": "full",
             "file": {"data": {"content": content}, "meta": {"name": "plan.md"}}}
     chat_id, sizes = None, []
-    for n in range(3):
+    for n in range(1, 4):
         word = f"{marker}-turn{n}"
         chat_id, msg = _chat_turn(token, f"{word}: what does the plan say?", chat_id=chat_id,
                                   extra={"files": [item]})
@@ -3401,5 +3401,9 @@ def test_a_chat_file_reaches_the_agent_once_over_three_turns(token):
         request = next(a for a in reversed(asked) if word in a)
         sizes.append(len(request))
         copies = request.count(f"{marker} The plan")
+        print(f"turn {n}: request {sizes[-1]} chars, {copies} copies of the file")
         assert copies == 1, f"turn {n}: the file reached the agent {copies} times; request sizes {sizes}"
     assert "not repeated here: plan.md" in request, request[-600:]
+    # After turn 1 the request grows by the turn's own text, never by another copy of the file.
+    growth = [b - a for a, b in zip(sizes, sizes[1:])]
+    assert max(growth) < len(content), f"request sizes {sizes}"
