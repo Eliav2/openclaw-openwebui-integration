@@ -1415,11 +1415,16 @@ class Scenes:
         page.wait_for_selector("#chat-input", timeout=60_000)
         wait_js(page, last_text_has("the summary is in the forecast channel"), "the answer after a reload", 60_000)
         # The rebuild runs 20 s: a tab slow enough to send after it ended
-        # gets a reply of its own, which is not this scene.
-        noted = page.evaluate("""() => [...document.querySelectorAll('.chat-assistant')].slice(-3, -1)
-          .map(a => a.innerText.includes('sent together with your next one'))""")
-        if noted != [True, True]:
-            raise RuntimeError(f"the three messages did not go out together: {noted}")
+        # gets a reply of its own, which is not this scene. The first two
+        # replies are saved when the session settles, which can be after the
+        # reload's fetch; their final push brings the notes to the page then.
+        noted_js = """() => [...document.querySelectorAll('.chat-assistant')].slice(-3, -1)
+          .map(a => a.innerText.includes('sent together with your next one'))"""
+        try:
+            wait_js(page, f"() => {{ const n = ({noted_js})(); return n.length === 2 && n.every(Boolean); }}",
+                    "the two notes", 60_000)
+        except TimeoutError:
+            raise RuntimeError(f"the three messages did not go out together: {page.evaluate(noted_js)}") from None
         # To the bottom, where Open WebUI hides its scroll-down arrow.
         page.evaluate("() => { const c = document.getElementById('messages-container'); "
                       "if (c) c.scrollTop = c.scrollHeight; }")
