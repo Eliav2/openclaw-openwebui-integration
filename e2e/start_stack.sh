@@ -89,7 +89,7 @@ stack_down() {
   fi
   rm -f "${STACK_PID_FILES[@]}" "$LOG_DIR/owui.id"
   # Local sandboxes only (e2e-local/run.sh sets it): release the shared, read-only OpenClaw install this stack mounted. CI leaves it unset.
-  if [[ -n "${E2E_NPM_INSTALLER:-}" ]]; then "$E2E_NPM_INSTALLER" detach "$(npm prefix --global)" || true; fi
+  if [[ -n "${E2E_NPM_INSTALLER:-}" ]] && npm_prefix=$(npm prefix --global) && [[ -n "$npm_prefix" ]]; then "$E2E_NPM_INSTALLER" detach "$npm_prefix" || true; fi
   echo "stack down (${#pids[@]} processes stopped)"
 }
 
@@ -158,10 +158,13 @@ wait_for "fake model" 30 curl -fsS "http://127.0.0.1:$FAKE_LLM_PORT/health"
 echo "::endgroup::"
 
 echo "::group::OpenClaw Gateway (openclaw@$OPENCLAW_VERSION)"
-# E2E_NPM_INSTALLER (set only by a local sandbox runner, never by CI) installs openclaw once per version and mounts it read-only into every stack instead of
-# one ~950 MB npm install per stack; it takes the same arguments `npm install --global openclaw@<spec>` would. Unset, this is the plain npm install.
+# E2E_NPM_INSTALLER (set only by a local sandbox runner, never by CI) is an executable that replaces the npm install below: it is run as
+# `$E2E_NPM_INSTALLER install <npm spec> <npm global prefix>` and must leave openclaw runnable from <prefix>/bin (a shared, read-only install instead of one ~950 MB
+# npm install per stack); stack_down runs `$E2E_NPM_INSTALLER detach <npm global prefix>`. Unset, this is the plain npm install.
 if [[ -n "${E2E_NPM_INSTALLER:-}" ]]; then
-  "$E2E_NPM_INSTALLER" install "$OPENCLAW_VERSION" "$(npm prefix --global)" >"$LOG_DIR/npm-install.log" 2>&1 \
+  npm_prefix=$(npm prefix --global) && [[ -n "$npm_prefix" ]] \
+    || { echo "::error::npm prefix --global failed or printed nothing; not installing openclaw into an unknown path"; exit 1; }
+  "$E2E_NPM_INSTALLER" install "$OPENCLAW_VERSION" "$npm_prefix" >"$LOG_DIR/npm-install.log" 2>&1 \
     || { cat "$LOG_DIR/npm-install.log"; exit 1; }
 else
   npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DIR/npm-install.log" 2>&1 \
