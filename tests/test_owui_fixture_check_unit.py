@@ -86,11 +86,12 @@ class FrontendCopies(unittest.TestCase):
         self.assertEqual(self.m.copies_to_check("v0.15.0", "next"), [self.pinned])
 
     def test_the_vendored_copies_today(self):
-        """The pinned copy (0.12.4's reducer, the same through 0.13.0) plus 0.13.1's, whose only change is
-        three optional OutputItem fields."""
+        """The pinned copy (0.12.4's reducer, the same through 0.13.0), 0.13.1's, whose only change is
+        three optional OutputItem fields, and 0.13.2's for CI's next lane (the same as 0.13.1's)."""
         _load("check_owui_frontend_fixture")
         self.assertEqual([p.name for p in sys.modules["check_owui_frontend_fixture"].FIXTURES],
-                         ["test_fixture_owui_structured_output.ts", "test_fixture_owui_structured_output_v0.13.1.ts"])
+                         ["test_fixture_owui_structured_output.ts", "test_fixture_owui_structured_output_v0.13.1.ts",
+                          "test_fixture_owui_structured_output_v0.13.2.ts"])
 
 
 if __name__ == "__main__":
