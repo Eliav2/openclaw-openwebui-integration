@@ -141,6 +141,20 @@ The Gateway refuses an image over its size cap (6 MB on OpenClaw today, read fro
 
 Always on.
 
+## Files and knowledge you attach
+
+Open WebUI sends a chat's files again with every message: a document, a knowledge collection, or a chat you quoted. It retrieves text from them and puts that text before the message you typed. A model that keeps no history pays for it once per message. The agent's session keeps every message, so the same text would pile up in it, once per turn.
+
+The Pipe therefore sends each piece of retrieved text once per session. The first message carries it in full, in Open WebUI's own format with the citation numbers the chat shows. Later messages keep the `<source>` tag of each piece the session already has, so its citation number still holds, but leave out its text and name its files in one line instead. The rest of Open WebUI's template still goes with every message. A piece the agent has not seen yet, such as a new part of a document that a new question retrieves, or a file that changed, still goes in full.
+
+A new session starts the record afresh: `/new`, `/reset`, a deleted session, or a compaction the Gateway counts (`compactionCount`). A Gateway command such as `/status` goes as typed, with no file text before it.
+
+Known limit: claude-cli compacts a long session on its own, and the Gateway does not count that as a compaction. After such a compaction the agent may no longer hold a file's text while the Pipe still leaves it out. Send `/new` to have it sent again.
+
+Open WebUI 0.13.1 and later put a chat's file text into the message only for models with the **File Context** capability on. For any other chat from the browser, they offer file tools instead, and the agent can't run those tools. A Pipe model can't declare a capability itself. Turn it on for every model with `DEFAULT_MODEL_METADATA='{"capabilities":{"file_context":true}}'` in Open WebUI's environment, or per model under Admin Settings → Models. Without it, the agent never sees the files you attach.
+
+Always on.
+
 ## Voice calls
 
 When you talk to the agent in Open WebUI's voice mode, Open WebUI marks each spoken message as part of a voice call. The Pipe puts one short note before it that tells the agent the reply will be read aloud: answer in your language, in a few short spoken sentences, with no markdown, lists, tables, code, links or emoji, and with numbers and times said the way you would say them. A message you type in the same chat carries nothing, so the agent goes back to normal answers.

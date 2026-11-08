@@ -117,6 +117,7 @@ SHARDS = {
         f"{E2E}::test_a_pipe_model_next_to_another_provider_keeps_the_chats_session",
         f"{E2E}::test_two_pipe_models_side_by_side_run_at_the_same_time",
         f"{E2E}::test_a_spoken_message_reaches_the_agent_with_the_voice_note_and_a_typed_one_does_not",
+        f"{E2E}::test_a_chat_file_reaches_the_agent_once_over_three_turns",
     ],
     # Open WebUI stopped and redeployed mid-reply, then the queue flows.
     "3": [

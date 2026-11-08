@@ -69,7 +69,7 @@ PIPE = Artifact(
     out=ROOT / "openclaw_pipe.py",
     module_order=("_prelude", "identity", "state", "turns", "thinking", "media", "images", "emit",
                   "composer", "composer_watch", "askuser", "approvals", "gateway", "errors", "writer", "models",
-                  "history", "slash_prompts", "channels", "pipe"),
+                  "history", "filecontext", "slash_prompts", "channels", "pipe"),
 )
 
 # The status Action reuses the Pipe's connection/identity/formatting
