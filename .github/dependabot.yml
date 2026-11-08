@@ -18,6 +18,10 @@ updates:
       - dependency-name: pydantic
       - dependency-name: cryptography
       - dependency-name: websockets
+      # Unit tests run on Python 3.10, the floor install.py declares
+      # (ci.yml); Pillow 13 needs 3.11, so its floor stays below 13.
+      - dependency-name: pillow
+        versions: [">=13"]
     groups:
       test-tooling:
         patterns: ["*"]
