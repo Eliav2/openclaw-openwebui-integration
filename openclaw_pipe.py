@@ -5827,6 +5827,13 @@ class _GatewayConnection:
         self._session_change_waiters: dict[str, asyncio.Event] = {}
         self._session_message_waiters: dict[str, asyncio.Event] = {}
         self._session_child_waiters: dict[str, asyncio.Event] = {}
+        # Each run's assistant messages as `session.message` pushes them (ELI-381):
+        # its usage line and images come from these, not a `chat.history` read.
+        # Pushes can be lost in a socket gap, and a rewrite comes with no
+        # message: the counts tell a reader its run's messages may be incomplete.
+        self._run_messages: dict[tuple, list] = {}
+        self.message_gaps = 0
+        self.message_rewrites: dict[str, int] = {}
         # The Gateway's `cron` event (a job added, changed, removed, started
         # or finished), or a socket gap: the waiter, and a count readers keep
         # to tell a cached job list is old.
@@ -5999,6 +6006,7 @@ class _GatewayConnection:
                 ev.set()
         if session_key is None:
             # A gap or a fresh subscription: an append may be among the lost.
+            self.message_gaps += 1
             for key in list(self._session_message_waiters):
                 self._session_message_waiters.pop(key).set()
             for key in list(self._session_child_waiters):
@@ -6061,6 +6069,28 @@ class _GatewayConnection:
             if await within(changed.wait()) is bound:
                 return got, False
 
+    def _note_run_message(self, key: str, payload: dict) -> None:
+        """Keep a pushed assistant message under each run it belongs to."""
+        message = payload.get("message")
+        if not key or not isinstance(message, dict) or message.get("role") != _ASSISTANT_ROLE:
+            return
+        for run_id in _transcript_run_ids(message) | ({payload["runId"]} if payload.get("runId") else set()):
+            self._run_messages.setdefault((key, run_id), []).append(message)
+        while len(self._run_messages) > _RUN_MESSAGES_KEPT:
+            self._run_messages.pop(next(iter(self._run_messages)))
+
+    def run_transcript(self, session_key: str, run_id: str) -> dict:
+        """The run's pushed assistant messages, shaped like `chat.history`."""
+        return {"messages": list(self._run_messages.get((session_key, run_id), ()))}
+
+    def forget_run_transcript(self, session_key: str, run_id: str) -> None:
+        self._run_messages.pop((session_key, run_id), None)
+
+    def transcript_mark(self, session_key: str) -> tuple:
+        """Compare marks taken before and after a run: a difference means a
+        push may be missing from its messages (a socket gap or a rewrite)."""
+        return self.message_gaps, self.message_rewrites.get(session_key, 0)
+
     def _note_run_failed(self, payload: dict) -> None:
         """Record an aborted or failed run (no answer is stored) and wake its
         transcript waiters (`_await_steered_answer`)."""
@@ -6078,6 +6108,7 @@ class _GatewayConnection:
 
     def _on_session_message(self, payload: dict) -> None:
         key = payload.get("sessionKey") or ""
+        self._note_run_message(key, payload)
         self._wake_message_waiter(key)
         if key and isinstance(payload.get("message"), dict):
             self._on_user_message_committed(key, payload["message"])
@@ -6104,6 +6135,7 @@ class _GatewayConnection:
                 self.row_to_consumers(key, payload)
         if key and payload.get("phase") == "message":
             # A rewrite, not an append: no `session.message` follows.
+            self.message_rewrites[key] = self.message_rewrites.get(key, 0) + 1
             self._wake_message_waiter(key)
         parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
         if parent and parent != key:
@@ -7531,6 +7563,29 @@ def _idempotency_keys(message) -> tuple[str, str]:
         return "", ""
     meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
     return str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or "")
+
+
+# Runs whose pushed messages a connection keeps; the oldest go first. A reply
+# reads its own run's when the run ends, long before this many more start.
+_RUN_MESSAGES_KEPT = 200
+_ASSISTANT_ROLE = "assistant"
+_CLI_ASSISTANT_KEY_PREFIX = "cli-assistant:"
+_ASSISTANT_MEDIA_KEY_PART = ":assistant-media"
+
+
+def _transcript_run_ids(message: dict) -> set[str]:
+    """The runs a stored message belongs to: its `runId`, a CLI reply's
+    `cli-assistant:<run>` key, or the media message's `<run>:assistant-media[:n]`
+    key (which has no `runId`, 2026.10.10)."""
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    ids = {str(meta.get("runId") or ""), str(message.get("runId") or "")}
+    for key in _idempotency_keys(message):
+        if key.startswith(_CLI_ASSISTANT_KEY_PREFIX):
+            ids.add(key[len(_CLI_ASSISTANT_KEY_PREFIX):])
+        elif _ASSISTANT_MEDIA_KEY_PART in key:
+            ids.add(key.split(_ASSISTANT_MEDIA_KEY_PART, 1)[0])
+    ids.discard("")
+    return ids
 
 
 def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]:
@@ -14655,6 +14710,9 @@ class _PipeTurn:
 
         # Tool cards for this session's runs whoever started them (`ensure_message_subscription`).
         await self.conn.ensure_message_subscription(self.session_key)
+        # The run's messages come pushed from here on (ELI-381); a later mark that
+        # differs means a push may be missing (`run_end_messages`).
+        self.transcript_start = self.conn.transcript_mark(self.session_key)
 
     async def admit(self):
         """The run this reply streams: a duplicate Open WebUI call's (ELI-82), a
@@ -14947,6 +15005,9 @@ class _PipeTurn:
         # An idle row read after admission means the run is over; one read
         # before may show the previous run's settle.
         self.admitted_at = float("-inf") if self.adopted_run_id else time.monotonic()
+        if self.adopted_run_id:
+            # Its first messages may have been pushed before this reply subscribed.
+            self.transcript_start = None
         # After a gap the run's own final may be lost, so another settle may be the first sign.
         self.signals_lost = False
         if self.adopted_run_id and self.adopted_queue is not None:
@@ -15187,6 +15248,7 @@ class _PipeTurn:
                         self.conn.mark_delivered_live(self.session_key, self.our_run_id)
                         self.conn.unregister_run_target(self.session_key, self.our_run_id)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                    self.conn.forget_run_transcript(self.session_key, self.our_run_id)
                     self.turn.run_id = None
                     self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
@@ -15471,10 +15533,16 @@ class _PipeTurn:
             self.text_yielded = True
             self.pending_media_text = ""
 
-    async def run_end_history(self, fresh: bool = False) -> dict:
-        """The session's `chat.history` once the run ended, read once for
-        the run's images and its usage line (`fresh`: read again)."""
+    async def run_end_messages(self, fresh: bool = False) -> dict:
+        """The run's stored assistant messages, for its images and its usage
+        line: as the Gateway pushed them (ELI-381), or, when a push may be
+        missing, the session's `chat.history`, read once (`fresh`: again)."""
+        if getattr(self, "transcript_start", None) == self.conn.transcript_mark(self.session_key):
+            return self.conn.run_transcript(self.session_key, self.our_run_id)
         if self.end_history is None or fresh:
+            if self.end_history is None:
+                pipe_log("  run messages: a push may be missing (socket gap, rewrite or a run "
+                         "taken over); reading chat.history")
             # As long as the usage line's other reads (`_build_usage_status_lines`).
             self.end_history = await self.conn.session_history(
                 self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
@@ -15498,7 +15566,7 @@ class _PipeTurn:
                     [e for e in _history_media_errors_for_run(hist, self.our_run_id)
                      if os.path.basename(e) in names])
         async def read(fresh):
-            return stored(await self.run_end_history(fresh=fresh))
+            return stored(await self.run_end_messages(fresh=fresh))
         try:
             (blocks, errors), complete = await self.conn.read_until_stored(
                 self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
@@ -15851,7 +15919,7 @@ class _PipeTurn:
         if self.run_usage or not self.our_run_id:
             return self.run_usage
         try:
-            hist = await self.run_end_history()
+            hist = await self.run_end_messages()
         except Exception as ex:
             pipe_log(f"  usage line: chat.history failed: {ex!r}")
             return None
