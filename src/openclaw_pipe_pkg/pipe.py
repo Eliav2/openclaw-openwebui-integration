@@ -1120,6 +1120,11 @@ class _PipeTurn:
 
         # Tool cards for this session's runs whoever started them (`ensure_message_subscription`).
         await self.conn.ensure_message_subscription(self.session_key)
+        # The run's messages come pushed from here on (ELI-381); a later mark that
+        # differs means a push may be missing (`run_end_messages`). A failed
+        # subscription gets none: no mark, so the reply reads `chat.history`.
+        self.transcript_start = (self.conn.transcript_mark(self.session_key)
+                                 if self.conn.subscribed_to_messages(self.session_key) else None)
 
     async def admit(self):
         """The run this reply streams: a duplicate Open WebUI call's (ELI-82), a
@@ -1412,6 +1417,9 @@ class _PipeTurn:
         # An idle row read after admission means the run is over; one read
         # before may show the previous run's settle.
         self.admitted_at = float("-inf") if self.adopted_run_id else time.monotonic()
+        if self.adopted_run_id:
+            # Its first messages may have been pushed before this reply subscribed.
+            self.transcript_start = None
         # After a gap the run's own final may be lost, so another settle may be the first sign.
         self.signals_lost = False
         if self.adopted_run_id and self.adopted_queue is not None:
@@ -1652,6 +1660,8 @@ class _PipeTurn:
                         self.conn.mark_delivered_live(self.session_key, self.our_run_id)
                         self.conn.unregister_run_target(self.session_key, self.our_run_id)
                     self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                    # Kept while a steered-in message's reply continues the run.
+                    self.conn.forget_run_transcript(self.session_key, self.our_run_id)
                     self.turn.run_id = None
                     self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
@@ -1936,10 +1946,16 @@ class _PipeTurn:
             self.text_yielded = True
             self.pending_media_text = ""
 
-    async def run_end_history(self, fresh: bool = False) -> dict:
-        """The session's `chat.history` once the run ended, read once for
-        the run's images and its usage line (`fresh`: read again)."""
+    async def run_end_messages(self, fresh: bool = False) -> dict:
+        """The run's stored assistant messages, for its images and its usage
+        line: as the Gateway pushed them (ELI-381), or, when a push may be
+        missing, the session's `chat.history`, read once (`fresh`: again)."""
+        if getattr(self, "transcript_start", None) == self.conn.transcript_mark(self.session_key):
+            return self.conn.run_transcript(self.session_key, self.our_run_id)
         if self.end_history is None or fresh:
+            if self.end_history is None:
+                pipe_log("  run messages: a push may be missing (socket gap, rewrite or a run "
+                         "taken over); reading chat.history")
             # As long as the usage line's other reads (`_build_usage_status_lines`).
             self.end_history = await self.conn.session_history(
                 self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
@@ -1963,7 +1979,7 @@ class _PipeTurn:
                     [e for e in _history_media_errors_for_run(hist, self.our_run_id)
                      if os.path.basename(e) in names])
         async def read(fresh):
-            return stored(await self.run_end_history(fresh=fresh))
+            return stored(await self.run_end_messages(fresh=fresh))
         try:
             (blocks, errors), complete = await self.conn.read_until_stored(
                 self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
@@ -2316,7 +2332,7 @@ class _PipeTurn:
         if self.run_usage or not self.our_run_id:
             return self.run_usage
         try:
-            hist = await self.run_end_history()
+            hist = await self.run_end_messages()
         except Exception as ex:
             pipe_log(f"  usage line: chat.history failed: {ex!r}")
             return None

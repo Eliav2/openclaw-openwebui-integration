@@ -1589,6 +1589,13 @@ class _GatewayConnection:
         self._session_change_waiters: dict[str, asyncio.Event] = {}
         self._session_message_waiters: dict[str, asyncio.Event] = {}
         self._session_child_waiters: dict[str, asyncio.Event] = {}
+        # Each run's assistant messages as `session.message` pushes them (ELI-381):
+        # its usage line and images come from these, not a `chat.history` read.
+        # Pushes can be lost in a socket gap, and a rewrite comes with no
+        # message: the counts tell a reader its run's messages may be incomplete.
+        self._run_messages: dict[tuple, list] = {}
+        self.message_gaps = 0
+        self.message_rewrites: dict[str, int] = {}
         # The Gateway's `cron` event (a job added, changed, removed, started
         # or finished), or a socket gap: the waiter, and a count readers keep
         # to tell a cached job list is old.
@@ -1761,6 +1768,7 @@ class _GatewayConnection:
                 ev.set()
         if session_key is None:
             # A gap or a fresh subscription: an append may be among the lost.
+            self.message_gaps += 1
             for key in list(self._session_message_waiters):
                 self._session_message_waiters.pop(key).set()
             for key in list(self._session_child_waiters):
@@ -1823,6 +1831,47 @@ class _GatewayConnection:
             if await within(changed.wait()) is bound:
                 return got, False
 
+    def _note_run_message(self, key: str, payload: dict) -> None:
+        """Keep a pushed assistant message's digest under each run it belongs to,
+        for a run a reply follows only: one nobody reads (a wake's, say) is not kept.
+        A reply's consumer is registered before its run starts."""
+        message = payload.get("message")
+        if not key or not isinstance(message, dict) or message.get("role") != _ASSISTANT_ROLE:
+            return
+        digest = _run_message_digest(message)
+        for run_id in _transcript_run_ids(message) | ({payload["runId"]} if payload.get("runId") else set()):
+            if self._reply_follows(key, run_id):
+                self._run_messages.setdefault((key, run_id), []).append(digest)
+
+    def _reply_follows(self, session_key: str, run_id: str) -> bool:
+        """A reply streams the run, or continues it (a message steered into it)."""
+        return any(c.session_key == session_key and (c.run_id == run_id or (c.steered and c.steered_into == run_id))
+                   for c in self._consumers.values())
+
+    def _drop_unfollowed_runs(self, session_key: str) -> None:
+        """The session went idle: drop what no reply reads any more (a reply
+        parked and never claimed, say)."""
+        for key in [k for k in self._run_messages if k[0] == session_key and not self._reply_follows(*k)]:
+            del self._run_messages[key]
+
+    def subscribed_to_messages(self, session_key: str) -> bool:
+        """Whether this connection gets the session's `session.message` pushes."""
+        return session_key in self._message_subscriptions
+
+    def run_transcript(self, session_key: str, run_id: str) -> dict:
+        """The run's pushed assistant messages, shaped like `chat.history`."""
+        return {"messages": list(self._run_messages.get((session_key, run_id), ()))}
+
+    def forget_run_transcript(self, session_key: str, run_id: str) -> None:
+        """A reply ended: drop its run's messages unless another reply continues the run."""
+        if not self._reply_follows(session_key, run_id):
+            self._run_messages.pop((session_key, run_id), None)
+
+    def transcript_mark(self, session_key: str) -> tuple:
+        """Compare marks taken before and after a run: a difference means a
+        push may be missing from its messages (a socket gap or a rewrite)."""
+        return self.message_gaps, self.message_rewrites.get(session_key, 0)
+
     def _note_run_failed(self, payload: dict) -> None:
         """Record an aborted or failed run (no answer is stored) and wake its
         transcript waiters (`_await_steered_answer`)."""
@@ -1840,6 +1889,7 @@ class _GatewayConnection:
 
     def _on_session_message(self, payload: dict) -> None:
         key = payload.get("sessionKey") or ""
+        self._note_run_message(key, payload)
         self._wake_message_waiter(key)
         if key and isinstance(payload.get("message"), dict):
             self._on_user_message_committed(key, payload["message"])
@@ -1864,8 +1914,11 @@ class _GatewayConnection:
             self._wake_session_waiters(key)
             if "hasActiveRun" in payload:
                 self.row_to_consumers(key, payload)
+            if payload.get("hasActiveRun") is False:
+                self._drop_unfollowed_runs(key)
         if key and payload.get("phase") == "message":
             # A rewrite, not an append: no `session.message` follows.
+            self.message_rewrites[key] = self.message_rewrites.get(key, 0) + 1
             self._wake_message_waiter(key)
         parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
         if parent and parent != key:
@@ -2899,6 +2952,8 @@ class _GatewayConnection:
             except Exception:
                 pass
             self._ws = None
+        # No reply reads this connection's run messages any more.
+        self._run_messages.clear()
         # A follow waiting on this connection reads again, through a live one.
         self._on_cron_changed()
 
@@ -3293,6 +3348,42 @@ def _idempotency_keys(message) -> tuple[str, str]:
         return "", ""
     meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
     return str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or "")
+
+
+_ASSISTANT_ROLE = "assistant"
+# What a reply reads from its run's messages: the usage, image and
+# attachment_error blocks (ELI-322, ELI-328), and the keys that name the run.
+_DIGEST_BLOCK_TYPES = ("image", "attachment_error")
+_DIGEST_FIELDS = ("role", "usage", "runId", "idempotencyKey")
+_DIGEST_META_FIELDS = ("runId", "idempotencyKey")
+
+
+def _run_message_digest(message: dict) -> dict:
+    """The part of a stored message a reply reads, not its text or tool calls."""
+    digest = {k: message[k] for k in _DIGEST_FIELDS if k in message}
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    digest["__openclaw"] = {k: meta[k] for k in _DIGEST_META_FIELDS if k in meta}
+    content = message.get("content")
+    digest["content"] = [b for b in content if isinstance(b, dict) and b.get("type") in _DIGEST_BLOCK_TYPES] \
+        if isinstance(content, list) else []
+    return digest
+_CLI_ASSISTANT_KEY_PREFIX = "cli-assistant:"
+_ASSISTANT_MEDIA_KEY_PART = ":assistant-media"
+
+
+def _transcript_run_ids(message: dict) -> set[str]:
+    """The runs a stored message belongs to: its `runId`, a CLI reply's
+    `cli-assistant:<run>` key, or the media message's `<run>:assistant-media[:n]`
+    key (which has no `runId`, 2026.10.10)."""
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    ids = {str(meta.get("runId") or ""), str(message.get("runId") or "")}
+    for key in _idempotency_keys(message):
+        if key.startswith(_CLI_ASSISTANT_KEY_PREFIX):
+            ids.add(key[len(_CLI_ASSISTANT_KEY_PREFIX):])
+        elif _ASSISTANT_MEDIA_KEY_PART in key:
+            ids.add(key.split(_ASSISTANT_MEDIA_KEY_PART, 1)[0])
+    ids.discard("")
+    return ids
 
 
 def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]:

@@ -1732,6 +1732,29 @@ class MarkStoppedTests(unittest.IsolatedAsyncioTestCase):
 class _TurnCase(unittest.IsolatedAsyncioTestCase):
     """A Pipe turn against a fake Gateway connection: the shared setup and stream helpers."""
 
+    def _run_message(self, message, session_key=None):
+        """The Gateway's `session.message` push of a stored message (ELI-381). A
+        reply's consumer registers before its run starts, so a push held here
+        lands once one does, as the run's own pushes come after its start."""
+        payload = {"sessionKey": session_key or self.SK, "message": message}
+        runs = self.ocp._transcript_run_ids(message)
+        if any(self.conn._reply_follows(payload["sessionKey"], r) for r in runs):
+            self.conn._on_session_message(payload)
+            return
+        if not hasattr(self, "_held_pushes"):
+            self._held_pushes = []
+            register = self.conn.register_consumer
+
+            def register_then_push(session_key, run_id):
+                q = register(session_key, run_id)
+                for held in [h for h in self._held_pushes if h["sessionKey"] == session_key]:
+                    if run_id in self.ocp._transcript_run_ids(held["message"]):
+                        self._held_pushes.remove(held)
+                        self.conn._on_session_message(held)
+                return q
+            self.conn.register_consumer = register_then_push
+        self._held_pushes.append(payload)
+
     async def asyncSetUp(self):
         import openclaw_pipe as ocp
         self.ocp = ocp
@@ -2071,8 +2094,9 @@ class NoDroppedMessagesTests(_TurnCase):
         self.assertTrue(closed, "the retired connection closes once the queued message is served")
 
     async def test_a_reply_on_a_retired_connection_reads_its_usage_before_the_close(self):
-        """ELI-102 (#157): a reply on a retired connection reads its usage before the socket
-        closes, or its end waits out the timeout and done:true never lands."""
+        """ELI-102 (#157): a reply on a retired connection gets its usage before the socket
+        closes, or its end waits out the timeout and done:true never lands. Since ELI-381
+        the usage is the run's pushed message: no request at all."""
         closed = []
         closed_event = asyncio.Event()
         hung = []
@@ -2090,9 +2114,10 @@ class NoDroppedMessagesTests(_TurnCase):
             return await send_request(method, params, timeout=timeout)
         self.conn.disconnect = disconnect
         self.conn.send_request = closing_send_request
-        self.history = {"messages": [{"role": "assistant", "content": "hi",
-                                      "usage": {"input": 10, "output": 5},
-                                      "__openclaw": {"runId": "run-1"}}]}
+        # The run's stored message, as the Gateway pushes it (ELI-381).
+        self._run_message({
+            "role": "assistant", "content": "hi", "usage": {"input": 10, "output": 5},
+            "__openclaw": {"runId": "run-1"}})
 
         gen = self._reply("hello", "m1")
         first = asyncio.ensure_future(gen.__anext__())
@@ -2114,7 +2139,7 @@ class NoDroppedMessagesTests(_TurnCase):
         # The close is a background task the dropped consumer starts.
         await asyncio.wait_for(closed_event.wait(), 2)
         self.assertEqual(hung, [], "a request sent after the close")
-        self.assertIn("chat.history", self.rpc, "the reply's usage was read before the close")
+        self.assertNotIn("chat.history", self.rpc, "the usage comes from the run's pushed message")
         usage = self.ocp._build_usage_status_lines.await_args.kwargs.get("run_usage")
         self.assertEqual(usage, {"input": 10, "output": 5})
 
@@ -3484,11 +3509,14 @@ class GatewayImageBlockTests(_TurnCase):
         "mimeType": "image/png", "width": 1254, "height": 1254, "sizeBytes": 2064532,
     }
 
-    def _stored(self, run_id, *blocks):
-        self.history = {"messages": [
-            {"role": "user", "content": "draw a cactus"},
-            {"role": "assistant", "content": [{"type": "text", "text": "Here it is."}, *blocks],
-             "__openclaw": {"runId": run_id, "runTerminal": True}}]}
+    def _stored(self, run_id, *blocks, push=True):
+        """The run's stored message, in `chat.history` and (`push`) as the
+        Gateway pushes it (`session.message`, ELI-381)."""
+        message = {"role": "assistant", "content": [{"type": "text", "text": "Here it is."}, *blocks],
+                   "__openclaw": {"runId": run_id, "runTerminal": True}}
+        self.history = {"messages": [{"role": "user", "content": "draw a cactus"}, message]}
+        if push:
+            self._run_message(message)
 
     def _lifecycle_end(self, run_id):
         return {"type": "event", "event": "agent", "payload": {
@@ -3540,46 +3568,55 @@ class GatewayImageBlockTests(_TurnCase):
         self.assertIn(f"![{fname}](/api/v1/files/f1/content)", out)
         self.assertIn({"type": "files", "data": {"files": [
             {"id": "f1", "meta": {"content_type": "image/png"}}]}}, self.emitted)
-        self.assertEqual(self.rpc.count("chat.history"), 1,
-                         "one read serves the images and the usage line")
+        self.assertEqual(self.rpc.count("chat.history"), 0,
+                         "the images and the usage line come from the run's pushed message")
 
     def _image_made(self, run_id):
         return {"type": "event", "event": "agent", "payload": {
             "sessionKey": self.SK, "runId": run_id, "stream": "codex_app_server.item",
             "data": {"phase": "completed", "itemId": "exec-1", "type": "imageGeneration"}}}
 
-    def _attached_late(self, reads_before, appended=False):
-        """The Gateway stores the image block after the final (after the `reads_before`-th read):
-        in the run's message with a `sessions.changed` phase `message` push (2026.10.5+), or with
-        `appended` (2026.10.10) as a `<run>:assistant-media:1` message and a `session.message`
-        push."""
+    def _attached_late(self, attach_after=None, appended=True):
+        """The Gateway stores the image block after the final, once the reply
+        waits for it (`attach_after` s after the first look; None: never): with
+        `appended` (2026.10.10) as a `<run>:assistant-media:1` message and its
+        `session.message` push, else in the run's own message with only a
+        `sessions.changed` phase `message` push (2026.10.5+). Returns the
+        `chat.history` reads."""
         reads = []
         send_request = self.conn.send_request
         self._stored("run-1")
 
         def attach():
             if appended:
-                self._stored("run-1")
-                self.history["messages"].append({
-                    "role": "assistant", "content": [self.BLOCK], "model": "gateway-injected",
-                    "__openclaw": {"idempotencyKey": "run-1:assistant-media:1"}})
-                self.conn._on_session_message({"sessionKey": self.SK})
+                media = {"role": "assistant", "content": [self.BLOCK], "model": "gateway-injected",
+                         "__openclaw": {"idempotencyKey": "run-1:assistant-media:1"}}
+                self.history["messages"].append(media)
+                self._run_message(media)
                 return
-            self._stored("run-1", self.BLOCK)
+            self._stored("run-1", self.BLOCK, push=False)
             self.conn._on_sessions_changed({"sessionKey": self.SK, "phase": "message", "ts": 1})
 
-        async def late(method, params, timeout=10):
+        looked = []
+        run_transcript = self.conn.run_transcript
+
+        def first_look(session_key, run_id):
+            if not looked and attach_after is not None:
+                asyncio.get_running_loop().call_later(attach_after, attach)
+            looked.append(1)
+            return run_transcript(session_key, run_id)
+        self.conn.run_transcript = first_look
+
+        async def counted(method, params, timeout=10):
             if method == "chat.history":
                 reads.append(1)
-                if len(reads) == reads_before:
-                    asyncio.get_running_loop().call_soon(attach)
             return await send_request(method, params, timeout=timeout)
-        self.conn.send_request = late
+        self.conn.send_request = counted
         return reads
 
     async def test_an_image_the_run_made_is_read_once_it_is_attached(self):
         self._media_dir()
-        reads = self._attached_late(2)
+        reads = self._attached_late(0.05)
         gen = self._reply("draw a cactus", "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
@@ -3593,11 +3630,11 @@ class GatewayImageBlockTests(_TurnCase):
                                return_value={"id": "f1", "meta": {"content_type": "image/png"}}):
             out, _ = await self._collect(first, gen)
         fetch.assert_called_once()
-        self.assertEqual(len(reads), 3)
+        self.assertEqual(len(reads), 0, "the append's push wakes the wait and carries the image")
         self.assertIn("](/api/v1/files/f1/content)", out)
 
     async def test_an_image_never_attached_ends_the_reply_after_the_wait(self):
-        reads = self._attached_late(10 ** 6)
+        reads = self._attached_late(None)
         gen = self._reply("draw a cactus", "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
@@ -3608,13 +3645,15 @@ class GatewayImageBlockTests(_TurnCase):
         with mock.patch.object(self.ocp, "_RUN_IMAGES_MAX_WAIT_S", 0.1, create=True):
             out, _ = await self._collect(first, gen)
         self.assertEqual(out, "Here it is.")
-        self.assertEqual(len(reads), 2, "no push, no read: the transcript is not polled")
+        self.assertEqual(len(reads), 0, "no push, no read: the transcript is not polled")
 
-    async def test_a_run_that_made_no_image_reads_the_transcript_once(self):
-        reads = self._attached_late(10 ** 6)
+    async def test_a_run_that_made_no_image_reads_no_transcript(self):
+        """ELI-381: `chat.history` takes seconds on a big chat; the run's
+        messages came pushed."""
+        reads = self._attached_late(None)
         out, _ = await self._turn("Here it is.")
         self.assertEqual(out, "Here it is.")
-        self.assertEqual(len(reads), 1)
+        self.assertEqual(len(reads), 0)
 
     async def test_another_runs_image_is_not_shown(self):
         self._stored("run-0", self.BLOCK)
@@ -3676,27 +3715,27 @@ class GatewayImageBlockTests(_TurnCase):
 
     async def test_a_path_in_media_urls_waits_for_its_stored_block(self):
         self._media_dir()
-        reads = self._attached_late(2)
+        reads = self._attached_late(0.05, appended=False)
         out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
         fetch.assert_called_once()
-        self.assertEqual(len(reads), 3, "read until the block is stored")
+        self.assertEqual(len(reads), 1, "a rewrite comes with no message: read once, after it")
         self.assertTrue(out.startswith("Here it is."))
         self.assertIn("](/api/v1/files/f1/content)", out)
         self.assertNotIn("MEDIA:", out)
 
     async def test_a_path_stored_in_a_message_the_gateway_appends_is_shown(self):
         self._media_dir()
-        reads = self._attached_late(2, appended=True)
+        reads = self._attached_late(0.05)
         out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
         fetch.assert_called_once()
-        self.assertEqual(len(reads), 3, "read again on the append's push")
+        self.assertEqual(len(reads), 0, "the append's push carries the block")
         self.assertIn("](/api/v1/files/f1/content)", out)
         self.assertNotIn("could not be loaded", out)
 
     async def test_a_path_directive_in_the_text_shows_the_stored_block_not_a_link(self):
         """The file server never had a path: its link was a broken image."""
         self._media_dir()
-        self._attached_late(1)
+        self._attached_late(0.05)
         out, fetch = await self._events(self._delta("run-1", f"Here it is.\nMEDIA:{self.PATH}\n"))
         fetch.assert_called_once()
         self.assertNotIn("MEDIA:", out)
@@ -3706,12 +3745,11 @@ class GatewayImageBlockTests(_TurnCase):
         self.assertIn("](/api/v1/files/f1/content)", out)
 
     async def test_a_path_the_gateway_could_not_store_is_named(self):
-        self.history = {"messages": [
-            {"role": "user", "content": "show the image"},
-            {"role": "assistant", "__openclaw": {"runId": "run-1"}, "content": [
+        self._run_message({
+            "role": "assistant", "__openclaw": {"runId": "run-1"}, "content": [
                 {"type": "text", "text": "Here it is."},
                 {"type": "attachment_error", "attachment": {
-                    "code": "file-not-found", "kind": "image", "label": "qa-media-probe-eli.png"}}]}]}
+                    "code": "file-not-found", "kind": "image", "label": "qa-media-probe-eli.png"}}]})
         out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
         fetch.assert_not_called()
         self.assertIn("an image could not be loaded: qa-media-probe-eli.png", out)
@@ -3730,6 +3768,143 @@ class GatewayImageBlockTests(_TurnCase):
         fetch.assert_not_called()
         self.assertIn("![file-1.png](/api/v1/files/f1/content)", out)
         self.assertEqual(out.count("!["), 1)
+
+
+class RunMessagesTests(_TurnCase):
+    """ELI-381: a reply's usage line comes from its run's messages as the Gateway
+    pushes them (`session.message`), not a `chat.history` read after every reply,
+    which takes seconds on a big chat; the read is left for when a push may be lost."""
+
+    SK = None
+    _collect = staticmethod(NoDroppedMessagesTests._collect)
+    USAGE = {"input": 10, "cacheRead": 2000, "output": 5}
+
+    def _push(self, message):
+        self._run_message(message)
+
+    async def _turn(self, during=None):
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        if during:
+            during()
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle", "data": {"phase": "end"}}})
+        q.put_nowait(self._final("run-1"))
+        out, _ = await self._collect(first, gen)
+        called = self.ocp._build_usage_status_lines.await_args
+        return out, called.kwargs.get("run_usage") if called else None
+
+    async def test_the_usage_line_takes_the_runs_pushed_usage(self):
+        self._push({"role": "assistant", "content": "hi", "usage": self.USAGE,
+                    "__openclaw": {"runId": "run-1"}})
+        self._push({"role": "assistant", "content": "other", "usage": {"input": 99},
+                    "__openclaw": {"runId": "run-0"}})
+        _, usage = await self._turn()
+        self.assertEqual(usage, self.USAGE)
+        self.assertNotIn("chat.history", self.rpc)
+
+    async def test_a_cli_reply_is_found_by_its_key(self):
+        self._push({"role": "assistant", "content": "hi", "usage": self.USAGE,
+                    "idempotencyKey": "cli-assistant:run-1"})
+        _, usage = await self._turn()
+        self.assertEqual(usage, self.USAGE)
+
+    async def test_after_a_socket_gap_the_usage_is_read_from_chat_history(self):
+        """The Gateway has no replay: a push sent in the gap is lost."""
+        self.history = {"messages": [{"role": "assistant", "content": "hi", "usage": self.USAGE,
+                                      "__openclaw": {"runId": "run-1"}}]}
+        _, usage = await self._turn(during=self.conn._wake_session_waiters)
+        self.assertEqual(usage, self.USAGE)
+        self.assertEqual(self.rpc.count("chat.history"), 1)
+
+    async def test_a_rewritten_message_is_read_from_chat_history(self):
+        """A rewrite comes as `sessions.changed` phase `message`, without the message."""
+        self.history = {"messages": [{"role": "assistant", "content": "hi", "usage": self.USAGE,
+                                      "__openclaw": {"runId": "run-1"}}]}
+        _, usage = await self._turn(during=lambda: self.conn._on_sessions_changed(
+            {"sessionKey": self.SK, "phase": "message", "ts": 1}))
+        self.assertEqual(usage, self.USAGE)
+        self.assertEqual(self.rpc.count("chat.history"), 1)
+
+    async def test_the_runs_messages_go_when_its_reply_ends(self):
+        self._push({"role": "assistant", "content": "hi", "usage": self.USAGE,
+                    "__openclaw": {"runId": "run-1"}})
+        await self._turn()
+        self.assertEqual(self.conn.run_transcript(self.SK, "run-1"), {"messages": []})
+
+    async def test_without_a_message_subscription_the_usage_is_read_from_chat_history(self):
+        """A failed subscribe gets no pushes for the run."""
+        self.history = {"messages": [{"role": "assistant", "content": "hi", "usage": self.USAGE,
+                                      "__openclaw": {"runId": "run-1"}}]}
+
+        async def refused(session_key):
+            pass
+        self.conn.ensure_message_subscription = refused
+        _, usage = await self._turn()
+        self.assertEqual(usage, self.USAGE)
+        self.assertEqual(self.rpc.count("chat.history"), 1)
+
+    def test_a_run_no_reply_follows_is_not_kept(self):
+        """A wake's run, say: nobody reads its messages."""
+        self.conn._on_session_message({"sessionKey": self.SK, "message": {
+            "role": "assistant", "usage": self.USAGE, "__openclaw": {"runId": "wake-1"}}})
+        self.assertEqual(self.conn._run_messages, {})
+
+    def test_an_idle_session_drops_what_no_reply_reads(self):
+        """A reply parked and never claimed, say, never forgets its run."""
+        q = self.conn.register_consumer(self.SK, "run-1")
+        self._push({"role": "assistant", "usage": self.USAGE, "__openclaw": {"runId": "run-1"}})
+        self.conn._consumers.pop(f"{self.SK}:run-1")
+        self.assertTrue(self.conn._run_messages)
+        self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "ts": 1})
+        self.assertEqual(self.conn._run_messages, {})
+        del q
+
+    async def test_a_closed_connection_drops_every_runs_messages(self):
+        """A retired connection closes once its replies end; nothing reads it after."""
+        self.conn.register_consumer(self.SK, "run-1")
+        self._push({"role": "assistant", "usage": self.USAGE, "__openclaw": {"runId": "run-1"}})
+        self.conn._ws = None
+        await self.conn.disconnect()
+        self.assertEqual(self.conn._run_messages, {})
+
+    async def test_a_reply_a_later_message_was_steered_into_keeps_the_runs_messages(self):
+        """That message's reply continues the run and reads them."""
+        def steered():
+            self._push({"role": "assistant", "content": [self._image()], "__openclaw": {"runId": "run-1"}})
+            # The steered message's reply takes a queue on the run (`_steer`).
+            continuing.append(self.conn.register_consumer(self.SK, "run-1"))
+            self._queue("run-1").put_nowait({"type": self.ocp._STEERED_MARKER_TYPE, "into": "run-1"})
+        continuing = []
+        await self._turn(during=steered)
+        self.assertEqual(len(self.conn.run_transcript(self.SK, "run-1")["messages"]), 1)
+        self.conn.unregister_consumer(self.SK, "run-1", queue=continuing[0])
+        self.conn.forget_run_transcript(self.SK, "run-1")
+        self.assertEqual(self.conn.run_transcript(self.SK, "run-1"), {"messages": []},
+                         "gone once the continuing reply ends")
+
+    def _image(self):
+        return {"type": "image", "url": "/api/chat/media/outgoing/x/full", "alt": "a.png"}
+
+    def test_a_kept_message_holds_only_what_a_reply_reads(self):
+        self.conn.register_consumer(self.SK, "run-1")
+        self._push({"role": "assistant", "usage": self.USAGE, "model": "m",
+                    "content": [{"type": "text", "text": "long text " * 1000},
+                                {"type": "toolCall", "arguments": {"x": 1}}, self._image()],
+                    "__openclaw": {"runId": "run-1", "seq": 4}})
+        self.assertEqual(self.conn.run_transcript(self.SK, "run-1")["messages"], [{
+            "role": "assistant", "usage": self.USAGE, "__openclaw": {"runId": "run-1"},
+            "content": [self._image()]}])
+
+    def test_a_message_names_its_runs(self):
+        ids = self.ocp._transcript_run_ids
+        self.assertEqual(ids({"__openclaw": {"runId": "r1"}}), {"r1"})
+        self.assertEqual(ids({"idempotencyKey": "cli-assistant:r2"}), {"r2"})
+        self.assertEqual(ids({"__openclaw": {"idempotencyKey": "r3:assistant-media:2"}}), {"r3"})
+        self.assertEqual(ids({"role": "assistant"}), set())
 
 
 class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
