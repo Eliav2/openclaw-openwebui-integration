@@ -23,7 +23,7 @@
 # code, and a user message never streams, so no reply gets clobbered.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "9"
+_COMPOSER_BUTTON_VERSION = "10"
 
 # Status Action id (install_action.py FUNCTION_ID) and the default Pipe id;
 # a Pipe under another id adds its own prefixes.
@@ -340,14 +340,20 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
   // {parent, after}: insert right after `after` inside `parent`, or at the end
   // of `parent` when `after` is null. null when no known anchor is on screen.
-  // The composer's button row: [left group: More, Integrations] [chip row,
-  // scrolls] [model, send].
+  // The composer's button row: [left group: More (+), and up to Open WebUI
+  // 0.13.0 Integrations] [chip row, scrolls] [model, send]. 0.13.1 moved
+  // Integrations into the + menu, so the row is found from the + button and
+  // known by its shape. A channel's composer keeps its + inside the row's
+  // flex-1 group: that is not a chat composer.
   function composerRow() {
-    const integ = document.getElementById('integration-menu-button');
+    const integ = document.getElementById('input-menu-button')
+      || document.getElementById('integration-menu-button');
     const form = integ ? integ.closest('form') : null;
     const row = integ ? integ.closest('div.justify-between') : null;
     if (!form || !row || !form.contains(row)) return null;
-    return { integ: integ, form: form, row: row, chips: row.querySelector(':scope > div.flex-1') };
+    const chips = row.querySelector(':scope > div.flex-1');
+    if (chips && chips.contains(integ)) return null;
+    return { integ: integ, form: form, row: row, chips: chips };
   }
 
   // The left group, which never scrolls: the row's child holding Integrations.

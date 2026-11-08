@@ -729,7 +729,7 @@ class El {
   set innerHTML(v) {}
 }
 const group = new El('div');
-const chips = { querySelectorAll: function () { return [group]; } };
+const chips = { querySelectorAll: function () { return [group]; }, contains: function () { return false; } };
 const row = { querySelector: function () { return chips; } };
 const form = { querySelectorAll: function () { return []; }, contains: function () { return true; } };
 const integ = { closest: function (sel) { return sel === 'form' ? form : row; } };
@@ -740,7 +740,7 @@ group.appendChild(old);
 globalThis.document = {
   body: { appendChild: function () {} },
   documentElement: { classList: { contains: function () { return false; } } },
-  getElementById: function (id) { return id === 'integration-menu-button' ? integ : null; },
+  getElementById: function (id) { return id === 'input-menu-button' ? integ : null; },
   querySelectorAll: function (sel) { return group.children.filter(function (e) { return '#' + e.id === sel; }); },
   createElement: function (t) { return new El(t); },
   addEventListener: function () {},
@@ -789,6 +789,7 @@ class El {
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
              this.parent = null; }
   get lastElementChild() { return this.children[this.children.length - 1] || null; }
+  contains(e) { for (; e; e = e.parent) if (e === this) return true; return false; }
   getBoundingClientRect() { return rects[this.rect || 'button']; }
   set innerHTML(v) {}
 }
@@ -809,7 +810,7 @@ function button() {
 globalThis.document = {
   body: { appendChild: function () {} },
   documentElement: { classList: { contains: function () { return false; } } },
-  getElementById: function (id) { return id === 'integration-menu-button' ? integ : id === BTN ? button() : null; },
+  getElementById: function (id) { return id === 'input-menu-button' ? integ : id === BTN ? button() : null; },
   querySelectorAll: function (sel) { const b = button(); return b && sel === '#' + BTN ? [b] : []; },
   createElement: function (t) { return new El(t); },
   addEventListener: function () {},
@@ -831,6 +832,94 @@ globalThis.fetch = function () { return Promise.reject(new Error('no fetch expec
   process.exit(0);
 })().catch(function (e) { console.log('ERR ' + e); process.exit(1); });
 """
+
+# The composer as each Open WebUI version draws it (argv[3]): "0.13.0" has
+# More (+) and Integrations in the left group, "0.13.2" only the + (Integrations
+# moved into its menu), "channel" is a channel's composer, whose + sits in the
+# row's flex-1 group. Prints where the Status button went.
+_NODE_ANCHOR_HARNESS = r"""
+const code = require('fs').readFileSync(process.argv[2], 'utf8');
+const layout = process.argv[3];
+globalThis.window = globalThis;
+window.innerWidth = 1280;
+window.addEventListener = function () {};
+window.removeEventListener = function () {};
+globalThis.location = { pathname: '/c/chat-1' };
+globalThis.localStorage = { getItem: function () { return 'tok'; } };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+class El {
+  constructor(tag, cls, parent) {
+    this.tagName = tag.toUpperCase(); this.cls = (cls || '').split(' ').filter(Boolean);
+    this.children = []; this.parent = null; this.dataset = {}; this.attrs = {}; this.id = '';
+    if (parent) parent.appendChild(this);
+  }
+  get parentElement() { return this.parent; }
+  matches(sel) {
+    const [tag, ...cls] = sel.split('.');
+    return (!tag || this.tagName === tag.toUpperCase()) && cls.every((c) => this.cls.includes(c));
+  }
+  closest(sel) { for (let e = this; e; e = e.parent) if (e.matches(sel)) return e; return null; }
+  contains(e) { for (; e; e = e.parent) if (e === this) return true; return false; }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  querySelectorAll(sel) {
+    const direct = sel.startsWith(':scope > ');
+    const want = direct ? sel.slice(9) : sel;
+    if (want === 'img[alt]') return [];
+    const out = [];
+    const walk = (e) => { for (const c of e.children) { if (c.matches(want)) out.push(c); if (!direct) walk(c); } };
+    walk(this);
+    return out;
+  }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  getAttribute(k) { return this.attrs[k]; }
+  addEventListener() {}
+  appendChild(c) { if (c.parent) c.remove(); c.parent = this; this.children.push(c); return c; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
+             this.parent = null; }
+  get lastElementChild() { return this.children[this.children.length - 1] || null; }
+  getBoundingClientRect() { return { left: 0, right: 10, width: 10 }; }
+  set innerHTML(v) {}
+}
+const root = new El('div');
+const form = new El('form', '', root);
+const row = new El('div', 'flex justify-between', form);
+let group = null;
+if (layout === 'channel') {
+  const left = new El('div', 'flex items-center flex-1 min-w-0', row);
+  new El('button', '', left).id = 'input-menu-button';
+} else {
+  const left = new El('div', 'ml-1 self-end flex items-center', row);
+  new El('button', '', left).id = 'input-menu-button';
+  if (layout === '0.13.0') new El('button', '', left).id = 'integration-menu-button';
+  group = new El('div', 'shrink-0', new El('div', 'flex-1', row));
+}
+const byId = (id) => {
+  let f = null;
+  const walk = (e) => { for (const c of e.children) { if (c.id === id) f = f || c; walk(c); } };
+  walk(root);
+  return f;
+};
+const BTN = 'openclaw-composer-status-button';
+globalThis.document = {
+  body: { appendChild: function () {} },
+  documentElement: { classList: { contains: function () { return false; } } },
+  getElementById: byId,
+  querySelectorAll: function (sel) { const b = byId(BTN); return b && sel === '#' + BTN ? [b] : []; },
+  createElement: function (t) { return new El(t); },
+  addEventListener: function () {},
+  removeEventListener: function () {},
+};
+globalThis.fetch = function () { return Promise.reject(new Error('no fetch expected')); };
+(async function () {
+  await new Function('return (async () => { ' + code + ' })()')();
+  window.__openclawComposerBtn.ensure();
+  const b = byId(BTN);
+  console.log(JSON.stringify({ placed: !b ? 'none' : b.parent === group ? 'chips' : 'elsewhere' }));
+  process.exit(0);
+})().catch(function (e) { console.log('ERR ' + e); process.exit(1); });
+"""
+
 
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class SnippetUnderNodeTests(unittest.TestCase):
@@ -873,6 +962,23 @@ class SnippetUnderNodeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout.strip().splitlines()[-1]),
                          {"before": "chips", "watched": True, "after": "left", "narrowAt": 375})
+
+    def _placed(self, layout):
+        snippet = self._write(_render_composer_button_js(chat_id="chat-1"), ".js")
+        harness = self._write(_NODE_ANCHOR_HARNESS, ".cjs")
+        proc = subprocess.run(["node", harness, snippet, layout], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])["placed"]
+
+    def test_the_button_finds_the_composer_of_open_webui_0_13_0(self):
+        self.assertEqual(self._placed("0.13.0"), "chips")
+
+    def test_the_button_finds_the_composer_without_integrations_from_0_13_1(self):
+        """0.13.1 moved Integrations into the + menu: the row is found from the +."""
+        self.assertEqual(self._placed("0.13.2"), "chips")
+
+    def test_a_channels_composer_gets_no_button(self):
+        self.assertEqual(self._placed("channel"), "none")
 
     def test_a_button_of_this_version_is_kept(self):
         self.assertEqual(self._slot(_COMPOSER_BUTTON_VERSION),

@@ -1382,6 +1382,16 @@ def _listed_sessions(search: str) -> list:
             return out
 
 
+# The Open WebUI release that saves side chats as chats of their own.
+SAVED_SIDE_CHATS = (0, 13, 1)
+
+
+@functools.cache
+def _owui_version() -> tuple:
+    """Open WebUI's version, as (major, minor, patch)."""
+    return tuple(int(n) for n in re.findall(r"\d+", capture.api("GET", "/api/version")["version"])[:3])
+
+
 def _session_user_texts(key: str) -> list:
     """The text of each user message in a session, oldest first."""
     out = []
@@ -1394,9 +1404,9 @@ def _session_user_texts(key: str) -> list:
 
 
 def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
-    """`/btw` (Open WebUI 0.13): the side chat runs in its own session, whose first
-    message brings the chat's messages, so it answers from them; the chat's own
-    session gets nothing. The scripted model echoes the first `E2E_ECHO:` line it
+    """`/btw` (Open WebUI 0.13): the side chat runs in its own session (a temporary
+    one up to 0.13.0, its own saved chat's from 0.13.1), whose first message brings
+    the chat's messages, so it answers from them; the chat's own session gets nothing. The scripted model echoes the first `E2E_ECHO:` line it
     sees, and only the chat's message has one."""
     tag = f"BROWSER_SIDE_{time.time_ns() % 10**8}"
     capture.new_chat(page)
@@ -1415,10 +1425,14 @@ def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
 
     after = _gateway_call("chat.history", {"sessionKey": key, "limit": 50}).get("messages")
     assert after == before, "the chat's own session changed"
-    prefix = key.rsplit("-", 5)[0].lower() + "-temporary:"
-    sides = [s["key"] for s in _listed_sessions(prefix) if s["key"].startswith(prefix)]
-    first = [t for k in sides for t in _session_user_texts(k)[:1] if "what did I ask you to say?" in t]
-    assert first and f"E2E_ECHO: {tag}" in first[0], f"side sessions {sides}: {first}"
+    # Up to 0.13.0 a side chat is temporary ("-temporary:<id>"). From 0.13.1 it
+    # is a saved chat with its own id, so its session is an ordinary chat's.
+    user = key.rsplit("-", 5)[0].lower() + "-"
+    temporary = user + "temporary:"
+    sides = [s["key"] for s in _listed_sessions(user) if s["key"].startswith(user) and s["key"] != key]
+    sides = [k for k in sides if k.startswith(temporary) == (_owui_version() < SAVED_SIDE_CHATS)]
+    first = [(k, t) for k in sides for t in _session_user_texts(k)[:1] if "what did I ask you to say?" in t]
+    assert any(f"E2E_ECHO: {tag}" in t for _, t in first), f"side sessions {sides}: {first}"
 
 
 def test_the_open_status_dialog_follows_this_chats_schedule(page):
