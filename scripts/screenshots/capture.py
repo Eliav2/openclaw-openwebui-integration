@@ -1317,12 +1317,16 @@ class Scenes:
         # Steered, the rebuild's reply ends at its tool: a closing line in it
         # means the Gateway ran the old queued way.
         no_closing = f"&& !a[0].innerText.includes({json.dumps(REBUILD_DONE)})" if self.steers else ""
+        # Steered, the model gets the tool's result and the new message in one
+        # request (2026.10.10) and answers both in the new message's reply.
+        not_in_answer = "" if self.steers else \
+            f"&& !a[a.length - 1].innerText.includes({json.dumps(REBUILD_DONE)})"
         wait_js(page, f"""() => {{ const a = [...document.querySelectorAll('.chat-assistant')];
                  return a.length >= 2 && a[0].innerText.includes({json.dumps(self._rebuild_ends_with())})
                    {no_closing}
                    && !a[0].querySelector('[role=button] .shimmer')
                    && a[a.length - 1].innerText.includes("It's on main")
-                   && !a[a.length - 1].innerText.includes({json.dumps(REBUILD_DONE)}); }}""",
+                   {not_in_answer}; }}""",
                 "the rebuild finished in its own reply, and the new message's own answer")
         wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
                 "the answer finished", 60_000)
