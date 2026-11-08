@@ -961,6 +961,13 @@ ADMIN_ONLY_SEND_FIELDS = (
     "originatingThreadId",
 )
 _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
+# A user's or a saved chat's id: a UUID, joined in the session key by a dash.
+_UUID_LEN = len("2d206eab-acac-4945-bd2f-7e8b6365de8c")
+_KEY_PART_SEP = "-"
+# A temporary chat's id in a session key (a side chat's on Open WebUI 0.13.0):
+# `temporary:<socket id>[:<uuid>]`, or the legacy `local:` one, then the
+# column's `-m<n>` if any (open_webui/utils/chat_id.py).
+_OWUI_TEMPORARY_CHAT_ID = re.compile(r"((?:temporary|local):[^:]+?(?::[0-9a-f-]{36})?)(?:-m\d+)?")
 # An Open WebUI channel thread's session (channels.py).
 _CHANNEL_KEY_RE = re.compile(r"^agent:([^:]+):openwebui:channel:([^:]+):thread:([^:]+)$")
 
@@ -3284,7 +3291,8 @@ class _GatewayConnection:
 
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """(user_id, chat_id) of a key `_owui_session_key` built, else None.
-        Split by position: both are 36-char UUIDs containing dashes."""
+        Split by position: the user's id is a UUID, containing dashes; so is a
+        saved chat's, and a temporary chat's is `temporary:<socket id>[:<uuid>]`."""
         agent_id = getattr(self._valves(), "AGENT_ID", None)
         if not agent_id:
             return None
@@ -3292,9 +3300,13 @@ class _GatewayConnection:
         if not session_key.startswith(prefix):
             return None
         after = session_key[len(prefix):]
-        if len(after) < 73 or after[36] != "-":
+        user_id, sep, chat = after[:_UUID_LEN], after[_UUID_LEN:_UUID_LEN + 1], after[_UUID_LEN + 1:]
+        if len(user_id) < _UUID_LEN or sep != _KEY_PART_SEP or not chat:
             return None
-        return after[0:36], after[37:73]
+        temporary = _OWUI_TEMPORARY_CHAT_ID.fullmatch(chat)
+        if temporary:
+            return user_id, temporary.group(1)
+        return (user_id, chat[:_UUID_LEN]) if len(chat) >= _UUID_LEN else None
 
     async def dispatch_run_event(self, msg: dict) -> None:
         """Route one run event (or Pipe note, ELI-197): shadow render, then
@@ -5346,7 +5358,7 @@ async def _live_output(request, chat_id: str | None, message_id: str | None) -> 
 # code, and a user message never streams, so no reply gets clobbered.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "9"
+_COMPOSER_BUTTON_VERSION = "10"
 
 # Status Action id (install_action.py FUNCTION_ID) and the default Pipe id;
 # a Pipe under another id adds its own prefixes.
@@ -5663,14 +5675,20 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
   // {parent, after}: insert right after `after` inside `parent`, or at the end
   // of `parent` when `after` is null. null when no known anchor is on screen.
-  // The composer's button row: [left group: More, Integrations] [chip row,
-  // scrolls] [model, send].
+  // The composer's button row: [left group: More (+), and up to Open WebUI
+  // 0.13.0 Integrations] [chip row, scrolls] [model, send]. 0.13.1 moved
+  // Integrations into the + menu, so the row is found from the + button and
+  // known by its shape. A channel's composer keeps its + inside the row's
+  // flex-1 group: that is not a chat composer.
   function composerRow() {
-    const integ = document.getElementById('integration-menu-button');
+    const integ = document.getElementById('input-menu-button')
+      || document.getElementById('integration-menu-button');
     const form = integ ? integ.closest('form') : null;
     const row = integ ? integ.closest('div.justify-between') : null;
     if (!form || !row || !form.contains(row)) return null;
-    return { integ: integ, form: form, row: row, chips: row.querySelector(':scope > div.flex-1') };
+    const chips = row.querySelector(':scope > div.flex-1');
+    if (chips && chips.contains(integ)) return null;
+    return { integ: integ, form: form, row: row, chips: chips };
   }
 
   // The left group, which never scrolls: the row's child holding Integrations.

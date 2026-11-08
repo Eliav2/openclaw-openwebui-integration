@@ -47,6 +47,22 @@ class FakeConn:
         self.dispatched.append(msg)
 
 
+OWUI_USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+SIDE_SID = "jicrHYe0t7QTfdKOAAAB"
+SIDE = f"temporary:{SIDE_SID}:a25e0788-e7f6-49a0-8373-b26cb2c5f307"
+SIDE_KEY = ocp._owui_session_key("main", OWUI_USER, SIDE)
+
+
+class KeyConn(FakeConn):
+    """Parses keys as the Pipe does."""
+
+    def _valves(self):
+        return mock.Mock(AGENT_ID="main")
+
+    def parse_owui_session_key(self, key):
+        return ocp._GatewayConnection.parse_owui_session_key(self, key)
+
+
 class FakeTurn:
     """The reply streaming the run, on socket `sid`."""
 
@@ -219,6 +235,85 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         tabs.answer("sid-own", answered(db={"type": "option", "label": "SQLite"}))
         await self.finished()
         self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["SQLite"]}})
+
+    def side_chat_of(self, parent):
+        """chat-1 is a saved side chat opened from `parent` (Open WebUI 0.13.1+)."""
+        async def origin(chat_id):
+            return parent if chat_id == "chat-1" else None
+        patch = mock.patch.object(ocp, "_side_chat_parent", origin)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def test_a_side_chat_in_the_panel_gets_the_card_on_the_tab_that_asked(self):
+        """The panel never joins its own chat: the tab showing the chat it was
+        opened from is the one that asked, and the card goes there."""
+        self.side_chat_of("chat-parent")
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="chat-parent")
+        self.ask(conn, turn=FakeTurn())
+        sent = await tabs.card_on("sid-own")
+        # The tab's page cancels a card for another chat before the panel takes
+        # it (Open WebUI 0.13.2); it skips the user's own shared events.
+        self.assertEqual((sent.get("shared"), sent.get("user_id")), (True, "user-1"))
+        tabs.answer("sid-own", answered(db={"type": "option", "label": "SQLite"}))
+        await self.finished()
+        self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["SQLite"]}})
+
+    async def test_the_card_names_the_chat_in_its_own_case(self):
+        """A temporary side chat's id carries its socket's id, in upper and lower
+        case; the session key is in lower case. The panel takes events for its
+        exact id only (Open WebUI 0.13.0)."""
+        conn, tabs = KeyConn(), Tabs(self)
+        tabs.pool[SIDE_SID] = {"id": OWUI_USER, "chat_ids": ["chat-parent"]}
+        turn = FakeTurn(SIDE_SID)
+        turn.session_key = SIDE_KEY
+        self.ask(conn, {**record(), "sessionKey": SIDE_KEY}, turn=turn)
+        sent = await tabs.card_on(SIDE_SID)
+        self.assertEqual(sent["chat_id"], SIDE)
+        asked()["ask_1"].cancel()
+
+    async def test_a_writers_question_in_a_temporary_side_chat_goes_to_its_socket(self):
+        """No live turn names the tab, and without the composer watcher no tab
+        is on record: the chat's id names its socket."""
+        ocp._CHAT_TABS_TRACKED[0] = False
+        conn, tabs = KeyConn(), Tabs(self)
+        conn._turn_writers[(SIDE.lower(), "msg-w")] = mock.Mock(
+            chat_id=SIDE.lower(), session_key=SIDE_KEY, message_id="msg-w", closed=False)
+        tabs.pool[SIDE_SID] = {"id": OWUI_USER, "chat_ids": ["chat-parent"]}
+        self.ask(conn, {**record(), "sessionKey": SIDE_KEY})
+        sent = await tabs.card_on(SIDE_SID)
+        self.assertEqual((sent["chat_id"], sent["message_id"]), (SIDE, "msg-w"))
+        asked()["ask_1"].cancel()
+
+    async def test_a_side_chat_whose_tab_moved_to_another_chat_gets_no_card(self):
+        """That page would cancel the card for a chat it does not show."""
+        self.side_chat_of("chat-parent")
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="chat-other")
+        self.ask(conn, turn=FakeTurn())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(tabs.sio.calls, [])
+        asked()["ask_1"].cancel()
+
+    async def test_a_side_chat_opened_as_its_own_page_gets_the_card_again(self):
+        self.side_chat_of("chat-parent")
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="chat-parent")
+        self.ask(conn, turn=FakeTurn())
+        await tabs.card_on("sid-own")
+        first = len(tabs.sio.calls)
+        tabs.pool["sid-own"]["chat_ids"] = ["chat-1"]
+        ocp._chat_tab_ready("sid-own", "chat-1")
+        for _ in range(500):
+            if len(tabs.sio.calls) > first:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(tabs.sio.calls), first + 1, "the page gets the card the panel had")
+        self.assertNotIn("shared", tabs.sio.calls[-1][1], "the page skips a shared card")
+        tabs.answer("sid-own", answered(db={"type": "option", "label": "Postgres"}))
+        await self.finished()
+        self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["Postgres"]}})
 
     async def test_several_questions_and_a_multi_select_one(self):
         conn, tabs = FakeConn(), Tabs(self)

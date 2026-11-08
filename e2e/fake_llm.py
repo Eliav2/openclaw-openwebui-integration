@@ -301,6 +301,35 @@ def _scene_step(user_text: str, n_results: int, offered: list) -> dict | None:
     return None
 
 
+def _steered_scene_reply(turn: list, tool_results: list, offered: list) -> dict | None:
+    """A message steered into a scene's run while its tool ran: from OpenClaw
+    2026.10.10 it comes in the same request as the tool's result, after it. A
+    model answers both, so the scene's next step and the steered message's
+    scene's first step are said together, with the latter's tool call if it
+    has one. None when either is not a scene, or the running scene calls a tool."""
+    last_tool = max((i for i, m in enumerate(turn) if m.get("role") == "tool"), default=-1)
+    if not tool_results or last_tool < 0:
+        return None
+    before = [_text_of(m.get("content")) for m in turn[:last_tool] if m.get("role") == "user"]
+    after = [_text_of(m.get("content")) for m in turn[last_tool:] if m.get("role") == "user"]
+    if not before or not after:
+        return None
+    ran = next((p for start in range(len(before) - 1, -1, -1)
+                if (p := _scene_step("\n".join(before[start:]), len(tool_results), offered))), None)
+    asked = next((p for start in range(len(after) - 1, -1, -1)
+                  if (p := _scene_step("\n".join(after[start:]), 0, offered))), None)
+    if not ran or not asked or "tool" in ran:
+        return None
+    return {**asked, "text": f"{ran['text']}\n\n{asked['text']}", "delay": ran.get("delay", 0.02)}
+
+
+def _results_after(turn: list, user_index: int) -> int:
+    """The tool results after the turn's `user_index`-th user message: a scene's
+    own, not those of a scene that ran before it was steered in."""
+    at = [i for i, m in enumerate(turn) if m.get("role") == "user"][user_index]
+    return sum(1 for m in turn[at:] if m.get("role") == "tool")
+
+
 def plan_reply(body: dict) -> dict:
     """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
     the call) for one request."""
@@ -343,8 +372,11 @@ def plan_reply(body: dict) -> dict:
     # is the one answered, else the whole turn. A scene comes first: the
     # Gateway's context block alone, the newest part, would otherwise take the
     # generic answer to a question before the scene for that answer is seen.
+    steered = _steered_scene_reply(turn, tool_results, offered)
+    if steered is not None:
+        return steered
     for start in range(len(users) - 1, -1, -1):
-        plan = _scene_step("\n".join(users[start:]), len(tool_results), offered)
+        plan = _scene_step("\n".join(users[start:]), _results_after(turn, start), offered)
         if plan is not None:
             return plan
     for start in range(len(users) - 1, -1, -1):

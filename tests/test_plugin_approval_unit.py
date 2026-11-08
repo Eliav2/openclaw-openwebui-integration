@@ -13,7 +13,7 @@ install_stubs()
 
 import openclaw_pipe as ocp  # noqa: E402
 import openclaw_status_action as oca  # noqa: E402
-from test_ask_user_tool_unit import KEY, FakeConn, FakeTurn, Tabs  # noqa: E402
+from test_ask_user_tool_unit import KEY, OWUI_USER, SIDE, SIDE_KEY, SIDE_SID, FakeConn, FakeTurn, Tabs  # noqa: E402
 
 
 def record(aid="plugin:1", allowed=None, key=KEY):
@@ -130,6 +130,18 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         await self.finished()
         self.assertEqual(conn.sent, [("plugin.approval.resolve", {"id": "plugin:1", "decision": "allow-once"})])
         self.assertTrue(tabs.removed_from("sid-own"))
+
+    async def test_the_card_names_a_temporary_side_chat_in_its_own_case(self):
+        """The panel takes events for its exact id only (Open WebUI 0.13.0); the
+        session key is in lower case."""
+        conn, tabs = ApprovalConn(), Tabs(self)
+        tabs.pool[SIDE_SID] = {"id": OWUI_USER, "chat_ids": ["chat-parent"]}
+        turn = FakeTurn(SIDE_SID)
+        turn.session_key = SIDE_KEY
+        self.assertTrue(self.ask(conn, record(key=SIDE_KEY), turn=turn))
+        sent = await tabs.card_on(SIDE_SID)
+        self.assertEqual(sent["chat_id"], SIDE)
+        approvals()["plugin:1"].cancel()
 
     async def test_the_card_offers_only_the_decisions_the_request_allows(self):
         conn, tabs = ApprovalConn(), Tabs(self)
