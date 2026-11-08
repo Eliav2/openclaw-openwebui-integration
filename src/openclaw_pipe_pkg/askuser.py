@@ -1207,6 +1207,11 @@ async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str)
     turn = _SECRET_ASKERS.get(key)
     message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
     own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
+    # The key is in lower case (`_owui_session_key`); a temporary chat's id is
+    # not, and the side panel takes events for its exact id only.
+    asked_in = (turn.__metadata__ or {}).get("chat_id") if turn is not None else None
+    if isinstance(asked_in, str) and asked_in.lower() == chat_id:
+        chat_id = asked_in
     if not message_id:
         # Open WebUI cancels a card for a message the tab lacks: left to the Control UI.
         _AGENT_QUESTIONS.pop(qid, None)

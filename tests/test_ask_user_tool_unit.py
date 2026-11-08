@@ -240,6 +240,19 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         await self.finished()
         self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["SQLite"]}})
 
+    async def test_the_card_names_the_chat_in_its_own_case(self):
+        """A temporary side chat's id carries its socket's id, in upper and lower
+        case; the session key is in lower case. The panel takes events for its
+        exact id only (Open WebUI 0.13.0)."""
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="CHAT-1")
+        turn = FakeTurn()
+        turn.__metadata__["chat_id"] = "CHAT-1"
+        self.ask(conn, turn=turn)
+        sent = await tabs.card_on("sid-own")
+        self.assertEqual(sent["chat_id"], "CHAT-1")
+        asked()["ask_1"].cancel()
+
     async def test_a_side_chat_whose_tab_moved_to_another_chat_gets_no_card(self):
         """That page would cancel the card for a chat it does not show."""
         self.side_chat_of("chat-parent")

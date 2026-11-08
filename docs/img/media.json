@@ -68,39 +68,39 @@
       }
     },
     "demos/failed-tool.gif": {
-      "sha": "5f2588bb3503bc66",
+      "sha": "796bfa57e41382d7",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/failed-tool.mp4": {
-      "sha": "d89e031978b65398",
+      "sha": "9ad3e1f15f12d82a",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/failed-tool.webm": {
-      "sha": "828d803c6e53e4fb",
+      "sha": "696df07ec513aff1",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/hero.gif": {
-      "sha": "4390a0560dbf7a91",
+      "sha": "012cdae9c701b9d1",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/hero.mp4": {
-      "sha": "c5752c65c2a121a6",
+      "sha": "7f8f28b764720ca9",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/hero.webm": {
-      "sha": "25970cc82f809165",
+      "sha": "33367cd38bc30772",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/live-browser.gif": {
@@ -125,168 +125,168 @@
       "manual": true
     },
     "demos/question-card.gif": {
-      "sha": "56765f33ef74a01b",
+      "sha": "e944a817ec0e3854",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/question-card.mp4": {
-      "sha": "f867c1d7917256de",
+      "sha": "c86e2ac5505e7a41",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/question-card.webm": {
-      "sha": "c59f24f33e6d58c5",
+      "sha": "7e60a775893c3f62",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/reload-mid-reply.gif": {
-      "sha": "7040962f4861b8b0",
+      "sha": "79409429ec490187",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/reload-mid-reply.mp4": {
-      "sha": "40f439efa60343cd",
+      "sha": "c32c2cdb42cd9380",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/reload-mid-reply.webm": {
-      "sha": "e94bc6f9720d6ee9",
+      "sha": "87bdf3b38c1d025e",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/send-now.gif": {
-      "sha": "e483005511f2f501",
+      "sha": "442b11debefe0189",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/send-now.mp4": {
-      "sha": "098d28a33b52de62",
+      "sha": "1173148cb5b48e79",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/send-now.webm": {
-      "sha": "e3f2c43c9891f479",
+      "sha": "319d12346d773d51",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/sent-mid-run.gif": {
-      "sha": "e9383e151c702efe",
+      "sha": "e7e44638de35675d",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/sent-mid-run.mp4": {
-      "sha": "b6778441e6539f2f",
+      "sha": "3789dba723037b55",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/sent-mid-run.webm": {
-      "sha": "707fda6ddddfd0ba",
+      "sha": "39e50b88e4d3bd3f",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/status-dialog.gif": {
-      "sha": "26ff0bdd04c7a75c",
+      "sha": "a7192c8e1582b752",
       "groups": {
-        "chrome": "05531e6ac29a5a41",
+        "chrome": "8cf05195dbd8b983",
         "status": "57fa7492dc80cd7d"
       }
     },
     "demos/status-dialog.mp4": {
-      "sha": "ee5fcda40948b63f",
+      "sha": "5142db69011c16ae",
       "groups": {
-        "chrome": "05531e6ac29a5a41",
+        "chrome": "8cf05195dbd8b983",
         "status": "57fa7492dc80cd7d"
       }
     },
     "demos/status-dialog.webm": {
-      "sha": "b8c2a22f7565f072",
+      "sha": "1716845cc30e332a",
       "groups": {
-        "chrome": "05531e6ac29a5a41",
+        "chrome": "8cf05195dbd8b983",
         "status": "57fa7492dc80cd7d"
       }
     },
     "demos/stop.gif": {
-      "sha": "1a4d43556682ca30",
+      "sha": "a777deba8cdc7156",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/stop.mp4": {
-      "sha": "129d792752d12d8d",
+      "sha": "77415f07f2efa386",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/stop.webm": {
-      "sha": "1a547bdb2facf3ec",
+      "sha": "f5bfcb1427802a21",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/streaming.gif": {
-      "sha": "993083eaa86f4a56",
+      "sha": "92cf1f3a85239024",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/streaming.mp4": {
-      "sha": "8b008c11727b24da",
+      "sha": "b9439bf41e68ee7f",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/streaming.webm": {
-      "sha": "3a7b13b2e743e25b",
+      "sha": "6d286f8aa5f4d1b6",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/tile-question.gif": {
-      "sha": "1887d3611fec9958",
+      "sha": "1fb1699728c7dbf0",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/tile-sub-agents.gif": {
-      "sha": "dea6eeb612642fe8",
+      "sha": "a9217e98c064f35d",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/tile-tool-cards.gif": {
-      "sha": "8ca9e02394d043e8",
+      "sha": "40c4affac5246ec7",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/tool-cards.gif": {
-      "sha": "16709fd8985504e7",
+      "sha": "0738c2ebf734f707",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/tool-cards.mp4": {
-      "sha": "fd81f03a13bd7f12",
+      "sha": "0b7e61a2186fe972",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "demos/tool-cards.webm": {
-      "sha": "6c544ac8f178f7a5",
+      "sha": "73d4ccaff60918fc",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "error-message-light.png": {
@@ -357,9 +357,9 @@
       }
     },
     "social-preview.png": {
-      "sha": "133489d877c1ea9b",
+      "sha": "f3f11f7a84d7ba61",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "spawn-card-light.png": {
@@ -443,28 +443,28 @@
       }
     },
     "tile-question.jpg": {
-      "sha": "7e02c7e42df264bd",
+      "sha": "1742ab6de7cc3faf",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "tile-status-dialog.jpg": {
-      "sha": "cf041e13aa034c27",
+      "sha": "88f88b25da42e6bd",
       "groups": {
-        "chrome": "05531e6ac29a5a41",
+        "chrome": "8cf05195dbd8b983",
         "status": "57fa7492dc80cd7d"
       }
     },
     "tile-sub-agents.jpg": {
-      "sha": "cc7c9d3674ea0820",
+      "sha": "30ea02f476003709",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "tile-tool-cards.jpg": {
-      "sha": "2cdfb6f39b37640e",
+      "sha": "2f00b9328593f109",
       "groups": {
-        "chrome": "05531e6ac29a5a41"
+        "chrome": "8cf05195dbd8b983"
       }
     },
     "toolbar-button-light.png": {
