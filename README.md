@@ -92,9 +92,15 @@ With the Status Action installed, one click shows context used, rate limits and 
 - **[Every Gateway model](https://eliav2.github.io/openclaw-openwebui-integration/features/sessions-and-models#model-picker):** the model picker lists the models your Gateway allows, one session per chat.
 - **[Channels](https://eliav2.github.io/openclaw-openwebui-integration/features/channels):** mention the agent in a channel and it answers in a thread, then follows it, answering what is meant for it without a new mention.
 
-## Push notifications
+## Optional add-on: push notifications and offline open
 
-Notifications on your phone or computer when a reply finishes live in a separate project, [Eliav2/open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push). This repository only publishes the `chat.finished` event it listens for ([`PUBLISH_CHAT_FINISHED`](./docs/configuration.md#publish_chat_finished)); there is no push function to install from here.
+[open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push) is a separate project, not part of this install, and nothing here needs it. It adds three things to any Open WebUI, whatever models you use:
+
+- **Push notifications** when a reply finishes, also when Open WebUI is closed.
+- **Offline open** of the chats you read last.
+- **Instant chat open** from the copy kept on the device.
+
+This repository only publishes the `chat.finished` event it listens for: with OpenClaw models, turn on the Pipe's [`PUBLISH_CHAT_FINISHED`](./docs/configuration.md#publish_chat_finished) so each reply is notified once it is saved, including the replies the agent starts. There is no push function to install from here; follow [its README](https://github.com/Eliav2/open-webui-pwa-push#install).
 
 ## Docs
 
