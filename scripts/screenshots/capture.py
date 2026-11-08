@@ -1349,7 +1349,8 @@ class Scenes:
                     and (not self.steers or any(i.get("type") == TOOL_OUTPUT_ITEM
                                                 for i in replies[0].get("output") or []))
                     and "It's on main" in (replies[-1].get("content") or "")
-                    and REBUILD_DONE not in (replies[-1].get("content") or "")):
+                    # Steered, the answer carries the rebuild's close too (`_both_answered`).
+                    and (self.steers or REBUILD_DONE not in (replies[-1].get("content") or ""))):
                 return
             time.sleep(1)
         raise RuntimeError(f"stored replies of {chat_id} do not match the page: {last}")
