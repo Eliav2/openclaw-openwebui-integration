@@ -141,6 +141,18 @@ The Gateway refuses an image over its size cap (6 MB on OpenClaw today, read fro
 
 Always on.
 
+## Files and knowledge you attach
+
+Open WebUI sends a chat's files again with every message: a document, a knowledge collection, or a chat you quoted. It retrieves text from them and puts that text before the message you typed. A model that keeps no history pays for it once per message. The agent's session keeps every message, so the same text would pile up in it, once per turn.
+
+The Pipe therefore sends each piece of retrieved text once per session. The first message carries it in full, in Open WebUI's own format with the citation numbers the chat shows. Later messages leave out the pieces the session already has and name their files in one line instead. A piece the agent has not seen yet, such as a new part of a document that a new question retrieves, or a file that changed, still goes in full.
+
+A new session starts the record afresh: `/new`, `/reset`, a deleted session, or a compaction the Gateway counts (`compactionCount`). A Gateway command such as `/status` goes as typed, with no file text before it.
+
+Known limit: claude-cli compacts a long session on its own, and the Gateway does not count that as a compaction. After such a compaction the agent may no longer hold a file's text while the Pipe still leaves it out. Send `/new` to have it sent again.
+
+Always on.
+
 ## Voice calls
 
 When you talk to the agent in Open WebUI's voice mode, Open WebUI marks each spoken message as part of a voice call. The Pipe puts one short note before it that tells the agent the reply will be read aloud: answer in your language, in a few short spoken sentences, with no markdown, lists, tables, code, links or emoji, and with numbers and times said the way you would say them. A message you type in the same chat carries nothing, so the agent goes back to normal answers.

@@ -868,6 +868,11 @@ class _PipeTurn:
         # OWUI sends content as a string, or as blocks when an image is attached.
         raw_content = messages[-1]["content"] if messages else ""
         self.text = _coerce_text(raw_content)
+        # Open WebUI wraps a chat's files into the message; the typed text is kept apart (ELI-379).
+        split = _file_context_split(self.text, (self.__metadata__ or {}).get("base_user_prompt"))
+        self.file_context = ""
+        if split:
+            self.file_context, self.text = split
         has_image = _content_has_image(raw_content)
         self.image_attachments = _extract_image_attachments(raw_content) if has_image else []
         if not self.text and not self.image_attachments:
@@ -983,9 +988,16 @@ class _PipeTurn:
             spawn_background(_temporary_sessions_tend(
                 self.conn, self.__request__, state_dir, self.session_key, self.owui_origin_chat_id,
                 self.owui_origin_user_id))
-        self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [history_prefix + ("" if command else _voice_note(self.__metadata__))
-                                  + self.text])
+        # The file context goes once per session; a command goes without it.
+        file_context, file_context_record = "", None
+        if self.file_context and not command and not self._send_texts and not self.channel_id:
+            file_context, file_context_record = await _file_context_message(
+                self.conn, state_dir, self.session_key, (self.__metadata__ or {}).get("message_id"),
+                self.file_context, (self.__metadata__ or {}).get("sources"))
+        message = (history_prefix + ("" if command else _voice_note(self.__metadata__))
+                   + (file_context + "\n" if file_context else "") + self.text)
+        _file_context_hold(self.session_key, message, file_context_record)
+        self.turn.unsent = list(self._send_texts) if self._send_texts else [message]
         self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
                                  else list(self.image_attachments))
         meta = self.__metadata__ or {}
@@ -1366,6 +1378,8 @@ class _PipeTurn:
                 self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
             self.sent_texts = list(self.turn.unsent)
             self.sent_attachments = list(self.turn.attachments)
+            _file_context_commit(_state_dir(getattr(self.pipe.valves, "STATE_DIR", "")), self.session_key,
+                                 self.sent_texts)
             self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
                                  "\n\n".join(t for t in self.sent_texts if t))
             self.turn.unsent = []

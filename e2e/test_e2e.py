@@ -3378,3 +3378,28 @@ def test_a_spoken_message_reaches_the_agent_with_the_voice_note_and_a_typed_one_
     typed = [t for t in _session_texts(key) if typed_marker in t]
     assert typed == [f"E2E_ECHO: {typed_marker}"], typed
     _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
+
+
+# ── Chat files (ELI-379) ──────────────────────────────────────────────────────
+
+def test_a_chat_file_reaches_the_agent_once_over_three_turns(token):
+    """Open WebUI resends a chat's files with every request and wraps them into
+    the newest message. The model request of turn 3 holds the whole session, so
+    it counts how often the file reached it: once, not once per turn."""
+    marker = f"eli379-{uuid.uuid4().hex[:8]}"
+    content = f"{marker} " + "The plan for Kyoto: Fushimi Inari at seven, then Gion. " * 200
+    item = {"type": "text", "name": "plan.md", "context": "full",
+            "file": {"data": {"content": content}, "meta": {"name": "plan.md"}}}
+    chat_id, sizes = None, []
+    for n in range(3):
+        word = f"{marker}-turn{n}"
+        chat_id, msg = _chat_turn(token, f"{word}: what does the plan say?", chat_id=chat_id,
+                                  extra={"files": [item]})
+        assert msg.get("done"), msg
+        with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
+            asked = [json.dumps(json.loads(line)["request"]["messages"]) for line in f if line.strip()]
+        request = next(a for a in reversed(asked) if word in a)
+        sizes.append(len(request))
+        copies = request.count(f"{marker} The plan")
+        assert copies == 1, f"turn {n}: the file reached the agent {copies} times; request sizes {sizes}"
+    assert "not repeated here: plan.md" in request, request[-600:]
