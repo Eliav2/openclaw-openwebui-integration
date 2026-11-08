@@ -3867,12 +3867,39 @@ def _views_chat(session_pool, sid, user_id, chat_id) -> bool:
         "chat_ids" not in session or chat_id in (session.get("chat_ids") or []))
 
 
-def _agent_card_tab(session_pool, user_id, chat_id, own_sid) -> str | None:
+def _shows_chat(session_pool, sid, user_id, chat_id, parent_id=None) -> bool:
+    """`sid` shows the chat: it loaded it as its page, or it is the tab that
+    asked from a side chat's panel. A panel never joins its own chat, so the
+    socket has no record of it: a temporary side chat (Open WebUI 0.13.0) is
+    shown by the tab that asked, a saved one (0.13.1+) while that tab shows the
+    chat it was opened from (`parent_id`). The page cancels a card for a saved
+    chat it does not show, so without its parent the tab is not used."""
+    if _views_chat(session_pool, sid, user_id, chat_id):
+        return True
+    session = session_pool.get(sid) if sid else None
+    if not session or session.get("id") != user_id:
+        return False
+    return _is_temporary_chat(chat_id) or (
+        parent_id is not None and parent_id in (session.get("chat_ids") or []))
+
+
+async def _side_chat_parent(chat_id: str) -> str | None:
+    """The chat a saved side chat was opened from (its `originalChatId`), if any."""
+    if _is_temporary_chat(chat_id):
+        return None
+    try:
+        return await _owui_history_rows(chat_id).origin()
+    except Exception as ex:
+        pipe_log(f"  ask_user: the parent of chat {chat_id[:8]}... not read: {ex!r}")
+        return None
+
+
+def _agent_card_tab(session_pool, user_id, chat_id, own_sid, parent_id=None) -> str | None:
     """The socket to show an ask_user card on, or None while no tab can."""
     for sid in reversed(_READY_CHAT_TABS.get(chat_id, [])):
         if _views_chat(session_pool, sid, user_id, chat_id):
             return sid
-    if _views_chat(session_pool, own_sid, user_id, chat_id):
+    if _shows_chat(session_pool, own_sid, user_id, chat_id, parent_id):
         return own_sid
     if not _CHAT_TABS_TRACKED[0]:
         return _live_session_id_for_user(user_id, session_pool, chat_id)
@@ -3894,9 +3921,13 @@ def _chat_tab_signal(chat_id):
                 del _CHAT_TAB_WAITERS[chat_id]
 
 
-async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline):
+async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline,
+                       parent_id=None):
     """Show the card on `sid`: (response, None), (None, "moved") when a newer
     tab loads the chat or `sid` leaves it, or (None, None) at the deadline."""
+    # Shown in a side chat's panel: when the tab opens the chat as its page, the
+    # panel is gone, so the card goes again to the page.
+    panel = not _views_chat(session_pool, sid, user_id, chat_id)
     interaction_id = str(uuid.uuid4())
     data = {**payload["data"], "interaction_id": interaction_id}
     pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
@@ -3924,12 +3955,13 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
                     except Exception as ex:
                         pipe_log(f"  ask_user: the card on {sid[:8]}... failed: {ex!r}")
                         return None, "moved"
-                    if not _views_chat(session_pool, sid, user_id, chat_id):
+                    if not _shows_chat(session_pool, sid, user_id, chat_id, parent_id):
                         return None, "moved"
                     return response, None
                 newer.clear()
-                if _agent_card_tab(session_pool, user_id, chat_id, sid) != sid \
-                        or not _views_chat(session_pool, sid, user_id, chat_id):
+                if _agent_card_tab(session_pool, user_id, chat_id, sid, parent_id) != sid \
+                        or not _shows_chat(session_pool, sid, user_id, chat_id, parent_id) \
+                        or (panel and _views_chat(session_pool, sid, user_id, chat_id)):
                     return None, "moved"
         finally:
             call.cancel()
@@ -3948,8 +3980,9 @@ async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadli
     except Exception as ex:
         pipe_log(f"  ask_user: no Open WebUI sockets here: {ex}")
         return None
+    parent_id = await _side_chat_parent(chat_id)
     while (left := deadline - time.time()) > 0:
-        sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid)
+        sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid, parent_id)
         if sid is None:
             with _chat_tab_signal(chat_id) as ready:
                 wait = left if _CHAT_TABS_TRACKED[0] else min(left, _UNTRACKED_TAB_POLL_S)
@@ -3959,7 +3992,7 @@ async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadli
                     pass
             continue
         response, moved = await _card_on_tab(sio, SESSION_POOL, sid, user_id, chat_id,
-                                             message_id, payload, deadline)
+                                             message_id, payload, deadline, parent_id)
         if moved:
             if sid == own_sid:
                 own_sid = None

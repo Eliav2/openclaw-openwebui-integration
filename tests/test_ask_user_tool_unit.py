@@ -220,6 +220,55 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         await self.finished()
         self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["SQLite"]}})
 
+    def side_chat_of(self, parent):
+        """chat-1 is a saved side chat opened from `parent` (Open WebUI 0.13.1+)."""
+        async def origin(chat_id):
+            return parent if chat_id == "chat-1" else None
+        patch = mock.patch.object(ocp, "_side_chat_parent", origin)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def test_a_side_chat_in_the_panel_gets_the_card_on_the_tab_that_asked(self):
+        """The panel never joins its own chat: the tab showing the chat it was
+        opened from is the one that asked, and the card goes there."""
+        self.side_chat_of("chat-parent")
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="chat-parent")
+        self.ask(conn, turn=FakeTurn())
+        await tabs.card_on("sid-own")
+        tabs.answer("sid-own", answered(db={"type": "option", "label": "SQLite"}))
+        await self.finished()
+        self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["SQLite"]}})
+
+    async def test_a_side_chat_whose_tab_moved_to_another_chat_gets_no_card(self):
+        """That page would cancel the card for a chat it does not show."""
+        self.side_chat_of("chat-parent")
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="chat-other")
+        self.ask(conn, turn=FakeTurn())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(tabs.sio.calls, [])
+        asked()["ask_1"].cancel()
+
+    async def test_a_side_chat_opened_as_its_own_page_gets_the_card_again(self):
+        self.side_chat_of("chat-parent")
+        conn, tabs = FakeConn(), Tabs(self)
+        tabs.open("sid-own", chat="chat-parent")
+        self.ask(conn, turn=FakeTurn())
+        await tabs.card_on("sid-own")
+        first = len(tabs.sio.calls)
+        tabs.pool["sid-own"]["chat_ids"] = ["chat-1"]
+        ocp._chat_tab_ready("sid-own", "chat-1")
+        for _ in range(500):
+            if len(tabs.sio.calls) > first:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(tabs.sio.calls), first + 1, "the page gets the card the panel had")
+        tabs.answer("sid-own", answered(db={"type": "option", "label": "Postgres"}))
+        await self.finished()
+        self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["Postgres"]}})
+
     async def test_several_questions_and_a_multi_select_one(self):
         conn, tabs = FakeConn(), Tabs(self)
         tabs.open("sid-own")

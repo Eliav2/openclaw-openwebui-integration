@@ -1384,6 +1384,8 @@ def _listed_sessions(search: str) -> list:
 
 # The Open WebUI release that saves side chats as chats of their own.
 SAVED_SIDE_CHATS = (0, 13, 1)
+# The Open WebUI release whose chat, opened from the sidebar, no longer focuses its input.
+UNFOCUSED_CHAT_LOAD = (0, 13, 1)
 
 
 @functools.cache
@@ -1406,8 +1408,9 @@ def _session_user_texts(key: str) -> list:
 def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
     """`/btw` (Open WebUI 0.13): the side chat runs in its own session (a temporary
     one up to 0.13.0, its own saved chat's from 0.13.1), whose first message brings
-    the chat's messages, so it answers from them; the chat's own session gets nothing. The scripted model echoes the first `E2E_ECHO:` line it
-    sees, and only the chat's message has one."""
+    the chat's messages, so it answers from them; the chat's own session gets
+    nothing. The scripted model echoes the first `E2E_ECHO:` line it sees, and
+    only the chat's message has one."""
     tag = f"BROWSER_SIDE_{time.time_ns() % 10**8}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {tag}")
@@ -1433,6 +1436,26 @@ def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
     sides = [k for k in sides if k.startswith(temporary) == (_owui_version() < SAVED_SIDE_CHATS)]
     first = [(k, t) for k in sides for t in _session_user_texts(k)[:1] if "what did I ask you to say?" in t]
     assert any(f"E2E_ECHO: {tag}" in t for _, t in first), f"side sessions {sides}: {first}"
+
+
+def test_an_ask_user_question_in_a_side_chat_is_answered_in_its_panel(page):
+    """The side panel never joins its own chat, so no tab is on record for it:
+    the card goes to the tab that asked, and shows in the panel above its
+    message box. The clicked option is the tool's answer, in the side chat."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: side question parent")
+    _wait(page, _turn_over("side question parent"), "the chat's reply")
+    box = page.locator("#chat-input")
+    box.click()
+    page.keyboard.type("/btw E2E_ASK_TOOL", delay=5)
+    page.locator("#send-message-button").click()
+    _wait(page, "() => document.body.innerText.includes('Which database?') "
+                "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+          "the ask_user card in the side panel")
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    side = "[...document.querySelectorAll('[id^=\"side-chat-input-\"][id$=\"-messages\"]')]"
+    _wait(page, f"() => {side}.some(e => e.innerText.includes('E2E_ASK_TOOL_RESULT answered Database: SQLite'))",
+          "the side chat's reply with the tool's answer")
 
 
 def test_the_open_status_dialog_follows_this_chats_schedule(page):
@@ -2002,8 +2025,14 @@ def _rename_in_sidebar(page, chat_id: str, title: str) -> None:
     with page.expect_response(lambda r: r.request.method == "GET"
                               and r.url.endswith(f"/api/v1/chats/{chat_id}")):
         link.click()
-    capture.wait_js(page, "() => !!document.activeElement?.closest('#chat-input')",
-                    "the opened chat to focus its message input", 30_000)
+    if _owui_version() < UNFOCUSED_CHAT_LOAD:
+        capture.wait_js(page, "() => !!document.activeElement?.closest('#chat-input')",
+                        "the opened chat to focus its message input", 30_000)
+    else:
+        # From 0.13.1 opening a chat from the sidebar leaves the focus alone: its
+        # last step is drawing the messages.
+        capture.wait_js(page, "() => !!document.querySelector('.chat-user') && !!document.querySelector('#chat-input')",
+                        "the opened chat to draw its messages", 30_000)
     link.dblclick()
     box_id = f"chat-title-input-{chat_id}"
     capture.wait_js(page, f"() => document.activeElement?.id === {json.dumps(box_id)}",

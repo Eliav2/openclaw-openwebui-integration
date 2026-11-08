@@ -301,6 +301,28 @@ def _scene_step(user_text: str, n_results: int, offered: list) -> dict | None:
     return None
 
 
+def _steered_scene_reply(turn: list, tool_results: list, offered: list) -> dict | None:
+    """A message steered into a scene's run while its tool ran: from OpenClaw
+    2026.10.10 it comes in the same request as the tool's result, after it. A
+    model answers both, so the scene's next step and the steered message's
+    scene are said together. None when either is not a scene, or either one
+    calls a tool."""
+    last_tool = max((i for i, m in enumerate(turn) if m.get("role") == "tool"), default=-1)
+    if not tool_results or last_tool < 0:
+        return None
+    before = [_text_of(m.get("content")) for m in turn[:last_tool] if m.get("role") == "user"]
+    after = [_text_of(m.get("content")) for m in turn[last_tool:] if m.get("role") == "user"]
+    if not before or not after:
+        return None
+    ran = next((p for start in range(len(before) - 1, -1, -1)
+                if (p := _scene_step("\n".join(before[start:]), len(tool_results), offered))), None)
+    asked = next((p for start in range(len(after) - 1, -1, -1)
+                  if (p := _scene_step("\n".join(after[start:]), 0, offered))), None)
+    if not ran or not asked or "tool" in ran or "tool" in asked:
+        return None
+    return {"text": f"{ran['text']}\n\n{asked['text']}", "delay": ran.get("delay", 0.02)}
+
+
 def plan_reply(body: dict) -> dict:
     """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
     the call) for one request."""
@@ -343,6 +365,9 @@ def plan_reply(body: dict) -> dict:
     # is the one answered, else the whole turn. A scene comes first: the
     # Gateway's context block alone, the newest part, would otherwise take the
     # generic answer to a question before the scene for that answer is seen.
+    steered = _steered_scene_reply(turn, tool_results, offered)
+    if steered is not None:
+        return steered
     for start in range(len(users) - 1, -1, -1):
         plan = _scene_step("\n".join(users[start:]), len(tool_results), offered)
         if plan is not None:
