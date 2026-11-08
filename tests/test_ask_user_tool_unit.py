@@ -235,7 +235,10 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         conn, tabs = FakeConn(), Tabs(self)
         tabs.open("sid-own", chat="chat-parent")
         self.ask(conn, turn=FakeTurn())
-        await tabs.card_on("sid-own")
+        sent = await tabs.card_on("sid-own")
+        # The tab's page cancels a card for another chat before the panel takes
+        # it (Open WebUI 0.13.2); it skips the user's own shared events.
+        self.assertEqual((sent.get("shared"), sent.get("user_id")), (True, "user-1"))
         tabs.answer("sid-own", answered(db={"type": "option", "label": "SQLite"}))
         await self.finished()
         self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["SQLite"]}})
@@ -278,6 +281,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
         self.assertEqual(len(tabs.sio.calls), first + 1, "the page gets the card the panel had")
+        self.assertNotIn("shared", tabs.sio.calls[-1][1], "the page skips a shared card")
         tabs.answer("sid-own", answered(db={"type": "option", "label": "Postgres"}))
         await self.finished()
         self.assertEqual(conn.sent[0][1]["answers"], {"answers": {"db": ["Postgres"]}})

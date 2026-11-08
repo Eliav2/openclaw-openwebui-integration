@@ -1128,12 +1128,16 @@ async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, pay
     panel = not _views_chat(session_pool, sid, user_id, chat_id)
     interaction_id = str(uuid.uuid4())
     data = {**payload["data"], "interaction_id": interaction_id}
+    event = {"chat_id": chat_id, "message_id": message_id, "data": {**payload, "data": data}}
+    if panel:
+        # The tab's page answers `cancelled` at once to a card for a chat it does
+        # not show, before the panel takes it (Open WebUI 0.13.2 Chat.svelte:1544);
+        # the page skips the user's own shared events (Chat.svelte:1528), the panel does not.
+        event = {**event, "shared": True, "user_id": user_id}
     pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
     with _chat_tab_signal(chat_id) as newer:
         call = asyncio.ensure_future(sio.call(
-            "events", {"chat_id": chat_id, "message_id": message_id,
-                       "data": {**payload, "data": data}},
-            to=sid, timeout=max(1.0, deadline - time.time())))
+            "events", event, to=sid, timeout=max(1.0, deadline - time.time())))
         try:
             while True:
                 left = deadline - time.time()
