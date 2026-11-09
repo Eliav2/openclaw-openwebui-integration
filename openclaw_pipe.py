@@ -6874,11 +6874,11 @@ class _GatewayConnection:
                 writer = fed.writer
                 # Its own run's span (a steered message's answer), after the
                 # replies the run was split into before it.
-                own = next((r for (s, r), p in self._turn_pumps.items() if s == sess and p is fed), run.run_id)
-                prior = dict(fed.steered_earlier or {})
-                before = [*(prior.pop("before", None) or []), *([prior] if prior else [])]
+                own = fed.span_run or next(
+                    (r for (s, r), p in self._turn_pumps.items() if s == sess and p is fed), run.run_id)
                 earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
-                                      "request_task_id": None, "span_run": own, "before": before}
+                                      "request_task_id": None, "span_run": own,
+                                      "before": list(fed.steered_before or [])}
                 run_text = _pump_baselines(fed)
                 run.held.append(fed)
             else:
@@ -6904,8 +6904,6 @@ class _GatewayConnection:
                 # The old writer ends at the settle from the transcript, which
                 # covers event gaps. Baselines now: its pump may be busy.
                 run_text = _pump_baselines(pump)
-                # The next steer into this run carries the replies before it.
-                consumer.queues[0].pump.steered_earlier = earlier
             else:
                 pump.queue.put_nowait(("steered", run_text))
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
@@ -6914,6 +6912,10 @@ class _GatewayConnection:
         else:
             return False
         consumer.steered, consumer.steered_into = True, run_id
+        if earlier and _feeds_writer(consumer):
+            # The next steer into this run carries the replies before it.
+            chain = dict(earlier)
+            consumer.queues[0].pump.steered_before = [*(chain.pop("before", None) or []), chain]
         for q in consumer.queues:
             q.put_control({"type": _STEERED_MARKER_TYPE, "_steered": {
                 "run": run_id, "run_text": run_text, "earlier": earlier}})
@@ -10313,8 +10315,10 @@ class _RunPump:
         self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
         # A cleanly ended run a later message was steered into (`_turn_next_run`).
         self.ended_clean: str | None = None
-        # Its writer's message was steered in after this reply (`_steer`).
-        self.steered_earlier: dict | None = None
+        # Its writer's reply when steered (`_steer`): the replies the run was
+        # split into before it, and its own span when not the pump's run.
+        self.steered_before: list | None = None
+        self.span_run: str | None = None
 
 
 def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -10522,6 +10526,9 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
             pump.queue.put_nowait(("event", payload))
             pump.started = pump.started or not (payload.get("state") == "final"
                                                 and not payload.get("message"))
+    if target and target.get("span_run") not in (None, run_id):
+        # A steered reply keeps its own span and the replies before it (`_steer`).
+        pump.span_run, pump.steered_before = target["span_run"], list(target.get("before") or [])
     pump.stop_notice_before = conn._stop_notice_seen
     conn.unregister_run_target(session_key, run_id)
     spawn_background(_turn_pump_loop(conn, session_key, run_id, parsed, pump))
@@ -11120,6 +11127,16 @@ def _history_steered_tail(history: dict, run_id: str) -> list | None:
             and not any(k.startswith("cli-assistant:") for k in _idempotency_keys(m))]
 
 
+def _history_steer_target(history: dict, run_id: str) -> str | None:
+    """The run `run_id`'s message was steered into, as its commit stored it
+    (`__openclaw.steerTargetRunId`, set once the runtime took it in)."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    message = next((m for m in messages if _history_user_run_id(m) == run_id), None)
+    return ((message or {}).get("__openclaw") or {}).get("steerTargetRunId")
+
+
 def _history_later_turn(history: dict, run_id: str) -> bool:
     """A turn began after `run_id`'s message."""
     messages = (history or {}).get("messages")
@@ -11135,16 +11152,19 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
     message was steered into. The run's terminal and its idle push can come
     before the Gateway commits the message. Ends on the answer, a failed run,
     or a restart without the run, with the last transcript read (None if none).
-    `host`: the run it went into, when the steer was seen here; then it also
-    ends once the session settled. A claude-cli run stops counting as active
-    only after it stored its answer (2026.10.10: `finishCliAttempt` awaits
-    Claude Code's flush and the closing copy before the run resolves, and
-    `deferredLifecycle.complete()` clears the active run after that), so the
-    settled transcript holds the answer if there is one."""
+    `host`: the run it went into, when the steer was seen here. With it, or
+    with the steer target its commit stored, it also ends once the session
+    settled: a claude-cli run stops counting as active only after it stored
+    its answer (2026.10.10: `finishCliAttempt` awaits Claude Code's flush and
+    the closing copy before the run resolves, and `deferredLifecycle.complete()`
+    clears the active run after that), so the settled transcript holds the
+    answer if there is one. A read during a reconnect waits for the
+    connection and reads again."""
     restarts = conn.gateway_restarts
+    last = None
     while True:
         appended = conn.session_message_event(session_key)
-        changed = conn.session_change_event(session_key) if host else None
+        changed = conn.session_change_event(session_key)
         pump = conn._turn_pumps.get((session_key, run_id))
         # A terminal means no commit, except the lone steered final: the
         # commit can come after it and the idle row.
@@ -11152,15 +11172,25 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
         try:
             hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
         except Exception as ex:
-            pipe_log(f"  {who}: chat.history failed waiting for a steered answer: {ex!r}")
-            return None
+            if not conn.reconnecting:
+                pipe_log(f"  {who}: chat.history failed waiting for a steered answer: {ex!r}")
+                return last
+            pipe_log(f"  {who}: chat.history waits for the Gateway connection: {ex!r}")
+            try:
+                await conn.ensure_connected()
+            except Exception as down:
+                pipe_log(f"  {who}: the Gateway connection did not come back: {down!r}")
+                return last
+            continue
+        last = hist
         pending = _history_steered_answer_pending(hist, run_id, uncommitted=not ended, steered=steered)
         if host and not pending:
             # On claude-cli the transcript names the host only once it closed.
             pending = _history_steered_span(hist, run_id) is None and not _history_later_turn(hist, run_id)
         if not pending:
             return hist
-        into = host or _history_steered_host(hist, run_id)
+        target = host or _history_steer_target(hist, run_id)
+        into = target or _history_steered_host(hist, run_id)
         if into and conn.runs_failed.get(f"{session_key}:{into}"):
             pipe_log(f"  {who}: the run its message went into "
                      f"ended {conn.runs_failed[f'{session_key}:{into}']} before answering it")
@@ -11169,7 +11199,7 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
             pipe_log(f"  {who}: the Gateway restarted without the "
                      "run its message went into; it ends without the answer")
             return hist
-        if host and await _session_list_active(conn, session_key) is False:
+        if target and await _session_list_active(conn, session_key) is False:
             # The run it went into ended and the session settled: the
             # transcript holds all it will, closed or not.
             try:
@@ -11181,7 +11211,7 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
             return hist
         pipe_log(f"  {who} waits for its steered message's answer in the transcript")
         waits = [asyncio.ensure_future(appended.wait())]
-        if changed is not None:
+        if target:
             waits.append(asyncio.ensure_future(changed.wait()))
         if pump is not None and not pump.terminal.is_set():
             waits.append(asyncio.ensure_future(pump.terminal.wait()))
@@ -16190,6 +16220,9 @@ class _PipeTurn:
             pipe_log(f"  settled run: chat.history failed: {ex!r}")
             hist = None
         found, whole = _history_text_for_run(hist, self.our_run_id) if hist else (False, None)
+        if getattr(self, "steered_span_run", None) and not self.text_yielded and (found or not closer_only):
+            # Nothing of it shown: its own message's answer, never the run it went into.
+            return await self.recover_from_transcript() or ""
         if found and whole:
             if whole.startswith(self.renderer.received):
                 return whole[len(self.renderer.received):]

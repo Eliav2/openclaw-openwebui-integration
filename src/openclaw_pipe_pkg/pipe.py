@@ -2377,6 +2377,9 @@ class _PipeTurn:
             pipe_log(f"  settled run: chat.history failed: {ex!r}")
             hist = None
         found, whole = _history_text_for_run(hist, self.our_run_id) if hist else (False, None)
+        if getattr(self, "steered_span_run", None) and not self.text_yielded and (found or not closer_only):
+            # Nothing of it shown: its own message's answer, never the run it went into.
+            return await self.recover_from_transcript() or ""
         if found and whole:
             if whole.startswith(self.renderer.received):
                 return whole[len(self.renderer.received):]
