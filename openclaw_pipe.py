@@ -621,7 +621,8 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
     """Claim `message_id` for `run_id` under the chat's row lock, inserting it
     under the deepest leaf. Never cut short by a cancel (ELI-205).
 
-    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}."""
+    Returns {claimed, how: new|takeover|taken, message_id, parent, messages,
+    was_done: a taken-over message was already finished}."""
     return await _uncancellable(_claim_turn_message_now(
         chat_id, user_id, message_id, run_id, writer_id, takeover))
 
@@ -652,6 +653,7 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
             msgs[message_id] = {**existing, "meta": meta}
             changed = {message_id: msgs[message_id]}
             how, parent = "takeover", existing.get("parentId")
+            was_done = existing.get("done") is True
         else:
             parent = _deepest_leaf_id(msgs, history.get("currentId"))
             leaf = msgs.get(parent) or {}
@@ -668,14 +670,14 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
                 changed[parent] = msgs[parent]
             history["currentId"] = message_id
             chat.current_message_id = message_id
-            how = "new"
+            how, was_done = "new", False
         chat.chat = {**data, "history": history}
         flag_modified(chat, "chat")
         chat.updated_at = int(time.time())
         for mid, m in changed.items():
             await ChatMessages.upsert_message(mid, chat_id, user_id, m, db=db)
         return {"claimed": True, "how": how, "message_id": message_id, "parent": parent,
-                "messages": changed}
+                "messages": changed, "was_done": was_done}
 
 
 # ---------------------------------------------------------------------------
@@ -8844,11 +8846,16 @@ CHAT_FINISHED_SOURCE = "openclaw-pipe"
 # finish it (a request can run twice, in any worker). Kept off the chat row,
 # whose every write rewrites the whole chat: Open WebUI's Redis when it has
 # one (its workers share it), else a set on this worker (Open WebUI without
-# Redis runs one worker). After a restart no path re-finishes a reply it
-# already published, so the claims need not outlive the process.
+# Redis runs one worker). Keyed by the reply's message id, which never
+# repeats, and never released by time: a claim goes only with its reply's
+# message row (_drop_chat_finished_claims_of_deleted_replies). A path that can
+# outlive a restart without Redis checks the reply itself (a writer taking
+# over a finished message does not publish it).
 CHAT_FINISHED_CLAIMS_KEY = "openclaw:chat_finished"
 _CHAT_FINISHED_CLAIMS_ATTR = "_openclaw_chat_finished_claims"
 _chat_finished_claims_local: set = set()
+# A Redis error is logged once per process, not per reply.
+_chat_finished_redis_error_logged = False
 
 
 def _chat_finished_claims() -> set:
@@ -8873,10 +8880,19 @@ def _chat_finished_redis_key() -> str:
 async def _claim_chat_finished(chat_id: str, message_id: str) -> bool:
     """Whether this caller is the reply's one publisher: an atomic test-and-set
     (Redis HSETNX across workers, else one set on this event loop)."""
+    global _chat_finished_redis_error_logged
     claim = f"{chat_id}:{message_id}"
     redis = _owui_redis()
     if redis is not None:
-        return bool(await redis.hsetnx(_chat_finished_redis_key(), claim, "1"))
+        try:
+            return bool(await redis.hsetnx(_chat_finished_redis_key(), claim, "1"))
+        except Exception as ex:
+            # Errs toward publishing: this process's claim still stops its own
+            # repeats, while two processes may each publish once. A duplicate
+            # notification is better than a reply that never notifies.
+            if not _chat_finished_redis_error_logged:
+                _chat_finished_redis_error_logged = True
+                pipe_log(f"  chat.finished claim: Redis failed ({ex!r}); claiming in this process")
     claims = _chat_finished_claims()
     if claim in claims:
         return False
@@ -8884,31 +8900,47 @@ async def _claim_chat_finished(chat_id: str, message_id: str) -> bool:
     return True
 
 
-async def _release_chat_finished_claims() -> None:
-    """Drop the claims of chats with no live Open WebUI task (requests and
-    turn writers file theirs under the chat id): no path can still finish
-    their replies. Run after each publish and once per Pipe load."""
+async def _drop_chat_finished_claims_of_deleted_replies() -> None:
+    """Garbage collection only, run once per Pipe load: drop the claims of
+    replies whose message row is gone (the chat or message was deleted), as no
+    path can finish those again."""
     try:
-        from open_webui.tasks import list_task_ids_by_item_id
-
         redis = _owui_redis()
         if redis is not None:
             key = _chat_finished_redis_key()
             claims = [c.decode() if isinstance(c, bytes) else c for c in await redis.hkeys(key)]
         else:
             claims = list(_chat_finished_claims())
-        by_chat: dict = {}
+        gone = []
         for claim in claims:
-            by_chat.setdefault(claim.rsplit(":", 1)[0], []).append(claim)
-        for chat_id, held in by_chat.items():
-            if await list_task_ids_by_item_id(redis, chat_id):
-                continue
-            if redis is not None:
-                await redis.hdel(key, *held)
-            else:
-                _chat_finished_claims().difference_update(held)
+            chat_id, _, message_id = claim.rpartition(":")
+            if await _finished_message(chat_id, message_id) is None:
+                gone.append(claim)
+        if not gone:
+            return
+        if redis is not None:
+            await redis.hdel(key, *gone)
+        else:
+            _chat_finished_claims().difference_update(gone)
     except Exception as ex:
-        pipe_log(f"  releasing chat.finished claims failed: {ex!r}")
+        pipe_log(f"  dropping chat.finished claims of deleted replies failed: {ex!r}")
+
+
+# Open WebUI's output item and content part that carry a reply's text.
+OUTPUT_MESSAGE_ITEM = "message"
+OUTPUT_TEXT_PART = "output_text"
+
+
+def _output_reply_text(output) -> str:
+    """The text of a reply's `message` items, as their cards show it."""
+    texts = []
+    for item in output or []:
+        if isinstance(item, dict) and item.get("type") == OUTPUT_MESSAGE_ITEM:
+            text = "".join(p.get("text") or "" for p in item.get("content") or []
+                           if isinstance(p, dict) and p.get("type") == OUTPUT_TEXT_PART).strip()
+            if text:
+                texts.append(text)
+    return "\n\n".join(texts)
 
 
 async def _finished_message(chat_id: str, message_id: str):
@@ -8938,7 +8970,8 @@ async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
         if row is None or row.done is not True or not await _claim_chat_finished(chat_id, message_id):
             return
         if text is None:
-            text = _coerce_text(row.content)
+            # A reply of cards only has no content: its text is in its output.
+            text = _coerce_text(row.content) or _output_reply_text(getattr(row, "output", None))
         title = await Chats.get_chat_title_by_id(chat_id) or ""
         user = await Users.get_user_by_id(user_id)
         try:
@@ -8959,7 +8992,6 @@ async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
             message=title or "Chat finished")
     except Exception as ex:
         pipe_log(f"  turn writer: publishing chat.finished for {message_id[:8]}... failed: {ex!r}")
-    await _release_chat_finished_claims()
 
 
 def _owui_request_task(task_id: str | None):
@@ -10124,7 +10156,10 @@ class _TurnWriter:
                 await _clear_response_stream(self.task_id)
                 async with self._push_lock:
                     pushed = await self._push_final(text, output, history)
-                if not stopped and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False):
+                # A finished reply this writer took over was published when it
+                # first finished: the run continues into it, with no second publish.
+                if (not stopped and not self._claim.get("was_done")
+                        and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False)):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
                 pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
@@ -11855,8 +11890,8 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     except Exception as ex:
         pipe_log(f"  orphan stub reconcile could not start: {ex}")
         return
-    # Claims left by a worker that died with its chats' tasks.
-    await _release_chat_finished_claims()
+    # Claims of replies deleted since (garbage collection, not correctness).
+    await _drop_chat_finished_claims_of_deleted_replies()
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")

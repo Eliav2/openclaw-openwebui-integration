@@ -208,7 +208,8 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
     """Claim `message_id` for `run_id` under the chat's row lock, inserting it
     under the deepest leaf. Never cut short by a cancel (ELI-205).
 
-    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}."""
+    Returns {claimed, how: new|takeover|taken, message_id, parent, messages,
+    was_done: a taken-over message was already finished}."""
     return await _uncancellable(_claim_turn_message_now(
         chat_id, user_id, message_id, run_id, writer_id, takeover))
 
@@ -239,6 +240,7 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
             msgs[message_id] = {**existing, "meta": meta}
             changed = {message_id: msgs[message_id]}
             how, parent = "takeover", existing.get("parentId")
+            was_done = existing.get("done") is True
         else:
             parent = _deepest_leaf_id(msgs, history.get("currentId"))
             leaf = msgs.get(parent) or {}
@@ -255,14 +257,14 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
                 changed[parent] = msgs[parent]
             history["currentId"] = message_id
             chat.current_message_id = message_id
-            how = "new"
+            how, was_done = "new", False
         chat.chat = {**data, "history": history}
         flag_modified(chat, "chat")
         chat.updated_at = int(time.time())
         for mid, m in changed.items():
             await ChatMessages.upsert_message(mid, chat_id, user_id, m, db=db)
         return {"claimed": True, "how": how, "message_id": message_id, "parent": parent,
-                "messages": changed}
+                "messages": changed, "was_done": was_done}
 
 
 # ---------------------------------------------------------------------------
