@@ -1352,11 +1352,13 @@ class _TurnWriter:
             # A run whose reply is only an image has no text to show.
             blocks, missing = ([], []) if steered else await self._stored_media(hist)
             if not self.opened:
+                # Adopted, with nothing new: it ends as it stands only when the
+                # transcript was read; unread, a later load may still rebuild it.
                 if not (self._showable() or note or blocks or missing or self.event_media
-                        or self.adopted) or not await self._open_at_end():
+                        or (self.adopted and hist)) or not await self._open_at_end():
                     return
             output, text = await self._view(final=True)
-            if self.adopted and not self._showable():
+            if self.adopted and hist and not self._showable():
                 # Nothing came for it here: it ends with what its gone writer
                 # showed, not left unfinished for every load to adopt again.
                 shown = self._claim["messages"].get(self.message_id) or {}
@@ -2551,6 +2553,14 @@ def _history_reaches_run(history: dict, run_id: str) -> bool:
     return not stamps or min(stamps) / 1000 <= sent
 
 
+def _history_later_user_turn(history: dict, run_id: str) -> bool:
+    """Whether a read that does not reach `run_id`'s message holds another
+    user turn: committed after its send, so it is not still waiting to be
+    (a session's messages commit in order). A compaction alone leaves none."""
+    return any(_history_user_run_id(m) not in (None, run_id)
+               for m in (history or {}).get("messages") or [])
+
+
 def _history_steered_span(history: dict, run_id: str) -> list | None:
     """The answer to a steered message: the host run's messages after it, up
     to the next turn or the host's closing message. None if not steered or
@@ -2665,9 +2675,10 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
         # A commit lands at the end, so a read that does not go back to the
         # message's send time can show it only if it was never committed.
         unreached = not _history_reaches_run(hist, run_id)
-        if unreached and await _session_list_active(conn, session_key) is False:
+        if (unreached and _history_later_user_turn(hist, run_id)
+                and await _session_list_active(conn, session_key) is False):
             pipe_log(f"  {who}: its message was sent before the oldest one the transcript read "
-                     "holds and the session settled; it ends with what it shows")
+                     "holds, a later message is in, and the session settled; it ends with what it shows")
             return hist
         target = host or _history_steer_target(hist, run_id)
         into = target or _history_steered_host(hist, run_id)

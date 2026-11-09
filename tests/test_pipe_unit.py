@@ -14853,6 +14853,60 @@ class RetiredWriterTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Checking the manager's reply.")
 
+    async def test_an_out_of_reach_message_with_no_later_turn_read_keeps_waiting(self):
+        """Review on #382: a read whose messages are all newer than the send time can follow a
+        compaction while the message still waits to be committed. Only a later user turn in the
+        read shows its commit is not coming (the session's messages commit in order)."""
+        mid = "5b0e1d2c-0000-4000-8000-00000000000c"
+        self.history = {"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "summary"}],
+             "timestamp": 2_000_000}]}
+        await self.adopt_a_reply(mid, f"msg-{self.CHAT}-{mid}-1000.0", "Checking.")
+        self.assertEqual(len(self.pump_tasks()), 1, "it waits: its commit may still come")
+        self.assertIs(self.owui.msgs()[mid]["done"], False)
+
+    async def test_an_adopted_reply_whose_closing_read_failed_stays_open_for_the_next_load(self):
+        """Review on #382: with no transcript read, an adopted reply that got nothing new is not
+        known to be over; it stays unfinished for a later load, not saved done as it stands."""
+        mid = "5b0e1d2c-0000-4000-8000-00000000000d"
+        plain = self.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                raise GatewayError("chat.history timed out")
+            return await plain(method, params, timeout)
+        self.conn.send_request = send_request
+        await self.adopt_a_reply(mid, f"msg-{self.CHAT}-{mid}-1000.0", "Checking.")
+        self.assertFalse(self.pump_tasks())
+        self.assertIs(self.owui.msgs()[mid]["done"], False)
+
+    async def test_retire_lets_a_finalizing_writer_finish_its_publication(self):
+        """Review on #382: a retire landing between M's final save and its push would leave M
+        saved done (so no successor adopts it) while open tabs never hear it ended."""
+        self.active = True
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        (mid, _m), = self.new_messages().items()
+        gate, reached = asyncio.Event(), asyncio.Event()
+
+        async def held(*a, **k):
+            reached.set()
+            await gate.wait()
+        with mock.patch.object(openclaw_pipe, "_clear_response_stream", held):
+            self.active = False
+            self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                            "status": "done", "lastRunId": self.RUN,
+                                            "reason": "chat.run.settled"})
+            await asyncio.wait_for(reached.wait(), 5)
+            retiring = asyncio.ensure_future(self.conn.retire())
+            await self.spin()
+            gate.set()
+            await asyncio.wait_for(retiring, 5)
+        await self.spin()
+        self.assertIs(self.owui.msgs()[mid]["done"], True)
+        self.assertTrue([e for e in self.owui.events("chat:completion") if e["data"].get("done")],
+                        "M was saved done but no tab was told it ended")
+
 
 class GatewayOwnerNeverRecoversTests(_RoutingCase):
     """A settled `running` row keeps M open for the recovery; the tombstone to failed

@@ -3886,9 +3886,14 @@ class _GatewayConnection:
         it is destroyed once the old code is collected (errwatch 06:15)."""
         pumps = [p for p in self._turn_pumps.values() if p.task is not None and not p.task.done()]
         for pump in pumps:
-            pump.task.cancel()
+            # A finalizing writer saves M done and then tells the tabs: cut
+            # between the two, no successor adopts M and no tab hears it ended.
+            if not (pump.writer is not None and pump.writer.finalizing):
+                pump.task.cancel()
         if pumps:
-            await asyncio.gather(*(p.task for p in pumps), return_exceptions=True)
+            # `wait`, not `gather`: a retire cut short by its caller's timeout
+            # leaves a finalizing pump to finish.
+            await asyncio.wait([p.task for p in pumps])
             pipe_log(f"  retired gateway connection: ended {len(pumps)} turn writer pump(s)")
 
     async def disconnect(self):
