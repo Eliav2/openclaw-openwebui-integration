@@ -770,6 +770,8 @@ class _TurnWriter:
         # since the orphan reconcile adopts only `done: false` (ELI-115).
         self.handover_owed = renderer is not None
         self.request_task = request
+        # Taken over from a gone writer by its meta (`_adopt_turn_message`).
+        self.adopted = False
         if renderer is not None:
             # Tabs hold these items under Open WebUI's ids: unknown items make
             # the first diff replace them in place, not duplicate (ELI-158).
@@ -1316,8 +1318,9 @@ class _TurnWriter:
         self.closed = self.finalizing = True
         try:
             try:
-                hist = None if steered else await self.conn.session_history(
-                    self.session_key, limit=RUN_HISTORY_LIMIT)
+                hist = None if steered else await _history_once_connected(
+                    self.conn, self.session_key, f"turn writer: {self.message_id[:8]}...",
+                    limit=RUN_HISTORY_LIMIT)
             except Exception as ex:
                 hist = None
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
@@ -1349,10 +1352,17 @@ class _TurnWriter:
             # A run whose reply is only an image has no text to show.
             blocks, missing = ([], []) if steered else await self._stored_media(hist)
             if not self.opened:
-                if not (self._showable() or note or blocks or missing or self.event_media) \
-                        or not await self._open_at_end():
+                # Adopted, with nothing new: it ends as it stands only when the
+                # transcript was read; unread, a later load may still rebuild it.
+                if not (self._showable() or note or blocks or missing or self.event_media
+                        or (self.adopted and hist)) or not await self._open_at_end():
                     return
             output, text = await self._view(final=True)
+            if self.adopted and hist and not self._showable():
+                # Nothing came for it here: it ends with what its gone writer
+                # showed, not left unfinished for every load to adopt again.
+                shown = self._claim["messages"].get(self.message_id) or {}
+                output, text = copy.deepcopy(shown.get("output") or []), shown.get("content") or ""
             output = [i for i in output if not _is_sentinel_message_item(i)]
             text = text.strip()
             if text in _SILENT_SENTINELS:
@@ -1763,6 +1773,7 @@ class _RunPump:
         # split into before it, and its own span when not the pump's run.
         self.steered_before: list | None = None
         self.span_run: str | None = None
+        self.task: "asyncio.Task | None" = None  # its `_turn_pump_loop`, which a retire ends
 
 
 def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -1812,7 +1823,7 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
             pump.handover = conn.handover_of(sess, run)
             pump.started = _handover_started(pump.handover)
             conn.unregister_run_target(sess, run)
-        spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
+        pump.task = spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
         child = parse_announce_run_id(run)
         if child is not None:
@@ -1975,7 +1986,7 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
         pump.span_run, pump.steered_before = target["span_run"], list(target.get("before") or [])
     pump.stop_notice_before = conn._stop_notice_seen
     conn.unregister_run_target(session_key, run_id)
-    spawn_background(_turn_pump_loop(conn, session_key, run_id, parsed, pump))
+    pump.task = spawn_background(_turn_pump_loop(conn, session_key, run_id, parsed, pump))
     spawn_background(conn.ensure_message_subscription(session_key))
     if read_row:
         spawn_background(_turn_resync(conn, skip=set(conn.active_run_snapshot)))
@@ -2103,8 +2114,6 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
         while True:
             kind, item = await pump.queue.get()
-            if kind == "retired":
-                return
             if pump.wake:
                 if await _wake_step(conn, sess, run, user_id, chat_id, pump, kind, item):
                     return
@@ -2155,8 +2164,9 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
     finally:
         if conn._turn_pumps.get((sess, run)) is pump:
             conn._turn_pumps.pop((sess, run), None)
-            # Wakes share this run id: what queued after the end is the next one's.
-            while pump.wake and not pump.queue.empty():
+            # Wakes share this run id: what queued after the end is the next
+            # one's. A retired connection starts none (`_end_turn_pumps`).
+            while pump.wake and not conn._retired and not pump.queue.empty():
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
@@ -2372,8 +2382,9 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
     pump.writer = _TurnWriter(conn, session_key=session_key, chat_id=chat_id, user_id=user_id,
                               run_id=run, message_id=message_id, takeover=True,
                               wake=dict(wake) if pump.wake else None)
+    pump.writer.adopted = True
     conn._turn_writers[(chat_id, message_id)] = pump.writer
-    spawn_background(_turn_pump_loop(conn, session_key, run, (user_id, chat_id), pump))
+    pump.task = spawn_background(_turn_pump_loop(conn, session_key, run, (user_id, chat_id), pump))
     spawn_background(conn.ensure_message_subscription(session_key))
     pipe_log(f"  turn writer: adopted {message_id[:8]}... (run {run[:24]}...) from writer "
              f"{str(meta.get('openclaw_writer'))[:12]}...")
@@ -2530,6 +2541,26 @@ def _history_steered_answer_pending(history: dict, run_id: str, uncommitted: boo
     return _history_steered_span(history, run_id) is None
 
 
+def _history_reaches_run(history: dict, run_id: str) -> bool:
+    """Whether a transcript read goes back to `run_id`'s message: it holds
+    it, or its oldest message (ms) is no older than the run id's send time."""
+    sent = _run_id_sent_at(run_id)
+    messages = (history or {}).get("messages") or []
+    if sent is None or any(_history_user_run_id(m) == run_id for m in messages):
+        return True
+    stamps = [m["timestamp"] for m in messages
+              if isinstance(m, dict) and isinstance(m.get("timestamp"), (int, float))]
+    return not stamps or min(stamps) / 1000 <= sent
+
+
+def _history_later_user_turn(history: dict, run_id: str) -> bool:
+    """Whether a read that does not reach `run_id`'s message holds another
+    user turn: committed after its send, so it is not still waiting to be
+    (a session's messages commit in order). A compaction alone leaves none."""
+    return any(_history_user_run_id(m) not in (None, run_id)
+               for m in (history or {}).get("messages") or [])
+
+
 def _history_steered_span(history: dict, run_id: str) -> list | None:
     """The answer to a steered message: the host run's messages after it, up
     to the next turn or the host's closing message. None if not steered or
@@ -2590,6 +2621,21 @@ def _history_later_turn(history: dict, run_id: str) -> bool:
     return start is not None and any(_history_next_turn(m) for m in messages[start + 1:])
 
 
+async def _history_once_connected(conn, session_key: str, who: str, **params) -> dict:
+    """chat.history; a read the socket's reconnect failed waits for the
+    connection to be back (`ensure_connected`, an event) and reads again.
+    Raises what the read raised otherwise, or why the connection is not
+    coming back (retired)."""
+    while True:
+        try:
+            return await conn.session_history(session_key, **params)
+        except Exception as ex:
+            if not conn.reconnecting:
+                raise
+            pipe_log(f"  {who}: chat.history waits for the Gateway connection: {ex!r}")
+        await conn.ensure_connected()
+
+
 async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *,
                                 steered: bool = False, host: str | None = None) -> dict | None:
     """Wait for the transcript to hold the answer of the run `run_id`'s
@@ -2602,8 +2648,9 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
     its answer (2026.10.10: `finishCliAttempt` awaits Claude Code's flush and
     the closing copy before the run resolves, and `deferredLifecycle.complete()`
     clears the active run after that), so the settled transcript holds the
-    answer if there is one. A read during a reconnect waits for the
-    connection and reads again."""
+    answer if there is one. A message sent before the oldest one a read
+    holds is not in it to wait for: it ends once the session settled. A read
+    during a reconnect waits for the connection and reads again."""
     restarts = conn.gateway_restarts
     last = None
     while True:
@@ -2614,24 +2661,24 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
         # commit can come after it and the idle row.
         ended = pump is not None and pump.terminal.is_set() and not steered
         try:
-            hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+            hist = await _history_once_connected(conn, session_key, who, limit=RUN_HISTORY_LIMIT)
         except Exception as ex:
-            if not conn.reconnecting:
-                pipe_log(f"  {who}: chat.history failed waiting for a steered answer: {ex!r}")
-                return last
-            pipe_log(f"  {who}: chat.history waits for the Gateway connection: {ex!r}")
-            try:
-                await conn.ensure_connected()
-            except Exception as down:
-                pipe_log(f"  {who}: the Gateway connection did not come back: {down!r}")
-                return last
-            continue
+            pipe_log(f"  {who}: chat.history failed waiting for a steered answer: {ex!r}")
+            return last
         last = hist
         pending = _history_steered_answer_pending(hist, run_id, uncommitted=not ended, steered=steered)
         if host and not pending:
             # On claude-cli the transcript names the host only once it closed.
             pending = _history_steered_span(hist, run_id) is None and not _history_later_turn(hist, run_id)
         if not pending:
+            return hist
+        # A commit lands at the end, so a read that does not go back to the
+        # message's send time can show it only if it was never committed.
+        unreached = not _history_reaches_run(hist, run_id)
+        if (unreached and _history_later_user_turn(hist, run_id)
+                and await _session_list_active(conn, session_key) is False):
+            pipe_log(f"  {who}: its message was sent before the oldest one the transcript read "
+                     "holds, a later message is in, and the session settled; it ends with what it shows")
             return hist
         target = host or _history_steer_target(hist, run_id)
         into = target or _history_steered_host(hist, run_id)
@@ -2655,7 +2702,7 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
             return hist
         pipe_log(f"  {who} waits for its steered message's answer in the transcript")
         waits = [asyncio.ensure_future(appended.wait())]
-        if target:
+        if target or unreached:
             waits.append(asyncio.ensure_future(changed.wait()))
         if pump is not None and not pump.terminal.is_set():
             waits.append(asyncio.ensure_future(pump.terminal.wait()))

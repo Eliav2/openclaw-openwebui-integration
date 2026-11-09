@@ -2961,8 +2961,7 @@ class _GatewayConnection:
         _retire_turn_writer(self.writer_id)
         for writer in list(self._turn_writers.values()):
             writer.release()
-        for pump in list(self._turn_pumps.values()):
-            pump.queue.put_nowait(("retired", None))
+        await self._end_turn_pumps()
         if self._serving():
             pipe_log(
                 f"  retired gateway connection: serving {len(self._consumers)} "
@@ -2970,6 +2969,23 @@ class _GatewayConnection:
             )
             return
         await self.disconnect()
+
+    async def _end_turn_pumps(self) -> None:
+        """End every run pump, its writer released first so no end reads as a
+        Stop. A pump waiting on an event (a steered answer, a recovery turn)
+        reads no queue, and a retired connection gets no event: left pending,
+        it is destroyed once the old code is collected (errwatch 06:15)."""
+        pumps = [p for p in self._turn_pumps.values() if p.task is not None and not p.task.done()]
+        for pump in pumps:
+            # A finalizing writer saves M done and then tells the tabs: cut
+            # between the two, no successor adopts M and no tab hears it ended.
+            if not (pump.writer is not None and pump.writer.finalizing):
+                pump.task.cancel()
+        if pumps:
+            # `wait`, not `gather`: a retire cut short by its caller's timeout
+            # leaves a finalizing pump to finish.
+            await asyncio.wait([p.task for p in pumps])
+            pipe_log(f"  retired gateway connection: ended {len(pumps)} turn writer pump(s)")
 
     async def disconnect(self):
         """Gracefully close the connection."""
