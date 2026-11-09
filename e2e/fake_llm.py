@@ -187,8 +187,14 @@ ASK_TOOL_ARGS = {"questions": [{"id": "db", "header": "Database", "question": "W
                                 "options": [{"label": "Postgres", "description": "needs a server"},
                                             {"label": "SQLite"}]}],
                  "timeoutSeconds": 300}
-# E2E_MAP: the arguments a model gives the map tool; the stack's stand-in ignores them.
-MAP_ARGS = {"stops": [{"label": "Fushimi Inari", "query": "Fushimi Inari Taisha, Kyoto, Japan"}]}
+# E2E_MAP: the arguments a model gives the map tool (a walking day plan). The stack's stand-in
+# ignores them and shows its own fixed map; the real plugin (gateway-plugins/map in the
+# openclaw-workspace repo) uses them.
+MAP_ARGS = {"title": "Kyoto, day 1",
+            "stops": [{"label": "Fushimi Inari", "query": "Fushimi Inari Taisha, Kyoto, Japan", "group": "Day 1"},
+                      {"label": "Kiyomizu-dera", "query": "Kiyomizu-dera, Kyoto, Japan", "group": "Day 1"},
+                      {"label": "Gion", "query": "Gion, Kyoto, Japan", "group": "Day 1"}],
+            "route": {"mode": "walk"}}
 _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 # The result's JSON sits inside the tool's text, so its quotes may be escaped.
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
