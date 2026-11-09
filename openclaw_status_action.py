@@ -1302,7 +1302,7 @@ def _ladder_cache_path(state_dir: str = "") -> str:
 def _thinking_default_levels(state_dir: str = "") -> list:
     """The `thinking_default` dropdown: UNSET, then every level the Gateway's
     models offer (the ladder cache's union, by rank), less those sent as
-    another. Open WebUI builds it once per load; each send clamps per model."""
+    another. Each send still clamps to its own model's ladder."""
     cached = (_read_json_file(_ladder_cache_path(state_dir)) or {}).get("levels")
     levels = [lv for lv in cached if lv in LEVEL_RANKS] if isinstance(cached, list) else []
     levels = {lv for lv in levels or FALLBACK_LEVELS if lv not in LEVEL_SENT_AS}

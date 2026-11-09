@@ -62,9 +62,10 @@ class DropdownTests(_StateDirCase):
     models offer, from the ladder cache the Pipe writes."""
 
     def _choices(self, mod):
-        schema = mod.Pipe.UserValves.model_json_schema()["properties"]["thinking_default"]
-        self.assertEqual(schema["enum"], mod._thinking_default_levels())
-        return schema["enum"]
+        # Open WebUI resolves `input.options` by calling that method on UserValves.
+        field = mod.Pipe.UserValves.model_fields["thinking_default"].json_schema_extra
+        options = getattr(mod.Pipe.UserValves, field["input"]["options"])()
+        return [o["value"] for o in options]
 
     def test_falls_back_when_there_is_no_cache(self):
         self.assertEqual(self._choices(self.mod), FALLBACK)
@@ -82,6 +83,12 @@ class DropdownTests(_StateDirCase):
     def test_a_corrupt_or_empty_cache_degrades_to_the_fallback(self):
         self.assertEqual(self._choices(self._load("{ not json")), FALLBACK)
         self.assertEqual(self._choices(self._load(json.dumps({"levels": []}))), FALLBACK)
+
+    def test_levels_learned_after_load_are_listed(self):
+        """No re-save of the Pipe: the cache is read when the valves are shown."""
+        cache = Path(os.environ["OPENCLAW_BRIDGE_STATE_DIR"]) / "thinking-ladders.json"
+        cache.write_text(json.dumps({"levels": ["low", "high", "xhigh"]}))
+        self.assertEqual(self._choices(self.mod), ["default", "low", "high", "xhigh"])
 
     def test_the_default_is_unset_so_no_saved_valve_changes(self):
         self.assertEqual(self.mod.Pipe.UserValves().thinking_default, "default")

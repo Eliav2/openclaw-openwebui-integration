@@ -4640,7 +4640,7 @@ def _ladder_cache_path(state_dir: str = "") -> str:
 def _thinking_default_levels(state_dir: str = "") -> list:
     """The `thinking_default` dropdown: UNSET, then every level the Gateway's
     models offer (the ladder cache's union, by rank), less those sent as
-    another. Open WebUI builds it once per load; each send clamps per model."""
+    another. Each send still clamps to its own model's ladder."""
     cached = (_read_json_file(_ladder_cache_path(state_dir)) or {}).get("levels")
     levels = [lv for lv in cached if lv in LEVEL_RANKS] if isinstance(cached, list) else []
     levels = {lv for lv in levels or FALLBACK_LEVELS if lv not in LEVEL_SENT_AS}
@@ -14307,6 +14307,14 @@ class _TurnState:
     parked: bool = False
 
 
+class _UserValvesBase(BaseModel):
+    @classmethod
+    def get_thinking_levels(cls):
+        """The `thinking_default` dropdown. Open WebUI calls this each time it
+        shows the valves, so levels learned since the Pipe loaded are listed."""
+        return [{"value": lv, "label": lv} for lv in _thinking_default_levels(Pipe._last_state_dir)]
+
+
 class Pipe:
     """Open WebUI Pipe that routes messages through the OpenClaw Gateway over
     a persistent WebSocket. Valves: see `Valves` or docs/configuration.md.
@@ -14593,10 +14601,10 @@ class Pipe:
                     "model's own level. A level a model does not support is clamped "
                     "down, and the chat says so."
                 ),
-                json_schema_extra={"enum": _thinking_default_levels()},
+                json_schema_extra={"input": {"type": "select", "options": "get_thinking_levels"}},
             ),
         ),
-        __base__=BaseModel,
+        __base__=_UserValvesBase,
     )
 
     # The DEFAULT_MODEL dropdown is a classmethod: it reads the cache via this.

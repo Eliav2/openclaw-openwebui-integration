@@ -171,6 +171,14 @@ class _TurnState:
     parked: bool = False
 
 
+class _UserValvesBase(BaseModel):
+    @classmethod
+    def get_thinking_levels(cls):
+        """The `thinking_default` dropdown. Open WebUI calls this each time it
+        shows the valves, so levels learned since the Pipe loaded are listed."""
+        return [{"value": lv, "label": lv} for lv in _thinking_default_levels(Pipe._last_state_dir)]
+
+
 class Pipe:
     """Open WebUI Pipe that routes messages through the OpenClaw Gateway over
     a persistent WebSocket. Valves: see `Valves` or docs/configuration.md.
@@ -457,10 +465,10 @@ class Pipe:
                     "model's own level. A level a model does not support is clamped "
                     "down, and the chat says so."
                 ),
-                json_schema_extra={"enum": _thinking_default_levels()},
+                json_schema_extra={"input": {"type": "select", "options": "get_thinking_levels"}},
             ),
         ),
-        __base__=BaseModel,
+        __base__=_UserValvesBase,
     )
 
     # The DEFAULT_MODEL dropdown is a classmethod: it reads the cache via this.
