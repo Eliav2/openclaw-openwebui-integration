@@ -16,10 +16,9 @@ Only the tip of `main` is supported. Fixes ship there; there are no backports.
 
 ## What is in scope
 
-The three Open WebUI functions (`openclaw_pipe.py`, `openclaw_status_action.py`,
-`openclaw_thinking_filter.py`), their source fragments under
-`src/openclaw_pipe_pkg/`, and the installers (`install.py`, `install_action.py`,
-`install_filter.py`).
+The two Open WebUI functions (`openclaw_pipe.py`, `openclaw_status_action.py`),
+their source fragments under `src/openclaw_pipe_pkg/`, and the installers
+(`install.py`, `install_action.py`).
 
 Out of scope: Open WebUI itself, the OpenClaw Gateway, and the agent you route
 to. Report those upstream.

@@ -30,7 +30,8 @@ _COMPOSER_BUTTON_VERSION = "11"
 _COMPOSER_ACTION_ID = "openclaw_status_action"
 _COMPOSER_DEFAULT_MODEL_PREFIX = "openclaw_gateway."
 
-# The Thinking filter chip's alt text (install_filter.py); the button follows it.
+# The alt text of the removed Thinking filter's chip: while a user still has
+# that filter installed, the button follows it.
 _COMPOSER_THINKING_CHIP_LABEL = "OpenClaw Thinking"
 
 _COMPOSER_BUTTON_JS_TEMPLATE = r"""

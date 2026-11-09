@@ -9,5 +9,4 @@
 # from language stats, so reviewers see only the source change.
 openclaw_pipe.py linguist-generated=true
 openclaw_status_action.py linguist-generated=true
-openclaw_thinking_filter.py linguist-generated=true
 docs/configuration.md linguist-generated=true

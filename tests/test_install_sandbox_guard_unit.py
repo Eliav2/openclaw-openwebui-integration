@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-INSTALLERS = ("install.py", "install_action.py", "install_filter.py")
+INSTALLERS = ("install.py", "install_action.py")
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):

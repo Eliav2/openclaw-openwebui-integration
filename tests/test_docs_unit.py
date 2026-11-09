@@ -322,7 +322,7 @@ class VersionsTests(unittest.TestCase):
         tested = tuple(int(x) for x in self.owui.split("."))
         self.assertLessEqual(tuple(int(x) for x in next(iter(minimums)).split(".")), tested,
                              "the minimum is above the version CI tests")
-        for name in ("openclaw_pipe.py", "openclaw_status_action.py", "openclaw_thinking_filter.py"):
+        for name in ("openclaw_pipe.py", "openclaw_status_action.py"):
             with self.subTest(name):
                 field = re.search(r"^required_open_webui_version:\s*(\S+)$",
                                   (ROOT / name).read_text(), re.M)

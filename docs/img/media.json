@@ -431,13 +431,7 @@
       }
     },
     "thinking-level-light.png": {
-      "sha": "703abf3b1672c817",
-      "groups": {
-        "chrome": "40732052bff72db4"
-      }
-    },
-    "thinking-toggle-light.png": {
-      "sha": "f70bd71a8c26bff8",
+      "sha": "555bbfbec07bf5e8",
       "groups": {
         "chrome": "40732052bff72db4"
       }

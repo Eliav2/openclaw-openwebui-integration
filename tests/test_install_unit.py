@@ -204,7 +204,6 @@ class InstallerCoreTests(unittest.TestCase):
         import dataclasses
         from unittest import mock
         import install_action
-        import install_filter
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
         for patch in (mock.patch.object(inst, "BACKUP_DIR", tmp / "backups"),
@@ -212,9 +211,7 @@ class InstallerCoreTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         (tmp / "action.py").write_text("action v2")
-        (tmp / "filter.py").write_text("filter v2")
         self.action = dataclasses.replace(install_action.SPEC, artifact=tmp / "action.py")
-        self.filter = dataclasses.replace(install_filter.SPEC, artifact=tmp / "filter.py")
 
     def test_a_new_action_is_created_active_global_with_the_pipes_valves(self):
         owui = _FakeOwui([self.PIPE], {"openclaw_gateway": self.PIPE_VALVES})
@@ -239,19 +236,12 @@ class InstallerCoreTests(unittest.TestCase):
         self.assertEqual(owui.valves["openclaw_status_action"]["GATEWAY_TOKEN"], "t")
         self.assertFalse([p for p in owui.posts if p.endswith("/toggle") or p.endswith("/toggle/global")])
 
-    def test_the_filter_is_activated_and_never_made_global(self):
-        owui = _FakeOwui([self.PIPE])
-        self.assertTrue(inst.install_function(owui, self.filter))
-        fn = owui.functions["openclaw_thinking"]
-        self.assertEqual((fn["type"], fn["is_active"], fn["is_global"]), ("filter", True, False))
-        self.assertTrue(inst.function_status(owui, self.filter), "per-model is the right state")
-
     def test_a_server_that_kept_the_old_code_fails_the_install_and_the_status(self):
-        old = {"id": "openclaw_thinking", "type": "filter", "content": "filter v1",
-               "is_active": True, "is_global": False}
-        owui = _FakeOwui([self.PIPE, old], takes_updates=False)
-        self.assertFalse(inst.install_function(owui, self.filter))
-        self.assertFalse(inst.function_status(owui, self.filter))
+        old = {"id": "openclaw_status_action", "type": "action", "content": "action v1",
+               "is_active": True, "is_global": True}
+        owui = _FakeOwui([self.PIPE, old], {"openclaw_gateway": self.PIPE_VALVES}, takes_updates=False)
+        self.assertFalse(inst.install_function(owui, self.action))
+        self.assertFalse(inst.function_status(owui, self.action))
 
 
 class UpdateValvesTests(unittest.TestCase):

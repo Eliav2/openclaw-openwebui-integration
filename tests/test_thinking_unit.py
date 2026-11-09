@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Unit tests for the Thinking filter (ELI-85), on the built artifact Open WebUI loads."""
+"""Unit tests for the thinking level (ELI-85): the levels, the clamp, the
+Gateway's rejection and the `thinking_default` dropdown, on the built Pipe."""
 
 import importlib.util
 import json
 import os
-import re
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ARTIFACT = ROOT / "openclaw_thinking_filter.py"
+ARTIFACT = ROOT / "openclaw_pipe.py"
 
 # This suite needs the real pydantic (create_model, model_json_schema);
 # conftest.py imports it first. On CI a miss must fail, not skip.
@@ -26,13 +24,10 @@ except ImportError as exc:  # pragma: no cover - environment guard
     pytest.skip(_reason, allow_module_level=True)
 
 
-def load(state_dir=None):
-    """Import the built artifact fresh with STATE_DIR set (the dropdown is baked in
-    at import). Tests restore it (`_StateDirCase`)."""
-    if state_dir is None:
-        os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
-    else:
-        os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = str(state_dir)
+def load(state_dir):
+    """Import the built Pipe fresh with OPENCLAW_BRIDGE_STATE_DIR set (the
+    dropdown is baked in at import). Tests restore it (`_StateDirCase`)."""
+    os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = str(state_dir)
     spec = importlib.util.spec_from_file_location("owui_thinking_test", ARTIFACT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -52,55 +47,86 @@ class _StateDirCase(unittest.TestCase):
             else:
                 os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = before
         self.addCleanup(restore)
-        self.mod = load(state_dir="/nonexistent-on-purpose")
+        self.mod = self._load()
 
-
-class BuildTests(unittest.TestCase):
-    def test_built_artifacts_match_src(self):
-        proc = subprocess.run([sys.executable, "build.py", "--check-all"],
-                              cwd=ROOT, capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0,
-                         "run: python3 build.py --all\n" + (proc.stdout or proc.stderr)[:400])
-
-    def test_open_webui_frontmatter(self):
-        # OWUI reads metadata only from `key: value` lines in the docstring.
-        head = ARTIFACT.read_text()[:4000]
-        doc = head.split('"""')[1] if '"""' in head else ""
-        meta = {}
-        for line in doc.splitlines():
-            m = re.match(r"^\s*([a-z_]+):\s*(.+)$", line)
-            if m:
-                meta.setdefault(m.group(1), m.group(2).strip())
-        self.assertEqual(meta.get("title"), "OpenClaw Thinking")
-        self.assertEqual(meta.get("version"), "1.0.0")
-        self.assertTrue(meta.get("description"))
-        self.assertNotIn("requirements", meta, "stdlib plus pydantic only")
+    def _load(self, cache=None):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        if cache is not None:
+            (Path(td.name) / "thinking-ladders.json").write_text(cache)
+        return load(td.name)
 
 
 class DropdownTests(_StateDirCase):
-    def _cache(self, content):
-        td = tempfile.TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        (Path(td.name) / "thinking-ladders.json").write_text(content)
-        return load(state_dir=td.name)
+    """The `thinking_default` user valve's choices: the levels the Gateway's
+    models offer, from the ladder cache the Pipe writes."""
+
+    def _choices(self, mod):
+        # Open WebUI resolves `input.options` by calling that method on UserValves.
+        field = mod.Pipe.UserValves.model_fields["thinking_default"].json_schema_extra
+        options = getattr(mod.Pipe.UserValves, field["input"]["options"])()
+        return [o["value"] for o in options]
 
     def test_falls_back_when_there_is_no_cache(self):
-        self.assertEqual(self.mod.available_levels(), FALLBACK)
+        self.assertEqual(self._choices(self.mod), FALLBACK)
 
-    def test_the_cache_drives_the_list_ordered_by_rank(self):
-        mod = self._cache(json.dumps({"levels": ["high", "off", "max", "medium", "xhigh", "low", "minimal"],
-                                      "updated": 1786784049}))
-        want = ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
-        self.assertEqual(mod.available_levels(), want)
-        self.assertEqual(mod.Filter.UserValves.model_json_schema()["properties"]["level"]["enum"], want)
+    def test_the_cache_drives_the_list_ordered_by_rank_without_ultra(self):
+        mod = self._load(json.dumps({"levels": ["high", "off", "ultra", "max", "medium", "xhigh", "low",
+                                                "minimal"], "updated": 1786784049}))
+        self.assertEqual(self._choices(mod),
+                         ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
 
     def test_unknown_level_ids_in_the_cache_are_dropped(self):
-        mod = self._cache(json.dumps({"levels": ["low", "bogus", "medium"]}))
-        self.assertEqual(mod.available_levels(), ["default", "low", "medium"])
+        self.assertEqual(self._choices(self._load(json.dumps({"levels": ["low", "bogus", "medium"]}))),
+                         ["default", "low", "medium"])
 
     def test_a_corrupt_or_empty_cache_degrades_to_the_fallback(self):
-        self.assertEqual(self._cache("{ not json").available_levels(), FALLBACK)
-        self.assertEqual(self._cache(json.dumps({"levels": []})).available_levels(), FALLBACK)
+        self.assertEqual(self._choices(self._load("{ not json")), FALLBACK)
+        self.assertEqual(self._choices(self._load(json.dumps({"levels": []}))), FALLBACK)
+
+    def test_a_cache_that_is_not_an_object_degrades_to_the_fallback(self):
+        """CodeRabbit (#388): valid JSON of another shape must not break the Valves dialog."""
+        for text in ('["low", "high"]', '"low"', "7", "true"):
+            mod = self._load(text)
+            self.assertEqual(self._choices(mod), FALLBACK, text)
+            self.assertIsNone(mod._read_model_thinking_ladder("anthropic/claude-opus-5-5"), text)
+            # A write replaces it with a valid cache.
+            self.assertTrue(mod._record_thinking_ladder(["low"], model_key="anthropic/claude-opus-5-5"))
+            self.assertEqual(mod._read_model_thinking_ladder("anthropic/claude-opus-5-5"), ["low"])
+
+    def test_levels_learned_after_load_are_listed(self):
+        """No re-save of the Pipe: the cache is read when the valves are shown."""
+        cache = Path(os.environ["OPENCLAW_BRIDGE_STATE_DIR"]) / "thinking-ladders.json"
+        cache.write_text(json.dumps({"levels": ["low", "high", "xhigh"]}))
+        self.assertEqual(self._choices(self.mod), ["default", "low", "high", "xhigh"])
+
+    def test_an_admins_new_state_dir_is_read_before_the_next_model_list(self):
+        """Open WebUI swaps `valves` on the Pipe when an admin saves them; the dropdown reads
+        that STATE_DIR at once, not the one the last `pipes()` saw (CodeRabbit, #388)."""
+        pipe = self.mod.Pipe()
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        (Path(other.name) / "thinking-ladders.json").write_text(json.dumps({"levels": ["low", "xhigh"]}))
+        pipe.valves = self.mod.Pipe.Valves(STATE_DIR=other.name)
+        self.assertEqual(self._choices(self.mod), ["default", "low", "xhigh"])
+
+    def test_the_default_is_unset_so_no_saved_valve_changes(self):
+        self.assertEqual(self.mod.Pipe.UserValves().thinking_default, "default")
+
+
+class NormalizeTests(_StateDirCase):
+    """Advanced Params' Reasoning Effort is free text."""
+
+    def test_case_and_spaces_are_ignored(self):
+        self.assertEqual(self.mod.normalize_thinking_level(" XHigh "), "xhigh")
+
+    def test_ultra_is_sent_as_max(self):
+        self.assertEqual(self.mod.normalize_thinking_level("Ultra"), "max")
+
+    def test_empty_and_default_mean_no_level(self):
+        for value in (None, "", "  ", "default", "Default"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.mod.normalize_thinking_level(value))
 
 
 class ClampTests(_StateDirCase):
@@ -135,8 +161,6 @@ class ClampTests(_StateDirCase):
 
 
 class RejectionTests(_StateDirCase):
-    """The parser lives in the shared fragment; the filter imports nothing beyond pydantic."""
-
     def test_the_real_wording_yields_level_model_and_ladder(self):
         self.assertEqual(
             self.mod.parse_thinking_rejection(
@@ -177,44 +201,6 @@ class RejectionTests(_StateDirCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(self.mod.parse_thinking_rejection(text))
-
-
-class _UV:
-    def __init__(self, level):
-        self.level = level
-
-
-class InletTests(_StateDirCase):
-    def test_toggle_and_icon_are_instance_attributes(self):
-        f = self.mod.Filter()
-        self.assertIn("toggle", vars(f))
-        self.assertIn("icon", vars(f))
-        self.assertIs(f.toggle, True)
-
-    def test_a_chosen_level_lands_in_reasoning_effort(self):
-        f = self.mod.Filter()
-        self.assertEqual(f.inlet({}, {"valves": _UV("high")}).get("reasoning_effort"), "high")
-        self.assertEqual(f.inlet({}, {"valves": {"level": "low"}}).get("reasoning_effort"), "low")
-        self.assertNotIn("reasoning_effort", f.inlet({}, {"valves": _UV("default")}))
-        self.assertNotIn("reasoning_effort", f.inlet({}, None))
-
-    def test_advanced_params_override(self):
-        f = self.mod.Filter()
-        self.assertEqual(f.inlet({"reasoning_effort": "low"}, {"valves": _UV("high")})["reasoning_effort"],
-                         "high")
-        f2 = self.mod.Filter()
-        f2.valves.override_advanced_params = False
-        self.assertEqual(f2.inlet({"reasoning_effort": "low"}, {"valves": _UV("high")})["reasoning_effort"],
-                         "low")
-        self.assertEqual(f2.inlet({}, {"valves": _UV("high")})["reasoning_effort"], "high")
-
-    def test_the_body_is_mutated_in_place(self):
-        f = self.mod.Filter()
-        self.assertIsNone(f.inlet(None, {"valves": _UV("high")}))
-        body = {"messages": [{"role": "user", "content": "hi"}]}
-        out = f.inlet(body, {"valves": _UV("medium")})
-        self.assertIs(out, body)
-        self.assertEqual(out["messages"][0]["content"], "hi")
 
 
 if __name__ == "__main__":

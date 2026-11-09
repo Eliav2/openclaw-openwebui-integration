@@ -22,7 +22,7 @@ bun run docs:build                                           # docs site, fails 
 
 Literals that carry meaning get a name (`AGENTS.md`, "No magic numbers or strings"); CI fails on a new one.
 
-`openclaw_pipe.py`, `openclaw_status_action.py` and `openclaw_thinking_filter.py` are built from `src/openclaw_pipe_pkg/`. Edit the source there, then run `python3 build.py --all`.
+`openclaw_pipe.py` and `openclaw_status_action.py` are built from `src/openclaw_pipe_pkg/`. Edit the source there, then run `python3 build.py --all`.
 
 The end-to-end suite runs a real Gateway and Open WebUI in CI on every pull request. To run it locally, and for everything else (CI jobs, screenshots, the docs site), see [Development](https://eliav2.github.io/openclaw-openwebui-integration/development).
 

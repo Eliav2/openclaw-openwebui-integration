@@ -57,12 +57,9 @@ If no request is pending yet, send one message in a chat first: the Pipe connect
 
 Reload Open WebUI, choose **OpenClaw · Default** (or any discovered model) and start chatting. The reply should stream in token by token.
 
-## The Status Action and the thinking filter, by hand
+## The Status Action, by hand
 
-Both are optional and install the same way, as their own functions:
-
-- [Status button](./status-action.md#install-by-hand): an **Action** with ID `openclaw_status_action`, whose five connection valves must match the Pipe's.
-- [Thinking control](./thinking-filter.md#install-by-hand): a **Filter** with ID `openclaw_thinking`, attached per model.
+It is optional and installs the same way, as its own function: [Status button](./status-action.md#install-by-hand), an **Action** with ID `openclaw_status_action`, whose five connection valves must match the Pipe's.
 
 ## Next
 

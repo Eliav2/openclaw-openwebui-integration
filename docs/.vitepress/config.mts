@@ -191,7 +191,6 @@ export default withMermaid(defineConfig({
           { text: "Device pairing", link: "/install/pairing" },
           { text: "Two hosts", link: "/install/two-hosts" },
           { text: "Status button", link: "/install/status-action" },
-          { text: "Thinking control", link: "/install/thinking-filter" },
           { text: "Push notifications", link: "/install/web-push" },
           { text: "Agent skills", link: "/install/agent-skills" },
           { text: "Update and uninstall", link: "/install/update-uninstall" },

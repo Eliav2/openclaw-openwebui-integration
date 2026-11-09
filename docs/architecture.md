@@ -53,17 +53,16 @@ to be sent as a fresh item, not a patch to an old one.
 
 ## File layout
 
-### The three functions
+### The two functions
 
-The repo ships three Open WebUI functions, each a single built file at the repo root:
+The repo ships two Open WebUI functions, each a single built file at the repo root:
 
 | File | Open WebUI type | Purpose |
 |---|---|---|
 | [`openclaw_pipe.py`](../openclaw_pipe.py) | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration: almost every [feature](./features/index.md). |
 | [`openclaw_status_action.py`](../openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) | The Status button on the message toolbar, for on-demand session and usage lookups. It reuses the Pipe's live connection and device identity, so there is no second pairing. |
-| [`openclaw_thinking_filter.py`](../openclaw_thinking_filter.py) | [Filter](https://docs.openwebui.com/features/extensibility/plugin/functions/filter) | The per-chat thinking control in the composer. Optional, and it imports nothing but the standard library and pydantic. |
 
-All three are generated from the same source fragments in `src/openclaw_pipe_pkg/`, by `build.py`.
+Both are generated from the same source fragments in `src/openclaw_pipe_pkg/`, by `build.py`.
 
 ### The tree
 
@@ -71,11 +70,9 @@ All three are generated from the same source fragments in `src/openclaw_pipe_pkg
 openclaw-openwebui-integration/
 ├── openclaw_pipe.py           # Built artifact, paste this into OWUI (Pipe)
 ├── openclaw_status_action.py  # Built artifact, paste this into OWUI (Action)
-├── openclaw_thinking_filter.py # Built artifact, paste this into OWUI (Filter)
 ├── src/
 │   ├── frontmatter.txt         # Pipe docstring + OWUI metadata (title/version/requirements)
 │   ├── frontmatter-action.txt  # Same, for the Action
-│   ├── frontmatter-filter.txt  # Same, for the Filter
 │   └── openclaw_pipe_pkg/     # Source of truth, edit these, not the artifacts above
 │       ├── _prelude.py         # Imports shared by every fragment, plus pipe_log()
 │       ├── pipe.py              # Pipe class: valves and the pipe() entry point
@@ -93,13 +90,11 @@ openclaw-openwebui-integration/
 │       ├── slash_prompts.py           # Pipe only: mirrors the Gateway's slash commands into Workspace Prompts (SYNC_SLASH_COMMANDS)
 │       ├── identity.py                 # Ed25519 device identity load/generate/persist
 │       ├── state.py                     # STATE_DIR read/write helpers
-│       ├── thinking.py                  # Thinking levels and clamping, shared by the Pipe and the Filter
-│       ├── thinking_filter.py           # Filter class
+│       ├── thinking.py                  # Thinking levels and clamping
 │       └── __init__.py
 ├── build.py                    # Concatenates src/ fragments into the artifacts above
 ├── install.py                  # Automated installer/updater/healthcheck script
 ├── install_action.py           # Same, for the Status Action
-├── install_filter.py           # Same, for the thinking Filter
 ├── test_*.py                   # Unit + integration test suites (see Development)
 ├── e2e/                        # End-to-end stack: fake model, real Gateway and Open WebUI, pinned versions
 ├── gateway-plugins/            # Optional Gateway plugins for a Claude CLI login: rate limits, /claude_login
@@ -121,7 +116,6 @@ openclaw-openwebui-integration/
 
 - **Pipe:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `media`, `emit`, `composer`, `composer_watch`, `askuser`, `gateway`, `writer`, `models`, `history`, `slash_prompts`, `pipe`.
 - **Status Action:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `gateway`, `emit`, `composer`, `action`. It reuses the Pipe's connection code verbatim, so its numbers come from the same logic as the Pipe's status line.
-- **Thinking filter:** `thinking`, `thinking_filter` only. It skips `_prelude` on purpose: a filter runs on every message, so it does not import `websockets` or `cryptography`.
 
 Build commands and the drift guard: [Development](./development.md#building-the-artifacts).
 

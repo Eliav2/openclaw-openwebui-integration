@@ -105,7 +105,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 # The chat and run a log line belongs to (ELI-368). Each reply opens a
 # log_scope with its chat (Pipe.pipe) and each run inside it another with no
@@ -847,9 +847,8 @@ def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
 
 
 # --- thinking --------------------------------------------------------------
-# Shared by the Thinking filter and the Pipe so both use one ranking and clamp.
-# No imports or extra names: it lands in the Pipe's flat namespace, where a
-# helper could shadow a Pipe name. Filter-only helpers go in thinking_filter.
+# Thinking levels: their ranking, the clamp and the Gateway's rejection text.
+# Shared by the Pipe and the Status Action (its ladder cache helper).
 
 # Mirrors the Gateway's table. Clamp only downward: less thinking is safe,
 # more costs money.
@@ -867,6 +866,17 @@ LEVEL_RANKS = {
 
 # Means "send no level": keep the agent's own. "off" is an explicit level.
 UNSET = "default"
+
+# Levels sent as another (Eliav, 2026-11-09: `ultra` goes out as `max`).
+LEVEL_SENT_AS = {"ultra": "max"}
+
+
+def normalize_thinking_level(value):
+    """A level as typed (Advanced Params is free text) or picked: lowercased,
+    an alias sent as its level, None for empty or UNSET."""
+    level = str(value or "").strip().lower()
+    level = LEVEL_SENT_AS.get(level, level)
+    return None if not level or level == UNSET else level
 
 # Used until the Pipe writes a ladder cache. Every known provider has these.
 FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
@@ -890,7 +900,7 @@ def parse_thinking_rejection(text):
     `sessions.describe` builds its ladder without the model catalog, so it
     over-reports levels; only the send path's rejection is accurate.
     Returns None, or `{"level", "model", "levels"}`; `levels` may be empty, so
-    check for None. No `re`, since the filter shares this fragment.
+    check for None.
     """
     if not text:
         return None
@@ -1289,6 +1299,22 @@ def _ladder_cache_path(state_dir: str = "") -> str:
     return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
 
 
+def _read_ladder_cache(state_dir: str = "") -> dict:
+    """The ladder cache's object; {} when missing, corrupt or another JSON shape."""
+    cache = _read_json_file(_ladder_cache_path(state_dir))
+    return cache if isinstance(cache, dict) else {}
+
+
+def _thinking_default_levels(state_dir: str = "") -> list:
+    """The `thinking_default` dropdown: UNSET, then every level the Gateway's
+    models offer (the ladder cache's union, by rank), less those sent as
+    another. Each send still clamps to its own model's ladder."""
+    cached = _read_ladder_cache(state_dir).get("levels")
+    levels = [lv for lv in cached if lv in LEVEL_RANKS] if isinstance(cached, list) else []
+    levels = {lv for lv in levels or FALLBACK_LEVELS if lv not in LEVEL_SENT_AS}
+    return [UNSET] + sorted(levels, key=lambda lv: (LEVEL_RANKS[lv], lv))
+
+
 # Guards the ladder cache's read-merge-write: Pipe and Status Action threads
 # in one OWUI process would otherwise drop each other's updates.
 _LADDER_CACHE_LOCK = threading.Lock()
@@ -1298,7 +1324,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
                              state_dir: str = "") -> bool:
     """Fold a ladder into the cache, as a union and per model.
 
-    `levels` (union) feeds the Thinking filter dropdown, which OWUI cannot
+    `levels` (union) feeds the `thinking_default` dropdown, which OWUI cannot
     vary per model. `models[key]` is what sends clamp against. An
     `authoritative` ladder (stated in a Gateway rejection) is never
     overwritten by a describe-observed one, which can be the generic profile.
@@ -1308,7 +1334,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
     path = _ladder_cache_path(state_dir)
 
     with _LADDER_CACHE_LOCK:
-        current = _read_json_file(path) or {}
+        current = _read_ladder_cache(state_dir)
 
         have = current.get("levels")
         have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
@@ -1354,8 +1380,7 @@ def _read_model_thinking_ladder(model_key, state_dir: str = ""):
     """The exact ladder for one model, or None if unknown (empty counts as unknown)."""
     if not model_key:
         return None
-    cache = _read_json_file(_ladder_cache_path(state_dir)) or {}
-    models = cache.get("models")
+    models = _read_ladder_cache(state_dir).get("models")
     if not isinstance(models, dict):
         return None
     entry = models.get(model_key)
@@ -5628,7 +5653,8 @@ _COMPOSER_BUTTON_VERSION = "11"
 _COMPOSER_ACTION_ID = "openclaw_status_action"
 _COMPOSER_DEFAULT_MODEL_PREFIX = "openclaw_gateway."
 
-# The Thinking filter chip's alt text (install_filter.py); the button follows it.
+# The alt text of the removed Thinking filter's chip: while a user still has
+# that filter installed, the button follows it.
 _COMPOSER_THINKING_CHIP_LABEL = "OpenClaw Thinking"
 
 _COMPOSER_BUTTON_JS_TEMPLATE = r"""

@@ -111,7 +111,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 # The chat and run a log line belongs to (ELI-368). Each reply opens a
 # log_scope with its chat (Pipe.pipe) and each run inside it another with no
@@ -853,9 +853,8 @@ def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
 
 
 # --- thinking --------------------------------------------------------------
-# Shared by the Thinking filter and the Pipe so both use one ranking and clamp.
-# No imports or extra names: it lands in the Pipe's flat namespace, where a
-# helper could shadow a Pipe name. Filter-only helpers go in thinking_filter.
+# Thinking levels: their ranking, the clamp and the Gateway's rejection text.
+# Shared by the Pipe and the Status Action (its ladder cache helper).
 
 # Mirrors the Gateway's table. Clamp only downward: less thinking is safe,
 # more costs money.
@@ -873,6 +872,17 @@ LEVEL_RANKS = {
 
 # Means "send no level": keep the agent's own. "off" is an explicit level.
 UNSET = "default"
+
+# Levels sent as another (Eliav, 2026-11-09: `ultra` goes out as `max`).
+LEVEL_SENT_AS = {"ultra": "max"}
+
+
+def normalize_thinking_level(value):
+    """A level as typed (Advanced Params is free text) or picked: lowercased,
+    an alias sent as its level, None for empty or UNSET."""
+    level = str(value or "").strip().lower()
+    level = LEVEL_SENT_AS.get(level, level)
+    return None if not level or level == UNSET else level
 
 # Used until the Pipe writes a ladder cache. Every known provider has these.
 FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
@@ -896,7 +906,7 @@ def parse_thinking_rejection(text):
     `sessions.describe` builds its ladder without the model catalog, so it
     over-reports levels; only the send path's rejection is accurate.
     Returns None, or `{"level", "model", "levels"}`; `levels` may be empty, so
-    check for None. No `re`, since the filter shares this fragment.
+    check for None.
     """
     if not text:
         return None
@@ -2013,7 +2023,8 @@ _COMPOSER_BUTTON_VERSION = "11"
 _COMPOSER_ACTION_ID = "openclaw_status_action"
 _COMPOSER_DEFAULT_MODEL_PREFIX = "openclaw_gateway."
 
-# The Thinking filter chip's alt text (install_filter.py); the button follows it.
+# The alt text of the removed Thinking filter's chip: while a user still has
+# that filter installed, the button follows it.
 _COMPOSER_THINKING_CHIP_LABEL = "OpenClaw Thinking"
 
 _COMPOSER_BUTTON_JS_TEMPLATE = r"""
@@ -4626,6 +4637,22 @@ def _ladder_cache_path(state_dir: str = "") -> str:
     return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
 
 
+def _read_ladder_cache(state_dir: str = "") -> dict:
+    """The ladder cache's object; {} when missing, corrupt or another JSON shape."""
+    cache = _read_json_file(_ladder_cache_path(state_dir))
+    return cache if isinstance(cache, dict) else {}
+
+
+def _thinking_default_levels(state_dir: str = "") -> list:
+    """The `thinking_default` dropdown: UNSET, then every level the Gateway's
+    models offer (the ladder cache's union, by rank), less those sent as
+    another. Each send still clamps to its own model's ladder."""
+    cached = _read_ladder_cache(state_dir).get("levels")
+    levels = [lv for lv in cached if lv in LEVEL_RANKS] if isinstance(cached, list) else []
+    levels = {lv for lv in levels or FALLBACK_LEVELS if lv not in LEVEL_SENT_AS}
+    return [UNSET] + sorted(levels, key=lambda lv: (LEVEL_RANKS[lv], lv))
+
+
 # Guards the ladder cache's read-merge-write: Pipe and Status Action threads
 # in one OWUI process would otherwise drop each other's updates.
 _LADDER_CACHE_LOCK = threading.Lock()
@@ -4635,7 +4662,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
                              state_dir: str = "") -> bool:
     """Fold a ladder into the cache, as a union and per model.
 
-    `levels` (union) feeds the Thinking filter dropdown, which OWUI cannot
+    `levels` (union) feeds the `thinking_default` dropdown, which OWUI cannot
     vary per model. `models[key]` is what sends clamp against. An
     `authoritative` ladder (stated in a Gateway rejection) is never
     overwritten by a describe-observed one, which can be the generic profile.
@@ -4645,7 +4672,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
     path = _ladder_cache_path(state_dir)
 
     with _LADDER_CACHE_LOCK:
-        current = _read_json_file(path) or {}
+        current = _read_ladder_cache(state_dir)
 
         have = current.get("levels")
         have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
@@ -4691,8 +4718,7 @@ def _read_model_thinking_ladder(model_key, state_dir: str = ""):
     """The exact ladder for one model, or None if unknown (empty counts as unknown)."""
     if not model_key:
         return None
-    cache = _read_json_file(_ladder_cache_path(state_dir)) or {}
-    models = cache.get("models")
+    models = _read_ladder_cache(state_dir).get("models")
     if not isinstance(models, dict):
         return None
     entry = models.get(model_key)
@@ -14141,10 +14167,16 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
+# Marks a retry body after a thinking-level rejection: it sends no level, not
+# even the user's `thinking_default`.
+THINKING_DROPPED_KEY = "openclaw_thinking_dropped"
+
+
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     """The retry body for a textless turn whose preview-recovered text is the
     Gateway's thinking-level rejection, else None (ELI-85 follow-up). The retry
-    drops `reasoning_effort`, so it cannot match twice in a row.
+    sends no level at all, so it cannot match twice in a row, whether or not
+    the rejected ladder could be recorded.
     """
     if not recovered or resolved_thinking is None:
         return None
@@ -14152,6 +14184,7 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
         return None
     retry_body = dict(body)
     retry_body.pop("reasoning_effort", None)
+    retry_body[THINKING_DROPPED_KEY] = True
     return retry_body
 
 
@@ -14284,6 +14317,14 @@ class _TurnState:
     queue: object = None
     run_text: dict | None = None
     parked: bool = False
+
+
+class _UserValvesBase(BaseModel):
+    @classmethod
+    def get_thinking_levels(cls):
+        """The `thinking_default` dropdown. Open WebUI calls this each time it
+        shows the valves, so levels learned since the Pipe loaded are listed."""
+        return [{"value": lv, "label": lv} for lv in _thinking_default_levels(Pipe._current_state_dir())]
 
 
 class Pipe:
@@ -14558,15 +14599,41 @@ class Pipe:
                 "queues behind your conversation."
         )
 
-    # The DEFAULT_MODEL dropdown is a classmethod: it reads the cache via this.
-    _last_state_dir = ""
+    # Each user's own (Open WebUI: Valves next to the model's name). The chat's
+    # Advanced Params reasoning effort wins; this applies to a chat without one.
+    UserValves = create_model(
+        "UserValves",
+        thinking_default=(
+            str,
+            Field(
+                default=UNSET,
+                description=(
+                    "Your thinking level for chats that set none in Advanced Params "
+                    "(Reasoning Effort). '" + UNSET + "' sends nothing and keeps the "
+                    "model's own level. A level a model does not support is clamped "
+                    "down, and the chat says so."
+                ),
+                json_schema_extra={"input": {"type": "select", "options": "get_thinking_levels"}},
+            ),
+        ),
+        __base__=_UserValvesBase,
+    )
+
+    # The dropdowns are classmethods, with no valves of their own. They read
+    # STATE_DIR off the live Pipe, whose `valves` Open WebUI replaces when an
+    # admin saves them.
+    _instance = None
 
     def __init__(self):
         self.valves = self.Valves()
+        type(self)._instance = self
+
+    @classmethod
+    def _current_state_dir(cls) -> str:
+        return getattr(getattr(cls._instance, "valves", None), "STATE_DIR", "") or ""
 
     async def pipes(self):
         """One model-selector entry per Gateway model, plus 'Default'."""
-        type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         # The first model list after a deploy: with the valve off, close a
         # file server an earlier load left on the port.
         if not self.valves.ENABLE_FILE_SERVER:
@@ -14603,12 +14670,11 @@ class Pipe:
 
     @classmethod
     def get_model_options(cls):
-        """Model options for the DEFAULT_MODEL valve dropdown. Reads the state
-        dir the running Pipe last resolved: a classmethod has no valves, and the
-        default dir would miss a custom STATE_DIR's cache.
+        """Model options for the DEFAULT_MODEL valve dropdown, from the cache
+        in the live Pipe's STATE_DIR (`_current_state_dir`).
         """
         cache = _read_json_file(
-            os.path.join(_state_dir(cls._last_state_dir), MODELS_CACHE_NAME)
+            os.path.join(_state_dir(cls._current_state_dir()), MODELS_CACHE_NAME)
         )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
@@ -14943,12 +15009,15 @@ class _PipeTurn:
         preset = self.pipe._selected_preset(self.body)
         self.model_override = self.pipe._model_override_for_preset(preset)
 
-        # Per-chat thinking level (ELI-85): `reasoning_effort`, written by Open
-        # WebUI's Advanced Params and by the Thinking filter. Absent means the
+        # Thinking level (ELI-85): the chat's `reasoning_effort` (Open WebUI's
+        # Advanced Params), else the user's `thinking_default`. Absent means the
         # agent's own level; it is checked against the ladder after describe.
-        self.requested_thinking = self.body.get("reasoning_effort") or None
-        if self.requested_thinking is not None:
-            self.requested_thinking = str(self.requested_thinking).strip().lower() or None
+        user_valves = (self.__user__ or {}).get("valves")
+        user_default = (user_valves.get("thinking_default") if isinstance(user_valves, dict)
+                        else getattr(user_valves, "thinking_default", None))
+        self.requested_thinking = None if self.body.get(THINKING_DROPPED_KEY) else (
+            normalize_thinking_level(self.body.get("reasoning_effort"))
+            or normalize_thinking_level(user_default))
         self.session_thinking_ladder = None
         self.session_model_key = None
         self.session_runtime = None

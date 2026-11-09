@@ -26,10 +26,16 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
+# Marks a retry body after a thinking-level rejection: it sends no level, not
+# even the user's `thinking_default`.
+THINKING_DROPPED_KEY = "openclaw_thinking_dropped"
+
+
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     """The retry body for a textless turn whose preview-recovered text is the
     Gateway's thinking-level rejection, else None (ELI-85 follow-up). The retry
-    drops `reasoning_effort`, so it cannot match twice in a row.
+    sends no level at all, so it cannot match twice in a row, whether or not
+    the rejected ladder could be recorded.
     """
     if not recovered or resolved_thinking is None:
         return None
@@ -37,6 +43,7 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
         return None
     retry_body = dict(body)
     retry_body.pop("reasoning_effort", None)
+    retry_body[THINKING_DROPPED_KEY] = True
     return retry_body
 
 
@@ -169,6 +176,14 @@ class _TurnState:
     queue: object = None
     run_text: dict | None = None
     parked: bool = False
+
+
+class _UserValvesBase(BaseModel):
+    @classmethod
+    def get_thinking_levels(cls):
+        """The `thinking_default` dropdown. Open WebUI calls this each time it
+        shows the valves, so levels learned since the Pipe loaded are listed."""
+        return [{"value": lv, "label": lv} for lv in _thinking_default_levels(Pipe._current_state_dir())]
 
 
 class Pipe:
@@ -443,15 +458,41 @@ class Pipe:
                 "queues behind your conversation."
         )
 
-    # The DEFAULT_MODEL dropdown is a classmethod: it reads the cache via this.
-    _last_state_dir = ""
+    # Each user's own (Open WebUI: Valves next to the model's name). The chat's
+    # Advanced Params reasoning effort wins; this applies to a chat without one.
+    UserValves = create_model(
+        "UserValves",
+        thinking_default=(
+            str,
+            Field(
+                default=UNSET,
+                description=(
+                    "Your thinking level for chats that set none in Advanced Params "
+                    "(Reasoning Effort). '" + UNSET + "' sends nothing and keeps the "
+                    "model's own level. A level a model does not support is clamped "
+                    "down, and the chat says so."
+                ),
+                json_schema_extra={"input": {"type": "select", "options": "get_thinking_levels"}},
+            ),
+        ),
+        __base__=_UserValvesBase,
+    )
+
+    # The dropdowns are classmethods, with no valves of their own. They read
+    # STATE_DIR off the live Pipe, whose `valves` Open WebUI replaces when an
+    # admin saves them.
+    _instance = None
 
     def __init__(self):
         self.valves = self.Valves()
+        type(self)._instance = self
+
+    @classmethod
+    def _current_state_dir(cls) -> str:
+        return getattr(getattr(cls._instance, "valves", None), "STATE_DIR", "") or ""
 
     async def pipes(self):
         """One model-selector entry per Gateway model, plus 'Default'."""
-        type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         # The first model list after a deploy: with the valve off, close a
         # file server an earlier load left on the port.
         if not self.valves.ENABLE_FILE_SERVER:
@@ -488,12 +529,11 @@ class Pipe:
 
     @classmethod
     def get_model_options(cls):
-        """Model options for the DEFAULT_MODEL valve dropdown. Reads the state
-        dir the running Pipe last resolved: a classmethod has no valves, and the
-        default dir would miss a custom STATE_DIR's cache.
+        """Model options for the DEFAULT_MODEL valve dropdown, from the cache
+        in the live Pipe's STATE_DIR (`_current_state_dir`).
         """
         cache = _read_json_file(
-            os.path.join(_state_dir(cls._last_state_dir), MODELS_CACHE_NAME)
+            os.path.join(_state_dir(cls._current_state_dir()), MODELS_CACHE_NAME)
         )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
@@ -828,12 +868,15 @@ class _PipeTurn:
         preset = self.pipe._selected_preset(self.body)
         self.model_override = self.pipe._model_override_for_preset(preset)
 
-        # Per-chat thinking level (ELI-85): `reasoning_effort`, written by Open
-        # WebUI's Advanced Params and by the Thinking filter. Absent means the
+        # Thinking level (ELI-85): the chat's `reasoning_effort` (Open WebUI's
+        # Advanced Params), else the user's `thinking_default`. Absent means the
         # agent's own level; it is checked against the ladder after describe.
-        self.requested_thinking = self.body.get("reasoning_effort") or None
-        if self.requested_thinking is not None:
-            self.requested_thinking = str(self.requested_thinking).strip().lower() or None
+        user_valves = (self.__user__ or {}).get("valves")
+        user_default = (user_valves.get("thinking_default") if isinstance(user_valves, dict)
+                        else getattr(user_valves, "thinking_default", None))
+        self.requested_thinking = None if self.body.get(THINKING_DROPPED_KEY) else (
+            normalize_thinking_level(self.body.get("reasoning_effort"))
+            or normalize_thinking_level(user_default))
         self.session_thinking_ladder = None
         self.session_model_key = None
         self.session_runtime = None

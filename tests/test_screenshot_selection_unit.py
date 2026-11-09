@@ -110,8 +110,23 @@ class PrerequisiteScenes(unittest.TestCase):
                 guarded |= set(re.findall(r'shooter\.run\("([^"]+)"', g.group(1)))
             self.assertTrue(guarded, f"scenes guarded by {attr}")
             self.assertEqual(guarded - declared, set(), f"{producer} must list them in needed_by")
-        # thinking-level also needs the filter thinking-toggle attaches
-        self.assertRegex(main, r'"thinking-toggle", scenes\.thinking, page, needed_by=\("thinking-level",\)')
+
+
+    def test_a_selected_scene_that_never_ran_is_a_failure(self):
+        """A removed or misspelled name (`thinking-toggle`, gone in #388) must not pass with no
+        image written (CodeRabbit, #388)."""
+        shooter, run_all = self.shooter({"thinking-toggle"})
+        run_all()
+        shooter.fail_unrun_selection()
+        self.assertEqual(self.written(shooter), [])
+        self.assertEqual(len(shooter.failures), 1)
+        self.assertIn("thinking-toggle", shooter.failures[0])
+
+    def test_a_selection_that_ran_adds_no_failure(self):
+        shooter, run_all = self.shooter({"drawer-long-parent"})
+        run_all()
+        shooter.fail_unrun_selection()
+        self.assertEqual(shooter.failures, [])
 
 
 if __name__ == "__main__":

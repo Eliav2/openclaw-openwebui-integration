@@ -2,7 +2,7 @@
 
 Why this integration exists, what the Gateway's native protocol gives you that a text-in, text-out API cannot, and when OpenClaw's built-in `/v1` endpoint is the better choice.
 
-Applies to: Pipe, Action, Filter
+Applies to: Pipe, Action
 
 ## Why I built this
 
@@ -28,10 +28,7 @@ The [feature list](./features/index.md) has everything.
 
 The chat integration is an Open WebUI [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) function. It connects to your Gateway as an [external app](https://docs.openclaw.ai/gateway/external-apps): a plain protocol client that adds nothing to your OpenClaw install and needs nothing else running. That connection is what gives you real-time streaming, native tool cards and one persistent agent session per chat.
 
-Two optional companions install the same way:
-
-- the Status [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) adds a Status button that fetches context, rate limits and sub-agents live from the Gateway ([install](./install/status-action.md));
-- the thinking [Filter](https://docs.openwebui.com/features/extensibility/plugin/functions/filter) adds a per-chat reasoning-effort control ([install](./install/thinking-filter.md)).
+An optional companion installs the same way: the Status [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) adds a Status button that fetches context, rate limits and sub-agents live from the Gateway ([install](./install/status-action.md)).
 
 How the pieces fit: [Architecture](./architecture.md).
 
@@ -53,7 +50,7 @@ The difference is what each one gives you:
 
 | | `/v1` endpoint | This integration |
 |---|---|---|
-| Setup | Change one config flag | One install command for the Pipe; the Status button and thinking control are optional |
+| Setup | Change one config flag | One install command for the Pipe; the Status button is optional |
 | Streams assistant text | Yes | Yes |
 | Client-declared OpenAI function tools | Yes | Not applicable |
 | **The agent's own tool calls:** its shell commands, file edits and searches | Not surfaced | Rendered live as native tool cards |

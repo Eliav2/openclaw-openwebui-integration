@@ -2,9 +2,8 @@
 
 Only the language model is fake (`e2e/fake_llm.py`), which is what lets every
 assertion here be exact. Everything between the user and the model is the
-real code users run: the Open WebUI container, the installed Pipe, Action and
-Filter, the Gateway with its device pairing, and the agent loop with a real
-tool call.
+real code users run: the Open WebUI container, the installed Pipe and Action,
+the Gateway with its device pairing, and the agent loop with a real tool call.
 
 The chat tests go through the same path the browser does: create a chat, ask
 for a completion bound to it, and read back what Open WebUI *persisted*. That
@@ -82,7 +81,7 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
                created: list | None = None, folder_id: str | None = None) -> tuple[str, dict]:
     """(chat id, saved assistant message) of one turn in a new persisted chat,
     or of the next turn in `chat_id`. `extra`: more fields of the completion
-    request, as the browser adds them (`filter_ids` for a filter chip turned on).
+    request, as the browser adds them (`params` for Advanced Params).
     `created`: gets a new chat's id as soon as it exists, for a turn run in a
     thread."""
     now = int(time.time())
@@ -148,11 +147,11 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
                 f"{json.dumps(msg)[:1500]}")
 
 
-def test_all_three_functions_installed_and_active(token):
+def test_both_functions_installed_and_active(token):
     status, functions = _request("GET", "/api/v1/functions/", token=token)
     assert status == 200, functions
     by_type = {(f["type"], f["id"]): f for f in functions}
-    for kind in ("pipe", "action", "filter"):
+    for kind in ("pipe", "action"):
         matches = [f for (t, _), f in by_type.items() if t == kind]
         assert matches, f"no {kind} function installed: {sorted(by_type)}"
         assert all(f.get("is_active") for f in matches), f"{kind} installed but inactive"
@@ -2933,6 +2932,17 @@ def _pipe_log_since(since: str) -> str:
     return out.stdout
 
 
+# The Gateway's startup trace line once restart recovery of sub-agents ended
+# (`startup phase: <name> <ms>ms total=...`, server-startup-trace).
+SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
+
+
+def _read_from(path: str, offset: int) -> str:
+    with open(path, errors="replace") as f:
+        f.seek(offset)
+        return f.read()
+
+
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
                     reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
 def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
@@ -2941,11 +2951,20 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     (ELI-176: the turn connected a socket of its own, which nothing read until
     the backoff ended, so the turn's first request timed out)."""
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    restart_log = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
+    offset = os.path.getsize(restart_log) if os.path.exists(restart_log) else 0
     # Down until the Pipe waits its longest backoff, so the Gateway is back
     # well before its next attempt.
     _kill_and_restart_gateway(15, while_down=lambda: _until(
         "the Pipe to wait 30 s before its next attempt",
         lambda: "reconnect in 30s" in _pipe_log_since(since), timeout_s=120))
+    # The relaunched Gateway recovers sub-agents an earlier test left. On
+    # OpenClaw 2026.10.5 a chat.send whose session read overlaps any write to
+    # the agent's database fails (SessionEntryChangedDuringReadError, run
+    # 42610236049); 2026.10.10 dropped that check. This test is about the
+    # Pipe's backoff, so it sends once that recovery has ended.
+    _until("the Gateway's sub-agent recovery to end", lambda: re.search(
+        SUBAGENT_RECOVERY_DONE, _read_from(restart_log, offset)), timeout_s=180)
     log = _pipe_log_since(since)
     assert log.rfind("reconnect in ") > log.rfind("Connected to Gateway (persistent)"), \
         "precondition: the Pipe reconnected before the message went out"
@@ -2955,8 +2974,8 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
 
 # ── MEDIA out and the thinking level (ELI-179) ───────────────────────────────
 # Two flows a user sees in the reply that had no end-to-end test: a file the
-# agent sends with a `MEDIA:<file>` line, and the thinking level picked with the
-# Thinking filter.
+# agent sends with a `MEDIA:<file>` line, and the thinking level (Advanced
+# Params, else the user's default).
 
 MEDIA_DIR = "/tmp/openclaw-pipe-media"   # media.MEDIA_DIR, inside the Open WebUI container
 PNG_1PX = bytes.fromhex(
@@ -3035,59 +3054,45 @@ def test_a_file_named_by_path_shows_as_the_image_the_gateway_stored(token):
     assert "run images: WARNING" not in log.stdout + log.stderr, "the Pipe waited out its bound"
 
 
-THINKING_FILTER_ID = "openclaw_thinking"   # install_filter.py
+PIPE_FUNCTION_ID = "openclaw_gateway"   # install.py FUNCTION_ID
 
 
 @pytest.fixture
 def think_model(token):
-    """The e2e-think entry with the Thinking filter attached, as the README has
-    a user do it (Workspace > Models > the model > Filters). Yields (model id,
-    pick), where pick(level) is the level the user picks in the filter; both are
-    undone afterwards."""
+    """The e2e-think model and a setter for the user's `thinking_default`
+    valve, as a user sets it (Valves, next to the model's name). Undone
+    afterwards."""
     status, body = _request("GET", "/api/models", token=token)
     assert status == 200, body
     model = next(m["id"] for m in body["data"]
                  if m["id"].startswith("openclaw_gateway.") and m["id"].endswith("/e2e-think"))
-    status, created = _request("POST", "/api/v1/models/create", {
-        "id": model, "base_model_id": None, "name": "E2E Think",
-        "meta": {"filterIds": [THINKING_FILTER_ID]}, "params": {},
-    }, token)
-    assert status == 200, created
-    # Open WebUI answers a completion from its cached model list, which only a
-    # model list read refreshes; the browser reads it after saving the model.
-    status, body = _request("GET", "/api/models", token=token)
-    entry = next(m for m in body["data"] if m["id"] == model)
-    assert [f["id"] for f in entry.get("filters") or []] == [THINKING_FILTER_ID], entry
 
-    def pick(level: str) -> None:
-        status, got = _request("POST", f"/api/v1/functions/id/{THINKING_FILTER_ID}/valves/user/update",
-                               {"level": level}, token)
-        assert status == 200 and got.get("level") == level, got
+    def set_default(level: str) -> None:
+        status, got = _request("POST", f"/api/v1/functions/id/{PIPE_FUNCTION_ID}/valves/user/update",
+                               {"thinking_default": level}, token)
+        assert status == 200 and got.get("thinking_default") == level, got
 
-    yield model, pick
-    pick("default")
-    _request("POST", "/api/v1/models/model/delete", {"id": model}, token)
-    _request("GET", "/api/models", token=token)
+    yield model, set_default
+    set_default("default")
 
 
-def test_the_picked_thinking_level_reaches_the_model_and_a_clamp_says_so(token, think_model):
-    """A level the model supports reaches it unchanged (the Gateway sends
-    e2e-think's level on as `reasoning_effort`). A level above the model's
-    ladder (off to high, plus ultra above max on 2026.10) is sent as the
-    nearest one below, and the reply says so."""
-    model, pick = think_model
-    chip_on = {"filter_ids": [THINKING_FILTER_ID]}   # the filter's chip turned on in the composer
+def test_the_thinking_level_reaches_the_model_and_a_clamp_says_so(token, think_model):
+    """With no level in the chat, the user's `thinking_default` reaches the
+    model (the Gateway sends e2e-think's level on as `reasoning_effort`). The
+    chat's Advanced Params Reasoning Effort, free text as typed, beats it; a
+    level above the model's ladder (off to high) is sent as the nearest one
+    below, and the reply says so."""
+    model, set_default = think_model
 
-    pick("low")
+    set_default("low")
     first_marker = f"E2E_THINK_LOW_{uuid.uuid4().hex[:6]}"
-    chat_id, first = _chat_turn(token, f"Respond with exactly: {first_marker}", model, extra=chip_on)
+    chat_id, first = _chat_turn(token, f"Respond with exactly: {first_marker}", model)
     assert _model_request(first_marker).get("reasoning_effort") == "low"
     assert first.get("content") == first_marker, json.dumps(first)[:1500]
 
-    pick("max")
     second_marker = f"E2E_THINK_MAX_{uuid.uuid4().hex[:6]}"
     _, second = _chat_turn(token, f"Respond with exactly: {second_marker}", model,
-                           chat_id=chat_id, extra=chip_on)
+                           chat_id=chat_id, extra={"params": {"reasoning_effort": " Max"}})
     assert _model_request(second_marker).get("reasoning_effort") == "high"
     content = second.get("content") or ""
     assert "This model does not support thinking level 'max', using 'high' instead." in content, content
