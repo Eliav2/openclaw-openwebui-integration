@@ -24,12 +24,6 @@
  "install_action.py": {
   "if status != HTTPStatus.OK or not isinstance(payload, dict) or \"status\" not in payload:": 1
  },
- "push/openclaw_web_push.py": {
-  "if event.get(\"event\") != \"chat.finished\":": 1,
-  "payload = {**payload, \"body\": snippet(payload[\"body\"].rstrip(\"…\"), keep) if keep > 20 else \"\"}": 1,
-  "return (cut.rsplit(\" \", 1)[0] if \" \" in cut else cut).rstrip(\" ,;:\") + \"…\"": 1,
-  "return str(sub.get(\"endpoint\", \"\")).split(\"/\")[2:3][0] if \"//\" in str(sub.get(\"endpoint\", \"\")) else \"?\"": 1
- },
  "scripts/check_owui_fixture.py": {
   "if which == \"next\":": 1,
   "if which == \"pinned\":": 1

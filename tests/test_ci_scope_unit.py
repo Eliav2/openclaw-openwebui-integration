@@ -24,7 +24,7 @@ class InertPathTests(unittest.TestCase):
 
     def test_runtime_paths_are_not(self):
         for path in ("src/openclaw_pipe_pkg/gateway.py", "openclaw_pipe.py", "openclaw_status_action.py",
-                     "install.py", "install_action.py", "e2e/versions.env", "e2e/test_e2e.py", "push/openclaw_web_push.py",
+                     "install.py", "install_action.py", "e2e/versions.env", "e2e/test_e2e.py",
                      "gateway-plugins/x/index.js", "build.py", "requirements-dev.txt", "scripts/owui_css.py",
                      ".github/workflows/ci.yml", ".github/workflows/e2e.yml", ".github/actions/stack/action.yml",
                      "tests/fixtures/test_fixture_owui_css_classes.txt"):
