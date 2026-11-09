@@ -2551,6 +2551,21 @@ def _history_steered_span(history: dict, run_id: str) -> list | None:
     return own if answered else span
 
 
+def _history_steered_tail(history: dict, run_id: str) -> list | None:
+    """What follows `run_id`'s message up to the next turn, without the host's
+    closing copy (the whole run): its answer when the run it went into never
+    closed it. None without the message."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    start = next((n for n, m in enumerate(messages) if _history_user_run_id(m) == run_id), None)
+    if start is None:
+        return None
+    end = next((n for n in range(start + 1, len(messages)) if _history_next_turn(messages[n])), len(messages))
+    return [m for m in messages[start + 1:end] if not _history_wake_prompt(m)
+            and not any(k.startswith("cli-assistant:") for k in _idempotency_keys(m))]
+
+
 def _history_later_turn(history: dict, run_id: str) -> bool:
     """A turn began after `run_id`'s message."""
     messages = (history or {}).get("messages")
@@ -2570,6 +2585,7 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
     restarts = conn.gateway_restarts
     while True:
         appended = conn.session_message_event(session_key)
+        changed = conn.session_change_event(session_key) if host else None
         pump = conn._turn_pumps.get((session_key, run_id))
         # A terminal means no commit, except the lone steered final: the
         # commit can come after it and the idle row.
@@ -2594,8 +2610,20 @@ async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *
             pipe_log(f"  {who}: the Gateway restarted without the "
                      "run its message went into; it ends without the answer")
             return hist
+        if host and await _session_list_active(conn, session_key) is False:
+            # The run it went into ended and the session settled: the
+            # transcript holds all it will, closed or not.
+            try:
+                hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+            except Exception as ex:
+                pipe_log(f"  {who}: chat.history failed after the session settled: {ex!r}")
+            pipe_log(f"  {who}: the session settled with its steered message's answer not closed "
+                     "in the transcript")
+            return hist
         pipe_log(f"  {who} waits for its steered message's answer in the transcript")
         waits = [asyncio.ensure_future(appended.wait())]
+        if changed is not None:
+            waits.append(asyncio.ensure_future(changed.wait()))
         if pump is not None and not pump.terminal.is_set():
             waits.append(asyncio.ensure_future(pump.terminal.wait()))
         try:

@@ -16173,12 +16173,49 @@ class MidRunSteeringTests(_TurnCase):
         steered reply's baselines hold it: the rest of the run is repeats, and blue yields nothing
         (CI 42538220842, variant A). It ends with its own answer from the transcript, once the
         transcript closed the run: never blank, never the whole run, even with no settle."""
-        self.conn.gateway_version = "2026.10.10"
-        user, said = SteeredTranscriptSpanTests._user, SteeredTranscriptSpanTests._said
+        transcript = self._blue_transcript()
         whole = "ROUND 1\n\nblue answer"
-        transcript = [user(self.R1, "Do 4 rounds of sleep 12"), said("ROUND 1", stop="toolUse"),
-                      {"role": "toolResult", "content": "done"},
-                      user(self.R2, "say blue"), said("blue answer", stop="end_turn")]
+        said = SteeredTranscriptSpanTests._said
+        async with self._blue_streamed_before_its_commit(transcript, whole) as (first_b, gen_b):
+            self.history = {"messages": [*transcript, said(whole, run=self.R1, key=f"cli-assistant:{self.R1}")]}
+            self.conn._session_message_waiters.pop(self.SK).set()
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_b.strip(), "blue answer")
+
+    async def test_a_steered_reply_whose_run_ends_clean_with_its_answer_never_closed_ends_when_the_session_settles(self):
+        """The run blue went into ends cleanly, but the transcript never closes blue's answer and no
+        later turn starts. The session settling ends the wait: blue shows what follows its message
+        (claude-cli's own record), never the whole run."""
+        transcript = self._blue_transcript()
+        async with self._blue_streamed_before_its_commit(transcript, "ROUND 1\n\nblue answer") as (first_b, gen_b):
+            self.list_active = False
+            self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_b.strip(), "blue answer")
+
+    async def test_a_steered_reply_whose_message_never_reached_the_transcript_ends_when_the_session_settles(self):
+        """Blue's message is not in the transcript at all. The session settling ends the wait: the
+        reply ends with the no-text note, never blank and never the whole run."""
+        transcript = self._blue_transcript()[:3]
+        async with self._blue_streamed_before_its_commit(transcript, "ROUND 1\n\nblue answer") as (first_b, gen_b):
+            self.list_active = False
+            self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertIn("This turn produced no reply text", out_b)
+        self.assertNotIn("ROUND 1", out_b)
+
+    def _blue_transcript(self) -> list:
+        """claude-cli's transcript of the held run with blue steered in, before the host's closer."""
+        user, said = SteeredTranscriptSpanTests._user, SteeredTranscriptSpanTests._said
+        return [user(self.R1, "Do 4 rounds of sleep 12"), said("ROUND 1", stop="toolUse"),
+                {"role": "toolResult", "content": "done"},
+                user(self.R2, "say blue"), said("blue answer", stop="end_turn")]
+
+    @contextlib.asynccontextmanager
+    async def _blue_streamed_before_its_commit(self, transcript: list, whole: str):
+        """Blue's answer streams before its commit, the run ends, and blue's reply waits on the
+        transcript, with the session still running and no settle. Yields blue's reply to finish."""
+        self.conn.gateway_version = "2026.10.10"
         gen_a, first_a = await self._running_first_reply()
         gen_b = self._reply("say blue", "m2")
         first_b = asyncio.ensure_future(gen_b.__anext__())
@@ -16189,16 +16226,12 @@ class MidRunSteeringTests(_TurnCase):
                 self._commit(self.R2, "say blue", into=self.R1),
                 self._final(self.R2),
                 self._lifecycle(self.R1, "end"))
-            self.active = False
-            # The closing message is not in yet.
+            self.active, self.list_active = False, True
             self.history = {"messages": transcript}
             await self._dispatch(self._final(self.R1, whole))
             self.assertFalse(first_b.done(), "it waits for its answer in the transcript")
-            self.history = {"messages": [*transcript, said(whole, run=self.R1, key=f"cli-assistant:{self.R1}")]}
-            self.conn._session_message_waiters.pop(self.SK).set()
-            out_b, _ = await self._collect(first_b, gen_b)
+            yield first_b, gen_b
             await self._collect(first_a, gen_a)
-        self.assertEqual(out_b.strip(), "blue answer")
 
     async def test_the_answer_goes_to_the_steered_reply_from_its_message_commit(self):
         """The built-in runtime's order: commit, the answer's first event, then the steered run's
