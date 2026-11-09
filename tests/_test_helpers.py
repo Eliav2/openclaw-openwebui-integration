@@ -1,8 +1,10 @@
 """Helpers shared by the unit suites. Not a suite itself (pytest collects test_*.py only)."""
 
+import asyncio
 import inspect
 import json
 import os
+import selectors
 import shutil
 import subprocess
 import sys
@@ -102,3 +104,46 @@ class FakeSio:
 
     async def emit(self, event, data, to=None, **kwargs):
         self.emits.append((event, data, to))
+
+
+class _IdleJumpSelector(selectors.DefaultSelector):
+    """The loop's selector, with a clock that moves only when nothing can run: instead of sleeping until the next timer it adds the wait to
+    `now`. I/O readiness is still polled for real (never blocking)."""
+    now = 0.0
+
+    def select(self, timeout=None):
+        ready = super().select(0)
+        if ready:
+            return ready
+        if timeout is None:
+            raise RuntimeError("virtual clock: every task is blocked and no timer is scheduled (a deadlock)")
+        self.now += timeout
+        return ready
+
+
+class VirtualClockLoop(asyncio.SelectorEventLoop):
+    """An event loop on a virtual clock: `loop.time()`, `asyncio.sleep`, `asyncio.wait_for` and `call_later` all run on it, and it jumps to the
+    next timer only when every task is idle. A timeout therefore fires when the code under test has had nothing left to do for that long,
+    never because the CPU was busy: a test about "frames arrive within the window" asserts event order, not runner speed (a starved CI
+    runner stretched a real 0.03 s tick past a real 0.1 s watchdog: ELI-381)."""
+
+    def __init__(self):
+        self._idle_jump = _IdleJumpSelector()
+        super().__init__(self._idle_jump)
+
+    def time(self):
+        return self._idle_jump.now
+
+
+def run_on_virtual_clock(coro):
+    """Run `coro` to completion on a `VirtualClockLoop`, then cancel what it left behind."""
+    loop = VirtualClockLoop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        leftovers = asyncio.all_tasks(loop)
+        for task in leftovers:
+            task.cancel()
+        if leftovers:
+            loop.run_until_complete(asyncio.gather(*leftovers, return_exceptions=True))
+        loop.close()
