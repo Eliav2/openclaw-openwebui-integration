@@ -861,6 +861,9 @@ class _TurnWriter:
         self.gateway_media: set[str] = set()
         self.event_media: list[str] = []
         self.images_made = 0
+        # The reply's maps: page by map id, and the ids open tabs were shown (`_show_maps`).
+        self._map_seen: dict = {}
+        self._maps_shown: set[str] = set()
         self._emit = None
         self._done = asyncio.Event()
         # A running push of M never lands after its final one (`_push_running`).
@@ -1035,9 +1038,27 @@ class _TurnWriter:
             self.sent_output = copy.deepcopy(output)
             self.sent_text = text
         await _save_response_stream(self.task_id, self.chat_id, self.message_id, text, self.sent_output)
+        await self._show_maps()
         if self.handover_owed and (self.request_task is None or self.request_task.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
+
+    def _map_pages(self, output: list) -> list[str]:
+        """The pages of the maps in `output` that were fetched."""
+        return [self._map_seen[i] for i in _map_ids(output) if self._map_seen.get(i)]
+
+    async def _show_maps(self) -> None:
+        """Fetch the reply's maps and show open tabs all of them when one is new. A tab's
+        `embeds` event replaces its list, so it carries the whole list. update_db=False means
+        Open WebUI saves nothing of the event: `_persist` writes the pages."""
+        await _map_embeds(self.conn, self.renderer.output, self._map_seen)
+        ids = [i for i in _map_ids(self.renderer.output) if self._map_seen.get(i)]
+        if all(i in self._maps_shown for i in ids):
+            return
+        emit = await self._emitter()
+        async with self._emit_lock:
+            await emit({"type": "embeds", "data": {"embeds": [self._map_seen[i] for i in ids], "replace": True}})
+        self._maps_shown.update(ids)
 
     def _introduced(self) -> bool:
         """M is a message this writer inserted and introduced to open tabs."""
@@ -1127,6 +1148,9 @@ class _TurnWriter:
                    "done": done}
         if status_history is not None:
             message["statusHistory"] = status_history
+        pages = self._map_pages(message["output"])
+        if pages:
+            message["embeds"] = pages
         try:
             row = await _owui_upsert_message(self.chat_id, self.message_id, message)
         except Exception as ex:
@@ -1153,6 +1177,8 @@ class _TurnWriter:
                          f"its own status write may land after this one")
         lines = [] if stopped else await _build_usage_status_lines(
             self.conn, self.session_key, run_usage=run_usage)
+        # Before the lock: a map the stream never reached (a rebuilt reply) is fetched here.
+        await _map_embeds(self.conn, output, self._map_seen)
         async with self.conn._chat_write_lock(self.chat_id):
             try:
                 saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
@@ -1180,7 +1206,10 @@ class _TurnWriter:
         if not self._claim or self.message_id not in self._claim["messages"]:
             return False
         message = {**self._claim["messages"][self.message_id],
-                    "content": text, "output": output, "done": True, "statusHistory": status_history}
+                   "content": text, "output": output, "done": True, "statusHistory": status_history}
+        pages = self._map_pages(output)
+        if pages:
+            message["embeds"] = pages
         new = self._introduced()
         try:
             await _introduce_turn_message(

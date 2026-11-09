@@ -10,6 +10,10 @@
 // events claude-cli's runs send when Claude Code compacts. The native runtime
 // sends none for a compaction a test can bring about, so this stands in for it.
 //
+// And `map`, a stand-in for the Gateway plugin of the same name (gateway-plugins/map in the
+// openclaw-workspace repo): it answers every call with one fixed map and serves it on `map.get`,
+// so the Pipe's map embed is tested with no network.
+//
 // And `e2e_guarded`, a tool whose every call asks for a plugin approval (a
 // `before_tool_call` hook's `requireApproval`), the way a plugin guards a
 // sensitive action. It answers "E2E_GUARDED_RAN" only when the call is allowed.
@@ -23,6 +27,20 @@ function isCompactCall(event) {
   const p = event.params || {};
   return event.toolName === "e2e_compact" || p.id === "e2e_compact" || p.name === "e2e_compact";
 }
+
+// A map as `map.get` returns it: Kyoto, three stops, one walking route (polyline precision 5).
+const E2E_MAP_ID = "00000000e2e00001";
+const E2E_MAP = {
+  ok: true,
+  title: "E2E Kyoto",
+  stops: [
+    { n: 1, label: "Fushimi Inari", lat: 34.9671, lon: 135.7727, group: "Day 1", place: "Fushimi Inari Taisha, Kyoto" },
+    { n: 2, label: "Kiyomizu-dera", lat: 34.9949, lon: 135.785, group: "Day 1", note: "Go early" },
+    { n: 3, label: "Gion", lat: 35.0037, lon: 135.7756, group: "Day 1" },
+  ],
+  unresolved: [],
+  routes: [{ group: "Day 1", mode: "walk", distanceM: 5860.4, durationS: 4689.9, polyline: "koltEkbu{XsoAsl@c|Ag^_v@vy@" }],
+};
 
 export default {
   id: "e2e-agent-tool",
@@ -48,6 +66,21 @@ export default {
         return { content: [{ type: "text", text }] };
       },
     });
+    api.registerTool({
+      name: "map",
+      description: "Test-only: shows a fixed map of Kyoto.",
+      parameters: { type: "object", properties: { stops: { type: "array" } } },
+      async execute() {
+        const { title, stops, unresolved, routes } = E2E_MAP;
+        const result = { mapId: E2E_MAP_ID, title, stops, routes: routes.map(({ polyline, ...r }) => r), unresolved, note: "shown" };
+        return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+      },
+    });
+    api.registerGatewayMethod(
+      "map.get",
+      ({ params, respond }) => respond(true, params?.mapId === E2E_MAP_ID ? E2E_MAP : { ok: false, error: "unknown or expired map id" }),
+      { scope: "operator.read" },
+    );
     api.registerTool({
       name: "e2e_compact",
       description: "Test-only: the run reports a context compaction after this call.",

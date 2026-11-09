@@ -1517,6 +1517,9 @@ class _PipeTurn:
         self.end_history = None
         # Codex images: attached to the stored message after the final (ELI-322).
         self.images_made = 0
+        # The reply's maps: page by map id, and the ids the chat was shown (`show_maps`).
+        self.map_pages: dict = {}
+        self.maps_shown: set[str] = set()
         # Paths the reply named: the Gateway stores each as an image block after
         # the final (ELI-328).
         self.gateway_media: set[str] = set()
@@ -1658,6 +1661,7 @@ class _PipeTurn:
                                 )
                                 for event in events:
                                     yield event
+                                await self.show_maps()
                                 if _is_background_agent_launch(name, _tool_result_text(data.get("result", {})),
                                                                data.get("isError") is True):
                                     self.background_agents += 1
@@ -2626,6 +2630,23 @@ class _PipeTurn:
             self.conn.mark_delivered_live(self.session_key, self.our_run_id)
         else:
             self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
+
+    async def show_maps(self):
+        """Embed the reply's maps once each. The chat replaces its embeds list with an
+        event's, so the event carries all of them; with Open WebUI's own emitter it also
+        saves them, so a reload shows the map."""
+        if not self.__event_emitter__:
+            return
+        await _map_embeds(self.conn, self.renderer.output, self.map_pages)
+        ids = [i for i in _map_ids(self.renderer.output) if self.map_pages.get(i)]
+        if all(i in self.maps_shown for i in ids):
+            return
+        try:
+            await self.__event_emitter__({"type": "embeds", "data": {
+                "embeds": [self.map_pages[i] for i in ids], "replace": True}})
+            self.maps_shown.update(ids)
+        except Exception as ex:
+            pipe_log(f"  map embed failed: {ex!r}")
 
     async def maybe_show_live_view(self, tool_name, args):
         """Embed LIVE_VIEW_URL once, at the first browser tool call."""
