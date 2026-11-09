@@ -28,6 +28,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LOG_DIR="${E2E_LOG_DIR:-$PWD/e2e-logs}"
+# The installer keeps a copy of the device identity (a private key) in a file; by default it sits next to install.py, so two stacks started from one checkout
+# shared it and raced on creating it. Each stack gets its own, outside the log dir (CI uploads that as an artifact), removed by `down`. The file lives in a
+# private per-user directory (mode 700, created under umask 077, refused when it is a symlink or someone else's), so a shared /tmp cannot plant the file or a symlink.
+IDENTITY_DIR="${TMPDIR:-/tmp}/pipe-e2e-identity-$(id -u)"
+(umask 077 && mkdir -p -- "$IDENTITY_DIR")
+if [[ -L "$IDENTITY_DIR" || ! -d "$IDENTITY_DIR" || "$(stat -c %u -- "$IDENTITY_DIR")" != "$(id -u)" ]]; then
+  echo "::error::$IDENTITY_DIR is a symlink, not a directory, or not owned by this user; not keeping a private key there" >&2
+  exit 1
+fi
+chmod 700 -- "$IDENTITY_DIR"
+PIPE_DEVICE_IDENTITY_FILE="$IDENTITY_DIR/$(printf '%s' "$LOG_DIR" | sha1sum | cut -c1-12).json"
+export PIPE_DEVICE_IDENTITY_FILE
 # One pid file per process the stack starts. gateway.pid is also read (and
 # rewritten after a relaunch) by the crash tests, so it holds the bare pid.
 STACK_PID_FILES=("$LOG_DIR/fake-llm.pid" "$LOG_DIR/gateway.pid" "$LOG_DIR/docker-pull.pid")
@@ -58,7 +70,7 @@ running_as() {  # running_as <pid> <start ticks>: still that process, and not a 
 stack_down() {
   local f pid started st pids=() p left id
   declare -A ticks
-  command -v pgrep >/dev/null || { echo "::error::pgrep (procps) is needed to find the stack's child processes" >&2; exit 1; }
+  command -v pgrep >/dev/null || { rm -f "$PIPE_DEVICE_IDENTITY_FILE"; echo "::error::pgrep (procps) is needed to find the stack's child processes" >&2; exit 1; }
   for f in "${STACK_PID_FILES[@]}"; do
     [[ -s "$f" ]] || continue
     pid=$(<"$f")
@@ -88,6 +100,7 @@ stack_down() {
     docker rm -f "$id" >/dev/null 2>&1 || true
   fi
   rm -f "${STACK_PID_FILES[@]}" "$LOG_DIR/owui.id"
+  rm -f "$PIPE_DEVICE_IDENTITY_FILE"
   # Local sandboxes only (e2e-local/run.sh sets it): release the shared, read-only OpenClaw install this stack mounted. CI leaves it unset.
   if [[ -n "${E2E_NPM_INSTALLER:-}" ]] && npm_prefix=$(npm prefix --global) && [[ -n "$npm_prefix" ]]; then "$E2E_NPM_INSTALLER" detach "$npm_prefix" || true; fi
   echo "stack down (${#pids[@]} processes stopped)"

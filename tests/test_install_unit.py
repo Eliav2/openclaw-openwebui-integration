@@ -363,5 +363,51 @@ class SmokeSessionTests(unittest.TestCase):
             self.assertNotIn("chat_id", body)
 
 
+class IdentityFileTests(unittest.TestCase):
+    """PIPE_DEVICE_IDENTITY_FILE moves the installer's copy of the device identity; unset, it stays next to install.py."""
+
+    def test_unset_it_is_next_to_install_py(self):
+        from unittest import mock
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os_env = __import__("os").environ
+            os_env.pop(inst.IDENTITY_FILE_ENV, None)
+            self.assertEqual(inst.local_identity_file(), inst.ROOT / ".pipe_device_identity.json")
+
+    def test_set_the_identity_is_written_and_read_there_and_not_next_to_install_py(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "stack-a" / "identity.json"
+            target.parent.mkdir()
+            with mock.patch.dict("os.environ", {inst.IDENTITY_FILE_ENV: str(target)}), \
+                    mock.patch.object(inst, "generate_device_identity", return_value={"id": "dev-a", "privateKey": "k", "publicKey": "p"}):
+                made = inst.choose_identity({})
+                self.assertEqual(made["id"], "dev-a")
+                self.assertTrue(target.exists())
+                self.assertEqual(oct(target.stat().st_mode & 0o777), "0o600")
+                again = inst.choose_identity({})                      # a reinstall of this stack finds it
+                self.assertEqual(again["id"], "dev-a")
+            self.assertFalse(inst.DEFAULT_IDENTITY_FILE.exists() and inst.DEFAULT_IDENTITY_FILE.stat().st_mtime > target.stat().st_mtime)
+
+    def test_a_missing_directory_for_the_file_is_created(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "not" / "yet" / "identity.json"
+            with mock.patch.dict("os.environ", {inst.IDENTITY_FILE_ENV: str(target)}), \
+                    mock.patch.object(inst, "generate_device_identity", return_value={"id": "dev-a", "privateKey": "k", "publicKey": "p"}):
+                inst.choose_identity({})
+            self.assertTrue(target.exists())
+            self.assertEqual(oct(target.parent.stat().st_mode & 0o777), "0o700")
+
+    def test_two_stacks_get_two_identities(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            ids = []
+            for name in ("a", "b"):
+                with mock.patch.dict("os.environ", {inst.IDENTITY_FILE_ENV: str(Path(d) / f"{name}.json")}), \
+                        mock.patch.object(inst, "generate_device_identity", return_value={"id": f"dev-{name}", "privateKey": "k", "publicKey": "p"}):
+                    ids.append(inst.choose_identity({})["id"])
+            self.assertEqual(ids, ["dev-a", "dev-b"])
+
+
 if __name__ == "__main__":
     unittest.main()
