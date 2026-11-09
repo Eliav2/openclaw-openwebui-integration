@@ -3490,13 +3490,16 @@ class _GatewayConnection:
             return
         run_id = idem[:-len(":user")]
         consumer = self._consumers.get(f"{session_key}:{run_id}")
-        if consumer is not None and not (consumer.started or consumer.steered):
-            steered = consumer
-        elif consumer is None:
-            steered = self._steer_handed_over(session_key, run_id)
-        else:
+        if consumer is not None and consumer.steered:
             return
-        if steered is None or self._steer(steered, into=into):
+        if consumer is None:
+            steered = self._steer_handed_over(session_key, run_id)
+            if steered is None:
+                return  # no reply of ours waits for it
+        else:
+            # Started: its lone final came first, with no running run to steer into.
+            steered = None if consumer.started else consumer
+        if steered is not None and self._steer(steered, into=into):
             return
         # Its reply still takes its part of the run: from the transcript.
         pipe_log(f"  steer of run {run_id[:24]}... into {into[:24]}... not applied: that run is not "

@@ -6827,13 +6827,16 @@ class _GatewayConnection:
             return
         run_id = idem[:-len(":user")]
         consumer = self._consumers.get(f"{session_key}:{run_id}")
-        if consumer is not None and not (consumer.started or consumer.steered):
-            steered = consumer
-        elif consumer is None:
-            steered = self._steer_handed_over(session_key, run_id)
-        else:
+        if consumer is not None and consumer.steered:
             return
-        if steered is None or self._steer(steered, into=into):
+        if consumer is None:
+            steered = self._steer_handed_over(session_key, run_id)
+            if steered is None:
+                return  # no reply of ours waits for it
+        else:
+            # Started: its lone final came first, with no running run to steer into.
+            steered = None if consumer.started else consumer
+        if steered is not None and self._steer(steered, into=into):
             return
         # Its reply still takes its part of the run: from the transcript.
         pipe_log(f"  steer of run {run_id[:24]}... into {into[:24]}... not applied: that run is not "
@@ -8999,13 +9002,55 @@ def _steer_chain(history: dict, refs: list) -> list:
     if not refs or not isinstance(messages, list):
         return refs
     host, by_message = refs[0]["span_run"], {r["message_id"]: r for r in refs[1:]}
+    # A turn after the host's last closing message is a turn of its own, even
+    # before its answer is stored.
+    closers = [n for n, m in enumerate(messages) if _run_closed_by(m) == host]
     chain = [refs[0]]
-    for n, message in enumerate(messages):
+    for n, message in enumerate(messages[:closers[-1] if closers else len(messages)]):
         run = _history_user_run_id(message)
         ref = _settle_ref(run) if run else None
         if ref is not None and _history_steered_into(history, n) == host:
             chain.append(by_message.pop(ref["message_id"], None) or ref)
     return refs if by_message else chain
+
+
+# The Pipe's notes that a steered message's answer is in another reply: no
+# run text, and wrong once the settle gives the reply its answer.
+_STEER_NOTES = (REPLY_SENT_WITH_NEXT_NOTE, REPLY_SEND_FAILED_NOTE)
+
+
+def _settle_shown(content: str) -> str:
+    """A saved reply's text as the settle compares it: no steer notes."""
+    for note in _STEER_NOTES:
+        content = (content or "").replace(note, "")
+    return _settle_text(content)
+
+
+# A tool card in a message's `output` (`_tool_call_started_event`).
+_TOOL_CARD_TYPE = "function_call"
+
+
+def _tool_card_ids(output: list) -> set:
+    """The tool cards in `output`, by `call_id or id` (how consumers read them)."""
+    return {i.get("call_id") or i.get("id") for i in output or ()
+            if isinstance(i, dict) and i.get("type") == _TOOL_CARD_TYPE}
+
+
+async def _settle_waits(conn: "_GatewayConnection", refs: list) -> None:
+    """Until no one still saves a reply of `refs`: a turn writer (also while it
+    finalizes), or an Open WebUI request in its chat, which saves at its end."""
+    for writer in (conn._turn_writers.get((r["chat_id"], r["message_id"])) for r in refs):
+        if writer is not None and writer.saving():
+            await writer.wait_done()
+    try:
+        from open_webui.tasks import list_task_ids_by_item_id, tasks
+        for chat_id in dict.fromkeys(r["chat_id"] for r in refs):
+            for task_id in await list_task_ids_by_item_id(_owui_redis(), chat_id):
+                task = tasks.get(task_id)
+                if task is not None and not task.done() and task is not asyncio.current_task():
+                    await asyncio.wait({task})
+    except ImportError:
+        pass  # no Open WebUI tasks to wait for
 
 
 async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, refs: list) -> None:
@@ -9024,12 +9069,9 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
 
     try:
         while True:
-            # A reply a turn writer still has is read once it is saved, and
-            # the transcript after it: the writer ends when the session settled.
-            open_writers = [w for w in (conn._turn_writers.get((r["chat_id"], r["message_id"])) for r in refs)
-                            if w is not None and not w.closed]
-            for writer in open_writers:
-                await writer.wait_done()
+            # A reply is read once it is saved, and the transcript after that:
+            # a turn writer ends when the session settled.
+            await _settle_waits(conn, refs)
             hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
             chain = _steer_chain(hist, refs)
             if chain == refs:
@@ -9044,15 +9086,21 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
         saved = [await Chats.get_message_by_id_and_message_id(r["chat_id"], r["message_id"]) or {}
                  for r in refs]
         texts = [(m.get("content") or "") for m in saved]
-        shown, truth = [_settle_text(t) for t in texts], [_settle_text(p.text) for p in parts]
+        shown, truth = [_settle_shown(t) for t in texts], [_settle_text(p.text) for p in parts]
         if not _settle_misplaced(shown, truth):
             if shown != truth:
                 pipe_log(f"  replies around a steer left as they are: {len(refs)} replies hold more "
                          "than the transcript's text of the run")
             return
+        lost = set().union(*(_tool_card_ids(m.get("output")) for m in saved)) - set().union(
+            *(_tool_card_ids(p.finished_output()) for p in parts))
+        if lost:
+            pipe_log(f"  replies around a steer left as they are: the transcript lacks "
+                     f"{len(lost)} tool card(s) they show")
+            return
         user_id = (conn.parse_owui_session_key(session_key) or (None, None))[0]
-        for ref, part, was, message in zip(refs, parts, texts, saved):
-            if _settle_text(was) == _settle_text(part.text):
+        for ref, part, was, message in zip(refs, parts, shown, saved):
+            if was == _settle_text(part.text):
                 continue
             # The Pipe's own notes are in no transcript (ELI-229).
             _keep_pipe_notes(list(message.get("output") or []), part)
@@ -9255,6 +9303,7 @@ class _TurnWriter:
         self.request_attachments = 0    # its images or files, which a resume cannot carry
         self.awaiting_row = False       # kept open for a Gateway recovery
         self.closed = False
+        self.finalizing = False  # closed, its message still being saved
         # M's message was steered into another run (2026.10.10+): its own run
         # gets only a `chat` final with no message.
         self.steered_message = False
@@ -9844,7 +9893,7 @@ class _TurnWriter:
         streamed. `steered`: M ends with what streamed, since the run goes on."""
         if self.closed:
             return
-        self.closed = True
+        self.closed = self.finalizing = True
         try:
             try:
                 hist = None if steered else await self.conn.session_history(
@@ -10199,6 +10248,10 @@ class _TurnWriter:
                          f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
             except Exception as ex:
                 pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
+
+    def saving(self) -> bool:
+        """It may still save its message: open, or closed and finalizing."""
+        return not self._done.is_set() and (not self.closed or self.finalizing)
 
     async def wait_done(self) -> None:
         """Until this writer is done with its message."""
