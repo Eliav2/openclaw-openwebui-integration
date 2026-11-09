@@ -431,15 +431,15 @@ def _settle_text(text: str) -> str:
 def _settle_misplaced(saved: list, parts: list) -> bool:
     """The saved replies hold the transcript's parts with only the split
     points moved: in order, each one a piece of the run's text that starts
-    where the one before ended or earlier (a late steer's answer shows in
-    both replies), together all of it. Whitespace-blind."""
+    no later than where the ones before reach, together all of it. A piece
+    may repeat what an earlier reply shows (after a late steer the first
+    reply runs on into the next answers). Whitespace-blind."""
     if saved == parts or len(saved) != len(parts):
         return False
     whole, end = "".join(parts), 0  # `end`: how far the replies so far reach
     for was in saved:
-        start = next((s for s in range(end, max(end - len(was), 0) - 1, -1)
-                      if whole.startswith(was, s)), None)
-        if start is None:
+        start = whole.rfind(was, 0, end + len(was))  # the latest start at or before `end`
+        if start < 0:
             return False
         end = max(end, start + len(was))
     return end == len(whole)

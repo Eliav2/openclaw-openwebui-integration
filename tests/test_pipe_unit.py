@@ -15919,9 +15919,12 @@ class SettleSteeredRepliesTests(unittest.TestCase):
     def test_a_reply_that_also_shows_the_next_ones_answer_is_misplaced(self):
         """A late steer (CI 42538220842): the first reply ran on into tomato's answer, which
         tomato's own reply shows too. The replies still hold only the transcript's text, in
-        order, so it is a moved split."""
+        order, with no gap, so it is a moved split."""
         self.assertTrue(openclaw_pipe._settle_misplaced(
             ["holdSTEERED:a", "STEERED:a", "b"], ["hold", "STEERED:a", "b"]))
+        self.assertTrue(openclaw_pipe._settle_misplaced(
+            ["holdSTEERED:ab", "STEERED:a", "holdSTEERED:ab"], ["hold", "STEERED:a", "b"]),
+            "the forced CI order (w8 sandbox): the first and last replies each show the whole run")
         self.assertFalse(openclaw_pipe._settle_misplaced(
             ["holdSTEERED:a", "STEERED:aX", "b"], ["hold", "STEERED:a", "b"]))
         self.assertFalse(openclaw_pipe._settle_misplaced(
