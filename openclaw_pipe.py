@@ -572,6 +572,38 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
         Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields))
 
 
+async def _owui_upsert_message_with_statuses(chat_id: str, message_id: str, fields: dict,
+                                             statuses: list) -> bool:
+    """`fields` upserted and `statuses` appended to the message's statusHistory
+    in one write under the chat's row lock: a reply's final status lines ride
+    in its end snapshot instead of a save each. Never cut short by a cancel."""
+    return await _uncancellable(_owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses))
+
+
+async def _owui_upsert_message_with_statuses_now(chat_id: str, message_id: str, fields: dict,
+                                                 statuses: list) -> bool:
+    from open_webui.models.chats import Chats
+    from open_webui.models.chat_messages import ChatMessages
+    from sqlalchemy.orm.attributes import flag_modified
+
+    async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
+        data = chat.chat or {}
+        history = data.get("history") or {}
+        saved = (history.get("messages") or {}).get(message_id) or {}
+        # As Open WebUI's upsert and its status save, in one transaction.
+        message = Chats._clean_null_bytes(
+            {**fields, "statusHistory": [*(saved.get("statusHistory") or []), *statuses]})
+        message = Chats.upsert_message_to_history(history, message_id, message)
+        await ChatMessages.upsert_message(message_id, chat_id, message.get("user_id") or chat.user_id,
+                                          message, db=db)
+        chat.chat = {**data, "history": history}
+        flag_modified(chat, "chat")
+        chat.updated_at = int(time.time())
+        return True
+
+
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
                               writer_id: str, takeover: bool = False) -> dict:
     """Claim `message_id` for `run_id` under the chat's row lock, inserting it
@@ -14769,6 +14801,8 @@ class _PipeTurn:
         self.ended = False
         self._our_run_id = None
         self.system_note = ""
+        # The final status lines, shown unsaved until the end snapshot saves them.
+        self.final_statuses = []
 
     @property
     def our_run_id(self):
@@ -14794,6 +14828,8 @@ class _PipeTurn:
                     if self.ended:
                         return
             finally:
+                # Lines no end snapshot saved (a cancel before it) still get saved.
+                await self.save_final_statuses()
                 _secret_asker_leave(self)
 
     async def prepare(self):
@@ -15657,13 +15693,18 @@ class _PipeTurn:
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
-            elif status_lines:
+            else:
                 # One `status` per fact, since OWUI clamps each to one line. All
                 # done=True: done=False made them shimmer before the last one.
-                for line in status_lines:
-                    await _emit_status(self.__event_emitter__, line, done=True)
-            else:
-                await _emit_status(self.__event_emitter__, "", done=True)
+                emit = self.__event_emitter__
+                if self.end_snapshot_follows():
+                    # The end snapshot's own write saves them: a row save less.
+                    emit = await self.unsaved_emitter()
+                    self.final_statuses = [{"description": line, "done": True} for line in status_lines or [""]]
+                for line in status_lines or [""]:
+                    await _emit_status(emit, line, done=True)
+                # The request's emitter tracks this; the unsaved one goes around it.
+                self.turn.status_open = False
 
     async def on_steered(self, steered: dict) -> None:
         """Continue the run this message was steered into. What it sent before
@@ -16405,15 +16446,59 @@ class _PipeTurn:
         self.last_snapshot_text = self.visible_message_text
         self.last_snapshot_time = now
 
+    def end_snapshot_follows(self) -> bool:
+        """`finish` saves this reply's end snapshot, which can carry its final
+        status lines: the run ended here with text, and the snapshot can be
+        an upsert (a live output copy is reachable through the request)."""
+        return bool(not self.aborted and self.text_yielded and not self.adopted_run_id
+                    and not self.handed_over and self.__request__ is not None
+                    and self.__metadata__ and self.owui_message_id)
+
+    async def unsaved_emitter(self):
+        """This reply's emitter without its DB writes, as Open WebUI makes its
+        own (`get_event_emitter(metadata, update_db=False)`)."""
+        from open_webui.socket.main import get_event_emitter
+        return await get_event_emitter(self.__metadata__, update_db=False)
+
+    async def save_final_statuses(self):
+        """The final status lines no end snapshot carried, a save each as Open
+        WebUI's emitter would have made."""
+        statuses, self.final_statuses = getattr(self, "final_statuses", None), []
+        if not statuses:
+            return
+        from open_webui.models.chats import Chats
+        for status in statuses:
+            try:
+                await _uncancellable(Chats.add_message_status_to_chat_by_id_and_message_id(
+                    self.owui_origin_chat_id, self.owui_message_id, status))
+            except Exception as ex:
+                pipe_log(f"  saving the final status lines failed: {ex!r}")
+                return
+
     async def save_end_snapshot(self):
         """Save the reply as it stands before Open WebUI's end save, cards
-        included via the live output copy (ELI-267), else text alone."""
+        included via the live output copy (ELI-267), else text alone. The
+        upsert also saves the final status lines."""
         output = await _live_output(self.__request__, self.owui_origin_chat_id, self.owui_message_id)
         if output is None:
             await self.maybe_emit_snapshot(force=True)
+            await self.save_final_statuses()
             return
-        await _owui_upsert_message(self.owui_origin_chat_id, self.owui_message_id,
-                                   {"content": self.visible_message_text, "output": output})
+        fields = {"content": self.visible_message_text, "output": output}
+        if self.final_statuses:
+            try:
+                saved = await _owui_upsert_message_with_statuses(
+                    self.owui_origin_chat_id, self.owui_message_id, fields, self.final_statuses)
+            except Exception as ex:
+                saved = False
+                pipe_log(f"  end snapshot with the final status lines failed: {ex!r}")
+            if saved:
+                self.final_statuses = []
+            else:
+                await _owui_upsert_message(self.owui_origin_chat_id, self.owui_message_id, fields)
+                await self.save_final_statuses()
+        else:
+            await _owui_upsert_message(self.owui_origin_chat_id, self.owui_message_id, fields)
         self.last_snapshot_text = self.visible_message_text
         self.last_snapshot_time = time.time()
 
