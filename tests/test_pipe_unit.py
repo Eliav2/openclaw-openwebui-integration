@@ -16168,6 +16168,38 @@ class MidRunSteeringTests(_TurnCase):
         self.assertEqual(self.aborts, [], "nothing taken back")
         self.assertEqual(self.sent.count("Stop and say banana"), 1, "sent once")
 
+    async def test_a_steered_reply_whose_answer_streamed_before_its_commit_shows_its_own_answer(self):
+        """claude-cli streamed blue's answer before its commit, so the first reply got it and the
+        steered reply's baselines hold it: the rest of the run is repeats, and blue yields nothing
+        (CI 42538220842, variant A). It ends with its own answer from the transcript, once the
+        transcript closed the run: never blank, never the whole run, even with no settle."""
+        self.conn.gateway_version = "2026.10.10"
+        user, said = SteeredTranscriptSpanTests._user, SteeredTranscriptSpanTests._said
+        whole = "ROUND 1\n\nblue answer"
+        transcript = [user(self.R1, "Do 4 rounds of sleep 12"), said("ROUND 1", stop="toolUse"),
+                      {"role": "toolResult", "content": "done"},
+                      user(self.R2, "say blue"), said("blue answer", stop="end_turn")]
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("say blue", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        with mock.patch.object(openclaw_pipe, "_settle_steered_replies", mock.AsyncMock()):
+            await self._dispatch(
+                self._delta(self.R1, "\n\nblue answer"),
+                self._commit(self.R2, "say blue", into=self.R1),
+                self._final(self.R2),
+                self._lifecycle(self.R1, "end"))
+            self.active = False
+            # The closing message is not in yet.
+            self.history = {"messages": transcript}
+            await self._dispatch(self._final(self.R1, whole))
+            self.assertFalse(first_b.done(), "it waits for its answer in the transcript")
+            self.history = {"messages": [*transcript, said(whole, run=self.R1, key=f"cli-assistant:{self.R1}")]}
+            self.conn._session_message_waiters.pop(self.SK).set()
+            out_b, _ = await self._collect(first_b, gen_b)
+            await self._collect(first_a, gen_a)
+        self.assertEqual(out_b.strip(), "blue answer")
+
     async def test_the_answer_goes_to_the_steered_reply_from_its_message_commit(self):
         """The built-in runtime's order: commit, the answer's first event, then the steered run's
         lone final. The commit is the boundary."""
@@ -16359,6 +16391,10 @@ class MidRunSteeringTests(_TurnCase):
         # The handover keeps the run's target and renderer, so blue starts with baselines (#300).
         self.assertEqual(blue["run_text"]["received"], "21-40 41-50tomato", "after what tomato's reply showed")
         self.assertEqual(blue["earlier"]["message_id"], "w2")
+        # Tomato's reply holds its own run's span, after the first reply's: the settle's chain.
+        self.assertEqual(blue["earlier"]["span_run"], self.R2, "tomato's span, not the host run's")
+        self.assertEqual(blue["earlier"]["before"], [{"chat_id": self.CHAT, "message_id": "w1",
+                                                      "request_task_id": None, "span_run": self.R1}])
         await conn._dispatch_run_event(self._delta(self.R1, "blue"))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R1)
         self.assertTrue(host.queue.empty(), "nothing of the run after the commit reached the first reply")
