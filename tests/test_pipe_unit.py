@@ -13422,10 +13422,11 @@ class GapHandoverReplayTests(_RoutingCase):
                     self.assertEqual(kinds, [])
                     self.assertEqual(replaced, ["Reading them.\n\nFound it."])
 
-    async def _reply_with_usage_line(self, line, live_copy):
+    async def _reply_with_usage_line(self, line, live_copy, patches=()):
         """One reply whose request saves its statuses, with `line` as its usage line; the message as
-        Open WebUI's end save finds it."""
-        live = {}
+        Open WebUI's end save finds it (as stored, for a reply cancelled before that save).
+        `patches`: more (target, name, value) patched for the reply; `self.usage_live["reply"]` is it."""
+        self.usage_live = live = {}
 
         async def streams(redis, chat_id):
             return ([{"chat_id": chat_id, "message_id": self.STUB, "output": live["reply"]["output"]}]
@@ -13446,18 +13447,24 @@ class GapHandoverReplayTests(_RoutingCase):
         async def close(ref):
             self.closed.append(ref.get("message_id"))
         self.pipe.valves.PUBLISH_CHAT_FINISHED = True
-        with mock.patch.object(openclaw_pipe, "_build_usage_status_lines", mock.AsyncMock(return_value=[line])), \
-                mock.patch.object(openclaw_pipe, "_publish_chat_finished", publish), \
-                mock.patch.object(openclaw_pipe, "_close_reply_status", close):
+        with contextlib.ExitStack() as stack:
+            for target, name, value in (
+                    (openclaw_pipe, "_build_usage_status_lines", mock.AsyncMock(return_value=[line])),
+                    (openclaw_pipe, "_publish_chat_finished", publish),
+                    (openclaw_pipe, "_close_reply_status", close), *patches):
+                stack.enter_context(mock.patch.object(target, name, value))
             live["reply"] = reply = await self.start_reply(request=request, saves_statuses=True, task_id="req-1")
             self.history = _turn_history(run=self.run)
             self.frame(_delta("Found it."))
             self.frame({"state": "final"}, event="chat")
             self.settle()
-            await self.ended(reply)
+            try:
+                await self.ended(reply)
+            except asyncio.CancelledError:
+                await self.spin(600)
         unsaved = [d["data"]["data"]["description"] for e, d, _room in self.owui.emits
                    if e == "events" and d["data"].get("type") == "status"]
-        return at_end_save.pop(), unsaved
+        return (at_end_save.pop() if at_end_save else copy.deepcopy(self.owui.msgs()[self.STUB])), unsaved
 
     async def test_the_final_status_line_rides_in_the_end_snapshot(self):
         """A': the usage line goes to the tab unsaved, and the end snapshot's own write saves it
@@ -13481,6 +13488,68 @@ class GapHandoverReplayTests(_RoutingCase):
         self.assertEqual([s.get("description") for s in saved["statusHistory"]], ["Thinking...", line])
         self.assertEqual(self.owui.status_saves, ["Thinking...", line])
         self.assertEqual(unsaved, [line])
+
+    @staticmethod
+    def _lines(message):
+        return [x.get("description") for x in message.get("statusHistory") or []]
+
+    async def test_a_failed_end_snapshot_write_saves_the_final_status_line_once_on_its_own(self):
+        """A' failure path, an exception: the snapshot write with the statuses fails, so the
+        content is upserted alone and the usage line gets its own save, once."""
+        line = "🧠 1k/200k (0%)"
+
+        async def fails(*args, **kwargs):
+            raise RuntimeError("database is locked")
+        saved, _unsaved = await self._reply_with_usage_line(
+            line, live_copy=True, patches=[(openclaw_pipe, "_owui_upsert_message_with_statuses_now", fails)])
+        self.assertEqual(self._lines(saved), ["Thinking...", line])
+        self.assertEqual(saved["content"], "Found it.")
+        self.assertEqual(self.owui.status_saves, ["Thinking...", line])
+
+    async def test_a_cancel_during_the_end_snapshot_write_saves_the_final_status_line_once(self):
+        """A' failure path, a cancel: Stop lands while the snapshot write runs. The write
+        finishes (ELI-205) and commits the usage line, so the run's cleanup must not save it
+        again."""
+        line = "🧠 1k/200k (0%)"
+        write = openclaw_pipe._owui_upsert_message_with_statuses_now
+
+        async def cancelled_meanwhile(*args, **kwargs):
+            self.usage_live["reply"]["task"].cancel()
+            await asyncio.sleep(0)
+            return await write(*args, **kwargs)
+        saved, _unsaved = await self._reply_with_usage_line(
+            line, live_copy=True,
+            patches=[(openclaw_pipe, "_owui_upsert_message_with_statuses_now", cancelled_meanwhile)])
+        self.assertTrue(self.usage_live["reply"]["task"].cancelled())
+        self.assertEqual(self._lines(saved), ["Thinking...", line])
+        self.assertEqual(self.owui.status_saves, ["Thinking..."], "the committed line saved again")
+
+    async def test_a_final_status_line_whose_save_failed_is_saved_by_the_cleanup(self):
+        """A final status save Open WebUI fails (it returns None) keeps the line pending, and
+        the run's cleanup saves it."""
+        line = "🧠 1k/200k (0%)"
+        save, failed = self.owui._chats.add_message_status_to_chat_by_id_and_message_id, []
+
+        async def fails_once(chat_id, message_id, status):
+            if status.get("description") == line and not failed:
+                failed.append(line)
+                self.owui.status_saves.append(line)
+                return None
+            return await save(chat_id, message_id, status)
+        saved, _unsaved = await self._reply_with_usage_line(
+            line, live_copy=False,
+            patches=[(self.owui._chats, "add_message_status_to_chat_by_id_and_message_id", fails_once)])
+        self.assertEqual(failed, [line])
+        self.assertEqual(self._lines(self.owui.msgs()[self.STUB]), ["Thinking...", line])
+        self.assertEqual(self.owui.status_saves, ["Thinking...", line, line])
+
+    async def test_the_secret_asker_is_removed_even_when_the_status_save_is_cancelled(self):
+        """The run's cleanup saves the final status lines first; a cancel there must not leave
+        the reply registered for secret requests (ELI-96)."""
+        line = "🧠 1k/200k (0%)"
+        await self._reply_with_usage_line(line, live_copy=True, patches=[
+            (openclaw_pipe._PipeTurn, "save_final_statuses", mock.AsyncMock(side_effect=asyncio.CancelledError))])
+        self.assertEqual([t for t in openclaw_pipe._SECRET_ASKERS.values() if t.owui_message_id == self.STUB], [])
 
     async def test_case_1_frames_lost_mid_run(self):
         """A slow client: the frames of a whole tool call were dropped (only the seq shows it)."""

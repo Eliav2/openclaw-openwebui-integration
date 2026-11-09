@@ -572,12 +572,24 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
         Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields))
 
 
+async def _committed_then(write, on_commit):
+    """`write`'s result, after `on_commit()` when it is truthy (the write
+    committed). Run inside `_uncancellable`'s task, so a cancel of the caller
+    between the commit and its resume cannot skip it."""
+    result = await write
+    if result and on_commit is not None:
+        on_commit()
+    return result
+
+
 async def _owui_upsert_message_with_statuses(chat_id: str, message_id: str, fields: dict,
-                                             statuses: list) -> bool:
+                                             statuses: list, on_commit=None) -> bool:
     """`fields` upserted and `statuses` appended to the message's statusHistory
     in one write under the chat's row lock: a reply's final status lines ride
-    in its end snapshot instead of a save each. Never cut short by a cancel."""
-    return await _uncancellable(_owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses))
+    in its end snapshot instead of a save each. Never cut short by a cancel;
+    `on_commit` runs once it committed, even when the caller was cancelled."""
+    return await _uncancellable(_committed_then(
+        _owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses), on_commit))
 
 
 async def _owui_upsert_message_with_statuses_now(chat_id: str, message_id: str, fields: dict,
@@ -14828,9 +14840,11 @@ class _PipeTurn:
                     if self.ended:
                         return
             finally:
-                # Lines no end snapshot saved (a cancel before it) still get saved.
-                await self.save_final_statuses()
-                _secret_asker_leave(self)
+                try:
+                    # Lines no end snapshot saved (a cancel before it) still get saved.
+                    await self.save_final_statuses()
+                finally:
+                    _secret_asker_leave(self)
 
     async def prepare(self):
         """The message, connection, session key, a cancelled run to take over,
@@ -16460,19 +16474,31 @@ class _PipeTurn:
         from open_webui.socket.main import get_event_emitter
         return await get_event_emitter(self.__metadata__, update_db=False)
 
+    def final_statuses_committed(self, statuses):
+        """`statuses` are in the message's saved statusHistory: no longer pending."""
+        self.final_statuses = [x for x in self.final_statuses if not any(x is c for c in statuses)]
+
     async def save_final_statuses(self):
         """The final status lines no end snapshot carried, a save each as Open
-        WebUI's emitter would have made."""
-        statuses, self.final_statuses = getattr(self, "final_statuses", None), []
-        if not statuses:
+        WebUI's emitter would have made. A line stays pending until its save
+        commits: a failed save keeps it and the lines after it for the next try
+        (the run's cleanup)."""
+        if not getattr(self, "final_statuses", None):
             return
         from open_webui.models.chats import Chats
-        for status in statuses:
+        while self.final_statuses:
+            status = self.final_statuses[0]
             try:
-                await _uncancellable(Chats.add_message_status_to_chat_by_id_and_message_id(
-                    self.owui_origin_chat_id, self.owui_message_id, status))
+                saved = await _uncancellable(_committed_then(
+                    Chats.add_message_status_to_chat_by_id_and_message_id(
+                        self.owui_origin_chat_id, self.owui_message_id, status),
+                    lambda status=status: self.final_statuses_committed([status])))
             except Exception as ex:
                 pipe_log(f"  saving the final status lines failed: {ex!r}")
+                return
+            if not saved:
+                # Open WebUI returns None when its save failed.
+                pipe_log("  saving the final status lines failed")
                 return
 
     async def save_end_snapshot(self):
@@ -16486,15 +16512,17 @@ class _PipeTurn:
             return
         fields = {"content": self.visible_message_text, "output": output}
         if self.final_statuses:
+            statuses = list(self.final_statuses)
             try:
+                # Committed lines leave the pending list inside the write, so a cancel
+                # after the commit cannot have the run's cleanup save them again.
                 saved = await _owui_upsert_message_with_statuses(
-                    self.owui_origin_chat_id, self.owui_message_id, fields, self.final_statuses)
+                    self.owui_origin_chat_id, self.owui_message_id, fields, statuses,
+                    on_commit=lambda: self.final_statuses_committed(statuses))
             except Exception as ex:
                 saved = False
                 pipe_log(f"  end snapshot with the final status lines failed: {ex!r}")
-            if saved:
-                self.final_statuses = []
-            else:
+            if not saved:
                 await _owui_upsert_message(self.owui_origin_chat_id, self.owui_message_id, fields)
                 await self.save_final_statuses()
         else:

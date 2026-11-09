@@ -566,12 +566,24 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
         Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields))
 
 
+async def _committed_then(write, on_commit):
+    """`write`'s result, after `on_commit()` when it is truthy (the write
+    committed). Run inside `_uncancellable`'s task, so a cancel of the caller
+    between the commit and its resume cannot skip it."""
+    result = await write
+    if result and on_commit is not None:
+        on_commit()
+    return result
+
+
 async def _owui_upsert_message_with_statuses(chat_id: str, message_id: str, fields: dict,
-                                             statuses: list) -> bool:
+                                             statuses: list, on_commit=None) -> bool:
     """`fields` upserted and `statuses` appended to the message's statusHistory
     in one write under the chat's row lock: a reply's final status lines ride
-    in its end snapshot instead of a save each. Never cut short by a cancel."""
-    return await _uncancellable(_owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses))
+    in its end snapshot instead of a save each. Never cut short by a cancel;
+    `on_commit` runs once it committed, even when the caller was cancelled."""
+    return await _uncancellable(_committed_then(
+        _owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses), on_commit))
 
 
 async def _owui_upsert_message_with_statuses_now(chat_id: str, message_id: str, fields: dict,
