@@ -40,7 +40,7 @@ def extract(src: str) -> list:
     for name, text in _chunks(src):
         for m in re.finditer(r't\("Stop"\)', text):
             near = text[max(0, m.start() - 400):m.start()]
-            made = re.findall(r"var (\w+)=([\w$]+)\(\)", near)
+            made = re.findall(r"var ([\w$]+)=([\w$]+)\(\)", near)
             if not made:
                 continue
             fn = made[-1][1]
