@@ -2343,7 +2343,18 @@ class _PipeTurn:
 
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back by run id, else by user text (only for a run
-        seen here: otherwise the last reply may be another run's)."""
+        seen here: otherwise the last reply may be another run's). A steered
+        reply's text is its own message's answer, never the run it went into."""
+        span_run = getattr(self, "steered_span_run", None)
+        if span_run:
+            hist = await _await_steered_answer(self.conn, self.session_key, span_run,
+                                               f"steered reply {str(self.owui_message_id)[:8]}...",
+                                               host=self.our_run_id)
+            span = (_history_steered_span(hist, span_run) or _history_steered_tail(hist, span_run)) if hist else None
+            text = _history_renderer(span).text.strip() if span else ""
+            if not text:
+                pipe_log("  recovery: the steered message's answer is not in the transcript")
+            return text or None
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
             found, whole = _history_text_for_run(hist, self.our_run_id)
@@ -2366,6 +2377,9 @@ class _PipeTurn:
             pipe_log(f"  settled run: chat.history failed: {ex!r}")
             hist = None
         found, whole = _history_text_for_run(hist, self.our_run_id) if hist else (False, None)
+        if getattr(self, "steered_span_run", None) and not self.text_yielded and (found or not closer_only):
+            # Nothing of it shown: its own message's answer, never the run it went into.
+            return await self.recover_from_transcript() or ""
         if found and whole:
             if whole.startswith(self.renderer.received):
                 return whole[len(self.renderer.received):]

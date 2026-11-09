@@ -9422,6 +9422,62 @@ class TurnWriterEndTests(_TurnWriterCase):
         await asyncio.wait_for(ending, 5)
         self.assertEqual(self.m()["content"], "the aside")
 
+    async def test_a_confirmed_steer_whose_run_ended_clean_with_nothing_stored_ends_when_settled(self):
+        """The message's commit carries its steer target, the session settled, and the transcript
+        holds no answer to it (a host that ended with no text writes no closing copy). That is all
+        it will hold: the reply ends (review on #381), it does not wait for an append that never
+        comes."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        w.steered_message = True
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": [
+            {"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
+            {"role": "user", "content": "aside", "__openclaw": {
+                "idempotencyKey": f"{self.STEERED}:user", "steerTargetRunId": "R1"}}]})
+        with mock.patch.object(openclaw_pipe, "_session_list_active", mock.AsyncMock(return_value=False)):
+            await asyncio.wait_for(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}), 2)
+        self.assertTrue(w.closed)
+
+    async def test_a_steered_reply_whose_transcript_read_meets_a_reconnect_reads_again_once_connected(self):
+        """The socket dropped while the reply waits for its answer (errwatch 06:23, 1 s to the
+        same Gateway): the read waits for the connection and reads again, it does not end the
+        reply without its answer."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        answered = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        state = {"down": False, "answered": False}
+
+        async def history(*a, **k):
+            if state["down"]:
+                raise openclaw_pipe.GatewayError("gateway connection not ready (reconnecting)")
+            return copy.deepcopy(answered if state["answered"] else self._steered_transcript())
+
+        async def reconnected():
+            state["down"], state["answered"] = False, True
+        self.conn.session_history = history
+        self.conn.ensure_connected = mock.AsyncMock(side_effect=reconnected)
+        with mock.patch.object(type(self.conn), "reconnecting", new_callable=mock.PropertyMock,
+                               side_effect=lambda: state["down"]):
+            ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.assertFalse(ending.done(), "it waits: the answer is not stored yet")
+            state["down"] = True
+            self.conn._on_session_message({"sessionKey": self.KEY})
+            await asyncio.wait_for(ending, 5)
+        self.conn.ensure_connected.assert_awaited()
+        self.assertEqual(self.m()["content"], "the aside")
+
     async def test_a_steered_reply_stops_waiting_when_its_run_is_aborted(self):
         """An aborted or failed run stores no answer; its event ends the wait."""
         self.conn.gateway_version = "2026.10.10"
@@ -16168,6 +16224,116 @@ class MidRunSteeringTests(_TurnCase):
         self.assertEqual(self.aborts, [], "nothing taken back")
         self.assertEqual(self.sent.count("Stop and say banana"), 1, "sent once")
 
+    async def test_a_steered_reply_whose_answer_streamed_before_its_commit_shows_its_own_answer(self):
+        """claude-cli streamed blue's answer before its commit, so the first reply got it and the
+        steered reply's baselines hold it: the rest of the run is repeats, and blue yields nothing
+        (CI 42538220842, variant A). It ends with its own answer from the transcript, once the
+        transcript closed the run: never blank, never the whole run, even with no settle."""
+        transcript = self._blue_transcript()
+        whole = "ROUND 1\n\nblue answer"
+        said = SteeredTranscriptSpanTests._said
+        async with self._blue_streamed_before_its_commit(transcript, whole) as (first_b, gen_b):
+            self.history = {"messages": [*transcript, said(whole, run=self.R1, key=f"cli-assistant:{self.R1}")]}
+            self.conn._session_message_waiters.pop(self.SK).set()
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_b.strip(), "blue answer")
+
+    async def test_a_steered_reply_whose_run_ends_clean_with_its_answer_never_closed_ends_when_the_session_settles(self):
+        """The run blue went into ends cleanly, but the transcript never closes blue's answer and no
+        later turn starts. The session settling ends the wait: blue shows what follows its message
+        (claude-cli's own record), never the whole run."""
+        transcript = self._blue_transcript()
+        async with self._blue_streamed_before_its_commit(transcript, "ROUND 1\n\nblue answer") as (first_b, gen_b):
+            self.list_active = False
+            self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_b.strip(), "blue answer")
+
+    async def test_a_steered_reply_whose_message_never_reached_the_transcript_ends_when_the_session_settles(self):
+        """Blue's message is not in the transcript at all. The session settling ends the wait: the
+        reply ends with the no-text note, never blank and never the whole run."""
+        transcript = self._blue_transcript()[:3]
+        async with self._blue_streamed_before_its_commit(transcript, "ROUND 1\n\nblue answer") as (first_b, gen_b):
+            self.list_active = False
+            self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertIn("This turn produced no reply text", out_b)
+        self.assertNotIn("ROUND 1", out_b)
+
+    async def test_a_steered_reply_whose_transcript_read_fails_keeps_the_last_one_read(self):
+        """A read fails (not a reconnect) after one that held blue's own record: blue ends with that
+        answer, not the no-text note (review on #381)."""
+        transcript = self._blue_transcript()
+        async with self._blue_streamed_before_its_commit(transcript, "ROUND 1\n\nblue answer") as (first_b, gen_b):
+            # A read that holds blue's own record (the run not yet closed, the session busy).
+            self.conn._session_message_waiters.pop(self.SK).set()
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertFalse(first_b.done(), "still waiting for the run's closing copy")
+            send = self.conn.send_request
+
+            async def failing(method, params, timeout=10):
+                if method == "chat.history":
+                    raise openclaw_pipe.GatewayError("chat.history: internal error")
+                return await send(method, params, timeout)
+            self.conn.send_request = failing
+            self.conn._session_message_waiters.pop(self.SK).set()
+            out_b, _ = await self._collect(first_b, gen_b)
+        self.assertEqual(out_b.strip(), "blue answer")
+
+    async def test_a_steered_reply_settled_without_its_terminal_shows_its_own_answer(self):
+        """The run's terminal events never reached blue's reply; the idle row ends it. The host's
+        closing copy differs from what blue was seeded with (a newline), so it does not start with
+        it: blue still shows its own answer, never the whole run (review on #381)."""
+        self.conn.gateway_version = "2026.10.10"
+        said = SteeredTranscriptSpanTests._said
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("say blue", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        with mock.patch.object(openclaw_pipe, "_settle_steered_replies", mock.AsyncMock()):
+            await self._dispatch(
+                self._delta(self.R1, "\n\nblue answer"),
+                self._commit(self.R2, "say blue", into=self.R1),
+                self._final(self.R2))
+            self.active = False
+            self.history = {"messages": [*self._blue_transcript(),
+                                         said("ROUND 1\n\n\nblue answer", run=self.R1, key=f"cli-assistant:{self.R1}")]}
+            self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done",
+                                            "lastRunId": self.R1})
+            out_b, _ = await self._collect(first_b, gen_b)
+            await self._collect(first_a, gen_a)
+        self.assertEqual(out_b.strip(), "blue answer")
+
+    def _blue_transcript(self) -> list:
+        """claude-cli's transcript of the held run with blue steered in, before the host's closer."""
+        user, said = SteeredTranscriptSpanTests._user, SteeredTranscriptSpanTests._said
+        return [user(self.R1, "Do 4 rounds of sleep 12"), said("ROUND 1", stop="toolUse"),
+                {"role": "toolResult", "content": "done"},
+                user(self.R2, "say blue"), said("blue answer", stop="end_turn")]
+
+    @contextlib.asynccontextmanager
+    async def _blue_streamed_before_its_commit(self, transcript: list, whole: str):
+        """Blue's answer streams before its commit, the run ends, and blue's reply waits on the
+        transcript, with the session still running and no settle. Yields blue's reply to finish."""
+        self.conn.gateway_version = "2026.10.10"
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("say blue", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        with mock.patch.object(openclaw_pipe, "_settle_steered_replies", mock.AsyncMock()):
+            await self._dispatch(
+                self._delta(self.R1, "\n\nblue answer"),
+                self._commit(self.R2, "say blue", into=self.R1),
+                self._final(self.R2),
+                self._lifecycle(self.R1, "end"))
+            self.active, self.list_active = False, True
+            self.history = {"messages": transcript}
+            await self._dispatch(self._final(self.R1, whole))
+            self.assertFalse(first_b.done(), "it waits for its answer in the transcript")
+            yield first_b, gen_b
+            await self._collect(first_a, gen_a)
+
     async def test_the_answer_goes_to_the_steered_reply_from_its_message_commit(self):
         """The built-in runtime's order: commit, the answer's first event, then the steered run's
         lone final. The commit is the boundary."""
@@ -16309,6 +16475,67 @@ class MidRunSteeringTests(_TurnCase):
         writer.finalize.assert_awaited_once_with(steered=True)
         writer.feed.assert_not_awaited()
 
+    def _writer_pump(self, message_id: str, steer_pending: bool = True):
+        """A turn writer's pump for a reply waiting to be steered (Send now before the boundary)."""
+        pump = openclaw_pipe._RunPump()
+        pump.handover = {"message_id": message_id, "steer_pending": steer_pending,
+                         "renderer": types.SimpleNamespace(received="", output=None)}
+        pump.writer = mock.Mock(chat_id=self.CHAT, message_id=message_id, renderer=openclaw_pipe._TurnRenderer())
+        return pump
+
+    def _chain_ref(self, message_id: str, span_run: str) -> dict:
+        return {"chat_id": self.CHAT, "message_id": message_id, "request_task_id": None, "span_run": span_run}
+
+    async def test_a_third_steer_after_two_into_turn_writers_carries_both_earlier_replies(self):
+        """Tomato and blue are both held by turn writers. When green is steered in after blue, the
+        settle's chain is the first reply, tomato's, then blue's (review on #381: a writer-fed
+        steer's own pump kept no chain)."""
+        self.conn.gateway_version = "2026.10.10"
+        conn = self.conn
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
+        host = self._writer_pump("w1", steer_pending=False)
+        host.started = True
+        conn._turn_pumps[(sk, self.R1)] = host
+        conn._turn_pumps[(sk, self.R2)] = tomato = self._writer_pump("w2")
+        conn._turn_pumps[(sk, self.R3)] = self._writer_pump("w3")
+        r4 = "msg-c0ffee00-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000004-1.0"
+        q4 = conn.register_consumer(sk, r4)
+        for run, text in ((self.R2, "say tomato"), (self.R3, "say blue"), (r4, "say green")):
+            conn._on_session_message(self._commit(run, text, into=self.R1)["payload"])
+        self.assertTrue(tomato.queue.qsize() >= 1)
+        green = q4.get_nowait()["_steered"]
+        self.assertEqual(green["earlier"]["message_id"], "w3")
+        self.assertEqual(green["earlier"]["span_run"], self.R3)
+        self.assertEqual(green["earlier"]["before"], [self._chain_ref("w1", self.R1), self._chain_ref("w2", self.R2)])
+
+    async def test_a_steer_into_a_turn_writer_that_took_over_a_steered_reply_keeps_its_span_and_chain(self):
+        """Blue was steered into the run inline, then its reply was handed over to a turn writer
+        (the pump runs under the run's id). Green steered in next records blue's own span and the
+        replies before it, not the run's (review on #381)."""
+        self.conn.gateway_version = "2026.10.10"
+        conn = self.conn
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
+        # What `on_steered` registered for blue's reply under the run it went into.
+        conn.register_run_target(sk, self.R1, self.CHAT, "m2", span_run=self.R2,
+                                 before=[self._chain_ref("m1", self.R1)])
+        with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()), \
+                mock.patch.object(conn, "ensure_message_subscription", mock.AsyncMock()):
+            self.assertTrue(openclaw_pipe._hand_over_run(conn, sk, self.R1, reply={
+                "message_id": "m2", "renderer": openclaw_pipe._TurnRenderer(), "events": []}))
+        pump = conn._turn_pumps[(sk, self.R1)]
+        pump.writer = mock.Mock(chat_id=self.CHAT, message_id="m2", renderer=openclaw_pipe._TurnRenderer())
+        pump.started = True
+        conn._consumers[f"{sk}:{self.R1}"] = openclaw_pipe._Consumer(
+            session_key=sk, run_id=self.R1, queues=[openclaw_pipe._WriterQueue(pump)], started=True)
+        q3 = conn.register_consumer(sk, self.R3)
+        conn._on_session_message(self._commit(self.R3, "say green", into=self.R1)["payload"])
+        green = q3.get_nowait()["_steered"]
+        self.assertEqual(green["earlier"]["message_id"], "m2")
+        self.assertEqual(green["earlier"]["span_run"], self.R2, "blue's own span, not the run's")
+        self.assertEqual(green["earlier"]["before"], [self._chain_ref("m1", self.R1)])
+
     async def test_a_steered_message_whose_reply_a_turn_writer_has_still_ends_the_run_there(self):
         """A steered message held by a turn writer: from its commit the first reply gets no more
         events and ends from the transcript (#290); the writer shows the answer."""
@@ -16359,6 +16586,10 @@ class MidRunSteeringTests(_TurnCase):
         # The handover keeps the run's target and renderer, so blue starts with baselines (#300).
         self.assertEqual(blue["run_text"]["received"], "21-40 41-50tomato", "after what tomato's reply showed")
         self.assertEqual(blue["earlier"]["message_id"], "w2")
+        # Tomato's reply holds its own run's span, after the first reply's: the settle's chain.
+        self.assertEqual(blue["earlier"]["span_run"], self.R2, "tomato's span, not the host run's")
+        self.assertEqual(blue["earlier"]["before"], [{"chat_id": self.CHAT, "message_id": "w1",
+                                                      "request_task_id": None, "span_run": self.R1}])
         await conn._dispatch_run_event(self._delta(self.R1, "blue"))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R1)
         self.assertTrue(host.queue.empty(), "nothing of the run after the commit reached the first reply")

@@ -2626,8 +2626,13 @@ class _GatewayConnection:
                 # The writer has the baselines; it stays open until the settle.
                 fed = run.queues[0].pump
                 writer = fed.writer
+                # Its own run's span (a steered message's answer), after the
+                # replies the run was split into before it.
+                own = fed.span_run or next(
+                    (r for (s, r), p in self._turn_pumps.items() if s == sess and p is fed), run.run_id)
                 earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
-                                      "request_task_id": None, "span_run": run.run_id}
+                                      "request_task_id": None, "span_run": own,
+                                      "before": list(fed.steered_before or [])}
                 run_text = _pump_baselines(fed)
                 run.held.append(fed)
             else:
@@ -2661,6 +2666,10 @@ class _GatewayConnection:
         else:
             return False
         consumer.steered, consumer.steered_into = True, run_id
+        if earlier and _feeds_writer(consumer):
+            # The next steer into this run carries the replies before it.
+            chain = dict(earlier)
+            consumer.queues[0].pump.steered_before = [*(chain.pop("before", None) or []), chain]
         for q in consumer.queues:
             q.put_control({"type": _STEERED_MARKER_TYPE, "_steered": {
                 "run": run_id, "run_text": run_text, "earlier": earlier}})
