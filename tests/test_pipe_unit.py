@@ -9478,6 +9478,42 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.conn.ensure_connected.assert_awaited()
         self.assertEqual(self.m()["content"], "the aside")
 
+    def drop_the_socket(self, comes_back=True):
+        """The socket is down: chat.history fails as reconnecting until the connection is back."""
+        state, plain = {"down": True}, self.conn.session_history
+
+        async def history(*a, **k):
+            if state["down"]:
+                raise GatewayError("gateway connection not ready (reconnecting)")
+            return await plain(*a, **k)
+
+        async def reconnected():
+            if not comes_back:
+                raise GatewayError("gateway connection retired: a newer deploy of the pipe owns it now")
+            state["down"] = False
+        self.conn.session_history = history
+        self.conn.ensure_connected = mock.AsyncMock(side_effect=reconnected)
+        return mock.patch.object(type(self.conn), "reconnecting", new_callable=mock.PropertyMock,
+                                 side_effect=lambda: state["down"])
+
+    async def test_the_closing_transcript_read_meets_a_reconnect_reads_again_once_connected(self):
+        """errwatch 06:23: the socket dropped as M ended, the closing read failed ("chat.history
+        failed at the end") and M ended with only what streamed. The read waits for the
+        connection and reads again, so M ends from the transcript."""
+        w = await self.opened_writer()
+        with self.drop_the_socket():
+            await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.conn.ensure_connected.assert_awaited()
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], "Reading them.\n\nFound it.")
+
+    async def test_the_closing_transcript_read_whose_connection_is_retired_ends_with_what_streamed(self):
+        w = await self.opened_writer()
+        with self.drop_the_socket(comes_back=False):
+            await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], "Reading them.")
+
     async def test_a_steered_reply_stops_waiting_when_its_run_is_aborted(self):
         """An aborted or failed run stores no answer; its event ends the wait."""
         self.conn.gateway_version = "2026.10.10"
@@ -14749,6 +14785,73 @@ class RetiredWriterTests(_RoutingCase):
         b = self.successor()
         _turn_route_now(b, self.ev(self.RUN, _delta("\n\nFound it.")))
         self.assertEqual(await self.adopt(b, mid), "skip")
+
+    async def test_a_turn_streaming_across_the_retire_ends_with_its_full_text(self):
+        """A writer still streaming at a redeploy: the old connection stops writing turns at its
+        retire, before the new one connects, so an event in between reaches no writer. The
+        successor adopts the message once its socket is subscribed and ends it from the
+        transcript, so the reply holds the lost part too."""
+        mid, _ = await self.start_turn_then_retire()
+        for lost in (_tool("start", tcid="toolu_1"), _tool("result", tcid="toolu_1")):
+            self.assertFalse(_turn_route_now(self.conn, self.ev(self.RUN, lost)),
+                             "a retired connection writes no turn")
+        b = self.successor()
+        await self.adopt(b, mid)
+        _turn_route_now(b, self.ev(self.RUN, _delta("\n\nFound it.")))
+        _turn_route_now(b, self.ev(self.RUN, {"state": "final"}))
+        self.active = False
+        b._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                "lastRunId": self.RUN, "reason": "chat.run.settled"})
+        await self.spin()
+        m = self.owui.msgs()[mid]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
+        self.assertEqual([i["type"] for i in m["output"]],
+                         ["message", "function_call", "function_call_output", "message"])
+
+    def pump_tasks(self):
+        return [t for t in asyncio.all_tasks()
+                if getattr(t.get_coro(), "__qualname__", "") == "_turn_pump_loop" and not t.done()]
+
+    async def adopt_a_reply(self, mid, run, content):
+        self.conn.gateway_version = "2026.10.10"
+        meta = {"openclaw_run": run, "openclaw_writer": "gone-writer"}
+        self.add_stub(mid, content=content, meta=meta)
+        self.assertEqual(await self.adopt(self.conn, mid), "adopted")
+
+    async def test_retire_ends_a_pump_still_waiting_and_marks_nothing_stopped(self):
+        """errwatch 06:15: a pump waiting for its steered message's answer reads no queue, so the
+        retire's "retired" item never reached it; once the old connection closed, Python
+        destroyed the pending task ("Task was destroyed but it is pending!"). The retire releases
+        the writers, then ends their pumps and waits for them; no Stop is marked."""
+        mid = "5b0e1d2c-0000-4000-8000-00000000000a"
+        await self.adopt_a_reply(mid, f"msg-{self.CHAT}-{mid}-1.0", "Checking.")
+        waiting = self.pump_tasks()
+        self.assertEqual(len(waiting), 1, "precondition: its pump waits for the answer")
+        await self.conn.retire()
+        self.assertTrue(all(t.done() for t in waiting), "the retired connection's pump kept waiting")
+        self.assertFalse(self.conn._turn_pumps)
+        m = self.owui.msgs()[mid]
+        self.assertIs(m["done"], False, "left for the successor to adopt")
+        self.assertNotIn(openclaw_pipe.STOPPED_META, m.get("meta") or {})
+
+    async def test_an_adopted_reply_older_than_the_transcript_read_ends_as_it_stands(self):
+        """f3c5f30f (chat 87bf5a08): a reply stopped on 10-23 stayed done:false. Every load
+        adopted it and waited for its message, which the transcript read no longer reaches, so
+        the wait never ended. A message sent before the oldest message read, in a settled
+        session, is not coming: the reply ends done with what it shows."""
+        mid = "5b0e1d2c-0000-4000-8000-00000000000b"
+        sent_s, later_ms = 1000.0, 2_000_000
+        self.history = {"messages": [
+            {"role": "user", "content": "later", "timestamp": later_ms,
+             "idempotencyKey": "msg-c-x-2000.0:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "later answer"}],
+             "timestamp": later_ms, "idempotencyKey": "cli-assistant:msg-c-x-2000.0"}]}
+        await self.adopt_a_reply(mid, f"msg-{self.CHAT}-{mid}-{sent_s}", "Checking the manager's reply.")
+        self.assertFalse(self.pump_tasks(), "the adopted reply still waits")
+        m = self.owui.msgs()[mid]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Checking the manager's reply.")
 
 
 class GatewayOwnerNeverRecoversTests(_RoutingCase):
