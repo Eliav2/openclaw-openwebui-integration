@@ -17380,3 +17380,155 @@ class UnpublishedInputResendTests(_TurnCase):
             out += chunk if isinstance(chunk, str) else ""
         self.assertIn("Error sending message", out)
         self.assertEqual(self.rpc.count("chat.send"), 1)
+
+
+class ClaudeCliThinkingOffTests(_TurnCase):
+    """Thinking 'off' on claude-cli is MAX_THINKING_TOKENS=0, which Claude Code ignores on Sonnet 5.5
+    and Haiku 5.5: live off turns on both still held signed thinking blocks (W8, 2026-11-09), while
+    the Gateway's ladder still offers off. On claude-cli those two clamp off to the lowest real level,
+    with the usual note. Other runtimes and models keep off."""
+
+    GATEWAY_55 = ["off", "low", "medium", "high", "xhigh", "max"]
+    NOTE = "This model does not support thinking level 'off', using 'low' instead."
+
+    async def send_at(self, level, *, runtime, model):
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td)
+        env = mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td})
+        env.start()
+        self.addCleanup(env.stop)
+        self.runtime = runtime
+        self.describe_extra = {"modelProvider": "anthropic", "model": model,
+                               "thinkingLevels": [{"id": lv} for lv in self.GATEWAY_55]}
+        sent, plain = [], self.conn.send_request
+
+        async def record(method, params, timeout=10):
+            if method == "chat.send":
+                sent.append(params.get("thinking"))
+            return await plain(method, params, timeout)
+        self.conn.send_request = record
+        gen = self._reply("hi", "m1", thinking=level)
+
+        async def read_all():
+            # The clamp note comes before the send: keep reading while the run starts.
+            return "".join([c async for c in gen if isinstance(c, str)])
+        reading = asyncio.ensure_future(read_all())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "ok"))
+        q.put_nowait(self._final("run-1"))
+        return sent[0], await asyncio.wait_for(reading, 5)
+
+    async def test_off_on_claude_cli_sonnet_5_5_is_sent_as_low_with_the_note(self):
+        thinking, shown = await self.send_at("off", runtime="claude-cli", model="claude-sonnet-5-5")
+        self.assertEqual(thinking, "low")
+        self.assertIn(self.NOTE, shown)
+
+    async def test_off_on_claude_cli_haiku_5_5_is_sent_as_low(self):
+        thinking, _ = await self.send_at("off", runtime="claude-cli", model="claude-haiku-5-5")
+        self.assertEqual(thinking, "low")
+
+    async def test_off_on_another_runtime_stays_off(self):
+        thinking, shown = await self.send_at("off", runtime="pi", model="claude-sonnet-5-5")
+        self.assertEqual(thinking, "off")
+        self.assertNotIn(self.NOTE, shown)
+
+    async def test_off_on_another_claude_cli_model_stays_off(self):
+        thinking, _ = await self.send_at("off", runtime="claude-cli", model="claude-sonnet-5")
+        self.assertEqual(thinking, "off")
+
+    async def test_a_new_chat_on_a_legacy_claude_cli_ref_is_clamped(self):
+        """Review on #383: a `claude-cli/claude-sonnet-5-5` selection with no runtime recorded yet."""
+        self.pipe.valves.DEFAULT_MODEL = "claude-cli/claude-sonnet-5-5"
+        thinking, shown = await self.send_at("off", runtime=None, model="claude-sonnet-5-5")
+        self.assertEqual(thinking, "low")
+        self.assertIn(self.NOTE, shown)
+
+    async def test_a_new_chat_takes_the_runtime_from_the_gateways_catalog_off_the_loop(self):
+        """A new chat's describe has no session row, so no runtime: the Gateway's catalog
+        (`models.list` agentRuntime, cached by pipes()) gives it, read in a thread."""
+        threaded, real = [], asyncio.to_thread
+
+        async def to_thread(func, *args, **kwargs):
+            threaded.append(func.__name__)
+            return await real(func, *args, **kwargs)
+        with mock.patch.object(self.ocp.asyncio, "to_thread", to_thread), \
+                mock.patch.object(self.ocp, "_model_runtime", lambda *a, **k: "claude-cli"):
+            thinking, _ = await self.send_at("off", runtime=None, model="claude-sonnet-5-5")
+        self.assertEqual(thinking, "low")
+        self.assertIn("<lambda>", threaded)
+
+
+class ClaudeCliThinkingOffKeyTests(unittest.TestCase):
+    """Review on #383: the clamp matches a model the way the Gateway picks its profile, and takes
+    a new chat's runtime from the Gateway's own catalog: no runtimes file of the Pipe's."""
+
+    # A live `models.list` entry (OpenClaw 2026.10.10), trimmed.
+    SONNET = {"id": "claude-sonnet-5-5", "name": "Claude Sonnet 5.5", "provider": "anthropic",
+              "alias": "sonnet-5.5", "available": True,
+              "agentRuntime": {"id": "claude-cli", "source": "model"}}
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.td)
+
+    def test_ids_match_as_the_gateway_matches_them(self):
+        """anthropic-*.mjs resolveClaudeSonnet55ModelIdentity: dated ids, aliases, `.` and case."""
+        for key in ("anthropic/claude-sonnet-5-5", "anthropic/claude-sonnet-5-5-20261101",
+                    "claude-cli/claude-sonnet-5-5", "anthropic/Claude-Sonnet-5.5", "anthropic/sonnet",
+                    "sonnet-5-5", "anthropic/claude-haiku-5-5@2026", "haiku"):
+            with self.subTest(key):
+                self.assertTrue(openclaw_pipe._off_ignored_on_claude_cli(key))
+        for key in ("anthropic/claude-sonnet-5-50", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5-5",
+                    "openai/gpt-6", ""):
+            with self.subTest(key):
+                self.assertFalse(openclaw_pipe._off_ignored_on_claude_cli(key))
+
+    def test_the_catalog_keeps_each_models_runtime(self):
+        self.assertEqual(openclaw_pipe._normalize_model_entry(self.SONNET)["runtime"], "claude-cli")
+        self.assertNotIn("runtime", openclaw_pipe._normalize_model_entry({"id": "m", "provider": "p"}))
+
+    def test_a_new_chats_runtime_comes_from_the_cached_catalog(self):
+        openclaw_pipe._write_json_file(os.path.join(self.td, openclaw_pipe.MODELS_CACHE_NAME),
+                                       {"models": openclaw_pipe._usable_models([self.SONNET])})
+        self.assertEqual(openclaw_pipe._model_runtime("anthropic/claude-sonnet-5-5", self.td), "claude-cli")
+        self.assertIsNone(openclaw_pipe._model_runtime("anthropic/claude-opus-5-5", self.td))
+        self.assertFalse(os.path.exists(os.path.join(self.td, "model-runtimes.json")))
+
+    def test_a_legacy_claude_cli_ref_is_the_claude_cli_runtime(self):
+        """OpenClaw docs/concepts/agent-runtimes.md: `claude-cli/<model>` is `anthropic/<model>` on
+        claude-cli; describe and the catalog report the standard form."""
+        self.assertEqual(openclaw_pipe._model_runtime("claude-cli/claude-sonnet-5-5", self.td), "claude-cli")
+        self.assertEqual(openclaw_pipe._standard_model_key("claude-cli/claude-sonnet-5-5"),
+                         "anthropic/claude-sonnet-5-5")
+
+
+class ClaudeThinkingProfileFixtureTest(unittest.TestCase):
+    """The Gateway's own Claude thinking profiles, pinned. Once upstream drops 'off' for a model the
+    Pipe clamps (CLAUDE_CLI_THINKING_OFF_IGNORED), re-extracting the fixture fails the first test:
+    delete that model from the clamp."""
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                           "test_fixture_openclaw_claude_thinking_profiles.json")
+
+    def setUp(self):
+        self.fx = json.load(open(self.FIXTURE))
+
+    def test_every_clamped_model_still_has_off_in_the_gateways_profile(self):
+        for model in openclaw_pipe.CLAUDE_CLI_THINKING_OFF_IGNORED:
+            with self.subTest(model):
+                self.assertIn(model, self.fx["profiles"], "the clamp names a model the fixture lacks")
+                self.assertIn("off", self.fx["profiles"][model],
+                              f"the Gateway no longer offers 'off' for {model}: drop it from "
+                              "CLAUDE_CLI_THINKING_OFF_IGNORED")
+
+    def test_the_installed_dist_still_has_the_claude_thinking_profiles(self):
+        dist = _installed_dist(self)
+        with _scripts_on_path():
+            from extract_openclaw_claude_thinking_profiles import extract
+        got = extract(dist)
+        self.assertIsNotNone(got, "the Claude thinking profiles are gone from the dist")
+        self.assertEqual(got["profiles"], self.fx["profiles"],
+                         f"OpenClaw {got['openclaw_version']} changed the Claude thinking profiles "
+                         f"(fixture: {self.fx['openclaw_version']}); re-check CLAUDE_CLI_THINKING_OFF_IGNORED, "
+                         "then re-extract with scripts/extract_openclaw_claude_thinking_profiles.py --write")

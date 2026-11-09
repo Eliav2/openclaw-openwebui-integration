@@ -58,6 +58,8 @@ In Open WebUI, for each OpenClaw model you want the control on: **Workspace** â†
 
 A global filter runs on every chat with every model, and this one writes `reasoning_effort`, which other pipes may interpret differently. That is why both the installer and the manual steps leave **Global** off.
 
+Global is fine when every model in your Open WebUI is an OpenClaw model: the filter then reaches each of them with no per-model step, which is how an OpenClaw-only install can run it. What Global costs otherwise: the control shows in the composer for every model, and if you switch it on in a chat with a non-OpenClaw model, that model's request carries your `reasoning_effort` too. The filter does not check which model a chat uses; it acts only while its toggle is on in that chat.
+
 ## It does nothing until you switch it on
 
 Once active, it does nothing until you switch the toggle on in a given conversation. Open WebUI does not run a toggled filter's `inlet` while the toggle is off, so an untouched chat behaves exactly as if the filter were not installed.

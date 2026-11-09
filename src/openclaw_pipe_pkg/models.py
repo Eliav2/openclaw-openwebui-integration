@@ -36,7 +36,8 @@ def _provider_from_key(key: str) -> str:
 
 
 def _normalize_model_entry(raw: dict) -> dict:
-    """Gateway `models.list` entry {id, name, provider, alias, ...} -> {key, name, tags}."""
+    """Gateway `models.list` entry {id, name, provider, alias, agentRuntime, ...}
+    -> {key, name, tags, runtime}."""
     provider = raw.get("provider", "")
     model_id = raw.get("id", "")
     key = f"{provider}/{model_id}" if provider and model_id else (model_id or provider)
@@ -44,7 +45,11 @@ def _normalize_model_entry(raw: dict) -> dict:
     alias = raw.get("alias")
     if alias:
         tags.append(f"alias:{alias}")
-    return {"key": key, "name": raw.get("name", model_id), "tags": tags}
+    entry = {"key": key, "name": raw.get("name", model_id), "tags": tags}
+    runtime = (raw.get("agentRuntime") or {}).get("id")
+    if runtime:
+        entry["runtime"] = runtime   # the thinking clamp's source for a new chat
+    return entry
 
 
 def _usable_models(raw_models: list[dict]) -> list[dict]:
@@ -132,14 +137,14 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
             if raw_models:
                 models = _usable_models(raw_models)
                 _write_json_file(
-                    os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
+                    os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), MODELS_CACHE_NAME),
                     {"models": models, "cachedAt": time.time()}
                 )
                 return models, MODELS_SOURCE_LIVE
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
 
-    cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
+    cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), MODELS_CACHE_NAME))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
         return cache["models"], MODELS_SOURCE_CACHE

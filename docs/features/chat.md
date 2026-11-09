@@ -101,6 +101,8 @@ Open WebUI builds the dropdown once, so it is the union across your Gateway's mo
 
 Clamping lands on the nearest level at or below what you asked for, since quietly asking for more shows up on someone's bill. The one exception: if a model has nothing at or below the request, it uses that model's lowest level, which can be higher than what you asked for.
 
+`off` can't turn thinking off on Claude Sonnet 5.5 and Haiku 5.5 run through claude-cli. The Gateway sends it as `MAX_THINKING_TOKENS=0`, which Claude Code ignores on those models, so they still think. The Pipe treats `off` as unsupported there and sends `low`, the lowest level they honour, with the note above. Opus 5.5 and Fable never offer `off`. Other runtimes and other models keep `off`.
+
 The filter and Open WebUI's own Advanced Params reasoning-effort control write the same `reasoning_effort` field, so they are one setting, not two that fight. The filter's [`override_advanced_params`](../configuration.md#override_advanced_params) valve (on by default) decides who wins when both are set. Install steps and the filter's valves: [thinking filter](../install/thinking-filter.md).
 
 ## Images and files from the agent

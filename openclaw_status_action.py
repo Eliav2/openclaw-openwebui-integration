@@ -1322,6 +1322,79 @@ def _read_model_thinking_ladder(model_key, state_dir: str = ""):
     return known or None
 
 
+# claude-cli sends thinking `off` as MAX_THINKING_TOKENS=0 (OpenClaw
+# extensions/anthropic/cli-shared.ts `resolveClaudeCliThinkingEnv`; dist
+# 2026.10.10 cli-shared-GYwuFaMc.mjs), which Claude Code ignores on these
+# models: a live off turn on each still held signed thinking blocks, as at
+# medium (W8, 2026-11-09). The Gateway's own profiles still offer `off` for
+# them (tests/fixtures/test_fixture_openclaw_claude_thinking_profiles.json).
+# Upstream draft: projects/upstream/drafts/claude-cli-thinking-off-ignored-on-5-5.md
+# (maintainer workspace). Delete a model here once its profile drops `off`:
+# ClaudeThinkingProfileFixtureTest fails then. Each id with the Gateway's
+# short aliases for it.
+CLAUDE_CLI_THINKING_OFF_IGNORED = {"claude-sonnet-5-5": ("sonnet", "sonnet-5-5"),
+                                   "claude-haiku-5-5": ("haiku", "haiku-5-5")}
+CLAUDE_CLI_RUNTIME = "claude-cli"
+THINKING_OFF = "off"
+# A legacy `claude-cli/<model>` ref is `anthropic/<model>` on the claude-cli
+# runtime (OpenClaw docs/concepts/agent-runtimes.md); describe and the
+# catalog report the standard form.
+LEGACY_CLAUDE_CLI_PREFIX = "claude-cli/"
+# The model catalog as `pipes()` last read it from the Gateway.
+MODELS_CACHE_NAME = "models-cache.json"
+ANTHROPIC_PREFIX = "anthropic/"
+
+
+def _claude_model_identity(model_key) -> str:
+    """The Gateway's Claude model identity for `model_key`
+    (anthropic-*.mjs `normalizeClaudeModelId`, `resolveClaudeModelIdentity`):
+    lowercased, `._` and spaces as `-`, the trailing `claude-...` segment."""
+    normalized = re.sub(r"[._\s]+", "-", str(model_key or "").strip().lower())
+    match = re.search(r"(?:^|[-/])(claude-[^/]+)$", normalized)
+    return match.group(1) if match else normalized.rsplit("/", 1)[-1]
+
+
+def _off_ignored_on_claude_cli(model_key) -> bool:
+    """Whether `model_key` is one of CLAUDE_CLI_THINKING_OFF_IGNORED as the
+    Gateway matches it (`resolveClaudeSonnet55ModelIdentity`): an alias, or the
+    id followed by the end or a non-alphanumeric (a dated id)."""
+    identity = _claude_model_identity(model_key)
+    return any(identity in aliases or re.match(rf"{re.escape(model_id)}(?=$|[^a-z0-9])", identity)
+               for model_id, aliases in CLAUDE_CLI_THINKING_OFF_IGNORED.items())
+
+
+def _standard_model_key(model_key) -> str:
+    """`model_key` with a legacy `claude-cli/` provider as `anthropic/`."""
+    key = str(model_key or "")
+    if key.startswith(LEGACY_CLAUDE_CLI_PREFIX):
+        return ANTHROPIC_PREFIX + key[len(LEGACY_CLAUDE_CLI_PREFIX):]
+    return key
+
+
+def _honoured_thinking_ladder(ladder, model_key, runtime):
+    """`ladder` as the run can honour it: on claude-cli, without the `off`
+    Claude Code ignores for CLAUDE_CLI_THINKING_OFF_IGNORED."""
+    if (ladder and THINKING_OFF in ladder and runtime == CLAUDE_CLI_RUNTIME
+            and _off_ignored_on_claude_cli(model_key)):
+        return [lv for lv in ladder if lv != THINKING_OFF]
+    return ladder
+
+
+def _model_runtime(model_key, state_dir: str = ""):
+    """The runtime of `model_key` when no session row says it (a new chat):
+    claude-cli for a legacy `claude-cli/` ref, else the Gateway's catalog
+    (`models.list` `agentRuntime`, which `pipes()` caches whole in
+    MODELS_CACHE_NAME). None if unknown. Blocking: call it off the loop."""
+    if not model_key:
+        return None
+    if str(model_key).startswith(LEGACY_CLAUDE_CLI_PREFIX):
+        return CLAUDE_CLI_RUNTIME
+    key = _standard_model_key(model_key)
+    cache = _read_json_file(os.path.join(_state_dir(state_dir), MODELS_CACHE_NAME)) or {}
+    return next((m.get("runtime") for m in cache.get("models") or []
+                 if isinstance(m, dict) and m.get("key") == key), None)
+
+
 def _owui_chat_send_params(
     session_key: str,
     message: str,
