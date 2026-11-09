@@ -65,8 +65,8 @@ PIPE = Artifact(
     frontmatter=ROOT / "src" / "frontmatter.txt",
     out=ROOT / "openclaw_pipe.py",
     module_order=("_prelude", "texts", "identity", "state", "turns", "thinking", "media", "images", "emit",
-                  "composer", "composer_watch", "askuser", "approvals", "gateway", "errors", "writer", "pending", "models",
-                  "history", "filecontext", "slash_prompts", "channels", "pipe"),
+                  "composer", "composer_watch", "askuser", "approvals", "gateway", "mapspec", "mapembed", "errors", "writer",
+                  "pending", "models", "history", "filecontext", "slash_prompts", "channels", "pipe"),
 )
 
 # The status Action reuses the Pipe's connection/identity/formatting

@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Eliav2/openclaw-workspace/gateway-plugins/map/map-spec.schema.json",
+  "title": "MapSpec",
+  "description": "The one schema of the `map` tool: its input, the compact result the agent reads, and the route geometry the Pipe fetches. Python and TypeScript types are generated from this file (`bun run gen`).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "input": {
+      "$ref": "#/$defs/MapInput"
+    },
+    "result": {
+      "$ref": "#/$defs/MapToolResult"
+    },
+    "geometry": {
+      "$ref": "#/$defs/MapGeometry"
+    }
+  },
+  "$defs": {
+    "Mode": {
+      "enum": [
+        "walk",
+        "bike",
+        "drive"
+      ]
+    },
+    "InputStop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Short name shown on the map and in the stop list."
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "What to geocode, with city and country (for example 'Fushimi Inari Taisha, Kyoto, Japan'). Defaults to the label."
+        },
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "lon": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "group": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "A day or a category, for example 'Day 2'. Stops of one group share a colour; a route by group runs inside each group."
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "One short line shown under the stop."
+        }
+      }
+    },
+    "InputRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/Mode",
+          "default": "walk"
+        },
+        "by": {
+          "enum": [
+            "all",
+            "group"
+          ],
+          "default": "all",
+          "description": "'all' = one route through every stop in order, 'group' = one route per group."
+        }
+      }
+    },
+    "MapInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stops"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "stops": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 25,
+          "items": {
+            "$ref": "#/$defs/InputStop"
+          }
+        },
+        "route": {
+          "$ref": "#/$defs/InputRoute"
+        }
+      }
+    },
+    "ResultStop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "n",
+        "label",
+        "lat",
+        "lon"
+      ],
+      "properties": {
+        "n": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The number shown on the map."
+        },
+        "label": {
+          "type": "string"
+        },
+        "lat": {
+          "type": "number"
+        },
+        "lon": {
+          "type": "number"
+        },
+        "group": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "place": {
+          "type": "string",
+          "description": "What the geocoder matched, so a wrong match is visible."
+        }
+      }
+    },
+    "ResultRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "distanceM",
+        "durationS"
+      ],
+      "properties": {
+        "group": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "distanceM": {
+          "type": "number",
+          "minimum": 0
+        },
+        "durationS": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "Unresolved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "n",
+        "label",
+        "reason"
+      ],
+      "properties": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "label": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "MapToolResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mapId",
+        "stops",
+        "routes",
+        "unresolved",
+        "note"
+      ],
+      "properties": {
+        "mapId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "title": {
+          "type": "string"
+        },
+        "stops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResultStop"
+          }
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResultRoute"
+          }
+        },
+        "unresolved": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Unresolved"
+          }
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "GeometryRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "distanceM",
+        "durationS",
+        "polyline"
+      ],
+      "properties": {
+        "group": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "distanceM": {
+          "type": "number",
+          "minimum": 0
+        },
+        "durationS": {
+          "type": "number",
+          "minimum": 0
+        },
+        "polyline": {
+          "type": "string",
+          "description": "Encoded polyline, precision 5 (lat, lon order)."
+        }
+      }
+    },
+    "MapGeometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok"
+      ],
+      "description": "What `map.get` returns: the whole map, so the Pipe never depends on the tool text, which Open WebUI cards cut at 8000 characters.",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "title": {
+          "type": "string"
+        },
+        "stops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResultStop"
+          }
+        },
+        "unresolved": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Unresolved"
+          }
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GeometryRoute"
+          }
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
