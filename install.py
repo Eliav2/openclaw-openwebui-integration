@@ -335,10 +335,16 @@ def local_identity_file() -> Path:
     return Path(os.environ.get(IDENTITY_FILE_ENV) or DEFAULT_IDENTITY_FILE)
 
 
+def save_identity(identity: dict) -> None:
+    path = local_identity_file()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)       # PIPE_DEVICE_IDENTITY_FILE may name a directory that does not exist yet
+    save_json_private(path, identity)
+
+
 def choose_identity(existing_valves: dict) -> dict:
     valve_identity = parse_identity(existing_valves.get("DEVICE_IDENTITY"))
     if valve_identity:
-        save_json_private(local_identity_file(), valve_identity)
+        save_identity(valve_identity)
         info(f"Using DEVICE_IDENTITY from existing valves: {valve_identity['id'][:20]}...")
         return valve_identity
 
@@ -348,7 +354,7 @@ def choose_identity(existing_valves: dict) -> dict:
         return file_identity
 
     ident = generate_device_identity()
-    save_json_private(local_identity_file(), ident)
+    save_identity(ident)
     warn(f"Generated new device identity: {ident['id'][:20]}...")
     warn("This new identity must be approved once by OpenClaw.")
     return ident

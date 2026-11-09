@@ -388,6 +388,16 @@ class IdentityFileTests(unittest.TestCase):
                 self.assertEqual(again["id"], "dev-a")
             self.assertFalse(inst.DEFAULT_IDENTITY_FILE.exists() and inst.DEFAULT_IDENTITY_FILE.stat().st_mtime > target.stat().st_mtime)
 
+    def test_a_missing_directory_for_the_file_is_created(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "not" / "yet" / "identity.json"
+            with mock.patch.dict("os.environ", {inst.IDENTITY_FILE_ENV: str(target)}), \
+                    mock.patch.object(inst, "generate_device_identity", return_value={"id": "dev-a", "privateKey": "k", "publicKey": "p"}):
+                inst.choose_identity({})
+            self.assertTrue(target.exists())
+            self.assertEqual(oct(target.parent.stat().st_mode & 0o777), "0o700")
+
     def test_two_stacks_get_two_identities(self):
         from unittest import mock
         with tempfile.TemporaryDirectory() as d:
