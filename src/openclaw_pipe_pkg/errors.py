@@ -19,6 +19,37 @@ ERROR_TIMEOUT = "timeout"        # the Gateway did not answer in time
 ERROR_UNFINISHED = "unfinished"  # the run ended without a reply or a reason
 ERROR_DETAILS = "details"        # the summary of the collapsed raw text
 
+# The Gateway's error for a claude-cli turn whose reply is required (a person's
+# message, a `sessions_send`) and whose final text is empty or a silent sentinel
+# such as NO_REPLY (cli-runner, failover reason `empty_response`). The CLI
+# exited cleanly: the model chose to say nothing, so the reply shows no error
+# (ELI-336).
+EMPTY_RESPONSE_ERROR = "CLI backend returned an empty response."
+
+
+# With fallback models each silent candidate fails the same way, and the
+# Gateway sums the chain up (2026.10.10 model-fallback-runner):
+# `All models failed (N): provider/model: error (reason) | ...`.
+_FALLBACK_SUMMARY_RE = re.compile(r"^All models failed \((\d+)\): (.*)$", re.S)
+_FALLBACK_LEG_SEP = " | "
+_SILENT_LEG_RE = re.compile(r"^\S+/\S+: " + re.escape(EMPTY_RESPONSE_ERROR) + r"(?: \(empty_response\))?$")
+
+
+def _is_model_silence(error) -> bool:
+    """True when a run's error only says that the model ended without text:
+    the error itself, or a fallback summary whose every leg is that error.
+    Anything else in a summary (a real failure, legs that do not add up) is
+    shown."""
+    text = str(error or "").strip()
+    if text == EMPTY_RESPONSE_ERROR:
+        return True
+    summary = _FALLBACK_SUMMARY_RE.match(text)
+    if not summary:
+        return False
+    legs = summary.group(2).split(_FALLBACK_LEG_SEP)
+    return len(legs) == int(summary.group(1)) and all(_SILENT_LEG_RE.match(leg) for leg in legs)
+
+
 LANG_EN = "en"
 LANG_HE = "he"
 

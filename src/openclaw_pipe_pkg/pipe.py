@@ -1490,6 +1490,7 @@ class _PipeTurn:
         self.event_count = 0
         self.text_yielded = False
         self.error_shown = ""  # the run's "**Error:**" line, once shown
+        self.model_silent = False  # the run failed only because the model said nothing (ELI-336)
         self.aborted = False
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
@@ -1889,6 +1890,9 @@ class _PipeTurn:
         if stream == "lifecycle" and phase == "end":
             self.done = True
             pipe_log("  lifecycle end -> done")
+        elif _is_model_silence(err):
+            self.model_silent = self.done = True
+            pipe_log("  lifecycle error: the model ended without text -> done, nothing shown")
         elif err:
             self.error_shown = "\n\n" + _plain_error(ERROR_RUN, err, self.text)
             self.record_visible_chunk(self.error_shown)
@@ -1907,7 +1911,9 @@ class _PipeTurn:
         # why only here (ELI-139).
         run_error = str(payload.get("errorMessage") or "").strip() \
             if state == "error" else ""
-        if (run_error and not self.error_shown
+        if _is_model_silence(run_error):
+            self.model_silent = True
+        elif (run_error and not self.error_shown
                 and _thinking_rejection_retry_body(
                     self.body, run_error, self.resolved_thinking) is None):
             self.error_shown = "\n\n" + _plain_error(ERROR_RUN, run_error, self.text)
@@ -2207,6 +2213,9 @@ class _PipeTurn:
                 i.get("type") == "function_call" for i in self.renderer.output):
             # Silence after tool calls is on purpose: the cards are the reply (ELI-227).
             pipe_log("  the run answered with silence after its tool cards")
+        elif not self.aborted and not self.text_yielded and self.model_silent:
+            # The model's silence is its answer: no error and no fallback line (ELI-336).
+            pipe_log("  the run ended silent: nothing shown")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(

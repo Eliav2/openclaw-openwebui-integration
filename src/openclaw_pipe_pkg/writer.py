@@ -310,10 +310,6 @@ def _owui_request_task(task_id: str | None):
         return None
     return (getattr(sys.modules.get("open_webui.tasks"), "tasks", None) or {}).get(task_id)
 
-# The Gateway's error for a claude-cli turn with no final text. A
-# `sessions_send` turn often ends silent on purpose and still fails (ELI-336).
-EMPTY_RESPONSE_ERROR = "CLI backend returned an empty response."
-
 TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
@@ -1238,7 +1234,7 @@ class _TurnWriter:
         if turn_owner(row, stop_notice_before) == "pipe":
             note = TURN_CUT_OFF_NOTE
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
-            if not (row["lastRunError"].strip() == EMPTY_RESPONSE_ERROR and await self._run_is_inter_session()):
+            if not _is_model_silence(row["lastRunError"]):
                 request = self.request or (await self._run_request())[0]
                 note = _plain_error(ERROR_RUN, row["lastRunError"], request)
         if note is None and await self._ask_question():
@@ -1257,18 +1253,6 @@ class _TurnWriter:
             return
         await _await_steered_answer(self.conn, self.session_key, self.run_id,
                                     f"turn writer: {self.message_id[:8]}...", steered=self.steered_message)
-
-    async def _run_is_inter_session(self) -> bool:
-        """True when this run answers another session's `sessions_send`."""
-        try:
-            hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.history failed reading the run's source: {ex!r}")
-            return False
-        for m in (hist or {}).get("messages") or []:
-            if _history_user_run_id(m) == self.run_id:
-                return (m.get("provenance") or {}).get("kind") == "inter_session"
-        return False
 
     async def _ask_question(self) -> bool:
         """Ask a closing question as a card on the chat's tab (ELI-107) and
