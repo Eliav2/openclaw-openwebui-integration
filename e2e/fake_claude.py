@@ -31,6 +31,8 @@ Replies:
   after the Gateway recorded the message.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
+* a message saying `No reply needed` -> a bare `NO_REPLY`, the agent's silence (ELI-336). The
+  Gateway fails such a turn as `CLI backend returned an empty response.`.
 * anything else -> `E2E_CLI_REPLY`.
 """
 import json
@@ -59,6 +61,9 @@ HOLD = re.compile(r"E2E_CLI_HOLD\s+([A-Za-z0-9_]{3,})")
 TOOL_HOLD = re.compile(r"E2E_CLI_TOOL_HOLD\s+([A-Za-z0-9_]{3,})")
 ABORT_TOOL = re.compile(r"E2E_CLI_ABORT_TOOL\s+([A-Za-z0-9_]{3,})")
 LATE_STEER = re.compile(r"E2E_CLI_LATE_STEER\s+([A-Za-z0-9_]{3,})")
+# A message the agent answers with silence, and that silence (OpenClaw's NO_REPLY sentinel).
+SILENT_ASK = "No reply needed"
+SILENT_REPLY = "NO_REPLY"
 DIR = os.environ["E2E_FAKE_CLAUDE_DIR"]  # e2e/start_stack.sh: its log dir, where the hold files are
 sid = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a in ("--session-id", "--resume")),
            str(uuid.uuid4()))
@@ -324,7 +329,12 @@ while True:
         continue
     hold = HOLD.search(text_of(msg))
     if not hold:
-        reply = f"anthropic/{model}" if "exact model line" in text_of(msg) else "E2E_CLI_REPLY"
+        if "exact model line" in text_of(msg):
+            reply = f"anthropic/{model}"
+        elif SILENT_ASK in text_of(msg):
+            reply = SILENT_REPLY
+        else:
+            reply = "E2E_CLI_REPLY"
         say(reply)
         lifecycle("completed", msg.get("uuid"))
         result(reply)

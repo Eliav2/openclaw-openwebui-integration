@@ -778,6 +778,16 @@ def test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it(token):
     os.remove(gate)
 
 
+def test_a_turn_the_model_ends_silent_shows_no_error(token):
+    """ELI-336: a claude-cli turn the model ends with a bare NO_REPLY. The Gateway fails a
+    person's turn with no text as `CLI backend returned an empty response.`; that silence is the
+    model's answer, so the reply is empty, with no error card and no fallback line.
+    e2e/fake_claude.py answers `No reply needed` with NO_REPLY."""
+    _chat_id, reply = _chat_turn(token, "FYI, the nightly build finished. No reply needed.", model=CLI_MODEL)
+    assert reply.get("done") is True, reply
+    assert reply["content"].strip() == "", reply["content"]
+
+
 def test_no_tool_runs_after_the_run_is_aborted(token):
     """What the user stopped runs nothing more (gate 280c, chat 2ddcf087):
     a Claude Code the abort has not killed yet can still call a tool, as the

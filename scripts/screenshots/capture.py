@@ -36,6 +36,11 @@ from playwright.sync_api import Page, sync_playwright
 
 BASE = os.environ.get("OWUI_URL", "http://localhost:8080").rstrip("/")
 MODEL = "openclaw_gateway.default"
+ROLE_ASSISTANT = "assistant"
+# The model e2e/start_stack.sh runs on claude-cli, through e2e/fake_claude.py.
+CLI_MODEL = "openclaw_gateway.anthropic/claude-opus-5-5"
+# e2e/fake_claude.py answers a message saying "No reply needed" with NO_REPLY.
+SILENT_ASK = "FYI, the nightly build finished. No reply needed."
 PHONE = {"viewport": {"width": 390, "height": 844}, "device_scale_factor": 2,
          "is_mobile": True, "has_touch": True}
 DESKTOP = {"viewport": {"width": 1280, "height": 800}, "device_scale_factor": 2}
@@ -1230,6 +1235,23 @@ class Scenes:
         finally:
             pipe_valves(self.token, **old)
 
+    def silent_turn(self, page: Page) -> None:
+        """A message the agent answers with silence (NO_REPLY) on claude-cli, which the
+        Gateway fails as an empty response (ELI-336): the reply shows no error card."""
+        page.goto(f"{BASE}/?models={CLI_MODEL}")
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        dismiss_popups(page)
+        chat = send(page, SILENT_ASK)
+        poll(lambda: api("GET", f"/api/v1/chats/{chat}", token=self.token)["chat"]["history"]["messages"],
+             lambda msgs: any(m.get("role") == ROLE_ASSISTANT and m.get("done") is True for m in msgs.values()),
+             "the silent reply saved")
+        set_title(self.token, chat, "Nightly build")
+        # Reload: the shot is what the saved reply shows.
+        page.goto(f"{BASE}/c/{chat}")
+        wait_js(page, f"() => document.body.innerText.includes({json.dumps(SILENT_ASK)})", "the message")
+        park_mouse(page)
+        self.s.shot(page, "silent-turn")
+
     def chat_titles(self, page: Page) -> None:
         """Two messages in one chat; the Pipe's auto-title names it after the
         second, and the phone header shows the title."""
@@ -1628,6 +1650,7 @@ def main(argv=None) -> int:
             if scenes.spawn_chat:
                 shooter.run("spawn-card", scenes.spawn_card, page)
             shooter.run("error-message", scenes.error_message, page)
+            shooter.run("silent-turn", scenes.silent_turn, page)
             shooter.run("chat-titles", scenes.chat_titles, page)
             shooter.run("stop", scenes.stop, page)
             shooter.run("message-sent-mid-run", scenes.sent_mid_run, page)

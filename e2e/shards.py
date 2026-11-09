@@ -57,6 +57,7 @@ SHARDS = {
         f"{E2E}::test_a_message_sent_while_a_run_works_is_steered_into_it",
         f"{E2E}::test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it",
         f"{E2E}::test_no_tool_runs_after_the_run_is_aborted",
+        f"{E2E}::test_a_turn_the_model_ends_silent_shows_no_error",
         f"{E2E}::test_a_steered_message_splits_the_run_where_claude_code_took_it_in",
         f"{E2E}::test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once",
         f"{E2E}::test_a_user_not_in_owner_users_gets_replies_without_owner_rights",
