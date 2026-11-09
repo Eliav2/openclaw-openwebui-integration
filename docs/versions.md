@@ -8,7 +8,7 @@ Applies to: Pipe, Action, Filter
 
 | | Minimum | Tested in CI |
 |---|---|---|
-| Open WebUI | 0.12.4 | 0.13.0 |
+| Open WebUI | 0.12.4 | 0.13.2 |
 | OpenClaw Gateway | 2026.9.3 | 2026.10.10, and 2026.10.5 as the oldest supported |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
@@ -48,6 +48,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.12.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 0.12.5 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660465558) |
 | 0.13.0 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660471297) |
+| 0.13.2 | pass (on OpenClaw 2026.10.10) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/42592174456) |
 
 ### OpenClaw, with Open WebUI 0.12.0
 
@@ -58,7 +59,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 2026.9.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 2026.10.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641695395) |
 | 2026.10.5 | pass | | every pull request that can change runtime behaviour (reports, never blocks) |
-| 2026.10.10 | pass (on Open WebUI 0.13.0) | | every pull request that can change runtime behaviour ([first run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41675560751)) |
+| 2026.10.10 | pass (on Open WebUI 0.13.2) | | every pull request that can change runtime behaviour ([first run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41675560751)) |
 
 ## Keeping this page true
 

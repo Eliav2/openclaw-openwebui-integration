@@ -16,7 +16,7 @@ pytest-cov==7.1.0
 click==8.5.0
 rich==15.0.0
 # The Pipe shrinks photos over the Gateway's image cap with Pillow, which Open
-# WebUI's image ships (13.0.0 in v0.13.0, which needs Python 3.11; the range
+# WebUI's image ships (13.0.0 in v0.13.2, which needs Python 3.11; the range
 # also resolves on 3.10, which CI still tests); public installs without it get a
 # plain message instead.
 pillow>=11.0,<14

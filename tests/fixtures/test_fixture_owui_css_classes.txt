@@ -1,7 +1,7 @@
 # Class names defined by Open WebUI's shipped stylesheet (every CSS file
 # its index page links). Regenerate on every Open WebUI bump:
 #   python3 scripts/owui_css.py dump http://localhost:8080
-# ref: v0.13.0
+# ref: v0.13.2
 ![background-image:none]
 !bg-gray-50/40
 !bg-transparent
@@ -11,17 +11,21 @@
 !border-gray-100
 !border-gray-200
 !border-transparent
+!grid
 !h-6
 !h-[1.375rem]
-!items-start
 !leading-snug
+!m-0
 !max-w-[80rem]
 !max-w-none
+!mr-0
 !my-0
 !ps-1
 !text-[0.8125rem]
 !text-gray-500
 !text-xs
+!visible
+!w-6
 !w-[calc(100vw-2rem)]
 -bottom-0
 -bottom-0.5
@@ -33,6 +37,7 @@
 -end-[5px]
 -left-0.5
 -left-1.5
+-left-9
 -m-1
 -mb-0.5
 -mb-1
@@ -47,6 +52,7 @@
 -ml-2.5
 -ml-[1.375rem]
 -mr-0.5
+-mr-1
 -mt-0.25
 -mt-0.5
 -mt-1
@@ -113,9 +119,11 @@
 absolute
 accent-blue-500
 accent-gray-900
+active:cursor-grabbing
 active:scale-98
 addition
 ai-autocompletion
+align-baseline
 align-text-bottom
 animate-cursor-pulse
 animate-ping
@@ -127,10 +135,14 @@ app-icon-muted
 app-interactive-active
 app-muted
 appearance-none
+aria-disabled:cursor-progress
+aria-disabled:hover:bg-transparent
+aria-disabled:opacity-50
+aria-disabled:opacity-60
+aria-pressed:text-gray-900
 aspect-square
 aspect-video
 auto-rows-fr
-backdrop-blur-2xl
 backdrop-blur-[1px]
 backdrop-blur-lg
 backdrop-blur-sm
@@ -148,9 +160,7 @@ bg-black/10
 bg-black/20
 bg-black/40
 bg-black/45
-bg-black/5
 bg-black/60
-bg-black/80
 bg-black/[0.025]
 bg-black/[0.02]
 bg-black/[0.035]
@@ -159,7 +169,9 @@ bg-blue-100
 bg-blue-100/10
 bg-blue-300
 bg-blue-300/10
+bg-blue-50
 bg-blue-500
+bg-blue-500/10
 bg-blue-500/20
 bg-blue-600
 bg-blue-700
@@ -177,6 +189,7 @@ bg-gradient-to-t
 bg-gray-100
 bg-gray-100/40
 bg-gray-100/50
+bg-gray-100/60
 bg-gray-100/70
 bg-gray-100/80
 bg-gray-200
@@ -283,6 +296,7 @@ border-black
 border-black/5
 border-black/[0.06]
 border-blue-500
+border-blue-500/70
 border-collapse
 border-dashed
 border-e
@@ -339,9 +353,9 @@ bottom-0
 bottom-1
 bottom-2
 bottom-3
+bottom-6
 bottom-8
 bottom-9
-bottom-[0.3125rem]
 bottom-full
 break-all
 break-normal
@@ -379,6 +393,7 @@ cursor-not-allowed
 cursor-pointer
 cursor-row-resize
 cursor-text
+cursor-wait
 dark
 dark:!bg-gray-850
 dark:!bg-gray-900
@@ -395,6 +410,7 @@ dark:[&_a]:text-gray-300
 dark:[&_button:hover]:bg-transparent!
 dark:[--slider-fill:var(--color-gray-600)]
 dark:accent-gray-100
+dark:aria-pressed:text-white
 dark:bg-[#020C1D]
 dark:bg-[#202123]
 dark:bg-[var(--chat-tabs-dark-background,var(--color-gray-900))]
@@ -405,6 +421,7 @@ dark:bg-black/60
 dark:bg-blue-100/5
 dark:bg-blue-400
 dark:bg-blue-500
+dark:bg-blue-500/15
 dark:bg-blue-600/80
 dark:bg-blue-700/60
 dark:bg-blue-900/40
@@ -424,7 +441,6 @@ dark:bg-gray-500/10
 dark:bg-gray-500/5
 dark:bg-gray-600
 dark:bg-gray-700
-dark:bg-gray-700/20
 dark:bg-gray-700/50
 dark:bg-gray-800
 dark:bg-gray-800/25
@@ -434,6 +450,7 @@ dark:bg-gray-800/50
 dark:bg-gray-800/60
 dark:bg-gray-800/80
 dark:bg-gray-850
+dark:bg-gray-850/30
 dark:bg-gray-850/40
 dark:bg-gray-850/50
 dark:bg-gray-850/60
@@ -443,7 +460,6 @@ dark:bg-gray-850/95
 dark:bg-gray-900
 dark:bg-gray-900/50
 dark:bg-gray-900/60
-dark:bg-gray-900/80
 dark:bg-gray-900/90
 dark:bg-gray-950
 dark:bg-gray-950/20
@@ -513,6 +529,7 @@ dark:bg-yellow-900/40
 dark:border-[#03113B]
 dark:border-gray-200
 dark:border-gray-300
+dark:border-gray-500
 dark:border-gray-600
 dark:border-gray-700
 dark:border-gray-700/10
@@ -567,9 +584,10 @@ dark:divide-gray-850
 dark:divide-gray-850/60
 dark:divide-white/[0.03]
 dark:enabled:hover:text-gray-100
-dark:fill-[color-mix(in_srgb,var(--color-gray-900),white_4%)]
 dark:fill-gray-300
-dark:fill-white/8
+dark:fill-sky-200
+dark:fill-sky-500
+dark:fill-sky-600
 dark:focus-visible:bg-gray-900/80
 dark:focus-visible:outline-gray-500
 dark:focus-within:bg-gray-850
@@ -589,9 +607,9 @@ dark:group-focus-within/setting-row:text-white
 dark:group-hover/item:text-white
 dark:group-hover/selector:text-gray-300
 dark:group-hover/setting-row:text-white
+dark:group-hover:bg-gray-800
 dark:group-hover:bg-gray-900
 dark:group-hover:bg-white/10
-dark:group-hover:fill-white/4
 dark:group-hover:text-gray-100
 dark:group-hover:text-gray-200
 dark:group-hover:text-gray-300
@@ -671,6 +689,8 @@ dark:scheme-dark
 dark:text-[#6795EC]
 dark:text-[#8ba6c6]
 dark:text-[#8db395]
+dark:text-[#91bd91]
+dark:text-[#c7ad78]
 dark:text-amber-100
 dark:text-amber-300
 dark:text-amber-400
@@ -679,6 +699,7 @@ dark:text-blue-200
 dark:text-blue-300
 dark:text-blue-400
 dark:text-blue-950
+dark:text-emerald-300/85
 dark:text-emerald-400
 dark:text-gray-100
 dark:text-gray-200
@@ -695,15 +716,21 @@ dark:text-green-300
 dark:text-green-400
 dark:text-indigo-300
 dark:text-orange-200
+dark:text-orange-300/90
 dark:text-red-200
 dark:text-red-300
 dark:text-red-400
 dark:text-red-500
+dark:text-rose-300
+dark:text-rose-300/85
 dark:text-sky-300
+dark:text-sky-300/80
+dark:text-sky-300/85
+dark:text-slate-300
 dark:text-teal-400
+dark:text-violet-300
+dark:text-violet-300/80
 dark:text-white
-dark:text-white/10
-dark:text-white/25
 dark:text-white/50
 dark:text-white/60
 dark:text-white/80
@@ -733,7 +760,6 @@ disabled:bg-transparent
 disabled:bg-white
 disabled:cursor-default
 disabled:cursor-not-allowed
-disabled:cursor-progress
 disabled:cursor-wait
 disabled:hover:bg-transparent
 disabled:hover:text-gray-400
@@ -755,6 +781,7 @@ divide-gray-100
 divide-gray-100/60
 divide-gray-100/70
 divide-y
+document-code
 document-code-block
 document-markdown
 docx
@@ -779,16 +806,29 @@ end-0
 end-2
 end-2.5
 endOfContent
+excel-active
+excel-cell-input
 excel-col-hdr
+excel-comment
+excel-control
+excel-find
+excel-footer
+excel-formula-bar
+excel-match-count
 excel-num
+excel-resize
 excel-row-num
+excel-status
+excel-tabs
+excel-viewer
+excel-viewport
 fade-in-token
 file
-fill-black/5
 fill-gray-300
-fill-gray-50
 fill-red-500
-fill-transparent
+fill-sky-100
+fill-sky-400
+fill-sky-500
 fill-yellow-300
 filter
 first-letter:capitalize
@@ -816,7 +856,9 @@ focus-visible:outline-gray-400
 focus-visible:outline-none
 focus-visible:outline-none!
 focus-visible:outline-offset-2
+focus-visible:outline-offset-4
 focus-visible:ring-2
+focus-visible:ring-blue-500
 focus-visible:ring-gray-400
 focus-visible:underline
 focus-within:-outline-offset-2
@@ -893,6 +935,7 @@ gap-3.5
 gap-4
 gap-6
 gap-[0.03125rem]
+gap-[0.1875rem]
 gap-px
 gap-x-1
 gap-x-1.5
@@ -929,11 +972,12 @@ grid-cols-[minmax(0,1fr)_minmax(0,1fr)_1.5rem]
 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]
 grid-cols-[minmax(0,1fr)_minmax(0,8rem)]
 grid-cols-[repeat(auto-fill,minmax(min(160px,100%),1fr))]
-grid-cols-[repeat(auto-fill,minmax(min(94px,calc((100%_-_0.5rem)/2)),1fr))]
+grid-cols-[repeat(auto-fill,minmax(min(80px,100%),1fr))]
 grid-flow-col
-grid-rows-[auto_minmax(0,1fr)_auto]
 group
 group-focus-visible:opacity-100
+group-focus-within/instance:opacity-100
+group-focus-within/instance:pointer-events-auto
 group-focus-within/item:opacity-100
 group-focus-within/setting-row:text-gray-900
 group-focus-within:opacity-100
@@ -941,6 +985,8 @@ group-focus-within:opacity-60
 group-focus-within:text-blue-500
 group-has-[button[id$=-control]:disabled]/setting-row:cursor-not-allowed
 group-has-[button[id$=-control]:enabled]/setting-row:cursor-pointer
+group-hover/instance:opacity-100
+group-hover/instance:pointer-events-auto
 group-hover/item:opacity-100
 group-hover/item:text-gray-600
 group-hover/selector:text-gray-700
@@ -948,8 +994,8 @@ group-hover/setting-row:text-gray-900
 group-hover:bg-black/10
 group-hover:bg-black/40
 group-hover:bg-gray-100
+group-hover:bg-gray-200
 group-hover:block
-group-hover:fill-black/[0.02]
 group-hover:flex
 group-hover:hidden
 group-hover:inline
@@ -966,12 +1012,15 @@ group-hover:text-gray-950
 group-hover:translate-x-0.5
 group-hover:underline
 group-hover:visible
+group-open/network:rotate-0
 group-open/prompt:rotate-90
 group-open/setting:rotate-90
 group-open:rotate-180
 group-open:rotate-90
 group/header
+group/instance
 group/item
+group/network
 group/prompt
 group/selector
 group/setting
@@ -984,11 +1033,11 @@ h-1.5
 h-1/2
 h-10
 h-11
-h-15
-h-17
+h-14
 h-2
 h-2.5
 h-20
+h-24
 h-26
 h-3
 h-3.5
@@ -1003,6 +1052,7 @@ h-60
 h-7
 h-72
 h-8
+h-9
 h-96
 h-[1.25rem]
 h-[1.375rem]
@@ -1012,8 +1062,8 @@ h-[100dvh]
 h-[2.5rem]
 h-[22rem]
 h-[26px]
-h-[3.875rem]
 h-[5px]
+h-[60dvh]
 h-[60vh]
 h-[70vh]
 h-[calc(100%-14px)]
@@ -1198,6 +1248,7 @@ left-3
 left-4
 left-6
 left-[calc(144px+(100%-144px)/2)]
+left-[calc(50%_+_16px)]
 lg:!w-[calc(100vw-4rem)]
 lg:flex-col
 lg:flex-none
@@ -1250,6 +1301,7 @@ markdown-prose-sm
 markdown-prose-xs
 marked
 markedContent
+max-h-10
 max-h-16
 max-h-20
 max-h-24
@@ -1262,6 +1314,7 @@ max-h-52
 max-h-60
 max-h-64
 max-h-72
+max-h-8
 max-h-80
 max-h-96
 max-h-[100dvh]
@@ -1287,11 +1340,14 @@ max-h-[calc(100dvh-4rem)]
 max-h-[calc(100dvh-6rem)]
 max-h-[min(15rem,calc(100vh-4rem))]
 max-h-[min(17.5rem,calc(100vh-1.5rem))]
+max-h-[min(20rem,60dvh)]
 max-h-[min(21rem,calc(100dvh-2rem))]
 max-h-[min(28rem,calc(100dvh-12rem))]
 max-h-dvh
 max-h-fit
 max-h-full
+max-md:opacity-100
+max-sm:opacity-100
 max-w-12
 max-w-24
 max-w-28
@@ -1305,7 +1361,6 @@ max-w-44
 max-w-48
 max-w-56
 max-w-64
-max-w-70
 max-w-72
 max-w-80
 max-w-96
@@ -1327,7 +1382,6 @@ max-w-[520px]
 max-w-[55%]
 max-w-[58rem]
 max-w-[5rem]
-max-w-[6.25rem]
 max-w-[60%]
 max-w-[65%]
 max-w-[70%]
@@ -1367,7 +1421,7 @@ mb-4.5
 mb-5
 mb-6
 mb-8
-md:@2xl:px-20
+md:@3xl:px-20
 md:block
 md:border-b-0
 md:border-r
@@ -1379,6 +1433,7 @@ md:grid-cols-2
 md:grid-cols-3
 md:grid-cols-5
 md:hidden
+md:inline-flex
 md:items-center
 md:max-h-none
 md:max-w-3xl
@@ -1442,6 +1497,7 @@ min-h-[4rem]
 min-h-[6.25rem]
 min-h-[66rem]
 min-h-[calc(100dvh-13rem)]
+min-h-dvh
 min-h-fit
 min-h-full
 min-h-screen
@@ -1458,7 +1514,6 @@ min-w-48
 min-w-56
 min-w-6
 min-w-7
-min-w-70
 min-w-8
 min-w-80
 min-w-[10.625rem]
@@ -1588,6 +1643,7 @@ outline-offset-4
 overflow-auto
 overflow-clip
 overflow-hidden
+overflow-hidden!
 overflow-scroll
 overflow-visible
 overflow-x-auto
@@ -1621,7 +1677,6 @@ pb-16
 pb-18
 pb-2
 pb-2.5
-pb-20
 pb-24
 pb-3
 pb-3.5
@@ -1673,7 +1728,9 @@ pointer-events-none
 pr-0.5
 pr-1
 pr-1.5
+pr-10
 pr-12
+pr-14
 pr-2
 pr-2.5
 pr-3
@@ -1729,6 +1786,7 @@ px-7
 px-8
 px-[0.3125rem]
 px-[0.4375rem]
+px-[11px]
 px-[1rem]
 px-px
 py-0
@@ -1743,6 +1801,7 @@ py-16
 py-2
 py-2!
 py-2.5
+py-20
 py-24
 py-3
 py-3.5
@@ -1771,6 +1830,7 @@ right-2
 right-2.5
 right-3
 right-5
+right-6
 right-8
 right-9
 right-[0.5rem]
@@ -1778,8 +1838,11 @@ ring
 ring-1
 ring-2
 ring-amber-400
+ring-black/10
 ring-black/15
 ring-black/5
+ring-blue-500
+ring-blue-500/60
 ring-gray-200
 ring-gray-200/70
 ring-gray-300
@@ -1800,10 +1863,12 @@ rounded-3xl
 rounded-4xl
 rounded-[0.125rem]
 rounded-[0.5625rem]
+rounded-[3px]
 rounded-b-2xl
 rounded-b-2xl!
 rounded-b-lg
 rounded-b-none
+rounded-bl
 rounded-full
 rounded-full!
 rounded-l-xl
@@ -1821,10 +1886,8 @@ rounded-t-none
 rounded-tl-lg
 rounded-xl
 rounded-xl!
-rounded-xs
 row-start-1
 row-start-2
-row-start-3
 rtl:ml-2
 rtl:space-x-reverse
 rtl:text-right
@@ -1847,6 +1910,7 @@ shadow-none
 shadow-sm
 shadow-xl
 shadow-xs
+shiki
 shimmer
 shrink
 shrink-0
@@ -1916,7 +1980,6 @@ sm:left-10
 sm:max-w-80
 sm:max-w-[13rem]
 sm:max-w-[55%]
-sm:max-w-[9.375rem]
 sm:max-w-md
 sm:min-h-0
 sm:mx-2.5
@@ -1924,6 +1987,7 @@ sm:opacity-0
 sm:p-4
 sm:p-6
 sm:pb-10
+sm:pt-0
 sm:pt-0.5
 sm:px-10
 sm:px-2
@@ -1964,11 +2028,12 @@ status-description
 sticky
 stroke-red-500
 suggestion
-svelte-12yhxpf
 svelte-1490pbu
 svelte-1dcxxn4
+svelte-1t88xyr
 svelte-1vr5p4p
 svelte-4sys19
+svelte-9om8xm
 svelte-flow
 svelte-flow__edge
 svelte-m5no5e
@@ -1984,8 +2049,10 @@ task-content
 text-2xl
 text-3xl
 text-[#2B6CD4]
+text-[#476f36]
 text-[#4f6f93]
 text-[#4f7a5a]
+text-[#735c2a]
 text-[0.5625rem]
 text-[0.5rem]
 text-[0.625rem]
@@ -1998,6 +2065,7 @@ text-[0.78125rem]
 text-[0.7rem]
 text-[0.8125rem]
 text-[0.8125rem]!
+text-[0.90625rem]
 text-[0.9375rem]
 text-[10px]
 text-[11px]
@@ -2010,8 +2078,6 @@ text-amber-700
 text-amber-900
 text-base
 text-black
-text-black/10
-text-black/25
 text-black/50
 text-black/60
 text-black/80
@@ -2024,6 +2090,7 @@ text-ellipsis
 text-emerald-500
 text-emerald-600
 text-emerald-700
+text-emerald-700/85
 text-gray-100
 text-gray-200
 text-gray-300
@@ -2047,6 +2114,7 @@ text-indigo-600
 text-inherit
 text-left
 text-lg
+text-orange-600/90
 text-orange-800
 text-purple-500
 text-red-400
@@ -2056,12 +2124,18 @@ text-red-700
 text-red-800
 text-right
 text-rose-500
+text-rose-600/85
 text-sky-500
 text-sky-600
+text-sky-600/80
+text-sky-600/85
+text-slate-500
 text-sm
 text-sm!
 text-start
 text-teal-700
+text-violet-500
+text-violet-600/80
 text-white
 text-white/60
 text-wrap
@@ -2093,7 +2167,6 @@ top-3
 top-4
 top-6
 top-[0.125rem]
-top-[100%]
 top-full
 touch-auto
 touch-none
@@ -2178,6 +2251,7 @@ w-[0.03125rem]
 w-[0.0625rem]
 w-[0.125rem]
 w-[100rem]
+w-[11.5rem]
 w-[12.5rem]
 w-[15rem]
 w-[16rem]
@@ -2222,6 +2296,7 @@ z-9999
 z-99999
 z-99999999
 z-[-1]
+z-[9998]
 z-[9999999]
 z-[99999]
 z-[9999]

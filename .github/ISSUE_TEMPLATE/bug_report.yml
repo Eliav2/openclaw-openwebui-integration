@@ -20,7 +20,7 @@ body:
     attributes:
       label: Open WebUI version
       description: Settings > About in Open WebUI.
-      placeholder: "0.13.0"
+      placeholder: "0.13.2"
     validations:
       required: true
   - type: input

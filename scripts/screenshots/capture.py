@@ -1040,7 +1040,15 @@ class Scenes:
         # the first message under the translucent header (scrolled down) or
         # the jump-to-bottom arrow on the reply's toolbar (scrolled up).
         new_chat(page)
-        page.locator("button[aria-label='Integrations']").first.click()
+        # Open WebUI up to 0.13.0 has an Integrations button in the composer; from 0.13.1 Integrations sit in the + menu (#input-menu-button),
+        # in a submenu of their own when the menu lists more than the integrations.
+        integrations = page.locator("button[aria-label='Integrations']")
+        if integrations.count():
+            integrations.first.click()
+        else:
+            page.locator("#input-menu-button").click()
+            if not page.evaluate("() => /thinking/i.test(document.body.innerText)"):
+                page.get_by_role("menuitem", name=re.compile("integrations", re.I)).first.click()
         wait_js(page, "() => /thinking/i.test(document.body.innerText)", "the thinking toggle in the menu", 30_000)
         self.s.shot(page, "thinking-toggle")
         page.keyboard.press("Escape")
