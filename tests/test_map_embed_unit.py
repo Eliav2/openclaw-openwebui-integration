@@ -87,10 +87,12 @@ class MapScriptTests(unittest.TestCase):
         self.assertIn("areTilesLoaded()", js)
         self.assertIn("tileErrors", js)
 
-    def test_the_attribution_does_not_cover_the_foot_of_the_map(self):
-        js = self.js()
-        self.assertIn("maplibregl-compact-show", js)
-        self.assertIn("bottom:", js)
+    def test_the_library_adds_no_link_so_the_attribution_is_text_in_the_page(self):
+        # MapLibre's own attribution control is a row of links: no link may leave the page.
+        h = ocp._map_html(geometry())
+        self.assertIn("attributionControl: false", h)
+        self.assertIn("OpenStreetMap contributors", h)
+        self.assertIn("OpenMapTiles", h)
 
 
 class GeneratedTypesTests(unittest.TestCase):

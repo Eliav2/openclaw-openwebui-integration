@@ -33,7 +33,7 @@ MAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty"
 MAP_HEIGHT_PX = 300
 MAP_LOAD_TIMEOUT_MS = 10000
 MAP_PADDING_PX = 36
-# Room under the stops for the attribution control.
+# Room under the stops, so the lowest pin is not on the map's edge.
 MAP_PADDING_BOTTOM_PX = 56
 MAP_MAX_ZOOM = 16
 MAP_SINGLE_STOP_ZOOM = 14
@@ -254,7 +254,7 @@ _MAP_PAGE_JS = """
     var map;
     try {
       map = new maplibregl.Map({container: view, style: data.style, cooperativeGestures: true,
-                                attributionControl: {compact: true}});
+                                attributionControl: false});
     } catch (e) { view.remove(); return; }
     var tileErrors = 0;
     // No map in time: dispose it (it holds a WebGL context) and keep the drawing.
@@ -284,9 +284,6 @@ _MAP_PAGE_JS = """
       map.once('idle', function () {
         clearTimeout(giveUp);
         if (tileErrors || !map.areTilesLoaded()) { map.remove(); view.remove(); return; }
-        // The compact attribution opens on start and covers the map's foot until the first drag.
-        var attr = view.querySelector('.maplibregl-ctrl-attrib');
-        if (attr) { attr.classList.remove('maplibregl-compact-show'); attr.removeAttribute('open'); }
         view.style.visibility = 'visible';
         var fb = document.getElementById('fallback');
         if (fb) fb.style.display = 'none';
@@ -343,7 +340,7 @@ def _map_html(geo: MapGeometry) -> str:
         f'<div id="map">{_map_fallback_svg(stops, routes) if stops else ""}</div>'
         f'<ol id="stops">{"".join(items)}</ol>'
         f'{f"""<p class="missing">Not placed: {missing}</p>""" if missing else ""}'
-        '<p class="foot">Map data © OpenStreetMap contributors, OpenFreeMap.</p>'
+        '<p class="foot">Map data © OpenStreetMap contributors, © OpenMapTiles, OpenFreeMap.</p>'
         f'<script type="application/json" id="data">{_json_for_script(data)}</script>'
         f'<script src="{MAPLIBRE_JS_URL}" integrity="{MAPLIBRE_JS_SRI}" crossorigin="anonymous" async id="lib"></script>'
         f'<script>{js}</script></body></html>')
