@@ -4673,11 +4673,12 @@ CLAUDE_CLI_THINKING_OFF_IGNORED = {"claude-sonnet-5-5": ("sonnet", "sonnet-5-5")
                                    "claude-haiku-5-5": ("haiku", "haiku-5-5")}
 CLAUDE_CLI_RUNTIME = "claude-cli"
 THINKING_OFF = "off"
-MODEL_RUNTIMES_NAME = "model-runtimes.json"
 # A legacy `claude-cli/<model>` ref is `anthropic/<model>` on the claude-cli
-# runtime (OpenClaw docs/concepts/agent-runtimes.md); describe reports the
-# standard form, so runtimes are kept under it.
+# runtime (OpenClaw docs/concepts/agent-runtimes.md); describe and the
+# catalog report the standard form.
 LEGACY_CLAUDE_CLI_PREFIX = "claude-cli/"
+# The model catalog as `pipes()` last read it from the Gateway.
+MODELS_CACHE_NAME = "models-cache.json"
 ANTHROPIC_PREFIX = "anthropic/"
 
 
@@ -4716,59 +4717,19 @@ def _honoured_thinking_ladder(ladder, model_key, runtime):
     return ladder
 
 
-# The runtimes this process has recorded or read, by (state dir, model): the
-# describe of every waiting message's poll then reads and writes nothing.
-_model_runtimes_seen: dict = {}
-
-
-@contextlib.contextmanager
-def _model_runtimes(state_dir: str = ""):
-    """The runtimes file, read and written back under an flock: Open WebUI's
-    processes share it."""
-    path = os.path.join(_state_dir(state_dir), MODEL_RUNTIMES_NAME)
-    with open(path + ".lock", "a") as lock:
-        try:
-            import fcntl
-            fcntl.flock(lock, fcntl.LOCK_EX)
-        except ImportError:
-            pass
-        data = _read_json_file(path) or {}
-        before = dict(data)
-        yield data
-        if data != before:
-            _write_json_file(path, data)
-
-
-def _record_model_runtime(model_key, runtime, state_dir: str = "") -> None:
-    """Remember the runtime a session of `model_key` reported: a new chat's
-    describe has no session row to read it from. Best-effort."""
-    if not model_key or not runtime:
-        return
-    seen = (_state_dir(state_dir), _standard_model_key(model_key))
-    if _model_runtimes_seen.get(seen) == runtime:
-        return
-    try:
-        with _model_runtimes(state_dir) as runtimes:
-            runtimes[seen[1]] = runtime
-        _model_runtimes_seen[seen] = runtime
-    except Exception as ex:
-        pipe_log(f"  recording the runtime of {model_key} failed: {ex!r}")
-
-
-def _read_model_runtime(model_key, state_dir: str = ""):
-    """The runtime of `model_key`: claude-cli for a legacy `claude-cli/` ref,
-    else the one last seen for it, or None."""
+def _model_runtime(model_key, state_dir: str = ""):
+    """The runtime of `model_key` when no session row says it (a new chat):
+    claude-cli for a legacy `claude-cli/` ref, else the Gateway's catalog
+    (`models.list` `agentRuntime`, which `pipes()` caches whole in
+    MODELS_CACHE_NAME). None if unknown. Blocking: call it off the loop."""
     if not model_key:
         return None
     if str(model_key).startswith(LEGACY_CLAUDE_CLI_PREFIX):
         return CLAUDE_CLI_RUNTIME
-    seen = (_state_dir(state_dir), _standard_model_key(model_key))
-    if seen not in _model_runtimes_seen:
-        runtime = (_read_json_file(os.path.join(seen[0], MODEL_RUNTIMES_NAME)) or {}).get(seen[1])
-        if not isinstance(runtime, str):
-            return None  # not cached: another process may record it
-        _model_runtimes_seen[seen] = runtime
-    return _model_runtimes_seen[seen]
+    key = _standard_model_key(model_key)
+    cache = _read_json_file(os.path.join(_state_dir(state_dir), MODELS_CACHE_NAME)) or {}
+    return next((m.get("runtime") for m in cache.get("models") or []
+                 if isinstance(m, dict) and m.get("key") == key), None)
 
 
 def _owui_chat_send_params(
@@ -12040,7 +12001,8 @@ def _provider_from_key(key: str) -> str:
 
 
 def _normalize_model_entry(raw: dict) -> dict:
-    """Gateway `models.list` entry {id, name, provider, alias, ...} -> {key, name, tags}."""
+    """Gateway `models.list` entry {id, name, provider, alias, agentRuntime, ...}
+    -> {key, name, tags, runtime}."""
     provider = raw.get("provider", "")
     model_id = raw.get("id", "")
     key = f"{provider}/{model_id}" if provider and model_id else (model_id or provider)
@@ -12048,7 +12010,11 @@ def _normalize_model_entry(raw: dict) -> dict:
     alias = raw.get("alias")
     if alias:
         tags.append(f"alias:{alias}")
-    return {"key": key, "name": raw.get("name", model_id), "tags": tags}
+    entry = {"key": key, "name": raw.get("name", model_id), "tags": tags}
+    runtime = (raw.get("agentRuntime") or {}).get("id")
+    if runtime:
+        entry["runtime"] = runtime   # the thinking clamp's source for a new chat
+    return entry
 
 
 def _usable_models(raw_models: list[dict]) -> list[dict]:
@@ -12136,14 +12102,14 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
             if raw_models:
                 models = _usable_models(raw_models)
                 _write_json_file(
-                    os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
+                    os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), MODELS_CACHE_NAME),
                     {"models": models, "cachedAt": time.time()}
                 )
                 return models, MODELS_SOURCE_LIVE
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
 
-    cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
+    cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), MODELS_CACHE_NAME))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
         return cache["models"], MODELS_SOURCE_CACHE
@@ -14511,7 +14477,7 @@ class Pipe:
         default dir would miss a custom STATE_DIR's cache.
         """
         cache = _read_json_file(
-            os.path.join(_state_dir(cls._last_state_dir), "models-cache.json")
+            os.path.join(_state_dir(cls._last_state_dir), MODELS_CACHE_NAME)
         )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
@@ -15338,9 +15304,11 @@ class _PipeTurn:
                                 or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
                                 or self.session_thinking_ladder)
             model_key = self.model_override or self.session_model_key
-            effective_ladder = _honoured_thinking_ladder(
-                effective_ladder, model_key,
-                self.session_runtime or _read_model_runtime(model_key, _state_dir_valve))
+            runtime = self.session_runtime
+            if runtime is None and self.requested_thinking == THINKING_OFF and _off_ignored_on_claude_cli(model_key):
+                # Only then: the catalog file, read off the loop.
+                runtime = await asyncio.to_thread(_model_runtime, model_key, _state_dir_valve)
+            effective_ladder = _honoured_thinking_ladder(effective_ladder, model_key, runtime)
             self.resolved_thinking, thinking_note = clamp_to_ladder(
                 self.requested_thinking, effective_ladder)
             # Held until `visible_message_text` exists, so the note persists on reload.
@@ -16258,8 +16226,6 @@ class _PipeTurn:
             # for claude-cli/claude-opus-5, real ladder ["off"]). Good for the
             # dropdown, not for clamping once the Gateway has ruled.
             self.session_model_key = _session_model_key(row)
-            _record_model_runtime(self.session_model_key, (row.get("agentRuntime") or {}).get("id"),
-                                  getattr(self.pipe.valves, "STATE_DIR", ""))
             ladder = _session_thinking_ladder(desc)
             if ladder:
                 self.session_thinking_ladder = ladder

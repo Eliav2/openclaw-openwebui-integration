@@ -493,7 +493,7 @@ class Pipe:
         default dir would miss a custom STATE_DIR's cache.
         """
         cache = _read_json_file(
-            os.path.join(_state_dir(cls._last_state_dir), "models-cache.json")
+            os.path.join(_state_dir(cls._last_state_dir), MODELS_CACHE_NAME)
         )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
@@ -1320,9 +1320,11 @@ class _PipeTurn:
                                 or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
                                 or self.session_thinking_ladder)
             model_key = self.model_override or self.session_model_key
-            effective_ladder = _honoured_thinking_ladder(
-                effective_ladder, model_key,
-                self.session_runtime or _read_model_runtime(model_key, _state_dir_valve))
+            runtime = self.session_runtime
+            if runtime is None and self.requested_thinking == THINKING_OFF and _off_ignored_on_claude_cli(model_key):
+                # Only then: the catalog file, read off the loop.
+                runtime = await asyncio.to_thread(_model_runtime, model_key, _state_dir_valve)
+            effective_ladder = _honoured_thinking_ladder(effective_ladder, model_key, runtime)
             self.resolved_thinking, thinking_note = clamp_to_ladder(
                 self.requested_thinking, effective_ladder)
             # Held until `visible_message_text` exists, so the note persists on reload.
@@ -2240,8 +2242,6 @@ class _PipeTurn:
             # for claude-cli/claude-opus-5, real ladder ["off"]). Good for the
             # dropdown, not for clamping once the Gateway has ruled.
             self.session_model_key = _session_model_key(row)
-            _record_model_runtime(self.session_model_key, (row.get("agentRuntime") or {}).get("id"),
-                                  getattr(self.pipe.valves, "STATE_DIR", ""))
             ladder = _session_thinking_ladder(desc)
             if ladder:
                 self.session_thinking_ladder = ladder

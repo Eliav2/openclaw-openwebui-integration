@@ -17444,29 +17444,33 @@ class ClaudeCliThinkingOffTests(_TurnCase):
         self.assertEqual(thinking, "low")
         self.assertIn(self.NOTE, shown)
 
-    async def test_a_session_with_no_runtime_yet_uses_the_one_seen_for_its_model(self):
-        """A new chat's describe has no session row, so no runtime: the one an earlier session of the
-        same model reported decides."""
-        td = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, td)
-        with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
-            self.ocp._record_model_runtime("anthropic/claude-sonnet-5-5", "claude-cli")
-            self.assertEqual(self.ocp._read_model_runtime("anthropic/claude-sonnet-5-5"), "claude-cli")
-            self.assertIsNone(self.ocp._read_model_runtime("anthropic/claude-opus-5-5"))
-        with mock.patch.object(self.ocp, "_read_model_runtime", lambda *a, **k: "claude-cli"):
+    async def test_a_new_chat_takes_the_runtime_from_the_gateways_catalog_off_the_loop(self):
+        """A new chat's describe has no session row, so no runtime: the Gateway's catalog
+        (`models.list` agentRuntime, cached by pipes()) gives it, read in a thread."""
+        threaded, real = [], asyncio.to_thread
+
+        async def to_thread(func, *args, **kwargs):
+            threaded.append(func.__name__)
+            return await real(func, *args, **kwargs)
+        with mock.patch.object(self.ocp.asyncio, "to_thread", to_thread), \
+                mock.patch.object(self.ocp, "_model_runtime", lambda *a, **k: "claude-cli"):
             thinking, _ = await self.send_at("off", runtime=None, model="claude-sonnet-5-5")
         self.assertEqual(thinking, "low")
+        self.assertIn("<lambda>", threaded)
 
 
 class ClaudeCliThinkingOffKeyTests(unittest.TestCase):
-    """Review on #383: the clamp matches a model the way the Gateway picks its profile, and keeps
-    the runtimes file safe across Open WebUI's processes without I/O on every describe."""
+    """Review on #383: the clamp matches a model the way the Gateway picks its profile, and takes
+    a new chat's runtime from the Gateway's own catalog: no runtimes file of the Pipe's."""
+
+    # A live `models.list` entry (OpenClaw 2026.10.10), trimmed.
+    SONNET = {"id": "claude-sonnet-5-5", "name": "Claude Sonnet 5.5", "provider": "anthropic",
+              "alias": "sonnet-5.5", "available": True,
+              "agentRuntime": {"id": "claude-cli", "source": "model"}}
 
     def setUp(self):
         self.td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.td)
-        openclaw_pipe._model_runtimes_seen.clear()
-        self.addCleanup(openclaw_pipe._model_runtimes_seen.clear)
 
     def test_ids_match_as_the_gateway_matches_them(self):
         """anthropic-*.mjs resolveClaudeSonnet55ModelIdentity: dated ids, aliases, `.` and case."""
@@ -17480,41 +17484,23 @@ class ClaudeCliThinkingOffKeyTests(unittest.TestCase):
             with self.subTest(key):
                 self.assertFalse(openclaw_pipe._off_ignored_on_claude_cli(key))
 
+    def test_the_catalog_keeps_each_models_runtime(self):
+        self.assertEqual(openclaw_pipe._normalize_model_entry(self.SONNET)["runtime"], "claude-cli")
+        self.assertNotIn("runtime", openclaw_pipe._normalize_model_entry({"id": "m", "provider": "p"}))
+
+    def test_a_new_chats_runtime_comes_from_the_cached_catalog(self):
+        openclaw_pipe._write_json_file(os.path.join(self.td, openclaw_pipe.MODELS_CACHE_NAME),
+                                       {"models": openclaw_pipe._usable_models([self.SONNET])})
+        self.assertEqual(openclaw_pipe._model_runtime("anthropic/claude-sonnet-5-5", self.td), "claude-cli")
+        self.assertIsNone(openclaw_pipe._model_runtime("anthropic/claude-opus-5-5", self.td))
+        self.assertFalse(os.path.exists(os.path.join(self.td, "model-runtimes.json")))
+
     def test_a_legacy_claude_cli_ref_is_the_claude_cli_runtime(self):
         """OpenClaw docs/concepts/agent-runtimes.md: `claude-cli/<model>` is `anthropic/<model>` on
-        claude-cli, and describe reports the standard form."""
-        self.assertEqual(openclaw_pipe._read_model_runtime("claude-cli/claude-sonnet-5-5", self.td), "claude-cli")
-        openclaw_pipe._record_model_runtime("anthropic/claude-haiku-5-5", "claude-cli", self.td)
-        openclaw_pipe._model_runtimes_seen.clear()
-        self.assertEqual(openclaw_pipe._read_model_runtime("anthropic/claude-haiku-5-5", self.td), "claude-cli")
-
-    def test_recording_holds_an_flock_on_the_runtimes_file(self):
-        """Open WebUI's processes share the file: the read-modify-write holds an exclusive flock."""
-        import fcntl
-        locked = []
-        real = fcntl.flock
-
-        def flock(f, op):
-            locked.append((os.path.basename(f.name), op))
-            return real(f, op)
-        with mock.patch.object(fcntl, "flock", flock):
-            openclaw_pipe._record_model_runtime("anthropic/claude-sonnet-5-5", "claude-cli", self.td)
-        self.assertEqual(locked, [(openclaw_pipe.MODEL_RUNTIMES_NAME + ".lock", fcntl.LOCK_EX)])
-
-    def test_an_unchanged_runtime_does_no_file_io(self):
-        """Every describe of a waiting message records the runtime: after the first, nothing is read
-        or written, and a lookup reads the file once."""
-        reads = []
-        real = openclaw_pipe._read_json_file
-
-        def read(path):
-            reads.append(os.path.basename(path))
-            return real(path)
-        with mock.patch.object(openclaw_pipe, "_read_json_file", read):
-            for _ in range(3):
-                openclaw_pipe._record_model_runtime("anthropic/claude-sonnet-5-5", "claude-cli", self.td)
-                openclaw_pipe._read_model_runtime("anthropic/claude-sonnet-5-5", self.td)
-        self.assertEqual(reads, [openclaw_pipe.MODEL_RUNTIMES_NAME])
+        claude-cli; describe and the catalog report the standard form."""
+        self.assertEqual(openclaw_pipe._model_runtime("claude-cli/claude-sonnet-5-5", self.td), "claude-cli")
+        self.assertEqual(openclaw_pipe._standard_model_key("claude-cli/claude-sonnet-5-5"),
+                         "anthropic/claude-sonnet-5-5")
 
 
 class ClaudeThinkingProfileFixtureTest(unittest.TestCase):
