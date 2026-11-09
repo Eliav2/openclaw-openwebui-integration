@@ -566,6 +566,50 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
         Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields))
 
 
+async def _committed_then(write, on_commit):
+    """`write`'s result, after `on_commit()` when it is truthy (the write
+    committed). Run inside `_uncancellable`'s task, so a cancel of the caller
+    between the commit and its resume cannot skip it."""
+    result = await write
+    if result and on_commit is not None:
+        on_commit()
+    return result
+
+
+async def _owui_upsert_message_with_statuses(chat_id: str, message_id: str, fields: dict,
+                                             statuses: list, on_commit=None) -> bool:
+    """`fields` upserted and `statuses` appended to the message's statusHistory
+    in one write under the chat's row lock: a reply's final status lines ride
+    in its end snapshot instead of a save each. Never cut short by a cancel;
+    `on_commit` runs once it committed, even when the caller was cancelled."""
+    return await _uncancellable(_committed_then(
+        _owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses), on_commit))
+
+
+async def _owui_upsert_message_with_statuses_now(chat_id: str, message_id: str, fields: dict,
+                                                 statuses: list) -> bool:
+    from open_webui.models.chats import Chats
+    from open_webui.models.chat_messages import ChatMessages
+    from sqlalchemy.orm.attributes import flag_modified
+
+    async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
+        data = chat.chat or {}
+        history = data.get("history") or {}
+        saved = (history.get("messages") or {}).get(message_id) or {}
+        # As Open WebUI's upsert and its status save, in one transaction.
+        message = Chats._clean_null_bytes(
+            {**fields, "statusHistory": [*(saved.get("statusHistory") or []), *statuses]})
+        message = Chats.upsert_message_to_history(history, message_id, message)
+        await ChatMessages.upsert_message(message_id, chat_id, message.get("user_id") or chat.user_id,
+                                          message, db=db)
+        chat.chat = {**data, "history": history}
+        flag_modified(chat, "chat")
+        chat.updated_at = int(time.time())
+        return True
+
+
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
                               writer_id: str, takeover: bool = False) -> dict:
     """Claim `message_id` for `run_id` under the chat's row lock, inserting it

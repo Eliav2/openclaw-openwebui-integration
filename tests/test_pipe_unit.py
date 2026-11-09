@@ -8442,7 +8442,7 @@ class _FakeOwuiChat:
                 "q1": {"id": "q1", "role": "user", "parentId": None, "childrenIds": ["a1"]},
                 "a1": {"id": "a1", "role": "assistant", "parentId": "q1", "childrenIds": [],
                        "model": "openclaw_gateway.m", "done": True},
-            }}}, current_message_id="a1", updated_at=0)
+            }}}, current_message_id="a1", updated_at=0, user_id="u1")
         self.rows, self.emits, self.tasks = {}, [], {}
         # open_webui.tasks.tasks: the request tasks, by the request's task_id
         self.request_tasks = {}
@@ -8478,7 +8478,26 @@ class _FakeOwuiChat:
             @staticmethod
             async def get_message_by_id_and_message_id(chat_id, message_id):
                 return copy.deepcopy(fake.chat.chat["history"]["messages"].get(message_id))
-        self.upserts = []
+
+            @staticmethod
+            async def add_message_status_to_chat_by_id_and_message_id(chat_id, message_id, status):
+                # A row save of its own per status, as Open WebUI's saving emitter does.
+                fake.status_saves.append(status.get("description"))
+                msg = fake.chat.chat["history"]["messages"].get(message_id)
+                if msg is not None:
+                    msg["statusHistory"] = [*(msg.get("statusHistory") or []), dict(status)]
+                return fake.chat
+
+            @staticmethod
+            def upsert_message_to_history(history, message_id, message):
+                msgs = history.setdefault("messages", {})
+                msgs[message_id] = {**msgs.get(message_id, {}), **message}
+                return msgs[message_id]
+
+            @staticmethod
+            def _clean_null_bytes(obj):
+                return obj
+        self.upserts, self.status_saves = [], []
         self._chats = Chats
 
         class ChatMessages:
@@ -13284,17 +13303,29 @@ class GapHandoverReplayTests(_RoutingCase):
         self.pipe.valves.AUTO_TITLE = False
         self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.3
 
-    async def start_reply(self, text="count", message_id=None, intent=None, sends=True, request=None):
-        """A user turn's request, running until its run is sent (or a parked run is consumed)."""
+    async def start_reply(self, text="count", message_id=None, intent=None, sends=True, request=None,
+                          saves_statuses=False, task_id=None):
+        """A user turn's request, running until its run is sent (or a parked run is consumed).
+        `saves_statuses`: the request's emitter saves each status, as Open WebUI's does.
+        `task_id`: the request runs as Open WebUI's task under that id."""
         message_id = message_id or self.STUB
         self.add_stub(message_id)
         emitted = []
         emitter = RecordingEmitter(emitted)
+        if saves_statuses:
+            recording, chats = emitter, self.owui._chats
+
+            async def emitter(event):
+                await recording(event)
+                if event.get("type") == "status":
+                    await chats.add_message_status_to_chat_by_id_and_message_id(
+                        self.CHAT, message_id, event["data"])
 
         async def event_call(event):
             return intent
         body = {"model": "openclaw_gateway.main", "messages": [{"role": "user", "content": text}]}
-        meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id}
+        meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id,
+                **({"task_id": task_id} if task_id else {})}
         gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __request__=request,
                                    __event_call__=event_call if intent else None)
         reply = {"gen": gen, "text": "", "items": [], "emitted": emitted, "output": [],
@@ -13313,6 +13344,8 @@ class GapHandoverReplayTests(_RoutingCase):
                 await self.owui.end_request(message_id, reply["output"])
         sent_before = len(self.chat_sends)
         reply["task"] = asyncio.ensure_future(drain())
+        if task_id:
+            self.owui.request_tasks[task_id] = reply["task"]
         for _ in range(400 if sends else 0):
             if len(self.chat_sends) > sent_before:
                 break
@@ -13388,6 +13421,135 @@ class GapHandoverReplayTests(_RoutingCase):
                     # The `replace` event is Open WebUI's to save; this emitter only records it.
                     self.assertEqual(kinds, [])
                     self.assertEqual(replaced, ["Reading them.\n\nFound it."])
+
+    async def _reply_with_usage_line(self, line, live_copy, patches=()):
+        """One reply whose request saves its statuses, with `line` as its usage line; the message as
+        Open WebUI's end save finds it (as stored, for a reply cancelled before that save).
+        `patches`: more (target, name, value) patched for the reply; `self.usage_live["reply"]` is it."""
+        self.usage_live = live = {}
+
+        async def streams(redis, chat_id):
+            return ([{"chat_id": chat_id, "message_id": self.STUB, "output": live["reply"]["output"]}]
+                    if live_copy else [])
+        sys.modules["open_webui.tasks"].get_response_streams_by_chat_id = streams
+        at_end_save, end_request = [], self.owui.end_request
+
+        async def end_save(message_id, output):
+            at_end_save.append(copy.deepcopy(self.owui.msgs()[message_id]))
+            await end_request(message_id, output)
+        self.owui.end_request = end_save
+        request = types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace(redis=None)))
+        self.published, self.closed = [], []
+
+        async def publish(chat_id, message_id, user_id, text=None):
+            self.published.append(message_id)
+
+        async def close(ref):
+            self.closed.append(ref.get("message_id"))
+        self.pipe.valves.PUBLISH_CHAT_FINISHED = True
+        with contextlib.ExitStack() as stack:
+            for target, name, value in (
+                    (openclaw_pipe, "_build_usage_status_lines", mock.AsyncMock(return_value=[line])),
+                    (openclaw_pipe, "_publish_chat_finished", publish),
+                    (openclaw_pipe, "_close_reply_status", close), *patches):
+                stack.enter_context(mock.patch.object(target, name, value))
+            live["reply"] = reply = await self.start_reply(request=request, saves_statuses=True, task_id="req-1")
+            self.history = _turn_history(run=self.run)
+            self.frame(_delta("Found it."))
+            self.frame({"state": "final"}, event="chat")
+            self.settle()
+            try:
+                await self.ended(reply)
+            except asyncio.CancelledError:
+                await self.spin(600)
+        unsaved = [d["data"]["data"]["description"] for e, d, _room in self.owui.emits
+                   if e == "events" and d["data"].get("type") == "status"]
+        return (at_end_save.pop() if at_end_save else copy.deepcopy(self.owui.msgs()[self.STUB])), unsaved
+
+    async def test_the_final_status_line_rides_in_the_end_snapshot(self):
+        """A': the usage line goes to the tab unsaved, and the end snapshot's own write saves it
+        with the content and output: one whole-row save less per reply. "Thinking..." keeps its
+        save, the source for a tab opened mid-run."""
+        line = "🧠 1k/200k (0%)"
+        saved, unsaved = await self._reply_with_usage_line(line, live_copy=True)
+        self.assertEqual([s.get("description") for s in saved["statusHistory"]], ["Thinking...", line])
+        self.assertEqual(saved["content"], "Found it.")
+        self.assertEqual(self.owui.status_saves, ["Thinking..."], "the usage line saved on its own")
+        self.assertEqual(unsaved, [line], "the tab never got the usage line")
+        self.assertIs(self.owui.emitter_update_db, False)
+        # The unsaved line still closes the reply's status, so its request end publishes it.
+        self.assertEqual((self.published, self.closed), ([self.STUB], []))
+
+    async def test_with_no_live_copy_the_final_status_line_is_saved_on_its_own(self):
+        """A': with no live output copy the snapshot is Open WebUI's `replace`, which carries no
+        status, so the usage line gets its own save, as before."""
+        line = "🧠 1k/200k (0%)"
+        saved, unsaved = await self._reply_with_usage_line(line, live_copy=False)
+        self.assertEqual([s.get("description") for s in saved["statusHistory"]], ["Thinking...", line])
+        self.assertEqual(self.owui.status_saves, ["Thinking...", line])
+        self.assertEqual(unsaved, [line])
+
+    @staticmethod
+    def _lines(message):
+        return [x.get("description") for x in message.get("statusHistory") or []]
+
+    async def test_a_failed_end_snapshot_write_saves_the_final_status_line_once_on_its_own(self):
+        """A' failure path, an exception: the snapshot write with the statuses fails, so the
+        content is upserted alone and the usage line gets its own save, once."""
+        line = "🧠 1k/200k (0%)"
+
+        async def fails(*args, **kwargs):
+            raise RuntimeError("database is locked")
+        saved, _unsaved = await self._reply_with_usage_line(
+            line, live_copy=True, patches=[(openclaw_pipe, "_owui_upsert_message_with_statuses_now", fails)])
+        self.assertEqual(self._lines(saved), ["Thinking...", line])
+        self.assertEqual(saved["content"], "Found it.")
+        self.assertEqual(self.owui.status_saves, ["Thinking...", line])
+
+    async def test_a_cancel_during_the_end_snapshot_write_saves_the_final_status_line_once(self):
+        """A' failure path, a cancel: Stop lands while the snapshot write runs. The write
+        finishes (ELI-205) and commits the usage line, so the run's cleanup must not save it
+        again."""
+        line = "🧠 1k/200k (0%)"
+        write = openclaw_pipe._owui_upsert_message_with_statuses_now
+
+        async def cancelled_meanwhile(*args, **kwargs):
+            self.usage_live["reply"]["task"].cancel()
+            await asyncio.sleep(0)
+            return await write(*args, **kwargs)
+        saved, _unsaved = await self._reply_with_usage_line(
+            line, live_copy=True,
+            patches=[(openclaw_pipe, "_owui_upsert_message_with_statuses_now", cancelled_meanwhile)])
+        self.assertTrue(self.usage_live["reply"]["task"].cancelled())
+        self.assertEqual(self._lines(saved), ["Thinking...", line])
+        self.assertEqual(self.owui.status_saves, ["Thinking..."], "the committed line saved again")
+
+    async def test_a_final_status_line_whose_save_failed_is_saved_by_the_cleanup(self):
+        """A final status save Open WebUI fails (it returns None) keeps the line pending, and
+        the run's cleanup saves it."""
+        line = "🧠 1k/200k (0%)"
+        save, failed = self.owui._chats.add_message_status_to_chat_by_id_and_message_id, []
+
+        async def fails_once(chat_id, message_id, status):
+            if status.get("description") == line and not failed:
+                failed.append(line)
+                self.owui.status_saves.append(line)
+                return None
+            return await save(chat_id, message_id, status)
+        saved, _unsaved = await self._reply_with_usage_line(
+            line, live_copy=False,
+            patches=[(self.owui._chats, "add_message_status_to_chat_by_id_and_message_id", fails_once)])
+        self.assertEqual(failed, [line])
+        self.assertEqual(self._lines(self.owui.msgs()[self.STUB]), ["Thinking...", line])
+        self.assertEqual(self.owui.status_saves, ["Thinking...", line, line])
+
+    async def test_the_secret_asker_is_removed_even_when_the_status_save_is_cancelled(self):
+        """The run's cleanup saves the final status lines first; a cancel there must not leave
+        the reply registered for secret requests (ELI-96)."""
+        line = "🧠 1k/200k (0%)"
+        await self._reply_with_usage_line(line, live_copy=True, patches=[
+            (openclaw_pipe._PipeTurn, "save_final_statuses", mock.AsyncMock(side_effect=asyncio.CancelledError))])
+        self.assertEqual([t for t in openclaw_pipe._SECRET_ASKERS.values() if t.owui_message_id == self.STUB], [])
 
     async def test_case_1_frames_lost_mid_run(self):
         """A slow client: the frames of a whole tool call were dropped (only the seq shows it)."""
