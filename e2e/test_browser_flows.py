@@ -2428,16 +2428,16 @@ MAP_PAGE = ".chat-assistant iframe"
 NO_WEBGL_ARGS = ["--disable-gpu", "--disable-3d-apis"]
 
 
-def _map_in_a_phone_chat(token, launch_args=()):
-    """A phone browser (`launch_args` to the browser) asks for the map; returns its page, the chat
-    id and the closer of the browser."""
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(args=list(launch_args))
+def _map_in_a_phone_chat(page, token, launch_args=()):
+    """A phone browser (`launch_args` to it) asks for the map; returns its page, the chat id and the
+    closer of the browser. It launches from the module's own Playwright (`page`'s browser): a second
+    `sync_playwright()` cannot start inside the one the `page` fixture holds."""
+    browser = page.context.browser.browser_type.launch(args=list(launch_args))
     pg = capture.signed_in_page(browser, token, capture.PHONE)
     capture.new_chat(pg)
     chat_id = capture.send(pg, "E2E_MAP")
     capture.wait_js(pg, _last_reply_done("E2E_MAP_DONE"), "the reply after the map call", TURN_MS)
-    return pg, chat_id, lambda: (browser.close(), pw.stop())
+    return pg, chat_id, browser.close
 
 
 def _map_stops(page):
@@ -2450,8 +2450,8 @@ def _shot(page, name: str) -> None:
         page.screenshot(path=os.path.join(out, f"{name}.png"))
 
 
-def test_a_map_shows_on_a_phone_with_its_stops_and_survives_a_reload(token):
-    pg, chat_id, close = _map_in_a_phone_chat(token)
+def test_a_map_shows_on_a_phone_with_its_stops_and_survives_a_reload(page, token):
+    pg, chat_id, close = _map_in_a_phone_chat(page, token)
     try:
         assert pg.viewport_size["width"] == MAP_PHONE_WIDTH_PX
         _map_stops(pg).first.wait_for(timeout=60_000)
@@ -2477,8 +2477,8 @@ def test_a_map_shows_on_a_phone_with_its_stops_and_survives_a_reload(token):
         close()
 
 
-def test_a_map_without_webgl_keeps_the_drawing_of_its_stops_and_route(token):
-    pg, _chat_id, close = _map_in_a_phone_chat(token, NO_WEBGL_ARGS)
+def test_a_map_without_webgl_keeps_the_drawing_of_its_stops_and_route(page, token):
+    pg, _chat_id, close = _map_in_a_phone_chat(page, token, NO_WEBGL_ARGS)
     try:
         _map_stops(pg).first.wait_for(timeout=60_000)
         frame = pg.frame_locator(MAP_PAGE).last
