@@ -17437,6 +17437,13 @@ class ClaudeCliThinkingOffTests(_TurnCase):
         thinking, _ = await self.send_at("off", runtime="claude-cli", model="claude-sonnet-5")
         self.assertEqual(thinking, "off")
 
+    async def test_a_new_chat_on_a_legacy_claude_cli_ref_is_clamped(self):
+        """Review on #383: a `claude-cli/claude-sonnet-5-5` selection with no runtime recorded yet."""
+        self.pipe.valves.DEFAULT_MODEL = "claude-cli/claude-sonnet-5-5"
+        thinking, shown = await self.send_at("off", runtime=None, model="claude-sonnet-5-5")
+        self.assertEqual(thinking, "low")
+        self.assertIn(self.NOTE, shown)
+
     async def test_a_session_with_no_runtime_yet_uses_the_one_seen_for_its_model(self):
         """A new chat's describe has no session row, so no runtime: the one an earlier session of the
         same model reported decides."""
@@ -17449,6 +17456,65 @@ class ClaudeCliThinkingOffTests(_TurnCase):
         with mock.patch.object(self.ocp, "_read_model_runtime", lambda *a, **k: "claude-cli"):
             thinking, _ = await self.send_at("off", runtime=None, model="claude-sonnet-5-5")
         self.assertEqual(thinking, "low")
+
+
+class ClaudeCliThinkingOffKeyTests(unittest.TestCase):
+    """Review on #383: the clamp matches a model the way the Gateway picks its profile, and keeps
+    the runtimes file safe across Open WebUI's processes without I/O on every describe."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.td)
+        openclaw_pipe._model_runtimes_seen.clear()
+        self.addCleanup(openclaw_pipe._model_runtimes_seen.clear)
+
+    def test_ids_match_as_the_gateway_matches_them(self):
+        """anthropic-*.mjs resolveClaudeSonnet55ModelIdentity: dated ids, aliases, `.` and case."""
+        for key in ("anthropic/claude-sonnet-5-5", "anthropic/claude-sonnet-5-5-20261101",
+                    "claude-cli/claude-sonnet-5-5", "anthropic/Claude-Sonnet-5.5", "anthropic/sonnet",
+                    "sonnet-5-5", "anthropic/claude-haiku-5-5@2026", "haiku"):
+            with self.subTest(key):
+                self.assertTrue(openclaw_pipe._off_ignored_on_claude_cli(key))
+        for key in ("anthropic/claude-sonnet-5-50", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5-5",
+                    "openai/gpt-6", ""):
+            with self.subTest(key):
+                self.assertFalse(openclaw_pipe._off_ignored_on_claude_cli(key))
+
+    def test_a_legacy_claude_cli_ref_is_the_claude_cli_runtime(self):
+        """OpenClaw docs/concepts/agent-runtimes.md: `claude-cli/<model>` is `anthropic/<model>` on
+        claude-cli, and describe reports the standard form."""
+        self.assertEqual(openclaw_pipe._read_model_runtime("claude-cli/claude-sonnet-5-5", self.td), "claude-cli")
+        openclaw_pipe._record_model_runtime("anthropic/claude-haiku-5-5", "claude-cli", self.td)
+        openclaw_pipe._model_runtimes_seen.clear()
+        self.assertEqual(openclaw_pipe._read_model_runtime("anthropic/claude-haiku-5-5", self.td), "claude-cli")
+
+    def test_recording_holds_an_flock_on_the_runtimes_file(self):
+        """Open WebUI's processes share the file: the read-modify-write holds an exclusive flock."""
+        import fcntl
+        locked = []
+        real = fcntl.flock
+
+        def flock(f, op):
+            locked.append((os.path.basename(f.name), op))
+            return real(f, op)
+        with mock.patch.object(fcntl, "flock", flock):
+            openclaw_pipe._record_model_runtime("anthropic/claude-sonnet-5-5", "claude-cli", self.td)
+        self.assertEqual(locked, [(openclaw_pipe.MODEL_RUNTIMES_NAME + ".lock", fcntl.LOCK_EX)])
+
+    def test_an_unchanged_runtime_does_no_file_io(self):
+        """Every describe of a waiting message records the runtime: after the first, nothing is read
+        or written, and a lookup reads the file once."""
+        reads = []
+        real = openclaw_pipe._read_json_file
+
+        def read(path):
+            reads.append(os.path.basename(path))
+            return real(path)
+        with mock.patch.object(openclaw_pipe, "_read_json_file", read):
+            for _ in range(3):
+                openclaw_pipe._record_model_runtime("anthropic/claude-sonnet-5-5", "claude-cli", self.td)
+                openclaw_pipe._read_model_runtime("anthropic/claude-sonnet-5-5", self.td)
+        self.assertEqual(reads, [openclaw_pipe.MODEL_RUNTIMES_NAME])
 
 
 class ClaudeThinkingProfileFixtureTest(unittest.TestCase):

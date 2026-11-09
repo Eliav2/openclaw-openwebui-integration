@@ -4667,20 +4667,76 @@ def _read_model_thinking_ladder(model_key, state_dir: str = ""):
 # them (tests/fixtures/test_fixture_openclaw_claude_thinking_profiles.json).
 # Upstream draft: projects/upstream/drafts/claude-cli-thinking-off-ignored-on-5-5.md
 # (maintainer workspace). Delete a model here once its profile drops `off`:
-# ClaudeThinkingProfileFixtureTest fails then.
-CLAUDE_CLI_THINKING_OFF_IGNORED = ("claude-sonnet-5-5", "claude-haiku-5-5")
+# ClaudeThinkingProfileFixtureTest fails then. Each id with the Gateway's
+# short aliases for it.
+CLAUDE_CLI_THINKING_OFF_IGNORED = {"claude-sonnet-5-5": ("sonnet", "sonnet-5-5"),
+                                   "claude-haiku-5-5": ("haiku", "haiku-5-5")}
 CLAUDE_CLI_RUNTIME = "claude-cli"
 THINKING_OFF = "off"
 MODEL_RUNTIMES_NAME = "model-runtimes.json"
+# A legacy `claude-cli/<model>` ref is `anthropic/<model>` on the claude-cli
+# runtime (OpenClaw docs/concepts/agent-runtimes.md); describe reports the
+# standard form, so runtimes are kept under it.
+LEGACY_CLAUDE_CLI_PREFIX = "claude-cli/"
+ANTHROPIC_PREFIX = "anthropic/"
+
+
+def _claude_model_identity(model_key) -> str:
+    """The Gateway's Claude model identity for `model_key`
+    (anthropic-*.mjs `normalizeClaudeModelId`, `resolveClaudeModelIdentity`):
+    lowercased, `._` and spaces as `-`, the trailing `claude-...` segment."""
+    normalized = re.sub(r"[._\s]+", "-", str(model_key or "").strip().lower())
+    match = re.search(r"(?:^|[-/])(claude-[^/]+)$", normalized)
+    return match.group(1) if match else normalized.rsplit("/", 1)[-1]
+
+
+def _off_ignored_on_claude_cli(model_key) -> bool:
+    """Whether `model_key` is one of CLAUDE_CLI_THINKING_OFF_IGNORED as the
+    Gateway matches it (`resolveClaudeSonnet55ModelIdentity`): an alias, or the
+    id followed by the end or a non-alphanumeric (a dated id)."""
+    identity = _claude_model_identity(model_key)
+    return any(identity in aliases or re.match(rf"{re.escape(model_id)}(?=$|[^a-z0-9])", identity)
+               for model_id, aliases in CLAUDE_CLI_THINKING_OFF_IGNORED.items())
+
+
+def _standard_model_key(model_key) -> str:
+    """`model_key` with a legacy `claude-cli/` provider as `anthropic/`."""
+    key = str(model_key or "")
+    if key.startswith(LEGACY_CLAUDE_CLI_PREFIX):
+        return ANTHROPIC_PREFIX + key[len(LEGACY_CLAUDE_CLI_PREFIX):]
+    return key
 
 
 def _honoured_thinking_ladder(ladder, model_key, runtime):
     """`ladder` as the run can honour it: on claude-cli, without the `off`
     Claude Code ignores for CLAUDE_CLI_THINKING_OFF_IGNORED."""
     if (ladder and THINKING_OFF in ladder and runtime == CLAUDE_CLI_RUNTIME
-            and str(model_key or "").rsplit("/", 1)[-1] in CLAUDE_CLI_THINKING_OFF_IGNORED):
+            and _off_ignored_on_claude_cli(model_key)):
         return [lv for lv in ladder if lv != THINKING_OFF]
     return ladder
+
+
+# The runtimes this process has recorded or read, by (state dir, model): the
+# describe of every waiting message's poll then reads and writes nothing.
+_model_runtimes_seen: dict = {}
+
+
+@contextlib.contextmanager
+def _model_runtimes(state_dir: str = ""):
+    """The runtimes file, read and written back under an flock: Open WebUI's
+    processes share it."""
+    path = os.path.join(_state_dir(state_dir), MODEL_RUNTIMES_NAME)
+    with open(path + ".lock", "a") as lock:
+        try:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        data = _read_json_file(path) or {}
+        before = dict(data)
+        yield data
+        if data != before:
+            _write_json_file(path, data)
 
 
 def _record_model_runtime(model_key, runtime, state_dir: str = "") -> None:
@@ -4688,20 +4744,31 @@ def _record_model_runtime(model_key, runtime, state_dir: str = "") -> None:
     describe has no session row to read it from. Best-effort."""
     if not model_key or not runtime:
         return
-    path = os.path.join(_state_dir(state_dir), MODEL_RUNTIMES_NAME)
-    with _LADDER_CACHE_LOCK:
-        current = _read_json_file(path) or {}
-        if current.get(model_key) == runtime:
-            return
-        _write_json_file(path, {**current, model_key: runtime})
+    seen = (_state_dir(state_dir), _standard_model_key(model_key))
+    if _model_runtimes_seen.get(seen) == runtime:
+        return
+    try:
+        with _model_runtimes(state_dir) as runtimes:
+            runtimes[seen[1]] = runtime
+        _model_runtimes_seen[seen] = runtime
+    except Exception as ex:
+        pipe_log(f"  recording the runtime of {model_key} failed: {ex!r}")
 
 
 def _read_model_runtime(model_key, state_dir: str = ""):
-    """The runtime last seen for `model_key`, or None."""
+    """The runtime of `model_key`: claude-cli for a legacy `claude-cli/` ref,
+    else the one last seen for it, or None."""
     if not model_key:
         return None
-    runtime = (_read_json_file(os.path.join(_state_dir(state_dir), MODEL_RUNTIMES_NAME)) or {}).get(model_key)
-    return runtime if isinstance(runtime, str) else None
+    if str(model_key).startswith(LEGACY_CLAUDE_CLI_PREFIX):
+        return CLAUDE_CLI_RUNTIME
+    seen = (_state_dir(state_dir), _standard_model_key(model_key))
+    if seen not in _model_runtimes_seen:
+        runtime = (_read_json_file(os.path.join(seen[0], MODEL_RUNTIMES_NAME)) or {}).get(seen[1])
+        if not isinstance(runtime, str):
+            return None  # not cached: another process may record it
+        _model_runtimes_seen[seen] = runtime
+    return _model_runtimes_seen[seen]
 
 
 def _owui_chat_send_params(
