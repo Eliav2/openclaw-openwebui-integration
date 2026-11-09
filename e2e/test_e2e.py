@@ -2932,6 +2932,17 @@ def _pipe_log_since(since: str) -> str:
     return out.stdout
 
 
+# The Gateway's startup trace line once restart recovery of sub-agents ended
+# (`startup phase: <name> <ms>ms total=...`, server-startup-trace).
+SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
+
+
+def _read_from(path: str, offset: int) -> str:
+    with open(path, errors="replace") as f:
+        f.seek(offset)
+        return f.read()
+
+
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
                     reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
 def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
@@ -2940,11 +2951,20 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     (ELI-176: the turn connected a socket of its own, which nothing read until
     the backoff ended, so the turn's first request timed out)."""
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    restart_log = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
+    offset = os.path.getsize(restart_log) if os.path.exists(restart_log) else 0
     # Down until the Pipe waits its longest backoff, so the Gateway is back
     # well before its next attempt.
     _kill_and_restart_gateway(15, while_down=lambda: _until(
         "the Pipe to wait 30 s before its next attempt",
         lambda: "reconnect in 30s" in _pipe_log_since(since), timeout_s=120))
+    # The relaunched Gateway recovers sub-agents an earlier test left. On
+    # OpenClaw 2026.10.5 a chat.send whose session read overlaps any write to
+    # the agent's database fails (SessionEntryChangedDuringReadError, run
+    # 42610236049); 2026.10.10 dropped that check. This test is about the
+    # Pipe's backoff, so it sends once that recovery has ended.
+    _until("the Gateway's sub-agent recovery to end", lambda: re.search(
+        SUBAGENT_RECOVERY_DONE, _read_from(restart_log, offset)), timeout_s=180)
     log = _pipe_log_since(since)
     assert log.rfind("reconnect in ") > log.rfind("Connected to Gateway (persistent)"), \
         "precondition: the Pipe reconnected before the message went out"
