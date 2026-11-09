@@ -11132,10 +11132,15 @@ def _history_later_turn(history: dict, run_id: str) -> bool:
 async def _await_steered_answer(conn, session_key: str, run_id: str, who: str, *,
                                 steered: bool = False, host: str | None = None) -> dict | None:
     """Wait for the transcript to hold the answer of the run `run_id`'s
-    message was steered into. The idle push can come before the Gateway stores
-    that answer, or commits the message. Ends on the answer, a failed run, or a
-    restart without the run, with the last transcript read (None if none).
-    `host`: the run it went into, when the steer was seen here."""
+    message was steered into. The run's terminal and its idle push can come
+    before the Gateway commits the message. Ends on the answer, a failed run,
+    or a restart without the run, with the last transcript read (None if none).
+    `host`: the run it went into, when the steer was seen here; then it also
+    ends once the session settled. A claude-cli run stops counting as active
+    only after it stored its answer (2026.10.10: `finishCliAttempt` awaits
+    Claude Code's flush and the closing copy before the run resolves, and
+    `deferredLifecycle.complete()` clears the active run after that), so the
+    settled transcript holds the answer if there is one."""
     restarts = conn.gateway_restarts
     while True:
         appended = conn.session_message_event(session_key)
