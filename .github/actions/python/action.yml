@@ -19,19 +19,25 @@ runs:
       env:
         PY: ${{ inputs.python-version }}
       run: |
-        if compgen -G "$RUNNER_TOOL_CACHE/Python/$PY.*/x64.complete" > /dev/null; then
+        # "3.10" is installed as 3.10.<patch>, an exact "3.10.22" as itself: match both.
+        if compgen -G "$RUNNER_TOOL_CACHE/Python/$PY/x64.complete" > /dev/null \
+          || compgen -G "$RUNNER_TOOL_CACHE/Python/$PY.*/x64.complete" > /dev/null; then
           echo "shipped=true" >> "$GITHUB_OUTPUT"
         else
           echo "shipped=false" >> "$GITHUB_OUTPUT"
         fi
-    # The key names the image, so a new image (new system libraries) builds its own entry.
+        # The runner image's identity (machine env, not in the `env` context): an interpreter
+        # built against one image's system libraries never restores onto another.
+        echo "key=python-$RUNNER_OS-$RUNNER_ARCH-$ImageOS-$ImageVersion-$PY" >> "$GITHUB_OUTPUT"
     - name: Restore Python ${{ inputs.python-version }}
       if: steps.image.outputs.shipped == 'false'
       id: restore
       uses: actions/cache/restore@v6
       with:
-        path: ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}.*
-        key: python-${{ runner.os }}-${{ env.ImageOS }}-${{ runner.arch }}-${{ inputs.python-version }}
+        path: |
+          ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}
+          ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}.*
+        key: ${{ steps.image.outputs.key }}
     - uses: actions/setup-python@v7
       with:
         python-version: ${{ inputs.python-version }}
@@ -39,5 +45,7 @@ runs:
       if: steps.image.outputs.shipped == 'false' && steps.restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:
-        path: ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}.*
-        key: python-${{ runner.os }}-${{ env.ImageOS }}-${{ runner.arch }}-${{ inputs.python-version }}
+        path: |
+          ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}
+          ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}.*
+        key: ${{ steps.image.outputs.key }}

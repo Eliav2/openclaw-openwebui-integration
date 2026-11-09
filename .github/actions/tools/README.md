@@ -14,7 +14,7 @@ it: nothing here updates on its own.
 | uv | `UV_VERSION` in `.github/actions/tools/action.yml` | **No.** Bump by hand. |
 | gitleaks | `GITLEAKS_VERSION` + `GITLEAKS_SHA256` in `.github/actions/tools/action.yml` | **No.** Bump by hand, both lines. |
 | actionlint | `ACTIONLINT_VERSION` + `ACTIONLINT_SHA256` in `.github/actions/tools/action.yml` | **No.** Bump by hand, both lines. |
-| Python 3.10 (not in the runner image) | the `python-version` matrix in `ci.yml`; the patch is whatever setup-python downloaded on the first miss for that runner image | **No.** A new runner image (the cache key names it) downloads the current 3.10.x once. |
+| Python 3.10 (not in the runner image) | the `python-version` matrix in `ci.yml`; the patch is whatever setup-python downloaded on the first miss for that runner image (the cache key carries ImageOS + ImageVersion) | **No.** A new runner image (the cache key names it) downloads the current 3.10.x once. |
 | The actions themselves (`setup-bun`, `setup-uv`, `setup-node`, `setup-python`, `cache`) | `uses:` refs in the workflows and `.github/actions/*` | **Yes**, the weekly `github-actions` group in `.github/dependabot.yml`. This bumps the action, not the tool version it installs. |
 
 ## How to bump
