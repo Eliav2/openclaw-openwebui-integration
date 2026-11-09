@@ -33,6 +33,8 @@ MAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty"
 MAP_HEIGHT_PX = 300
 MAP_LOAD_TIMEOUT_MS = 10000
 MAP_PADDING_PX = 36
+# Room under the stops for the attribution control.
+MAP_PADDING_BOTTOM_PX = 56
 MAP_MAX_ZOOM = 16
 MAP_SINGLE_STOP_ZOOM = 14
 MAP_COPIED_MS = 1500
@@ -43,7 +45,8 @@ _ITEM_CALL, _ITEM_CALL_OUTPUT = "function_call", "function_call_output"
 _MIN_LINE_POINTS = 2
 _SVG_WIDTH, _SVG_HEIGHT, _SVG_PAD = 600, 340, 34
 _SVG_MAX_ROUTE_POINTS = 400
-_SVG_STOP_RADIUS = 12
+_SVG_STOP_RADIUS = 20
+_SVG_STOP_FONT = 22
 _POLYLINE_FACTOR = 100000
 _POLYLINE_CHUNK_BITS = 5
 _POLYLINE_CHUNK_MASK = 0x1F
@@ -156,13 +159,13 @@ def _map_fallback_svg(stops: list[ResultStop], routes: list[GeometryRoute]) -> s
         step = max(1, len(line) // _SVG_MAX_ROUTE_POINTS)
         shown = line[::step] + ([line[-1]] if (len(line) - 1) % step else [])
         parts.append(f'<polyline points="{" ".join(at(*p) for p in shown)}" fill="none" '
-                     f'stroke="{_map_color(stops, route.get("group"))}" stroke-width="4" '
+                     f'stroke="{_map_color(stops, route.get("group"))}" stroke-width="7" '
                      f'stroke-linejoin="round" stroke-linecap="round" opacity=".8"/>')
     for s in stops:
         x, y = at(s["lat"], s["lon"]).split(",")
         parts.append(f'<circle cx="{x}" cy="{y}" r="{_SVG_STOP_RADIUS}" fill="{_map_color(stops, s.get("group"))}" '
                      f'stroke="#fff" stroke-width="2"/>'
-                     f'<text x="{x}" y="{y}" dy=".35em" text-anchor="middle" fill="#fff" font-size="13" '
+                     f'<text x="{x}" y="{y}" dy=".35em" text-anchor="middle" fill="#fff" font-size="{_SVG_STOP_FONT}" '
                      f'font-weight="700">{s["n"]}</text>')
     parts.append("</svg>")
     return "".join(parts)
@@ -275,12 +278,15 @@ _MAP_PAGE_JS = """
       if (data.stops.length === 1 && !data.routes.length) {
         map.jumpTo({center: [data.stops[0].lon, data.stops[0].lat], zoom: __SINGLE_ZOOM__});
       } else {
-        map.fitBounds(bounds, {padding: __PADDING__, maxZoom: __MAX_ZOOM__, duration: 0});
+        map.fitBounds(bounds, {padding: {top: __PADDING__, left: __PADDING__, right: __PADDING__, bottom: __PADDING_BOTTOM__}, maxZoom: __MAX_ZOOM__, duration: 0});
       }
       // The style can load while its tiles do not: the drawing goes only once the tiles are in.
       map.once('idle', function () {
         clearTimeout(giveUp);
         if (tileErrors || !map.areTilesLoaded()) { map.remove(); view.remove(); return; }
+        // The compact attribution opens on start and covers the map's foot until the first drag.
+        var attr = view.querySelector('.maplibregl-ctrl-attrib');
+        if (attr) { attr.classList.remove('maplibregl-compact-show'); attr.removeAttribute('open'); }
         view.style.visibility = 'visible';
         var fb = document.getElementById('fallback');
         if (fb) fb.style.display = 'none';
@@ -325,7 +331,7 @@ def _map_html(geo: MapGeometry) -> str:
             "routes": [{"polyline": r["polyline"], "color": r["color"]} for r in lines]}
     js = (_MAP_PAGE_JS.replace("__COPIED_MS__", str(MAP_COPIED_MS))
           .replace("__TIMEOUT_MS__", str(MAP_LOAD_TIMEOUT_MS)).replace("__SINGLE_ZOOM__", str(MAP_SINGLE_STOP_ZOOM))
-          .replace("__PADDING__", str(MAP_PADDING_PX)).replace("__MAX_ZOOM__", str(MAP_MAX_ZOOM)))
+          .replace("__PADDING_BOTTOM__", str(MAP_PADDING_BOTTOM_PX)).replace("__PADDING__", str(MAP_PADDING_PX)).replace("__MAX_ZOOM__", str(MAP_MAX_ZOOM)))
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
