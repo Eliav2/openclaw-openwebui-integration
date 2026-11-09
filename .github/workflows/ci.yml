@@ -24,15 +24,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10.3.3
+      # uv, Bun and actionlint at pinned versions from the Actions cache (.github/actions/tools).
+      - uses: ./.github/actions/tools
+        with:
+          uv: "true"
+          bun: "true"
+          actionlint: "true"
 
       - name: Ruff (correctness rules, see ruff.toml)
         run: uvx ruff@0.17.0 check --output-format github .
 
       - name: No new magic numbers or strings (Python, baseline in scripts/magic-baseline.json)
         run: python3 scripts/magic_baseline.py
-
-      - uses: oven-sh/setup-bun@v2
 
       - name: No new magic numbers or strings (JS and TS, baseline in scripts/lint-js)
         run: scripts/lint-js/run.sh
@@ -41,9 +44,7 @@ jobs:
         run: shellcheck e2e/*.sh scripts/screenshots/*.sh
 
       - name: Workflows (actionlint)
-        run: |
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color
+        run: actionlint -color
 
       - name: Gateway plugin parses
         run: |
@@ -68,14 +69,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
+      # 3.10 is not in the runner image: from the Actions cache, not a download per run.
+      - uses: ./.github/actions/python
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: astral-sh/setup-uv@v10.3.3
-
-      # Runs the vendored Open WebUI frontend reducer for the live-order tests.
-      - uses: oven-sh/setup-bun@v2
+      # uv, and Bun for the vendored Open WebUI frontend reducer (the live-order tests).
+      - uses: ./.github/actions/tools
+        with:
+          uv: "true"
+          bun: "true"
 
       - name: Install dependencies
         run: uv pip install --system -r requirements-dev.txt
@@ -132,14 +135,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: ./.github/actions/tools
+        with:
+          gitleaks: "true"
       - name: gitleaks (full history)
         # The whole history, every run: it takes about a second, and a
         # credential that once reached a public repo is leaked no matter which
         # commit removed it. This is a public repo.
-        run: |
-          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            | tar -xz gitleaks
-          ./gitleaks git --redact --verbose .
+        run: gitleaks git --redact --verbose .
 
   scope:
     # Whether the PR can change what runs. A docs, Markdown, tests/ or

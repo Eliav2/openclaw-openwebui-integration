@@ -49,12 +49,39 @@ runs:
         echo "openclaw@$OPENCLAW_VERSION needs Node $range"
         echo "range=$range" >> "$GITHUB_OUTPUT"
 
+    # The newest Node in the range, not whichever one the runner image happens
+    # to ship: resolved from nodejs.org's release index with npm's own semver,
+    # then that exact build comes from the Actions cache. setup-node with
+    # check-latest downloaded it from github.com/actions/node-versions releases
+    # in every E2E job, the same per-run download that returned 504s elsewhere.
+    - name: Resolve the newest Node in that range
+      id: nodever
+      shell: bash
+      env:
+        RANGE: ${{ steps.node.outputs.range }}
+      run: |
+        # npm's own copy of semver (npm/bin/npm-cli.js -> npm/node_modules/semver).
+        semver="$(dirname "$(readlink -f "$(command -v npm)")")/../node_modules/semver"
+        v=$(curl -fsSL https://nodejs.org/dist/index.json | node -e '
+          const semver = require(process.argv[1])
+          const all = JSON.parse(require("fs").readFileSync(0, "utf8")).map((r) => r.version)
+          const v = semver.maxSatisfying(all, process.argv[2])
+          if (!v) process.exit(1)
+          console.log(v.replace(/^v/, ""))
+        ' "$semver" "$RANGE")
+        echo "Node $v (newest in $RANGE)"
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Node ${{ steps.nodever.outputs.version }}
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.tool_cache }}/node/${{ steps.nodever.outputs.version }}
+        key: node-${{ runner.os }}-${{ runner.arch }}-${{ steps.nodever.outputs.version }}
+
+    # An exact version already in the tool cache is used without a download.
     - uses: actions/setup-node@v7
       with:
-        node-version: ${{ steps.node.outputs.range }}
-        # The newest Node in the range, not whichever one the runner image
-        # happens to cache.
-        check-latest: true
+        node-version: ${{ steps.nodever.outputs.version }}
 
     # npm's download cache for the openclaw install, keyed on the exact version
     # (e2e/versions.env; a calendar version, 2026.x). A moving spec such as
@@ -86,7 +113,9 @@ runs:
       with:
         python-version: "3.11"
 
-    - uses: astral-sh/setup-uv@v10.3.3
+    - uses: ./.github/actions/tools
+      with:
+        uv: "true"
 
     - name: Start the stack and install the integration
       shell: bash

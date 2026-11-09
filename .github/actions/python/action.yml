@@ -1,0 +1,43 @@
+name: Python, from the image or the Actions cache
+description: >
+  actions/setup-python, but a version the runner image does not ship (3.10 on ubuntu 26.04) is
+  restored from the Actions cache instead of downloaded from github.com/actions/python-versions
+  releases on every run (a 504 there failed Unit py3.10). setup-python uses a version it finds in
+  the runner's tool cache without a download; a version the image ships is not cached at all.
+
+inputs:
+  python-version:
+    description: As for actions/setup-python ("3.10", "3.11", ...).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Is Python ${{ inputs.python-version }} in the image?
+      id: image
+      shell: bash
+      env:
+        PY: ${{ inputs.python-version }}
+      run: |
+        if compgen -G "$RUNNER_TOOL_CACHE/Python/$PY.*/x64.complete" > /dev/null; then
+          echo "shipped=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "shipped=false" >> "$GITHUB_OUTPUT"
+        fi
+    # The key names the image, so a new image (new system libraries) builds its own entry.
+    - name: Restore Python ${{ inputs.python-version }}
+      if: steps.image.outputs.shipped == 'false'
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}.*
+        key: python-${{ runner.os }}-${{ env.ImageOS }}-${{ runner.arch }}-${{ inputs.python-version }}
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Save Python ${{ inputs.python-version }} (downloaded this run)
+      if: steps.image.outputs.shipped == 'false' && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.tool_cache }}/Python/${{ inputs.python-version }}.*
+        key: python-${{ runner.os }}-${{ env.ImageOS }}-${{ runner.arch }}-${{ inputs.python-version }}
