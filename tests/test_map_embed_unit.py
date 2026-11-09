@@ -87,6 +87,11 @@ class MapScriptTests(unittest.TestCase):
         self.assertIn("areTilesLoaded()", js)
         self.assertIn("tileErrors", js)
 
+    def test_the_attribution_does_not_cover_the_foot_of_the_map(self):
+        js = self.js()
+        self.assertIn("maplibregl-compact-show", js)
+        self.assertIn("bottom:", js)
+
 
 class GeneratedTypesTests(unittest.TestCase):
     def test_the_types_load_on_python_3_10(self):
