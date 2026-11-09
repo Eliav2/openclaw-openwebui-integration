@@ -68,7 +68,32 @@ class MapIdsTests(unittest.TestCase):
         self.assertEqual(ocp._map_ids(out), [MAP_ID, other])
 
 
+class MapScriptTests(unittest.TestCase):
+    """The page script cannot run here (no browser): what it must do is pinned in its text, and
+    the browser tests in e2e/test_browser_flows.py run it."""
+
+    def js(self):
+        h = ocp._map_html(geometry())
+        return h[h.rindex("<script>"):]
+
+    def test_a_map_that_does_not_load_in_time_is_disposed_and_the_drawing_stays(self):
+        js = self.js()
+        self.assertIn("map.remove()", js)
+        self.assertNotIn("fb.style.display = 'none'", js[:js.index("'idle'")])
+
+    def test_the_drawing_is_hidden_only_when_the_first_tiles_are_in(self):
+        js = self.js()
+        self.assertIn("map.once('idle'", js)
+        self.assertIn("areTilesLoaded()", js)
+        self.assertIn("tileErrors", js)
+
+
 class GeneratedTypesTests(unittest.TestCase):
+    def test_the_types_load_on_python_3_10(self):
+        text = (Path(__file__).resolve().parent.parent / "src" / "openclaw_pipe_pkg" / "mapspec.py").read_text()
+        self.assertNotIn("from typing import Literal, NotRequired", text)
+        self.assertIn("from typing_extensions import", text)
+
     def test_the_types_are_generated_from_the_schema_copy_in_the_repo(self):
         root = Path(__file__).resolve().parent.parent
         digest = hashlib.sha256((root / "schemas" / "map-spec.schema.json").read_bytes()).hexdigest()
@@ -157,6 +182,22 @@ class MapHtmlTests(unittest.TestCase):
         self.assertNotIn("a </script>", h)
 
 
+class EmbedListTests(unittest.IsolatedAsyncioTestCase):
+    def test_saved_embeds_stay_and_new_pages_follow_without_a_repeat(self):
+        self.assertEqual(ocp._merge_embeds(["https://live", "<old>"], ["<old>", "<new>"]),
+                         ["https://live", "<old>", "<new>"])
+        self.assertEqual(ocp._merge_embeds(None, ["<new>"]), ["<new>"])
+
+    async def test_fields_for_a_rebuilt_reply_carry_its_map_and_what_was_saved(self):
+        conn = FakeConn({MAP_ID: geometry()})
+        fields = await ocp._embed_fields(conn, card("map", "c1", result_text()), ["https://live"])
+        self.assertEqual(fields["embeds"][0], "https://live")
+        self.assertEqual(len(fields["embeds"]), 2)
+
+    async def test_no_map_no_fields(self):
+        self.assertEqual(await ocp._embed_fields(FakeConn({}), card("exec", "c1", "x"), ["https://live"]), {})
+
+
 class FakeConn:
     def __init__(self, replies):
         self.replies, self.calls = replies, []
@@ -210,6 +251,7 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
                             run_id="run-1", message_id="m1")
         w.renderer.output = output
         w._map_seen = {MAP_ID: "<html>map</html>"} if seen is None else seen
+        w._saved_embeds = mock.AsyncMock(return_value=[])
         return w
 
     async def test_every_write_of_the_message_carries_the_embed(self):
@@ -246,6 +288,7 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
             await w._push_final("text", w.renderer.output, [])
         self.assertIn("<html>map</html>", json.dumps(pushed))
 
+    @mock.patch.object(ocp, "_owui_upsert_message", mock.AsyncMock(return_value={"id": "m1"}))
     async def test_a_map_is_fetched_before_the_final_write_and_shown_to_the_open_tab(self):
         w = self.writer(card("map", "c1", result_text()), seen={})
         w.conn.send_request = mock.AsyncMock(return_value=geometry())
@@ -260,6 +303,47 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(emitted[0]["data"]["embeds"]), 1)
         self.assertEqual(w.conn.send_request.await_count, 1)
 
+    async def test_saved_embeds_are_kept_when_the_writer_writes_the_list(self):
+        saved = []
+
+        async def upsert(chat_id, message_id, fields):
+            saved.append(fields)
+            return {"id": message_id}
+        w = self.writer(card("map", "c1", result_text()))
+        w._saved_embeds = mock.AsyncMock(return_value=["https://live", "<old map>"])
+        with mock.patch.object(ocp, "_owui_upsert_message", upsert):
+            await w._persist(done=True)
+        self.assertEqual(saved[0]["embeds"], ["https://live", "<old map>", "<html>map</html>"])
+
+    async def test_a_failed_embed_emission_is_logged_and_tried_again_not_raised(self):
+        w = self.writer(card("map", "c1", result_text()), seen={})
+        w.conn.send_request = mock.AsyncMock(return_value=geometry())
+        w._saved_embeds = mock.AsyncMock(return_value=[])
+        calls = []
+
+        async def emit(event):
+            calls.append(event)
+            if len(calls) == 1:
+                raise RuntimeError("socket gone")
+        w._emit = emit
+        with mock.patch.object(ocp, "_owui_upsert_message", mock.AsyncMock(return_value={"id": "m1"})):
+            await w._show_maps()
+            await w._show_maps()
+        self.assertEqual(len(calls), 2)
+
+    async def test_a_map_in_a_running_reply_is_saved_at_once_so_a_reload_shows_it(self):
+        w = self.writer(card("map", "c1", result_text()), seen={})
+        w.conn.send_request = mock.AsyncMock(return_value=geometry())
+        w._saved_embeds = mock.AsyncMock(return_value=[])
+        w._emit = mock.AsyncMock()
+        upsert = mock.AsyncMock(return_value={"id": "m1"})
+        with mock.patch.object(ocp, "_owui_upsert_message", upsert):
+            await w._show_maps()
+        (chat_id, message_id, fields), _ = upsert.call_args
+        self.assertEqual((chat_id, message_id, list(fields)), ("c1", "m1", ["embeds"]))
+        self.assertEqual(len(fields["embeds"]), 1)
+
+    @mock.patch.object(ocp, "_owui_upsert_message", mock.AsyncMock(return_value={"id": "m1"}))
     async def test_a_second_map_sends_the_whole_list_because_a_tab_replaces_its_embeds(self):
         other = "fedcba9876543210"
         w = self.writer(card("map", "c1", result_text()), seen={})
@@ -293,7 +377,7 @@ class InlineReplyTests(unittest.IsolatedAsyncioTestCase):
         await T.InlineOwnerRuleTests.asyncSetUp(self)
         self.requests = []
 
-        harness_request = self.conn.send_request
+        harness_request = self.harness_request = self.conn.send_request
 
         async def send_request(method, params, timeout=10):
             if method != "map.get":
@@ -326,6 +410,32 @@ class InlineReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(data["embeds"]), 1)
         self.assertIn("Fushimi Inari", data["embeds"][0])
         self.assertEqual(self.requests, [("map.get", {"mapId": MAP_ID})])
+
+    async def test_a_map_the_gateway_could_not_give_at_first_is_added_when_the_reply_ends(self):
+        answers = [RuntimeError("busy"), geometry()]
+
+        async def flaky(method, params, timeout=10):
+            if method != "map.get":
+                return await self.harness_request(method, params, timeout)
+            reply = answers.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        self.conn.send_request = flaky
+        await self._turn(self._tool("start", "map", "t1"), self._tool("result", "map", "t1", result_text()),
+                         self._final("run-1"))
+        (data,) = self.embeds()
+        self.assertEqual(len(data["embeds"]), 1)
+
+    async def test_the_live_view_stays_in_the_list_when_a_map_follows(self):
+        self.pipe.valves.LIVE_VIEW_URL = "https://replay.example/embed?chat={chat_id}&message={message_id}"
+        await self._turn(self._tool("start", "browser", "t1"), self._tool("result", "browser", "t1"),
+                         self._tool("start", "map", "t2"), self._tool("result", "map", "t2", result_text()),
+                         self._final("run-1"))
+        last = self.embeds()[-1]["embeds"]
+        self.assertTrue(last[0].startswith("https://replay.example/embed"))
+        self.assertEqual(len(last), 2)
+        self.assertTrue(self.embeds()[0]["replace"])
 
     async def test_other_tools_add_no_embed_and_make_no_request(self):
         await self._turn(self._tool("start", "exec", "t1"), self._tool("result", "exec", "t1", "ok"),

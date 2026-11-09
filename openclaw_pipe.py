@@ -8642,7 +8642,7 @@ async def _list_all_sessions(conn, *, timeout: float = 30, **filters) -> dict:
 
 
 # --- mapspec ---------------------------------------------------------------
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from typing_extensions import Literal, NotRequired, TypeAlias, TypedDict
 
 
 Mode: TypeAlias = Literal['walk', 'bike', 'drive']
@@ -8974,9 +8974,11 @@ _MAP_PAGE_JS = """
       map = new maplibregl.Map({container: view, style: data.style, cooperativeGestures: true,
                                 attributionControl: {compact: true}});
     } catch (e) { view.remove(); return; }
-    var giveUp = setTimeout(function () { view.remove(); }, __TIMEOUT_MS__);
+    var tileErrors = 0;
+    // No map in time: dispose it (it holds a WebGL context) and keep the drawing.
+    var giveUp = setTimeout(function () { map.remove(); view.remove(); }, __TIMEOUT_MS__);
+    map.on('error', function (e) { if (e && e.sourceId) tileErrors++; });
     map.on('load', function () {
-      clearTimeout(giveUp);
       var bounds = new maplibregl.LngLatBounds();
       data.routes.forEach(function (r, k) {
         var line = decode(r.polyline);
@@ -8996,10 +8998,15 @@ _MAP_PAGE_JS = """
       } else {
         map.fitBounds(bounds, {padding: __PADDING__, maxZoom: __MAX_ZOOM__, duration: 0});
       }
-      view.style.visibility = 'visible';
-      var fb = document.getElementById('fallback');
-      if (fb) fb.style.display = 'none';
-      tell();
+      // The style can load while its tiles do not: the drawing goes only once the tiles are in.
+      map.once('idle', function () {
+        clearTimeout(giveUp);
+        if (tileErrors || !map.areTilesLoaded()) { map.remove(); view.remove(); return; }
+        view.style.visibility = 'visible';
+        var fb = document.getElementById('fallback');
+        if (fb) fb.style.display = 'none';
+        tell();
+      });
     });
   }
   start();
@@ -9055,6 +9062,20 @@ def _map_html(geo: MapGeometry) -> str:
         f'<script type="application/json" id="data">{_json_for_script(data)}</script>'
         f'<script src="{MAPLIBRE_JS_URL}" integrity="{MAPLIBRE_JS_SRI}" crossorigin="anonymous" async id="lib"></script>'
         f'<script>{js}</script></body></html>')
+
+
+def _merge_embeds(saved, pages: list[str]) -> list[str]:
+    """What a message's `embeds` holds after a write: the embeds it already had (a live view, a map
+    the Gateway no longer has), then the pages not among them. A tab replaces its list with an
+    event's, so a write and an event carry this whole list."""
+    kept = [e for e in saved or [] if isinstance(e, str)]
+    return kept + [p for p in pages if p not in kept]
+
+
+async def _embed_fields(conn, output: list, saved) -> dict:
+    """`embeds` for a message rebuilt from the transcript, or nothing when it has no map."""
+    pages = await _map_embeds(conn, output, {})
+    return {"embeds": _merge_embeds(saved, pages)} if pages else {}
 
 
 async def _map_embeds(conn, output, seen: dict) -> list[str]:
@@ -9787,11 +9808,14 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
             # The Pipe's own notes are in no transcript (ELI-229).
             _keep_pipe_notes(list(message.get("output") or []), part)
             text, output = part.text.strip(), part.finished_output()
+            maps = await _embed_fields(conn, output, message.get("embeds"))
             async with conn._chat_write_lock(ref["chat_id"]):
                 await _owui_upsert_message(ref["chat_id"], ref["message_id"],
-                                           {"content": text, "output": output, "done": True})
+                                           {"content": text, "output": output, "done": True, **maps})
             emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": ref["message_id"],
                                             "user_id": user_id}, update_db=False)
+            if maps:
+                await emit({"type": "embeds", "data": {**maps, "replace": True}})
             await emit({"type": "chat:completion", "data": {"done": True, "content": text, "output": output}})
             pipe_log(f"  reply {ref['message_id'][:8]}... settled from the transcript around a steer")
     except Exception as ex:
@@ -10192,21 +10216,43 @@ class _TurnWriter:
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
 
+    async def _saved_embeds(self) -> list:
+        """The `embeds` M holds in the DB: a live view, or a map from before a takeover."""
+        from open_webui.models.chats import Chats
+        try:
+            saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+        except Exception as ex:
+            pipe_log(f"  turn writer: reading M's embeds failed: {ex!r}")
+            return []
+        return saved.get("embeds") or []
+
     def _map_pages(self, output: list) -> list[str]:
         """The pages of the maps in `output` that were fetched."""
         return [self._map_seen[i] for i in _map_ids(output) if self._map_seen.get(i)]
 
+    async def _embed_list(self, output: list) -> list[str]:
+        """M's whole `embeds`: what it holds, then this reply's map pages."""
+        return _merge_embeds(await self._saved_embeds(), self._map_pages(output))
+
     async def _show_maps(self) -> None:
-        """Fetch the reply's maps and show open tabs all of them when one is new. A tab's
-        `embeds` event replaces its list, so it carries the whole list. update_db=False means
-        Open WebUI saves nothing of the event: `_persist` writes the pages."""
+        """Fetch the reply's maps; when one is new, show open tabs the whole list and save it in M,
+        so a reload mid-reply shows it too. A tab replaces its `embeds` with an event's, and
+        update_db=False means Open WebUI saves nothing of the event. A failure leaves the map new,
+        for the next event to try again."""
         await _map_embeds(self.conn, self.renderer.output, self._map_seen)
         ids = [i for i in _map_ids(self.renderer.output) if self._map_seen.get(i)]
         if all(i in self._maps_shown for i in ids):
             return
-        emit = await self._emitter()
-        async with self._emit_lock:
-            await emit({"type": "embeds", "data": {"embeds": [self._map_seen[i] for i in ids], "replace": True}})
+        try:
+            embeds = await self._embed_list(self.renderer.output)
+            emit = await self._emitter()
+            async with self._emit_lock:
+                await emit({"type": "embeds", "data": {"embeds": embeds, "replace": True}})
+            async with self.conn._chat_write_lock(self.chat_id):
+                await _owui_upsert_message(self.chat_id, self.message_id, {"embeds": embeds})
+        except Exception as ex:
+            pipe_log(f"  turn writer: map embed of {self.message_id[:8]}... failed: {ex!r}")
+            return
         self._maps_shown.update(ids)
 
     def _introduced(self) -> bool:
@@ -10297,9 +10343,8 @@ class _TurnWriter:
                    "done": done}
         if status_history is not None:
             message["statusHistory"] = status_history
-        pages = self._map_pages(message["output"])
-        if pages:
-            message["embeds"] = pages
+        if self._map_pages(message["output"]):
+            message["embeds"] = await self._embed_list(message["output"])
         try:
             row = await _owui_upsert_message(self.chat_id, self.message_id, message)
         except Exception as ex:
@@ -10358,7 +10403,7 @@ class _TurnWriter:
                    "content": text, "output": output, "done": True, "statusHistory": status_history}
         pages = self._map_pages(output)
         if pages:
-            message["embeds"] = pages
+            message["embeds"] = _merge_embeds(message.get("embeds"), pages)
         new = self._introduced()
         try:
             await _introduce_turn_message(
@@ -12295,7 +12340,8 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         if rendered.output:
             output = rendered.finished_output()
             text = rendered.text.strip()
-            fields.update(content=text, output=output)
+            fields.update(content=text, output=output,
+                          **await _embed_fields(conn, output, stub.get("embeds")))
     elif not has_content:
         rendered = _TurnRenderer()
         rendered._add_text(ORPHAN_STUB_NOTE)
@@ -12498,6 +12544,7 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             runs=runs, messages=messages, rendered=rendered)
         if not output:
             continue
+        maps = await _embed_fields(conn, output, None)
         async with conn._chat_write_lock(chat_id):
             chat = await Chats.get_chat_by_id(chat_id)
             msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
@@ -12511,14 +12558,19 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             held_text = _coerce_text(current.get("content")).strip()
             if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
                 continue  # holds as much as the transcript: never rewritten
+            if maps:
+                maps = {"embeds": _merge_embeds(current.get("embeds"), maps["embeds"])}
             if await _owui_upsert_message(
-                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
+                    chat_id, mid, {"content": text, "output": output, "done": True, **maps}) is None:
                 pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
                          "Open WebUI did not save the write (ELI-94)")
                 continue
             conn.mark_delivered_live(session_key, run)
         await _relay_emit_event(chat.user_id, chat_id, mid,
                                 {"type": "chat:completion", "data": {"output": output}})
+        if maps:
+            await _relay_emit_event(chat.user_id, chat_id, mid,
+                                    {"type": "embeds", "data": {**maps, "replace": True}})
         if getattr(conn._valves(), "PUBLISH_CHAT_FINISHED", False):
             await _publish_chat_finished(chat_id, mid, chat.user_id)
         pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "
@@ -16121,6 +16173,7 @@ class _PipeTurn:
         self.images_made = 0
         # The reply's maps: page by map id, and the ids the chat was shown (`show_maps`).
         self.map_pages: dict = {}
+        self.live_view_embed: str | None = None
         self.maps_shown: set[str] = set()
         # Paths the reply named: the Gateway stores each as an image block after
         # the final (ELI-328).
@@ -16298,6 +16351,7 @@ class _PipeTurn:
                         yield chunk
                     async for chunk in self.close_open_cards():
                         yield chunk
+                    await self.show_maps()
 
         finally:
             if all(live_key) and _live_replies().get(live_key) is self.renderer:
@@ -17235,20 +17289,28 @@ class _PipeTurn:
 
     async def show_maps(self):
         """Embed the reply's maps once each. The chat replaces its embeds list with an
-        event's, so the event carries all of them; with Open WebUI's own emitter it also
-        saves them, so a reload shows the map."""
+        event's, so the event carries the whole list; with Open WebUI's own emitter it also
+        saves it, so a reload shows the map. A map that could not be fetched is tried again
+        by the next call (the reply's end makes the last one)."""
         if not self.__event_emitter__:
             return
         await _map_embeds(self.conn, self.renderer.output, self.map_pages)
         ids = [i for i in _map_ids(self.renderer.output) if self.map_pages.get(i)]
         if all(i in self.maps_shown for i in ids):
             return
-        try:
-            await self.__event_emitter__({"type": "embeds", "data": {
-                "embeds": [self.map_pages[i] for i in ids], "replace": True}})
+        if await self.emit_embeds():
             self.maps_shown.update(ids)
+
+    async def emit_embeds(self) -> bool:
+        """The reply's whole `embeds` (the live view, then its maps) to the chat."""
+        pages = [self.map_pages[i] for i in _map_ids(self.renderer.output) if self.map_pages.get(i)]
+        embeds = ([self.live_view_embed] if self.live_view_embed else []) + pages
+        try:
+            await self.__event_emitter__({"type": "embeds", "data": {"embeds": embeds, "replace": True}})
         except Exception as ex:
-            pipe_log(f"  map embed failed: {ex!r}")
+            pipe_log(f"  embeds failed: {ex!r}")
+            return False
+        return True
 
     async def maybe_show_live_view(self, tool_name, args):
         """Embed LIVE_VIEW_URL once, at the first browser tool call."""
@@ -17262,11 +17324,9 @@ class _PipeTurn:
         if not url:
             return
         self.live_view_shown = True
-        try:
-            await self.__event_emitter__({"type": "embeds", "data": {"embeds": [url]}})
+        self.live_view_embed = url
+        if await self.emit_embeds():
             pipe_log(f"  live view embed added: {url}")
-        except Exception as ex:
-            pipe_log(f"  live view embed failed: {ex!r}")
 
     async def show_text(self, text: str):
         """New run text through the reply's text hooks: held while it may open
