@@ -253,9 +253,11 @@ _MAP_PAGE_JS = """
       map = new maplibregl.Map({container: view, style: data.style, cooperativeGestures: true,
                                 attributionControl: {compact: true}});
     } catch (e) { view.remove(); return; }
-    var giveUp = setTimeout(function () { view.remove(); }, __TIMEOUT_MS__);
+    var tileErrors = 0;
+    // No map in time: dispose it (it holds a WebGL context) and keep the drawing.
+    var giveUp = setTimeout(function () { map.remove(); view.remove(); }, __TIMEOUT_MS__);
+    map.on('error', function (e) { if (e && e.sourceId) tileErrors++; });
     map.on('load', function () {
-      clearTimeout(giveUp);
       var bounds = new maplibregl.LngLatBounds();
       data.routes.forEach(function (r, k) {
         var line = decode(r.polyline);
@@ -275,10 +277,15 @@ _MAP_PAGE_JS = """
       } else {
         map.fitBounds(bounds, {padding: __PADDING__, maxZoom: __MAX_ZOOM__, duration: 0});
       }
-      view.style.visibility = 'visible';
-      var fb = document.getElementById('fallback');
-      if (fb) fb.style.display = 'none';
-      tell();
+      // The style can load while its tiles do not: the drawing goes only once the tiles are in.
+      map.once('idle', function () {
+        clearTimeout(giveUp);
+        if (tileErrors || !map.areTilesLoaded()) { map.remove(); view.remove(); return; }
+        view.style.visibility = 'visible';
+        var fb = document.getElementById('fallback');
+        if (fb) fb.style.display = 'none';
+        tell();
+      });
     });
   }
   start();
@@ -334,6 +341,20 @@ def _map_html(geo: MapGeometry) -> str:
         f'<script type="application/json" id="data">{_json_for_script(data)}</script>'
         f'<script src="{MAPLIBRE_JS_URL}" integrity="{MAPLIBRE_JS_SRI}" crossorigin="anonymous" async id="lib"></script>'
         f'<script>{js}</script></body></html>')
+
+
+def _merge_embeds(saved, pages: list[str]) -> list[str]:
+    """What a message's `embeds` holds after a write: the embeds it already had (a live view, a map
+    the Gateway no longer has), then the pages not among them. A tab replaces its list with an
+    event's, so a write and an event carry this whole list."""
+    kept = [e for e in saved or [] if isinstance(e, str)]
+    return kept + [p for p in pages if p not in kept]
+
+
+async def _embed_fields(conn, output: list, saved) -> dict:
+    """`embeds` for a message rebuilt from the transcript, or nothing when it has no map."""
+    pages = await _map_embeds(conn, output, {})
+    return {"embeds": _merge_embeds(saved, pages)} if pages else {}
 
 
 async def _map_embeds(conn, output, seen: dict) -> list[str]:
