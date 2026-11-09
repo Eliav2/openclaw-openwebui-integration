@@ -27,7 +27,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-from _test_helpers import FakeSio, RecordingEmitter, fake_owui, owui_modules  # noqa: E402
+from _test_helpers import FakeSio, RecordingEmitter, fake_owui, owui_modules, run_on_virtual_clock  # noqa: E402
 from _paged_sessions import PagedSessions, crowd  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
@@ -4493,60 +4493,134 @@ class TickWatchTests(unittest.IsolatedAsyncioTestCase):
     """The Gateway ticks every `policy.tickIntervalMs` (30 s) and its own client closes after twice
     that with no frame. A half-open socket never closes on its own, so the pipe does the same."""
 
+    # The watchdog tests run on a virtual clock (VirtualClockLoop): a tick, the 2x interval window and the reconnect are ordered by the
+    # loop's own timers, which move only when every task is idle, so a slow or CPU-starved runner cannot make a tick "late".
+    TICK_S = 0.05                    # the interval the Gateway told us; the watchdog closes after twice that with no frame
+    TICK_GAP_S = 0.03                # a tick arrives this long after the previous one: inside the window
+
     def conn(self):
         conn = _GatewayConnection(lambda: None)
         conn._max_backoff = 0
-        conn._tick_interval_s = 0.05
+        conn._tick_interval_s = self.TICK_S
         return conn
 
-    async def test_a_silent_socket_is_closed_and_replaced_after_two_tick_intervals(self):
-        conn = self.conn()
-        aborted, reconnects = [], []
+    def test_a_silent_socket_is_closed_and_replaced_after_two_tick_intervals(self):
+        async def scenario():
+            conn = self.conn()
+            loop = asyncio.get_running_loop()
+            aborted, reconnects = [], []
 
-        class HalfOpen:
-            transport = types.SimpleNamespace(abort=lambda: aborted.append(True))
+            class HalfOpen:
+                transport = types.SimpleNamespace(abort=lambda: aborted.append(True))
 
-            async def recv(self):
-                await asyncio.sleep(3600)
+                async def recv(self):
+                    await asyncio.sleep(3600)
 
-        class Fresh:
-            async def recv(self):
-                conn._stopped = True
-                raise websockets.exceptions.ConnectionClosed("closed")
+            class Fresh:
+                async def recv(self):
+                    conn._stopped = True
+                    raise websockets.exceptions.ConnectionClosed("closed")
 
-        async def connect_and_start():
-            reconnects.append(time.monotonic())
-            conn._ws = Fresh()
-        conn._connect_and_start = connect_and_start
-        conn._ws = HalfOpen()
-        gaps = []
-        conn._mark_event_gap = lambda: gaps.append(True)
-        t0 = time.monotonic()
-        await asyncio.wait_for(conn._event_loop(), 5)
-        self.assertEqual(len(reconnects), 1, "one new socket")
-        self.assertGreaterEqual(reconnects[0] - t0, 0.1, "not before two intervals")
-        self.assertEqual(aborted, [True], "the dead socket is torn down")
-        self.assertTrue(gaps, "runs learn their events may be lost")
+            async def connect_and_start():
+                reconnects.append(loop.time())
+                conn._ws = Fresh()
+            conn._connect_and_start = connect_and_start
+            conn._ws = HalfOpen()
+            gaps = []
+            conn._mark_event_gap = lambda: gaps.append(True)
+            t0 = loop.time()
+            await asyncio.wait_for(conn._event_loop(), 5)
+            self.assertEqual(len(reconnects), 1, "one new socket")
+            self.assertAlmostEqual(reconnects[0] - t0, 2 * self.TICK_S, places=6, msg="exactly two intervals after the last frame")
+            self.assertEqual(aborted, [True], "the dead socket is torn down")
+            self.assertTrue(gaps, "runs learn their events may be lost")
+        run_on_virtual_clock(scenario())
 
-    async def test_ticks_keep_a_quiet_socket(self):
-        conn = self.conn()
-        n = {"recv": 0}
+    def _ticking(self, conn, ticks, gap_s, after_ticks):
+        """A socket that delivers `ticks` ticks `gap_s` apart and then does `after_ticks(conn)`; returns the log of (recv number, loop time)."""
+        loop = asyncio.get_running_loop()
+        seen = []
 
         class Ticking:
             async def recv(self):
-                n["recv"] += 1
-                if n["recv"] > 8:
+                if len(seen) >= ticks:
+                    return await after_ticks()
+                await asyncio.sleep(gap_s)
+                seen.append(loop.time())
+                return json.dumps({"type": "event", "event": "tick", "payload": {"ts": len(seen)}})
+        return Ticking(), seen
+
+    def test_ticks_keep_a_quiet_socket(self):
+        """Each frame restarts the window: a socket whose only traffic is ticks, for far longer than one window in total, is never replaced."""
+        ticks = 40
+
+        async def scenario():
+            conn = self.conn()
+
+            async def end():
+                conn._stopped = True
+                raise websockets.exceptions.ConnectionClosed("closed")
+
+            async def connect_and_start():
+                raise AssertionError("a ticking socket was replaced")
+            conn._connect_and_start = connect_and_start
+            conn._ws, seen = self._ticking(conn, ticks, self.TICK_GAP_S, end)
+            await asyncio.wait_for(conn._event_loop(), 5)
+            self.assertEqual(len(seen), ticks)
+            self.assertGreater(seen[-1], 10 * 2 * self.TICK_S, "the ticks spanned many windows")
+        run_on_virtual_clock(scenario())
+
+    def test_a_socket_that_stops_ticking_is_replaced_two_intervals_after_its_last_tick(self):
+        async def scenario():
+            conn = self.conn()
+            loop = asyncio.get_running_loop()
+            replaced = []
+
+            async def go_quiet():
+                await asyncio.sleep(3600)
+
+            class Fresh:
+                async def recv(self):
                     conn._stopped = True
                     raise websockets.exceptions.ConnectionClosed("closed")
-                await asyncio.sleep(0.03)
-                return json.dumps({"type": "event", "event": "tick", "payload": {"ts": 1}})
 
-        async def connect_and_start():
-            raise AssertionError("a ticking socket was replaced")
-        conn._connect_and_start = connect_and_start
-        conn._ws = Ticking()
-        await asyncio.wait_for(conn._event_loop(), 5)
-        self.assertGreater(n["recv"], 8)
+            async def connect_and_start():
+                replaced.append(loop.time())
+                conn._ws = Fresh()
+            conn._connect_and_start = connect_and_start
+            conn._ws, seen = self._ticking(conn, 5, self.TICK_GAP_S, go_quiet)
+            await asyncio.wait_for(conn._event_loop(), 5)
+            self.assertEqual(len(replaced), 1)
+            self.assertAlmostEqual(replaced[0] - seen[-1], 2 * self.TICK_S, places=6)
+        run_on_virtual_clock(scenario())
+
+    def test_a_starved_runner_cannot_make_a_tick_late(self):
+        """Real time is not the watchdog's clock: every recv here burns more REAL time than the whole window (a CPU-starved runner), and the
+        socket is still kept, because on the loop's clock each tick is still inside it."""
+        burn_s = 4 * 2 * self.TICK_S
+
+        async def scenario():
+            conn = self.conn()
+            ws_ticks = 3
+
+            async def end():
+                conn._stopped = True
+                raise websockets.exceptions.ConnectionClosed("closed")
+
+            async def connect_and_start():
+                raise AssertionError("a runner stall replaced a ticking socket")
+            conn._connect_and_start = connect_and_start
+            ws, seen = self._ticking(conn, ws_ticks, self.TICK_GAP_S, end)
+            recv = ws.recv
+
+            async def starved():
+                time.sleep(burn_s)                     # blocks the loop for real, as a starved runner does
+                return await recv()
+            ws.recv = starved
+            conn._ws = ws
+            await asyncio.wait_for(conn._event_loop(), 5)
+            self.assertEqual(len(seen), ws_ticks)
+        run_on_virtual_clock(scenario())
 
     async def test_hello_sets_the_interval(self):
         conn = _GatewayConnection(lambda: types.SimpleNamespace(
