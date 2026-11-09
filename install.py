@@ -519,23 +519,21 @@ def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
 
 
 # --------------------------------------------------------------------------
-# One installer core for the three Functions (ELI-146)
+# One installer core for the two Functions (ELI-146)
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class FunctionSpec:
     """One Open WebUI Function this repo installs. The Pipe's installer is the
-    rest of this file; install_action.py and install_filter.py are a spec each
-    plus their own steps, run by `function_cli`."""
+    rest of this file; install_action.py is a spec plus its own steps, run by
+    `function_cli`."""
     id: str
     name: str
-    type: str                      # "pipe", "action" or "filter"
-    label: str                     # "Pipe", "Action", "Filter" in messages
+    type: str                      # "pipe" or "action"
+    label: str                     # "Pipe", "Action" in messages
     description: str
     artifact: Path | None = None   # the Pipe resolves its own (it may need fetching, no clone)
-    build_artifact: str = ""       # build.py's artifact object ("ACTION", "FILTER")
-    global_: bool = True           # made global; False: left per-model, warned if global
-    global_warning: str = ""
+    build_artifact: str = ""       # build.py's artifact object ("ACTION")
     valves: Callable | None = None         # (client): after create/update
     smoke: Callable | None = None          # (client) -> bool, after the content check
     status_checks: Callable | None = None  # (client) -> {field: must-be-true}
@@ -573,8 +571,7 @@ def deploy_function_code(client: OwuiClient, spec: FunctionSpec, code: str) -> d
 
 
 def ensure_active(client: OwuiClient, spec: FunctionSpec) -> None:
-    """Activate the Function if it is not; make it global only when the spec
-    says so (a filter stays attached per model)."""
+    """Activate the Function if it is not, and make it global."""
     summary = get_function_summary(client, spec.id)
     if not summary:
         raise SystemExit("Function summary not found after create/update")
@@ -588,10 +585,7 @@ def ensure_active(client: OwuiClient, spec: FunctionSpec) -> None:
         info(f"{spec.label} function already active")
 
     summary = get_function_summary(client, spec.id) or {}
-    if not spec.global_:
-        if summary.get("is_global") and spec.global_warning:
-            warn(spec.global_warning)
-    elif not summary.get("is_global"):
+    if not summary.get("is_global"):
         status, payload = client.request("POST", f"/api/v1/functions/id/{spec.id}/toggle/global")
         if status != HTTPStatus.OK:
             raise SystemExit(f"Failed to make function global: {payload}")
@@ -654,7 +648,7 @@ def function_status(client: OwuiClient, spec: FunctionSpec) -> bool:
     if spec.status_checks and summary:
         state.update(spec.status_checks(client))
     console.print_json(json.dumps(state))
-    return all(v for k, v in state.items() if k != "is_global" or spec.global_)
+    return all(state.values())
 
 
 def _in_host_netns() -> bool:

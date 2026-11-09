@@ -34,7 +34,7 @@ BROWSER = "test_browser_flows.py"
 SHARDS = {
     # Install, plain replies, wakes, owner rights, and the first two crashes.
     "1": [
-        f"{E2E}::test_all_three_functions_installed_and_active",
+        f"{E2E}::test_both_functions_installed_and_active",
         f"{E2E}::test_function_metadata_parsed",
         f"{E2E}::test_models_listed",
         f"{E2E}::test_non_streaming_reply_is_exact",
@@ -112,7 +112,7 @@ SHARDS = {
         f"{E2E}::test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply",
         f"{E2E}::test_a_media_line_from_the_agent_is_uploaded_attached_and_linked",
         f"{E2E}::test_a_file_named_by_path_shows_as_the_image_the_gateway_stored",
-        f"{E2E}::test_the_picked_thinking_level_reaches_the_model_and_a_clamp_says_so",
+        f"{E2E}::test_the_thinking_level_reaches_the_model_and_a_clamp_says_so",
         f"{E2E}::test_two_pipe_models_side_by_side_answer_in_their_own_sessions",
         f"{E2E}::test_a_pipe_model_next_to_another_provider_keeps_the_chats_session",
         f"{E2E}::test_two_pipe_models_side_by_side_run_at_the_same_time",

@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 # The chat and run a log line belongs to (ELI-368). Each reply opens a
 # log_scope with its chat (Pipe.pipe) and each run inside it another with no

@@ -95,24 +95,6 @@ def quiet_background_tasks(token: str) -> None:
     api("POST", f"/api/v1/functions/id/{fid}/valves/update", valves, token)
 
 
-def attach_filter(token: str, model_id: str, filter_id: str) -> None:
-    """Attach a Filter to a model the way the README tells a user to
-    (Workspace > Models > the model > Filters): through the model's settings,
-    which for a Pipe model creates its settings row on first save."""
-    try:
-        model = api("GET", f"/api/v1/models/model?id={model_id}", token=token)
-    except RuntimeError:
-        model = None
-    if model:
-        meta = dict(model.get("meta") or {})
-        meta["filterIds"] = sorted(set(meta.get("filterIds") or []) | {filter_id})
-        api("POST", f"/api/v1/models/model/update?id={model_id}", {**model, "meta": meta}, token)
-    else:
-        api("POST", "/api/v1/models/create", {
-            "id": model_id, "base_model_id": None, "name": "OpenClaw · Default",
-            "meta": {"filterIds": [filter_id]}, "params": {}, "is_active": True}, token)
-
-
 def pipe_valves(token: str, **changes) -> dict:
     """Set some of the Pipe's valves; returns the values they replaced."""
     fid = "openclaw_gateway"
@@ -1034,25 +1016,6 @@ class Scenes:
         finally:
             pipe_valves(self.token, **old)
 
-    def thinking(self, page: Page) -> None:
-        attach_filter(self.token, MODEL, "openclaw_thinking")
-        # A new chat: over a long one the menu shares the screen with either
-        # the first message under the translucent header (scrolled down) or
-        # the jump-to-bottom arrow on the reply's toolbar (scrolled up).
-        new_chat(page)
-        # Open WebUI up to 0.13.0 has an Integrations button in the composer; from 0.13.1 Integrations sit in the + menu (#input-menu-button),
-        # in a submenu of their own when the menu lists more than the integrations.
-        integrations = page.locator("button[aria-label='Integrations']")
-        if integrations.count():
-            integrations.first.click()
-        else:
-            page.locator("#input-menu-button").click()
-            if not page.evaluate("() => /thinking/i.test(document.body.innerText)"):
-                page.get_by_role("menuitem", name=re.compile("integrations", re.I)).first.click()
-        wait_js(page, "() => /thinking/i.test(document.body.innerText)", "the thinking toggle in the menu", 30_000)
-        self.s.shot(page, "thinking-toggle")
-        page.keyboard.press("Escape")
-
     def agent_turn(self, page: Page) -> None:
         new_chat(page)
         chat = send(page, "Can you keep an eye on the nightly build?")
@@ -1525,7 +1488,7 @@ class Scenes:
             pipe_valves(self.token, **old)
 
     def thinking_level(self, page: Page) -> None:
-        """The thinking level, a per-user valve of the filter, with its choices.
+        """The thinking level, the Pipe's per-user `thinking_default` valve, with its choices.
         A <select>'s native popup is not in a headless screenshot, so the same
         element is drawn as a list (size = its option count)."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
@@ -1536,7 +1499,7 @@ class Scenes:
         (top if top.count() else page.locator('button[aria-label="Model controls"]')).first.click()
         page.locator('button[aria-expanded]', has_text="Valves").first.click()
         page.locator('select:has(option[value="functions"])').first.select_option("functions")
-        page.locator('select:has(option[value="openclaw_thinking"])').first.select_option("openclaw_thinking")
+        page.locator('select:has(option[value="openclaw_gateway"])').first.select_option("openclaw_gateway")
         box = page.locator(".chat-control-valves")
         box.wait_for(timeout=30_000)
         if not box.locator("select").count():
@@ -1629,8 +1592,6 @@ def main(argv=None) -> int:
             if scenes.hero_chat:
                 shooter.run("tool-card-expanded", scenes.expanded, page)
                 shooter.run("composer-status", scenes.composer_status, page)
-            # Makes its own chat; thinking-level needs the filter it attaches.
-            shooter.run("thinking-toggle", scenes.thinking, page, needed_by=("thinking-level",))
             shooter.run("question-card", scenes.question, page)
             if scenes.steers:
                 shooter.run("secret-request", scenes.secret_request, page)

@@ -344,7 +344,7 @@ class ArtifactNameResolutionTests(unittest.TestCase):
     """Every artifact must define every module-level name its fragments use, or
     it raises NameError only when that line runs (e.g. LEVEL_RANKS in the Action)."""
 
-    ARTIFACTS = [build_mod.PIPE, build_mod.ACTION, build_mod.FILTER]
+    ARTIFACTS = [build_mod.PIPE, build_mod.ACTION]
 
     def _undefined_globals(self, path):
         tree = ast.parse(path.read_text(), filename=str(path))

@@ -2,7 +2,7 @@
 
 Every setting (valve) of the functions, with its type, default and what it does. Generated from the code by `python3 build.py --all`; do not edit by hand.
 
-Applies to: Pipe, Action, Filter, Web Push (event function)
+Applies to: Pipe, Action, Web Push (event function)
 
 Set them in Open WebUI: **Admin Panel > Functions >** the function **> Valves** (the gear). The installer rewrites the connection valves on every run ([which ones](./install/installer.md#valves-the-installer-sets)) and keeps the rest. Changes apply on the next message, with no restart.
 
@@ -198,6 +198,12 @@ Type: `str`. Default: `title-gen`.
 
 Agent id used for background chat-title generation. It must exist on the Gateway (default 'title-gen'); if it does not, titles are silently skipped. Kept separate from AGENT_ID so title generation never queues behind your conversation.
 
+### thinking_default
+
+Type: `str`. Default: `default`. Per user: each user sets it in **Valves** (Open WebUI 0.13: Model controls, next to the model's name; 0.12: Chat Controls) ([Thinking level](./features/chat.md#thinking-level)).
+
+Your thinking level for chats that set none in Advanced Params (Reasoning Effort). 'default' sends nothing and keeps the model's own level. A level a model does not support is clamped down, and the chat says so.
+
 ## Status Action
 
 File: `openclaw_status_action.py`.
@@ -239,28 +245,6 @@ Copy this exactly from the Pipe's valves -- the same OpenClaw agent the Pipe rou
 Type: `str`. Default: empty.
 
 The address you open the OpenClaw Control UI at, e.g. https://openclaw.example.com. When set, the Status dialog and the sub-agent drawer link to the session in it. Empty: no link.
-
-## Thinking filter
-
-File: `openclaw_thinking_filter.py`.
-
-### priority
-
-Type: `int`. Default: `0`.
-
-Filter execution order. Lower runs earlier.
-
-### override_advanced_params
-
-Type: `bool`. Default: `True`.
-
-When on, the level picked here wins over Open WebUI's own Advanced Params reasoning effort. Turn it off to let Advanced Params win and use this toggle only to enable thinking.
-
-### level
-
-Type: `str`. Default: `default`. Per user: each user sets it in **Valves** (Open WebUI 0.13: Model controls, next to the model's name; 0.12: Chat Controls), from only the levels your models support ([Thinking control](./install/thinking-filter.md)).
-
-How hard the agent thinks before answering. 'default' sends nothing and leaves the agent's own configured level alone. Levels a model does not support are clamped down, and the chat says so.
 
 ## Web Push
 

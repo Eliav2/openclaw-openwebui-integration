@@ -2,14 +2,14 @@
 
 The complete feature list, grouped by where you meet it. Each entry links to the page and section with the full explanation, the valves that control it, and a screenshot of it (or, for the parts with nothing on screen, the log lines that show them).
 
-Applies to: Pipe, Action, Filter
+Applies to: Pipe, Action
 
 ## Markers
 
 Everything here works as soon as the Pipe is installed, except entries marked:
 
 - **needs agent setup:** the integration provides the mechanism, but your agent has to know the convention, see [agent skills](../install/agent-skills.md);
-- **separate function:** ships as its own file and installs separately, see [Status button](../install/status-action.md), [thinking control](../install/thinking-filter.md) and [push notifications](../install/web-push.md).
+- **separate function:** ships as its own file and installs separately, see [Status button](../install/status-action.md) and [push notifications](../install/web-push.md).
 
 ## In the chat
 
@@ -21,7 +21,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Take-over link**](./chat.md#a-link-to-take-over-from-the-agent): when the agent hands you a page to do a step yourself (a login, a CAPTCHA) and waits, the reply gets a Take control link that opens it in a new tab
 - [**Questions as cards**](./questions.md) _(needs agent setup)_: agent questions become Open WebUI's question cards (text, yes/no, single choice, multi-select by number), a masked dialog for a secret, and survive a reload
 - [**Plugin approvals in the chat**](./questions.md#plugin-approvals): a tool call a plugin holds for approval, in an owner's chat, asks you in the question card with the decisions the plugin allows (Deny, Allow once, Always allow), instead of failing with "no approval route"; guests' chats and channel threads are denied at once, sub-agents are not asked
-- [**Per-chat thinking control**](./chat.md#thinking-level) _(separate function)_: a toggle in the composer sets the reasoning level per chat, offering only the levels your models support
+- [**Thinking level**](./chat.md#thinking-level): Open WebUI's Reasoning Effort per chat, or your own default, clamped to the levels the model supports
 - [**Images and files from the agent**](./chat.md#images-and-files-from-the-agent) _(needs agent setup)_: `MEDIA:` files, and images an agent's own image tool made, are uploaded to the Open WebUI Files API and attached natively
 - [**Image input**](./chat.md#images-you-attach): images you attach are forwarded to the agent
 - [**Voice calls**](./chat.md#voice-calls): a message you speak in Open WebUI's voice mode reaches the agent with a note that the reply will be read aloud, so it answers in short spoken sentences without markup
@@ -80,12 +80,11 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Installer**](../install/installer.md): wizard, in-place updates that keep your valves, backups, healthcheck
 - [**Valves**](../configuration.md): everything configurable from the Open WebUI admin UI, no file access and no restart
 
-## Three functions
+## Two functions
 
 | File | Open WebUI type | Purpose |
 | --- | --- | --- |
 | [`openclaw_pipe.py`](../../openclaw_pipe.py) | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration: almost everything above |
 | [`openclaw_status_action.py`](../../openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) | The toolbar button (a crab claw) and the dialog, titled Claw; reuses the Pipe's live connection and device identity, so there is no second pairing |
-| [`openclaw_thinking_filter.py`](../../openclaw_thinking_filter.py) | [Filter](https://docs.openwebui.com/features/extensibility/plugin/functions/filter) | The per-chat thinking toggle in the composer. Optional, and imports nothing but the standard library and pydantic |
 
-All three are generated from the same `src/openclaw_pipe_pkg/` source fragments. Contributing: [Development](../development.md).
+Both are generated from the same `src/openclaw_pipe_pkg/` source fragments. Contributing: [Development](../development.md).

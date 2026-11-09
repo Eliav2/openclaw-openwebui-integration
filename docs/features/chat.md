@@ -2,8 +2,8 @@
 
 What a reply looks like in the chat: live text, the agent's tool calls as real cards, failures marked, images and files both ways, a usage line under each reply, and chat titles. Everything here works as soon as the Pipe is installed, except where a section says otherwise.
 
-Applies to: Pipe (the thinking level also needs the thinking filter)
-Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`, `SYNC_SLASH_COMMANDS`, `SLASH_COMMANDS_EXCLUDE`, `PROMPT_PREFIX`, `SYNC_INTERVAL_MIN`
+Applies to: Pipe
+Valves: `thinking_default` (per user), `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`, `SYNC_SLASH_COMMANDS`, `SLASH_COMMANDS_EXCLUDE`, `PROMPT_PREFIX`, `SYNC_INTERVAL_MIN`
 
 ## Streaming
 
@@ -86,24 +86,28 @@ Off by default.
 
 ## Thinking level
 
-With the [thinking filter](../install/thinking-filter.md) installed, a toggle in the composer sets the reasoning level per chat: `default`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
+How hard the agent thinks before answering, set in Open WebUI's own controls. Two places, the first one set wins:
 
-<img src="../img/thinking-level-light.png" alt="The thinking level in Valves, its choices listed: default, off, minimal, low, medium, high" width="320">
+1. **The chat:** **Advanced Params** → **Reasoning Effort** (Chat Controls, or the model's settings for every chat with it). It is free text: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, in any case.
+2. **Your default:** the per-user valve [`thinking_default`](../configuration.md#thinking_default), in **Valves**: under **Model controls**, the sliders button next to the model's name (Open WebUI 0.13), or in **Chat Controls** (0.12). It applies to every chat that sets no level of its own.
 
-- `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies.
+<img src="../img/thinking-level-light.png" alt="The thinking_default valve in Valves, its choices listed: default, off, minimal, low, medium, high" width="320">
+
+- `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies. It is the valve's default, and an empty Reasoning Effort means the same.
 - `off` is an explicit instruction not to think, and it does override the agent's setting.
+- `ultra` is sent as `max`.
 
-The list only offers levels a model on your Gateway supports. The Pipe reads each session's real ladder from the `sessions.describe` it already makes before every send, so this costs no extra round trip. Until the Pipe has run once, the list falls back to the five levels every observed provider supports (`off` to `high`).
+The valve's list offers only levels a model on your Gateway supports. The Pipe reads each session's real ladder from the `sessions.describe` it already makes before every send, so this costs no extra round trip. Until the Pipe has run once, the list falls back to the five levels every observed provider supports (`off` to `high`). Open WebUI builds the list when it loads the Pipe, so it is the union across your Gateway's models, not the ladder of the model you picked; after a first chat with a new model, re-save the Pipe (**Admin Panel** → **Functions** → the Pipe → **Save**) to show its levels.
 
-Open WebUI builds the dropdown once, so it is the union across your Gateway's models, not the ladder of the model you picked. At send time the Pipe clamps the request to the nearest level the current model supports and says so once in the chat:
+At send time the Pipe clamps the request to the nearest level the current model supports and says so once in the chat:
 
 > _This model does not support thinking level 'ultra', using 'high' instead._
 
-Clamping lands on the nearest level at or below what you asked for, since quietly asking for more shows up on someone's bill. The one exception: if a model has nothing at or below the request, it uses that model's lowest level, which can be higher than what you asked for.
+Clamping lands on the nearest level at or below what you asked for, since quietly asking for more shows up on someone's bill. The one exception: if a model has nothing at or below the request, it uses that model's lowest level, which can be higher than what you asked for. Opus 5.5 has no `off`, so `off` there is sent as `low`.
 
-`off` can't turn thinking off on Claude Sonnet 5.5 and Haiku 5.5 run through claude-cli. The Gateway sends it as `MAX_THINKING_TOKENS=0`, which Claude Code ignores on those models, so they still think. The Pipe treats `off` as unsupported there and sends `low`, the lowest level they honour, with the note above. Opus 5.5 and Fable never offer `off`. Other runtimes and other models keep `off`.
+`off` can't turn thinking off on Claude Sonnet 5.5 and Haiku 5.5 run through claude-cli. The Gateway sends it as `MAX_THINKING_TOKENS=0`, which Claude Code ignores on those models, so they still think. The Pipe treats `off` as unsupported there and sends `low`, the lowest level they honour, with the note above. Other runtimes and other models keep `off`.
 
-The filter and Open WebUI's own Advanced Params reasoning-effort control write the same `reasoning_effort` field, so they are one setting, not two that fight. The filter's [`override_advanced_params`](../configuration.md#override_advanced_params) valve (on by default) decides who wins when both are set. Install steps and the filter's valves: [thinking filter](../install/thinking-filter.md).
+Earlier versions set the level with a separate Thinking filter. It is gone: the [update notes](../install/update-uninstall.md#the-thinking-filter) say how to remove it.
 
 ## Images and files from the agent
 

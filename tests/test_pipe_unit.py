@@ -1835,8 +1835,9 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
 
-    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None):
-        """`image`: base64 data of a PNG attached to the message."""
+    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None, user_valves=None):
+        """`image`: base64 data of a PNG attached to the message. `user_valves`: the user's Pipe
+        UserValves, as Open WebUI passes them in `__user__`."""
         self.emitted = getattr(self, "emitted", [])
 
         async def emitter(event):
@@ -1854,7 +1855,8 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
         if thinking:
             body["reasoning_effort"] = thinking
         meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id}
-        return self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+        user = {"id": "u1", "valves": user_valves} if user_valves is not None else None
+        return self.pipe._pipe_impl(body, emitter, __metadata__=meta, __user__=user,
                                     __event_call__=event_call if intent else None)
 
     def _queue(self, run_id):
@@ -17710,7 +17712,7 @@ class ClaudeCliThinkingOffTests(_TurnCase):
     GATEWAY_55 = ["off", "low", "medium", "high", "xhigh", "max"]
     NOTE = "This model does not support thinking level 'off', using 'low' instead."
 
-    async def send_at(self, level, *, runtime, model):
+    async def send_at(self, level, *, runtime, model, user_default=None, ladder=None):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td)
         env = mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td})
@@ -17718,7 +17720,7 @@ class ClaudeCliThinkingOffTests(_TurnCase):
         self.addCleanup(env.stop)
         self.runtime = runtime
         self.describe_extra = {"modelProvider": "anthropic", "model": model,
-                               "thinkingLevels": [{"id": lv} for lv in self.GATEWAY_55]}
+                               "thinkingLevels": [{"id": lv} for lv in ladder or self.GATEWAY_55]}
         sent, plain = [], self.conn.send_request
 
         async def record(method, params, timeout=10):
@@ -17726,7 +17728,9 @@ class ClaudeCliThinkingOffTests(_TurnCase):
                 sent.append(params.get("thinking"))
             return await plain(method, params, timeout)
         self.conn.send_request = record
-        gen = self._reply("hi", "m1", thinking=level)
+        valves = (self.ocp.Pipe.UserValves(thinking_default=user_default)
+                  if user_default is not None else None)
+        gen = self._reply("hi", "m1", thinking=level, user_valves=valves)
 
         async def read_all():
             # The clamp note comes before the send: keep reading while the run starts.
@@ -17755,6 +17759,44 @@ class ClaudeCliThinkingOffTests(_TurnCase):
     async def test_off_on_another_claude_cli_model_stays_off(self):
         thinking, _ = await self.send_at("off", runtime="claude-cli", model="claude-sonnet-5")
         self.assertEqual(thinking, "off")
+
+    async def test_with_no_chat_level_the_users_default_is_sent(self):
+        """Advanced Params is the one per-chat control; a chat without it takes the user's
+        `thinking_default` (Eliav 2026-11-09, replacing the Thinking filter)."""
+        thinking, _ = await self.send_at(None, runtime="claude-cli", model="claude-sonnet-5-5",
+                                         user_default="xhigh")
+        self.assertEqual(thinking, "xhigh")
+
+    async def test_the_chats_advanced_params_level_beats_the_users_default(self):
+        thinking, _ = await self.send_at("medium", runtime="claude-cli", model="claude-sonnet-5-5",
+                                         user_default="xhigh")
+        self.assertEqual(thinking, "medium")
+
+    async def test_the_default_user_valve_sends_no_level(self):
+        """`default` (the valve's starting value) leaves the model's own level."""
+        thinking, shown = await self.send_at(None, runtime="claude-cli", model="claude-sonnet-5-5",
+                                             user_default=self.ocp.UNSET)
+        self.assertIsNone(thinking)
+        self.assertNotIn("thinking level", shown)
+
+    async def _sent_for_ultra(self, level, default):
+        thinking, _ = await self.send_at(level, runtime="claude-cli", model="claude-opus-5-5",
+                                         user_default=default, ladder=["low", "max", "ultra"])
+        return thinking
+
+    async def test_ultra_from_the_chat_is_sent_as_max(self):
+        """Eliav 2026-11-09: `ultra` is sent as `max`, from a chat or the user's default."""
+        self.assertEqual(await self._sent_for_ultra("Ultra ", None), "max")
+
+    async def test_ultra_as_the_users_default_is_sent_as_max(self):
+        self.assertEqual(await self._sent_for_ultra(None, "ultra"), "max")
+
+    async def test_off_on_opus_5_5_is_sent_as_low_with_the_note(self):
+        """Opus 5.5's ladder has no off (the Gateway's own profile)."""
+        thinking, shown = await self.send_at("off", runtime="claude-cli", model="claude-opus-5-5",
+                                             ladder=["low", "medium", "high", "xhigh", "max"])
+        self.assertEqual(thinking, "low")
+        self.assertIn(self.NOTE, shown)
 
     async def test_a_new_chat_on_a_legacy_claude_cli_ref_is_clamped(self):
         """Review on #383: a `claude-cli/claude-sonnet-5-5` selection with no runtime recorded yet."""

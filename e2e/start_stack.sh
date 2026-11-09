@@ -3,7 +3,7 @@
 #
 #   fake model (e2e/fake_llm.py)  <-  OpenClaw Gateway  <-  Open WebUI container
 #
-# then install the Pipe, Filter and Action exactly the way the README tells a
+# then install the Pipe and Action exactly the way the README tells a
 # user to (`uv run install*.py install`), including device pairing. The
 # installer's own smoke test is the first end-to-end assertion: it fails the
 # script if a real chat completion does not come back through the Gateway.
@@ -283,10 +283,6 @@ export OWUI_URL OWUI_EMAIL OWUI_PASSWORD GATEWAY_TOKEN GATEWAY_URL="localhost:18
 
 echo "::group::Install the Pipe (pairs the device, runs the installer smoke test)"
 uv run install.py install
-echo "::endgroup::"
-
-echo "::group::Install the Thinking Filter"
-uv run install_filter.py install
 echo "::endgroup::"
 
 echo "::group::Install the Status Action"

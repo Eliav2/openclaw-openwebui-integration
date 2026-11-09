@@ -2,7 +2,7 @@
 
 Something not working? Find your symptom or the error in the chat below, then check the Open WebUI backend log for `[openclaw-pipe]` lines. If you still need help, the last section says what to put in a bug report.
 
-Applies to: Pipe, Action, Filter
+Applies to: Pipe, Action
 Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `STATE_DIR`, `DEVICE_IDENTITY`, `MAX_MODELS`, `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `TITLE_GEN_AGENT_ID`
 
 ## Start with the healthcheck
@@ -67,7 +67,7 @@ When a message can't be sent, the Gateway doesn't answer, or a run ends in an er
 
 ## Where the logs are
 
-Every turn logs to the Open WebUI backend log (its standard output), each line prefixed with `[openclaw-pipe]`. The Status Action logs with the same prefix. The thinking filter does not log.
+Every turn logs to the Open WebUI backend log (its standard output), each line prefixed with `[openclaw-pipe]`. The Status Action logs with the same prefix.
 
 A line logged during a reply ends with the chat's id, `chat_id=<chat id>`, and once the run has started also its `runId=...`. A run id the line already names is not repeated. The chat tag is always there, even when the run id contains the chat id. So one search for `chat_id=<chat id>`, or for a run id, finds every line of that reply, background work included. Each reply has only its own ids: lines outside a reply (connecting to the Gateway, startup) have none, and a retry shows no run id until its own run starts.
 
@@ -104,7 +104,7 @@ What you will find there, always on and not configurable:
 Open an issue at [github.com/Eliav2/openclaw-openwebui-integration/issues](https://github.com/Eliav2/openclaw-openwebui-integration/issues) with:
 
 1. **Versions:** Open WebUI, OpenClaw, and the function's version (Admin Panel > Functions, or the `version:` line at the top of `openclaw_pipe.py`). Check them against [Versions](./versions.md) first.
-2. **Setup:** one host or two ([two hosts](./install/two-hosts.md)), and which functions you installed (Pipe, Status Action, thinking filter).
+2. **Setup:** one host or two ([two hosts](./install/two-hosts.md)), and which functions you installed (Pipe, Status Action).
 3. **What happened:** what you did, what you expected, what you saw. A screenshot helps.
 4. **The healthcheck output:** `uv run install.py healthcheck`.
 5. **The log lines:** the `[openclaw-pipe]` lines for the failing turn, and the Gateway's log around the same time.

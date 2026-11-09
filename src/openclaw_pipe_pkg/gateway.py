@@ -334,6 +334,16 @@ def _ladder_cache_path(state_dir: str = "") -> str:
     return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
 
 
+def _thinking_default_levels(state_dir: str = "") -> list:
+    """The `thinking_default` dropdown: UNSET, then every level the Gateway's
+    models offer (the ladder cache's union, by rank), less those sent as
+    another. Open WebUI builds it once per load; each send clamps per model."""
+    cached = (_read_json_file(_ladder_cache_path(state_dir)) or {}).get("levels")
+    levels = [lv for lv in cached if lv in LEVEL_RANKS] if isinstance(cached, list) else []
+    levels = {lv for lv in levels or FALLBACK_LEVELS if lv not in LEVEL_SENT_AS}
+    return [UNSET] + sorted(levels, key=lambda lv: (LEVEL_RANKS[lv], lv))
+
+
 # Guards the ladder cache's read-merge-write: Pipe and Status Action threads
 # in one OWUI process would otherwise drop each other's updates.
 _LADDER_CACHE_LOCK = threading.Lock()
@@ -343,7 +353,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
                              state_dir: str = "") -> bool:
     """Fold a ladder into the cache, as a union and per model.
 
-    `levels` (union) feeds the Thinking filter dropdown, which OWUI cannot
+    `levels` (union) feeds the `thinking_default` dropdown, which OWUI cannot
     vary per model. `models[key]` is what sends clamp against. An
     `authoritative` ladder (stated in a Gateway rejection) is never
     overwritten by a describe-observed one, which can be the generic profile.

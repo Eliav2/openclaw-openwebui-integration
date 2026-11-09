@@ -2,7 +2,7 @@
 
 Which Open WebUI and OpenClaw versions the integration is tested on, the minimums, and what an older release loses, with the CI runs that show it.
 
-Applies to: Pipe, Action, Filter
+Applies to: Pipe, Action
 
 ## Tested and minimum
 

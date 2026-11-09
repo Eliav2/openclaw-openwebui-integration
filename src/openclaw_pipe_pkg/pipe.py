@@ -443,6 +443,26 @@ class Pipe:
                 "queues behind your conversation."
         )
 
+    # Each user's own (Open WebUI: Valves next to the model's name). The chat's
+    # Advanced Params reasoning effort wins; this applies to a chat without one.
+    UserValves = create_model(
+        "UserValves",
+        thinking_default=(
+            str,
+            Field(
+                default=UNSET,
+                description=(
+                    "Your thinking level for chats that set none in Advanced Params "
+                    "(Reasoning Effort). '" + UNSET + "' sends nothing and keeps the "
+                    "model's own level. A level a model does not support is clamped "
+                    "down, and the chat says so."
+                ),
+                json_schema_extra={"enum": _thinking_default_levels()},
+            ),
+        ),
+        __base__=BaseModel,
+    )
+
     # The DEFAULT_MODEL dropdown is a classmethod: it reads the cache via this.
     _last_state_dir = ""
 
@@ -828,12 +848,14 @@ class _PipeTurn:
         preset = self.pipe._selected_preset(self.body)
         self.model_override = self.pipe._model_override_for_preset(preset)
 
-        # Per-chat thinking level (ELI-85): `reasoning_effort`, written by Open
-        # WebUI's Advanced Params and by the Thinking filter. Absent means the
+        # Thinking level (ELI-85): the chat's `reasoning_effort` (Open WebUI's
+        # Advanced Params), else the user's `thinking_default`. Absent means the
         # agent's own level; it is checked against the ladder after describe.
-        self.requested_thinking = self.body.get("reasoning_effort") or None
-        if self.requested_thinking is not None:
-            self.requested_thinking = str(self.requested_thinking).strip().lower() or None
+        user_valves = (self.__user__ or {}).get("valves")
+        user_default = (user_valves.get("thinking_default") if isinstance(user_valves, dict)
+                        else getattr(user_valves, "thinking_default", None))
+        self.requested_thinking = (normalize_thinking_level(self.body.get("reasoning_effort"))
+                                   or normalize_thinking_level(user_default))
         self.session_thinking_ladder = None
         self.session_model_key = None
         self.session_runtime = None

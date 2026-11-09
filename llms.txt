@@ -1,6 +1,6 @@
 # OpenClaw for Open WebUI
 
-> Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel. It connects to a running OpenClaw Gateway with three Open WebUI functions: a Pipe (the chat), a Status Action (context, rate limits, sub-agents) and a thinking filter. Every page below is plain Markdown in this repo; start at docs/index.md.
+> Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel. It connects to a running OpenClaw Gateway with two Open WebUI functions: a Pipe (the chat) and a Status Action (context, rate limits, sub-agents). Every page below is plain Markdown in this repo; start at docs/index.md.
 
 ## Start
 
@@ -14,7 +14,6 @@
 - [Manual install](docs/install/manual.md): paste the function in the admin panel and set its valves
 - [Device pairing](docs/install/pairing.md): approving the device, where its identity lives
 - [Status Action](docs/install/status-action.md): the Status button and its rate-limit plugin
-- [Thinking filter](docs/install/thinking-filter.md): the per-chat thinking control
 - [Agent skills](docs/install/agent-skills.md): teaching the agent the questions and media conventions
 - [Update and uninstall](docs/install/update-uninstall.md)
 - [Two hosts](docs/install/two-hosts.md): Open WebUI and OpenClaw on different machines

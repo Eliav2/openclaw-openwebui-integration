@@ -2,7 +2,7 @@
 """Load each distributed artifact the way Open WebUI's plugin loader does.
 
 Open WebUI execs a Function's flat file into a fresh module and introspects a
-top-level Pipe/Action/Filter class, then instantiates it and its Valves. This
+top-level Pipe/Action class, then instantiates it and its Valves. This
 catches an artifact that imports and instantiates cleanly as fragments under
 src/ but not as one standalone file.
 """
@@ -13,7 +13,6 @@ import types
 ARTIFACTS = (
     ("openclaw_pipe", "openclaw_pipe.py", "Pipe"),
     ("openclaw_status_action", "openclaw_status_action.py", "Action"),
-    ("openclaw_thinking_filter", "openclaw_thinking_filter.py", "Filter"),
 )
 
 
@@ -28,6 +27,9 @@ def main() -> int:
         instance = cls()
         valves = getattr(instance, "valves", None) or cls.Valves()
         schema = type(valves).model_json_schema()
+        user_valves = getattr(cls, "UserValves", None)
+        if user_valves is not None:
+            user_valves().model_json_schema()
         print(f"{path}: {cls_name} loaded and instantiated, "
               f"{len(schema.get('properties', {}))} valves")
     return 0

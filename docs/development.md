@@ -4,8 +4,7 @@ Editing the source fragments, rebuilding the artifacts, and running the tests.
 
 ## Building the artifacts
 
-`openclaw_pipe.py`, `openclaw_status_action.py` and
-`openclaw_thinking_filter.py` are **built artifacts**, and so is
+`openclaw_pipe.py` and `openclaw_status_action.py` are **built artifacts**, and so is
 `docs/configuration.md`. Don't hand-edit them. Edit the fragments under `src/openclaw_pipe_pkg/`, then
 rebuild:
 
@@ -17,8 +16,6 @@ python3 build.py              # rebuild openclaw_pipe.py only
 python3 build.py --action     # rebuild openclaw_status_action.py only
 python3 build.py --check      # drift guard, Pipe only
 python3 build.py --check-action  # drift guard, Action only
-python3 build.py --filter     # rebuild openclaw_thinking_filter.py only
-python3 build.py --check-filter  # drift guard, filter only
 ```
 
 Each single-artifact invocation builds exactly one file, and several fragments
@@ -88,7 +85,7 @@ Every push and PR runs `.github/workflows/ci.yml`. The E2E lanes run on every pu
 OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
 it (with one test-only plugin, `e2e/agent-tool`: an `Agent` tool that answers
 like Claude Code's, which the Gateway's own runtime does not have), and Open
-WebUI in Docker; installs the Pipe, Filter and Action with
+WebUI in Docker; installs the Pipe and Action with
 `uv run install*.py install` exactly as the README tells users to (device
 pairing and the installer's smoke test included); then runs `e2e/test_e2e.py`
 against it, and the installed-dist fixture checks against the Gateway it

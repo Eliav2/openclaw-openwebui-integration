@@ -126,6 +126,6 @@ uv run install.py healthcheck
 ## Next steps
 
 - [Status button](./status-action.md): context, rate limits and sub-agents, one tap away.
-- [Thinking control](./thinking-filter.md): set reasoning effort per chat.
+- [Thinking level](../features/chat.md#thinking-level): set reasoning effort per chat, or your own default.
 - [Agent skills](./agent-skills.md): teach your agent to ask you questions as dialogs and to send images.
 - [The installer](./installer.md): every flag, the non-interactive form for scripts, and what `install` changes.

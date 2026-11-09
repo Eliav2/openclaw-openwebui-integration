@@ -75,7 +75,7 @@ In that form there is no `openclaw_pipe.py` next to the script, so the installer
 
 The download only happens when there is no repo at all next to the script. A partial checkout with the artifact missing fails loudly instead of deploying `main` from the internet.
 
-What the no-clone form can't do: `skills` (it needs the `skills/` folder), `install_action.py` and `install_filter.py` (they import `install.py`). For those, use a clone.
+What the no-clone form can't do: `skills` (it needs the `skills/` folder), `install_action.py` (it imports `install.py`). For those, use a clone.
 
 ## Configuration
 
@@ -119,7 +119,7 @@ That non-interactive form is what you want for CI, config management, or reinsta
 
 ## Python packages inside Open WebUI
 
-The Pipe and the Status Action need `websockets` and `cryptography` inside Open WebUI; `pydantic` already ships with it. Both functions declare the two packages in the `requirements:` frontmatter field, so Open WebUI pip-installs them itself the first time the function loads. The thinking filter needs neither: it imports only the standard library and pydantic.
+The Pipe and the Status Action need `websockets` and `cryptography` inside Open WebUI; `pydantic` already ships with it. Both functions declare the two packages in the `requirements:` frontmatter field, so Open WebUI pip-installs them itself the first time the function loads.
 
 If your deployment sets `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` or runs with `OFFLINE_MODE`, install `websockets` and `cryptography` into the Open WebUI image yourself. Otherwise the function fails to load with `ModuleNotFoundError: websockets`.
 
@@ -168,12 +168,11 @@ So pass the same values on every run. A re-run without `GATEWAY_URL` sets it bac
 
 `status` reports `function_exists`, `is_active`, `is_global`, `model_visible`, `has_gateway_url`, `has_gateway_token`, `has_device_identity`, `device_id` and `device_paired`. `device_paired` asks the local `openclaw` CLI, so it is only ever `true` on the Gateway host. On any other machine `status` and `healthcheck` exit 1 even when everything works; read the smoke test lines instead.
 
-## The companion installers
+## The companion installer
 
-- `install_action.py` installs the Status Action and mirrors the five shared valves from the Pipe: [Status button](./status-action.md).
-- `install_filter.py` installs the thinking filter: [thinking control](./thinking-filter.md).
+`install_action.py` installs the Status Action and mirrors the five shared valves from the Pipe: [Status button](./status-action.md).
 
-Both take only `OWUI_URL`, `OWUI_EMAIL` and `OWUI_PASSWORD`, have `install`, `repair` and `status` but no `healthcheck`, and must run from a clone.
+It takes only `OWUI_URL`, `OWUI_EMAIL` and `OWUI_PASSWORD`, have `install`, `repair` and `status` but no `healthcheck`, and must run from a clone.
 
 ## After the install
 

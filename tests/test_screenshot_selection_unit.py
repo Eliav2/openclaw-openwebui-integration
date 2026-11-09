@@ -110,8 +110,6 @@ class PrerequisiteScenes(unittest.TestCase):
                 guarded |= set(re.findall(r'shooter\.run\("([^"]+)"', g.group(1)))
             self.assertTrue(guarded, f"scenes guarded by {attr}")
             self.assertEqual(guarded - declared, set(), f"{producer} must list them in needed_by")
-        # thinking-level also needs the filter thinking-toggle attaches
-        self.assertRegex(main, r'"thinking-toggle", scenes\.thinking, page, needed_by=\("thinking-level",\)')
 
 
 if __name__ == "__main__":

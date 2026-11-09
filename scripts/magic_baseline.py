@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "scripts" / "magic-baseline.json"
 # The Pipe's real source is the fragments under src/; the openclaw_*.py files
 # at the root are built from them and would count every hit twice.
-PATHS = ["src", "install.py", "install_action.py", "install_filter.py", "build.py", "scripts",
+PATHS = ["src", "install.py", "install_action.py", "build.py", "scripts",
          "push/openclaw_web_push.py", "gateway-plugins"]
 
 
