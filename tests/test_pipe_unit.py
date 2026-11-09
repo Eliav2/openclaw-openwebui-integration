@@ -3471,6 +3471,21 @@ class NoDroppedMessagesTests(_TurnCase):
         await self._ended_reply()
         self.assertEqual(published, [])
 
+    async def test_a_request_end_publishes_only_its_own_reply_once(self):
+        """B, path 1 (a lost claim can't publish twice): the request's end publishes its own
+        reply, once, from its done callback. A restart ends the request, and no later request
+        publishes a reply that isn't its own, so no claim is needed across a restart."""
+        published = self._record_publishes()
+        self.pipe.valves.PUBLISH_CHAT_FINISHED = True
+        await self._ended_reply()
+        task, out = self._owui_request("again", "m2")
+        await self._until_registered("run-2")
+        self._queue("run-2").put_nowait(self._delta("run-2", "hi"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        await asyncio.wait_for(task, 30)
+        await self._spin()
+        self.assertEqual(published, [("chat-1", "m1", "u1"), ("chat-1", "m2", "u1")])
+
     async def test_a_cancelled_request_publishes_no_chat_finished(self):
         """A Stop cancels the request: nothing finished to tell."""
         published = self._record_publishes()
@@ -8659,6 +8674,36 @@ class TurnWriterChatFinishedTests(_TurnWriterCase):
         await w.finalize()
         self.assertEqual(self.published, [(self.CHAT, "m1", self.USER, "Hello")])
 
+    async def test_after_a_restart_a_new_writer_does_not_publish_a_finished_reply(self):
+        """B, path 2 (a lost claim can't publish twice): a writer opens only an unfinished
+        message (`_writer_may_take_over`), so after a restart no writer finishes a published
+        reply again."""
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        with mock.patch.object(openclaw_pipe, "_turn_writer_alive", lambda writer: False):
+            again = self.writer()
+            self.assertFalse(await again.open())
+            await again.feed(_delta("Hello again"))
+            await again.finalize()
+        self.assertEqual(self.published, [(self.CHAT, "m1", self.USER, "Hello")])
+
+    async def test_after_a_restart_a_takeover_continues_a_finished_reply_without_publishing_it(self):
+        """B, the routed restart path: a steered run that went on after its reply was published
+        is resumed from events after a restart, taking the message over (`takeover=True`). The
+        run continues into the reply, but the claims did not survive the restart, so the reply's
+        own state (it was done when taken) keeps it from being published again."""
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        with mock.patch.object(openclaw_pipe, "_turn_writer_alive", lambda writer: False):
+            again = self.writer()
+            self.assertTrue(await again.open(takeover=True))
+            await again.feed(_delta(" and more"))
+            await again.finalize()
+        self.assertEqual(self.published, [(self.CHAT, "m1", self.USER, "Hello")])
+        self.assertIn("and more", self.owui.msgs()["m1"]["content"], "the run's continuation was lost")
+
     async def test_a_failed_final_save_publishes_nothing(self):
         w = self.writer()
         await w.feed(_delta("Hello"))
@@ -8685,7 +8730,7 @@ class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
     through `publish_event`, for a saved chat's finished message only."""
 
     async def asyncSetUp(self):
-        self.app = types.SimpleNamespace(state=types.SimpleNamespace())
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(redis=None))
         self.calls = []
         self.message = {"id": "m1", "model": "openclaw_gateway.main", "done": True, "content": "saved text"}
         test = self
@@ -8693,17 +8738,34 @@ class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
         async def publish_event(request, event, **kw):
             test.calls.append((request, event, kw))
 
-        self.chat = types.SimpleNamespace(chat={"history": {"messages": {"m1": self.message}}})
+        # Each chat's live Open WebUI tasks (requests, turn writers), by chat id.
+        self.live_tasks = {}
+        self.redis = None
+        self.redis_down = False
+        self.row_transactions = 0
 
         class Chats:
             @staticmethod
             @contextlib.asynccontextmanager
             async def _chat_transaction(chat_id):
-                yield ("db", test.chat)
+                test.row_transactions += 1
+                raise AssertionError("a whole chat-row transaction")
+                yield
 
             @staticmethod
             async def get_chat_title_by_id(chat_id):
                 return "Trip plan"
+
+        class ChatMessages:
+            @staticmethod
+            async def get_message_by_id(id):
+                chat_id, _, message_id = id.partition("-")
+                m = test.message if (chat_id, message_id) == ("c1", "m1") else None
+                return m and types.SimpleNamespace(done=m["done"], content=m["content"], model_id=m["model"],
+                                                   output=m.get("output"))
+
+        async def list_task_ids_by_item_id(redis, id):
+            return list(test.live_tasks.get(id, []))
 
         class Users:
             @staticmethod
@@ -8725,6 +8787,10 @@ class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
             return m
         p = mock.patch.dict(sys.modules, {
             "open_webui": mod("open_webui"), "open_webui.main": mod("open_webui.main", app=self.app),
+            "open_webui.env": mod("open_webui.env", REDIS_KEY_PREFIX="open-webui"),
+            "open_webui.socket": mod("open_webui.socket"), "open_webui.socket.main": mod("open_webui.socket.main"),
+            "open_webui.tasks": mod("open_webui.tasks", list_task_ids_by_item_id=list_task_ids_by_item_id),
+            "open_webui.models.chat_messages": mod("open_webui.models.chat_messages", ChatMessages=ChatMessages),
             "open_webui.events": mod("open_webui.events", publish_event=publish_event,
                                      EVENTS=types.SimpleNamespace(CHAT_FINISHED="chat.finished")),
             "open_webui.models": mod("open_webui.models"),
@@ -8740,13 +8806,104 @@ class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    def _redis(self):
+        """Open WebUI's Redis, shared by its workers: the claims hash only."""
+        test = self
+        hashes = {}
+
+        class Redis:
+            async def hsetnx(self, key, field, value):
+                if test.redis_down:
+                    raise ConnectionError("Redis is down")
+                h = hashes.setdefault(key, {})
+                if field in h:
+                    return 0
+                h[field] = value
+                return 1
+
+            async def hkeys(self, key):
+                return [f.encode() for f in hashes.get(key, {})]
+
+            async def hdel(self, key, *fields):
+                for f in fields:
+                    hashes.get(key, {}).pop(f, None)
+        self.redis_hashes = hashes
+        test.app.state.redis = Redis()
+
     async def test_a_reply_is_published_once(self):
-        """Open WebUI can call the Pipe twice for one reply; the first publish claims it in the
-        message meta under the row lock (#273)."""
+        """Open WebUI can call the Pipe twice for one reply; the first publish claims it (#273),
+        off the chat row: no whole-row transaction (B)."""
+        self.live_tasks["c1"] = ["task-1"]
         await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
         await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
         self.assertEqual(len(self.calls), 1)
-        self.assertTrue(self.message["meta"][openclaw_pipe.CHAT_FINISHED_META])
+        self.assertEqual(self.row_transactions, 0)
+
+    async def test_with_redis_two_workers_publish_a_reply_once(self):
+        """With Open WebUI's Redis the claim is one HSETNX, shared by every worker; this worker's
+        own set stays empty."""
+        self._redis()
+        self.live_tasks["c1"] = ["task-1"]
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+        sys.modules["open_webui.socket.main"] = types.ModuleType("open_webui.socket.main")  # another worker
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.redis_hashes, {"open-webui:openclaw:chat_finished": {"c1:m1": "1"}})
+        self.assertEqual(openclaw_pipe._chat_finished_claims(), set())
+
+    async def test_a_claim_outlives_its_chat_going_idle(self):
+        """The claim is keyed by the reply and never expires with time or idleness: a second
+        finisher for the same reply, whenever it comes, sees it."""
+        for redis in (False, True):
+            with self.subTest(redis=redis):
+                if redis:
+                    self._redis()
+                self.calls.clear()
+                self.live_tasks["c1"] = ["task-1"]
+                await openclaw_pipe._publish_chat_finished("c1", "m1", "u1")
+                self.live_tasks["c1"] = []
+                await openclaw_pipe._drop_chat_finished_claims_of_deleted_replies()
+                await openclaw_pipe._publish_chat_finished("c1", "m1", "u1")
+                self.assertEqual(len(self.calls), 1)
+
+    async def test_claims_of_deleted_replies_are_dropped(self):
+        """Garbage collection only, on an event: a reply whose message row is gone can never be
+        finished again, so its claim goes (checked once per Pipe load)."""
+        for redis in (False, True):
+            with self.subTest(redis=redis):
+                if redis:
+                    self._redis()
+                self.message = {"id": "m1", "model": "openclaw_gateway.main", "done": True,
+                                "content": "saved text"}
+                await openclaw_pipe._publish_chat_finished("c1", "m1", "u1")
+                self.message = None
+                await openclaw_pipe._drop_chat_finished_claims_of_deleted_replies()
+                self.assertEqual(openclaw_pipe._chat_finished_claims(), set())
+                if redis:
+                    self.assertEqual(self.redis_hashes["open-webui:openclaw:chat_finished"], {})
+
+    async def test_with_redis_down_the_claim_falls_back_to_this_process(self):
+        """A Redis error must not lose the push: the claim falls back to this process's set,
+        once logged. With several processes that can publish twice; a duplicate beats a
+        missed notification."""
+        self._redis()
+        self.redis_down = True
+        with mock.patch.object(openclaw_pipe, "pipe_log") as log:
+            await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+            await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(openclaw_pipe._chat_finished_claims(), {"c1:m1"})
+        self.assertEqual(sum("Redis" in str(c.args[0]) for c in log.call_args_list), 1, log.call_args_list)
+
+    async def test_a_reply_with_no_content_is_sent_from_its_output(self):
+        """A reply saved with cards only keeps its text in `output`: the event carries that."""
+        self.message["content"] = ""
+        self.message["output"] = [
+            {"type": "function_call", "id": "fc1", "name": "Bash", "arguments": "{}"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "All set."}]}]
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1")
+        self.assertEqual(self.calls[0][2]["data"]["message"], "Done.\n\nAll set.")
 
     async def test_the_event_as_the_middleware_shapes_it(self):
         await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
