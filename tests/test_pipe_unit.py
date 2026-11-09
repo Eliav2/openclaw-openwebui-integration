@@ -10034,11 +10034,15 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertNotIn("empty response", self.m()["content"])
         self.assertNotIn("Error", self.m()["content"])
 
-    async def test_an_empty_response_to_a_person_is_still_shown(self):
+    async def test_a_silent_turn_from_a_person_shows_no_error(self):
+        """ELI-336 (live chat bf04938b): a person's turn the model ends with NO_REPLY fails the
+        same way; the model's silence is its answer, not an error."""
         self._user_turn_from(None)
         w = await self.opened_writer()
         await w.end({"status": "failed", "lastRunError": self.EMPTY, "hasActiveRun": False})
-        self.assertIn(self.EMPTY, self.m()["content"].split("<details>")[1])
+        self.assertIs(self.m()["done"], True)
+        self.assertNotIn("empty response", self.m()["content"])
+        self.assertNotIn(RUN_ERROR_SENTENCE, self.m()["content"])
 
     async def test_another_error_on_an_inter_session_turn_is_still_shown(self):
         self._user_turn_from({"kind": "inter_session", "sourceTool": "sessions_send"})
@@ -13069,6 +13073,78 @@ class ToolStatusEventTests(_TurnCase):
         for tcid in ("toolu_1", "toolu_2"):
             self.assertEqual(cards[tcid], [("function_call", "in_progress"),
                                            ("function_call_output", "completed")])
+
+
+class SilentTurnTests(_TurnCase):
+    """ELI-336 (OpenClaw 2026.10.10, live chat bf04938b): a turn the model ends with a bare
+    NO_REPLY. A claude-cli run whose reply is required (trigger `user`) and whose final text is
+    empty or a silent sentinel fails as `empty_response` (cli-runner: `CLI backend returned an
+    empty response.`), with no text streamed: claude-cli turns emit their text only on success.
+    The silence is the model's answer, so the reply shows no error and no fallback line."""
+
+    EMPTY = "CLI backend returned an empty response."
+
+    def _event(self, event, **payload):
+        return {"type": "event", "event": event,
+                "payload": {"sessionKey": self.SK, "runId": "run-1", **payload}}
+
+    def _silent_run_ends(self):
+        """The live run's events: no text, the lifecycle error, then the chat error."""
+        return [self._event("agent", stream="lifecycle", state="error",
+                            data={"phase": "error", "error": self.EMPTY}),
+                self._event("chat", state="error", errorMessage=self.EMPTY)]
+
+    async def _silent_turn(self, *before_end):
+        self.describe_extra = {"status": "failed"}
+        # What chat.history holds after the live run: the user turn and the Gateway's note.
+        self.history = {"messages": [
+            {"role": "user", "content": "[manager] a note for you",
+             "idempotencyKey": "run-1:user"},
+            {"role": "custom", "content": f"Your request couldn't be completed: {self.EMPTY}",
+             "__openclaw": {"runId": "run-1"}}]}
+        gen = self._reply("[manager] a note for you", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for event in [*before_end, *self._silent_run_ends()]:
+            q.put_nowait(event)
+        items = []
+
+        async def drain():
+            try:
+                items.append(await first)
+            except StopAsyncIteration:  # a reply with nothing to show yields nothing
+                return
+            async for chunk in gen:
+                items.append(chunk)
+        # Bounds the test only.
+        await asyncio.wait_for(drain(), 5)
+        return "".join(i for i in items if isinstance(i, str)), items
+
+    def assert_silent(self, text):
+        self.assertNotIn(RUN_ERROR_SENTENCE, text)
+        self.assertNotIn(self.EMPTY, text)
+        self.assertNotIn("couldn't be completed", text)
+        self.assertNotIn("no reply text", text)
+        self.assertNotIn("The response failed", text)
+
+    async def test_a_bare_no_reply_to_a_person_shows_nothing(self):
+        text, _items = await self._silent_turn()
+        self.assert_silent(text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_silence_after_a_tool_call_keeps_only_the_card(self):
+        tool = self._event("agent", stream="tool", data={
+            "phase": "start", "name": "Bash", "toolCallId": "toolu_1", "args": {"command": "ls"}})
+        text, items = await self._silent_turn(tool)
+        self.assert_silent(text)
+        self.assertTrue(any(isinstance(i, dict) and (i.get("item") or {}).get("call_id") == "toolu_1"
+                            for i in items), items)
+
+    async def test_another_run_error_is_still_shown(self):
+        self.EMPTY = "429 rate limited"
+        text, _items = await self._silent_turn()
+        self.assertIn(RUN_ERROR_SENTENCE, text)
 
 
 class InlineOwnerRuleTests(_TurnCase):

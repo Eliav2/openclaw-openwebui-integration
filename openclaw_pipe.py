@@ -8657,6 +8657,19 @@ ERROR_TIMEOUT = "timeout"        # the Gateway did not answer in time
 ERROR_UNFINISHED = "unfinished"  # the run ended without a reply or a reason
 ERROR_DETAILS = "details"        # the summary of the collapsed raw text
 
+# The Gateway's error for a claude-cli turn whose reply is required (a person's
+# message, a `sessions_send`) and whose final text is empty or a silent sentinel
+# such as NO_REPLY (cli-runner, failover reason `empty_response`). The CLI
+# exited cleanly: the model chose to say nothing, so the reply shows no error
+# (ELI-336).
+EMPTY_RESPONSE_ERROR = "CLI backend returned an empty response."
+
+
+def _is_model_silence(error) -> bool:
+    """True when a run's error only says that the model ended without text."""
+    return str(error or "").strip() == EMPTY_RESPONSE_ERROR
+
+
 LANG_EN = "en"
 LANG_HE = "he"
 
@@ -9026,10 +9039,6 @@ def _owui_request_task(task_id: str | None):
     if not task_id:
         return None
     return (getattr(sys.modules.get("open_webui.tasks"), "tasks", None) or {}).get(task_id)
-
-# The Gateway's error for a claude-cli turn with no final text. A
-# `sessions_send` turn often ends silent on purpose and still fails (ELI-336).
-EMPTY_RESPONSE_ERROR = "CLI backend returned an empty response."
 
 TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
@@ -9955,7 +9964,7 @@ class _TurnWriter:
         if turn_owner(row, stop_notice_before) == "pipe":
             note = TURN_CUT_OFF_NOTE
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
-            if not (row["lastRunError"].strip() == EMPTY_RESPONSE_ERROR and await self._run_is_inter_session()):
+            if not _is_model_silence(row["lastRunError"]):
                 request = self.request or (await self._run_request())[0]
                 note = _plain_error(ERROR_RUN, row["lastRunError"], request)
         if note is None and await self._ask_question():
@@ -9974,18 +9983,6 @@ class _TurnWriter:
             return
         await _await_steered_answer(self.conn, self.session_key, self.run_id,
                                     f"turn writer: {self.message_id[:8]}...", steered=self.steered_message)
-
-    async def _run_is_inter_session(self) -> bool:
-        """True when this run answers another session's `sessions_send`."""
-        try:
-            hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.history failed reading the run's source: {ex!r}")
-            return False
-        for m in (hist or {}).get("messages") or []:
-            if _history_user_run_id(m) == self.run_id:
-                return (m.get("provenance") or {}).get("kind") == "inter_session"
-        return False
 
     async def _ask_question(self) -> bool:
         """Ask a closing question as a card on the chat's tab (ELI-107) and
@@ -15631,6 +15628,7 @@ class _PipeTurn:
         self.event_count = 0
         self.text_yielded = False
         self.error_shown = ""  # the run's "**Error:**" line, once shown
+        self.model_silent = False  # the run failed only because the model said nothing (ELI-336)
         self.aborted = False
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
@@ -16030,6 +16028,9 @@ class _PipeTurn:
         if stream == "lifecycle" and phase == "end":
             self.done = True
             pipe_log("  lifecycle end -> done")
+        elif _is_model_silence(err):
+            self.model_silent = self.done = True
+            pipe_log("  lifecycle error: the model ended without text -> done, nothing shown")
         elif err:
             self.error_shown = "\n\n" + _plain_error(ERROR_RUN, err, self.text)
             self.record_visible_chunk(self.error_shown)
@@ -16048,7 +16049,9 @@ class _PipeTurn:
         # why only here (ELI-139).
         run_error = str(payload.get("errorMessage") or "").strip() \
             if state == "error" else ""
-        if (run_error and not self.error_shown
+        if _is_model_silence(run_error):
+            self.model_silent = True
+        elif (run_error and not self.error_shown
                 and _thinking_rejection_retry_body(
                     self.body, run_error, self.resolved_thinking) is None):
             self.error_shown = "\n\n" + _plain_error(ERROR_RUN, run_error, self.text)
@@ -16348,6 +16351,9 @@ class _PipeTurn:
                 i.get("type") == "function_call" for i in self.renderer.output):
             # Silence after tool calls is on purpose: the cards are the reply (ELI-227).
             pipe_log("  the run answered with silence after its tool cards")
+        elif not self.aborted and not self.text_yielded and self.model_silent:
+            # The model's silence is its answer: no error and no fallback line (ELI-336).
+            pipe_log("  the run ended silent: nothing shown")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(

@@ -19,6 +19,19 @@ ERROR_TIMEOUT = "timeout"        # the Gateway did not answer in time
 ERROR_UNFINISHED = "unfinished"  # the run ended without a reply or a reason
 ERROR_DETAILS = "details"        # the summary of the collapsed raw text
 
+# The Gateway's error for a claude-cli turn whose reply is required (a person's
+# message, a `sessions_send`) and whose final text is empty or a silent sentinel
+# such as NO_REPLY (cli-runner, failover reason `empty_response`). The CLI
+# exited cleanly: the model chose to say nothing, so the reply shows no error
+# (ELI-336).
+EMPTY_RESPONSE_ERROR = "CLI backend returned an empty response."
+
+
+def _is_model_silence(error) -> bool:
+    """True when a run's error only says that the model ended without text."""
+    return str(error or "").strip() == EMPTY_RESPONSE_ERROR
+
+
 LANG_EN = "en"
 LANG_HE = "he"
 
