@@ -19,7 +19,7 @@ Where copies of them end up:
 |---|---|---|
 | The function's valves in Open WebUI | All of the above | Anyone who can open the function's valves in the admin panel can read them. The Status Action keeps its own copy of the shared valves. |
 | `STATE_DIR` (default `/data/openclaw-bridge`) | `identity.json` (the key pair), `device-token.json` (the token the Gateway issued), and with `OWNER_USERS` set, `identity-restricted.json` and its token | Written with mode `0600` in a `0700` directory, inside the Open WebUI container. If `STATE_DIR` is not writable, they go to `/tmp/openclaw-bridge` instead. |
-| `.pipe_device_identity.json` in your repo checkout | The device identity | Written by `install.py` (mode `0600`) so a reinstall keeps the same device. Gitignored. |
+| `.pipe_device_identity.json` in your repo checkout (or the file `PIPE_DEVICE_IDENTITY_FILE` names) | The device identity | Written by `install.py` (mode `0600`) so a reinstall keeps the same device. Gitignored. |
 | `backups/` in your repo checkout | The previous function and its valves, from every install | Mode `0600`, gitignored. The valves files hold the token and the identity. |
 
 Do not commit, paste or share any of them. Leave them out of bug reports.

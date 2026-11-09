@@ -134,7 +134,7 @@ Supported Open WebUI and OpenClaw versions: [Versions](../versions.md).
 5. **If it's new:** create the function.
 6. Make sure it is active and global, switching on only what is off. It never blindly toggles it off first.
 7. Set the valves. It restores any valve Open WebUI dropped during the update, and keeps every valve it does not manage (see [Valves the installer sets](#valves-the-installer-sets)).
-8. Pick the device identity (an Ed25519 key pair): the existing `DEVICE_IDENTITY` valve first, then `./.pipe_device_identity.json`, and only if neither exists, a new one. It is written to both.
+8. Pick the device identity (an Ed25519 key pair): the existing `DEVICE_IDENTITY` valve first, then `./.pipe_device_identity.json` (or the file named by the `PIPE_DEVICE_IDENTITY_FILE` environment variable, which the E2E stacks set so each keeps its own), and only if neither exists, a new one. It is written to both.
 9. Check that **OpenClaw · Default** and at least one discovered model are visible in Open WebUI's model list, and stop if not.
 10. Run an end-to-end smoke test through `/api/chat/completions`: it asks the agent to reply with a fixed word. If the reply says **pairing required** and the local `openclaw` CLI is available, it approves the matching pending pairing request and tries again.
 11. Run a route smoke test: it picks one discovered (non-default) model and asks the agent which model it is running on, to prove that picking a model in Open WebUI reaches the agent.

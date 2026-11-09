@@ -65,7 +65,10 @@ def smoke_session_id(prefix: str, now: datetime | None = None) -> str:
     return f"{prefix}-{(now or datetime.now(timezone.utc)).strftime('%Y-%m-%d')}"
 ROOT = Path(__file__).resolve().parent
 PIPE_FILE = ROOT / "openclaw_pipe.py"
-LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
+DEFAULT_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
+# PIPE_DEVICE_IDENTITY_FILE: where the installer keeps its copy of the device identity instead of next to install.py. The E2E stacks set it so that two stacks
+# started from one checkout do not share (and race on) one file.
+IDENTITY_FILE_ENV = "PIPE_DEVICE_IDENTITY_FILE"
 BACKUP_DIR = ROOT / "backups"
 SKILLS_DIR = ROOT / "skills"
 
@@ -328,20 +331,24 @@ def parse_identity(raw: object) -> dict | None:
     return None
 
 
+def local_identity_file() -> Path:
+    return Path(os.environ.get(IDENTITY_FILE_ENV) or DEFAULT_IDENTITY_FILE)
+
+
 def choose_identity(existing_valves: dict) -> dict:
     valve_identity = parse_identity(existing_valves.get("DEVICE_IDENTITY"))
     if valve_identity:
-        save_json_private(LOCAL_IDENTITY_FILE, valve_identity)
+        save_json_private(local_identity_file(), valve_identity)
         info(f"Using DEVICE_IDENTITY from existing valves: {valve_identity['id'][:20]}...")
         return valve_identity
 
-    file_identity = parse_identity(load_json(LOCAL_IDENTITY_FILE))
+    file_identity = parse_identity(load_json(local_identity_file()))
     if file_identity:
         info(f"Using local device identity: {file_identity['id'][:20]}...")
         return file_identity
 
     ident = generate_device_identity()
-    save_json_private(LOCAL_IDENTITY_FILE, ident)
+    save_json_private(local_identity_file(), ident)
     warn(f"Generated new device identity: {ident['id'][:20]}...")
     warn("This new identity must be approved once by OpenClaw.")
     return ident

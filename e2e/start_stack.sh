@@ -28,6 +28,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LOG_DIR="${E2E_LOG_DIR:-$PWD/e2e-logs}"
+# The installer keeps a copy of the device identity (a private key) in a file; by default it sits next to install.py, so two stacks started from one checkout
+# shared it and raced on creating it. Each stack gets its own, outside the log dir (CI uploads that as an artifact), removed by `down`.
+PIPE_DEVICE_IDENTITY_FILE="${TMPDIR:-/tmp}/pipe-e2e-identity-$(printf '%s' "$LOG_DIR" | sha1sum | cut -c1-12).json"
+export PIPE_DEVICE_IDENTITY_FILE
 # One pid file per process the stack starts. gateway.pid is also read (and
 # rewritten after a relaunch) by the crash tests, so it holds the bare pid.
 STACK_PID_FILES=("$LOG_DIR/fake-llm.pid" "$LOG_DIR/gateway.pid" "$LOG_DIR/docker-pull.pid")
@@ -88,6 +92,7 @@ stack_down() {
     docker rm -f "$id" >/dev/null 2>&1 || true
   fi
   rm -f "${STACK_PID_FILES[@]}" "$LOG_DIR/owui.id"
+  rm -f "$PIPE_DEVICE_IDENTITY_FILE"
   # Local sandboxes only (e2e-local/run.sh sets it): release the shared, read-only OpenClaw install this stack mounted. CI leaves it unset.
   if [[ -n "${E2E_NPM_INSTALLER:-}" ]] && npm_prefix=$(npm prefix --global) && [[ -n "$npm_prefix" ]]; then "$E2E_NPM_INSTALLER" detach "$npm_prefix" || true; fi
   echo "stack down (${#pids[@]} processes stopped)"
