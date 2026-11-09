@@ -428,6 +428,8 @@ def _subagent_index_mark_seeded(rows=()) -> None:
 TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")
 ACTION_RUN_PREFIX = "owui-action-"
 _UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# `parse_pipe_run_id`'s kind of a run that writes a reply.
+PIPE_RUN_REPLY = "reply"
 _PIPE_RUN_RE = re.compile(rf"^msg-(?P<chat>{_UUID_RE})-(?P<message>{_UUID_RE})-(?P<rest>.+)$")
 
 
@@ -442,7 +444,7 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
     if not m:
         return None
     head = m.group("rest").split("-", 1)[0]
-    kind = head if head in ("input", "resume") else "reply"
+    kind = head if head in ("input", "resume") else PIPE_RUN_REPLY
     return {"chat": m.group("chat"), "message": m.group("message"), "kind": kind}
 
 
@@ -4835,6 +4837,16 @@ _CHAT_FINAL = "final"
 _PHASE_END = "end"
 
 
+def _settle_ref(run_id: str) -> dict | None:
+    """The reply of a Pipe reply run, as `_settle_steered_replies` takes it;
+    None for any other run."""
+    pipe = parse_pipe_run_id(run_id)
+    if not pipe or pipe["kind"] != PIPE_RUN_REPLY:
+        return None
+    return {"chat_id": pipe["chat"], "message_id": pipe["message"], "request_task_id": None,
+            "span_run": run_id}
+
+
 def steers_mid_run_messages(version) -> bool:
     """True for a 2026.10.10+ Gateway, which steers mid-run messages into the
     run (claude-cli included). An unknown version counts as older."""
@@ -6800,8 +6812,11 @@ class _GatewayConnection:
 
     def _on_user_message_committed(self, session_key: str, message: dict) -> None:
         """A user message was committed. On 2026.10.10+ a commit naming a
-        steer target comes before the answer's first event, so the steer is
-        applied from here."""
+        steer target applies the steer from here. The Gateway publishes the
+        target in a second commit, once the runtime took the message in
+        (`confirmSteerTargetRunIdForPersistence`), with no order to the
+        run's events or to later messages' commits: it can come after the
+        run ended."""
         idem = str((message.get("__openclaw") or {}).get("idempotencyKey") or "")
         if not (message.get("role") == "user" and idem.endswith(":user")
                 and steers_mid_run_messages(self.gateway_version)):
@@ -6813,9 +6828,19 @@ class _GatewayConnection:
         run_id = idem[:-len(":user")]
         consumer = self._consumers.get(f"{session_key}:{run_id}")
         if consumer is not None and not (consumer.started or consumer.steered):
-            self._steer(consumer, into=into)
-        elif consumer is None and (handed := self._steer_handed_over(session_key, run_id)) is not None:
-            self._steer(handed, into=into)
+            steered = consumer
+        elif consumer is None:
+            steered = self._steer_handed_over(session_key, run_id)
+        else:
+            return
+        if steered is None or self._steer(steered, into=into):
+            return
+        # Its reply still takes its part of the run: from the transcript.
+        pipe_log(f"  steer of run {run_id[:24]}... into {into[:24]}... not applied: that run is not "
+                 "the session's running run; its replies settle from the transcript")
+        refs = [_settle_ref(r) for r in (into, run_id)]
+        if _TURNS and all(refs):
+            spawn_background(_TURNS.settle_steered_replies(self, session_key, refs))
 
     def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
         """A consumer feeding the turn writer that took over a reply still
@@ -8949,20 +8974,38 @@ def _settle_text(text: str) -> str:
 
 def _settle_misplaced(saved: list, parts: list) -> bool:
     """The saved replies hold the transcript's parts with only the split
-    points moved. Whitespace-blind."""
+    points moved: in order, each one a piece of the run's text that starts
+    where the one before ended or earlier (a late steer's answer shows in
+    both replies), together all of it. Whitespace-blind."""
     if saved == parts or len(saved) != len(parts):
         return False
-    shown = ""  # the start of this part the reply before showed
-    for n, (was, part) in enumerate(zip(saved, parts)):
-        if not part.startswith(shown):
+    whole, end = "".join(parts), 0  # `end`: how far the replies so far reach
+    for was in saved:
+        start = next((s for s in range(end, max(end - len(was), 0) - 1, -1)
+                      if whole.startswith(was, s)), None)
+        if start is None:
             return False
-        if n == len(parts) - 1:
-            return part.endswith(was)
-        rest = part[len(shown):]
-        if not was.startswith(rest):
-            return False
-        shown = was[len(rest):]
-    return False
+        end = max(end, start + len(was))
+    return end == len(whole)
+
+
+def _steer_chain(history: dict, refs: list) -> list:
+    """`refs` in the transcript's order: the host run's reply, then the reply
+    of each message steered into it. A message whose steer came after the
+    run ended (2026.10.10 publishes the steer target with no order to the
+    rest) is in no reply's chain; the transcript still shows it, so it
+    joins here. `refs` as they are when the transcript does not show them all."""
+    messages = (history or {}).get("messages")
+    if not refs or not isinstance(messages, list):
+        return refs
+    host, by_message = refs[0]["span_run"], {r["message_id"]: r for r in refs[1:]}
+    chain = [refs[0]]
+    for n, message in enumerate(messages):
+        run = _history_user_run_id(message)
+        ref = _settle_ref(run) if run else None
+        if ref is not None and _history_steered_into(history, n) == host:
+            chain.append(by_message.pop(ref["message_id"], None) or ref)
+    return refs if by_message else chain
 
 
 async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, refs: list) -> None:
@@ -8981,6 +9024,12 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
 
     try:
         hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+        refs = _steer_chain(hist, refs)
+        for ref in refs:
+            # A reply a turn writer still has is read once it is saved.
+            writer = conn._turn_writers.get((ref["chat_id"], ref["message_id"]))
+            if writer is not None and not writer.closed:
+                await writer.wait_done()
         spans = [_history_span_messages(hist, r["span_run"]) for r in refs]
         if any(s is None for s in spans):
             return
@@ -10139,6 +10188,10 @@ class _TurnWriter:
                          f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
             except Exception as ex:
                 pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
+
+    async def wait_done(self) -> None:
+        """Until this writer is done with its message."""
+        await self._done.wait()
 
     async def _hold(self) -> None:
         """The Open WebUI task, alive while this writer owns the run."""
@@ -11615,6 +11668,7 @@ class _TurnHooks:
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)
     end_unsent_replies = staticmethod(_end_unsent_replies)
+    settle_steered_replies = staticmethod(_settle_steered_replies)
 
 
 _TURNS = _TurnHooks

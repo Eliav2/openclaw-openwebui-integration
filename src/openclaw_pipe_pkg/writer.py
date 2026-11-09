@@ -430,20 +430,38 @@ def _settle_text(text: str) -> str:
 
 def _settle_misplaced(saved: list, parts: list) -> bool:
     """The saved replies hold the transcript's parts with only the split
-    points moved. Whitespace-blind."""
+    points moved: in order, each one a piece of the run's text that starts
+    where the one before ended or earlier (a late steer's answer shows in
+    both replies), together all of it. Whitespace-blind."""
     if saved == parts or len(saved) != len(parts):
         return False
-    shown = ""  # the start of this part the reply before showed
-    for n, (was, part) in enumerate(zip(saved, parts)):
-        if not part.startswith(shown):
+    whole, end = "".join(parts), 0  # `end`: how far the replies so far reach
+    for was in saved:
+        start = next((s for s in range(end, max(end - len(was), 0) - 1, -1)
+                      if whole.startswith(was, s)), None)
+        if start is None:
             return False
-        if n == len(parts) - 1:
-            return part.endswith(was)
-        rest = part[len(shown):]
-        if not was.startswith(rest):
-            return False
-        shown = was[len(rest):]
-    return False
+        end = max(end, start + len(was))
+    return end == len(whole)
+
+
+def _steer_chain(history: dict, refs: list) -> list:
+    """`refs` in the transcript's order: the host run's reply, then the reply
+    of each message steered into it. A message whose steer came after the
+    run ended (2026.10.10 publishes the steer target with no order to the
+    rest) is in no reply's chain; the transcript still shows it, so it
+    joins here. `refs` as they are when the transcript does not show them all."""
+    messages = (history or {}).get("messages")
+    if not refs or not isinstance(messages, list):
+        return refs
+    host, by_message = refs[0]["span_run"], {r["message_id"]: r for r in refs[1:]}
+    chain = [refs[0]]
+    for n, message in enumerate(messages):
+        run = _history_user_run_id(message)
+        ref = _settle_ref(run) if run else None
+        if ref is not None and _history_steered_into(history, n) == host:
+            chain.append(by_message.pop(ref["message_id"], None) or ref)
+    return refs if by_message else chain
 
 
 async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, refs: list) -> None:
@@ -462,6 +480,12 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
 
     try:
         hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+        refs = _steer_chain(hist, refs)
+        for ref in refs:
+            # A reply a turn writer still has is read once it is saved.
+            writer = conn._turn_writers.get((ref["chat_id"], ref["message_id"]))
+            if writer is not None and not writer.closed:
+                await writer.wait_done()
         spans = [_history_span_messages(hist, r["span_run"]) for r in refs]
         if any(s is None for s in spans):
             return
@@ -1620,6 +1644,10 @@ class _TurnWriter:
                          f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
             except Exception as ex:
                 pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
+
+    async def wait_done(self) -> None:
+        """Until this writer is done with its message."""
+        await self._done.wait()
 
     async def _hold(self) -> None:
         """The Open WebUI task, alive while this writer owns the run."""
@@ -3096,6 +3124,7 @@ class _TurnHooks:
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)
     end_unsent_replies = staticmethod(_end_unsent_replies)
+    settle_steered_replies = staticmethod(_settle_steered_replies)
 
 
 _TURNS = _TurnHooks

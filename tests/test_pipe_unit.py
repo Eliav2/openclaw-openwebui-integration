@@ -15916,6 +15916,17 @@ class SettleSteeredRepliesTests(unittest.TestCase):
         self.assertFalse(openclaw_pipe._settle_misplaced(
             ["holdSTEERED:", "aXSTEERED:", "b"], ["hold", "STEERED:a", "STEERED:b"]))
 
+    def test_a_reply_that_also_shows_the_next_ones_answer_is_misplaced(self):
+        """A late steer (CI 42538220842): the first reply ran on into tomato's answer, which
+        tomato's own reply shows too. The replies still hold only the transcript's text, in
+        order, so it is a moved split."""
+        self.assertTrue(openclaw_pipe._settle_misplaced(
+            ["holdSTEERED:a", "STEERED:a", "b"], ["hold", "STEERED:a", "b"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(
+            ["holdSTEERED:a", "STEERED:aX", "b"], ["hold", "STEERED:a", "b"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(
+            ["hold", "b", "STEERED:a"], ["hold", "STEERED:a", "b"]), "out of order")
+
     def test_replies_already_in_place_or_holding_more_stay(self):
         self.assertFalse(openclaw_pipe._settle_misplaced(["hold", "STEERED:a"], ["hold", "STEERED:a"]))
         self.assertFalse(openclaw_pipe._settle_misplaced(["holdnote", "STEERED:a"], ["hold", "STEERED:a"]))
@@ -16603,6 +16614,85 @@ class MidRunSteeringTests(_TurnCase):
         self.assertNotIn("Stop and say banana", self.sent)
         first.cancel()
         await self._spin()
+
+    def _ref(self, run_id):
+        """A reply's settle ref, from its Pipe run id."""
+        message = openclaw_pipe.parse_pipe_run_id(run_id)["message"]
+        return {"chat_id": self.CHAT, "message_id": message, "request_task_id": None, "span_run": run_id}
+
+    async def test_a_steer_committed_after_its_run_ended_is_logged_and_settled(self):
+        """CI 42538220842: 'say blue' was steered in too and its commit came first, then the run
+        ended; tomato's steer target came after. 2026.10.10 publishes it with no order to the
+        rest (`confirmSteerTargetRunIdForPersistence` runs once the runtime took the message
+        in). With no running run to steer into, the steer is logged and the reply joins the run's
+        settle from the transcript, never dropped."""
+        self.conn.gateway_version = "2026.10.10"
+        conn, sk = self.conn, self.SK
+        tomato = openclaw_pipe._RunPump()
+        tomato.handover = {"message_id": "w2", "steer_pending": True,
+                           "renderer": types.SimpleNamespace(received="", output=None)}
+        conn._turn_pumps[(sk, self.R2)] = tomato
+        logged, settled = [], []
+
+        async def settle(_conn, key, refs):
+            settled.append((key, refs))
+        with mock.patch.object(openclaw_pipe, "pipe_log", lambda *a, **k: logged.append(a[0])), \
+                mock.patch.object(openclaw_pipe._TurnHooks, "settle_steered_replies",
+                                  staticmethod(settle), create=True):
+            conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
+            await self._spin()
+        self.assertTrue(any("not the session's running run" in line for line in logged), logged)
+        self.assertEqual(settled, [(sk, [self._ref(self.R1), self._ref(self.R2)])])
+
+    async def test_the_settle_finds_a_reply_steered_in_late_from_the_transcript(self):
+        """Blue's reply settles [first, blue]; tomato, steered in between, is not in its chain
+        because its steer came late. The transcript shows it: the first reply is cut at tomato's
+        commit, once tomato's writer, still open, is done."""
+        conn, sk = self.conn, self.SK
+        refs = {n: self._ref(r) for n, r in ((1, self.R1), (2, self.R2), (3, self.R3))}
+        user = SteeredTranscriptSpanTests._user
+        said = SteeredTranscriptSpanTests._said
+        tool = {"role": "toolResult", "content": "done"}
+        conn.session_history = mock.AsyncMock(return_value={"messages": [
+            user(self.R1, "E2E_CLI_LATE_STEER x"), said("E2E_LATE_PART_1", stop="toolUse"), tool,
+            said("E2E_LATE_PART_2", stop="toolUse"), tool,
+            user(self.R2, "say tomato"), said("E2E_CLI_STEERED: tomato", stop="end_turn"),
+            user(self.R3, "say blue"), said("E2E_CLI_REPLY", stop="end_turn"),
+            said("E2E_LATE_PART_1\n\nE2E_LATE_PART_2\n\nE2E_CLI_STEERED: tomato\n\nE2E_CLI_REPLY",
+                 run=self.R1, key=f"cli-assistant:{self.R1}")]})
+        saved = {refs[1]["message_id"]: "E2E_LATE_PART_1\n\nE2E_LATE_PART_2\n\nE2E_CLI_STEERED: tomato",
+                 refs[2]["message_id"]: "E2E_CLI_STEERED: tomato",
+                 refs[3]["message_id"]: "E2E_CLI_REPLY"}
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return {"content": saved[message_id], "output": []}
+
+        async def emitter(*_a, **_k):
+            return mock.AsyncMock()
+        modules = owui_modules(get_event_emitter=emitter)
+        modules["open_webui.models"] = types.ModuleType("open_webui.models")
+        modules["open_webui.models.chats"] = types.ModuleType("open_webui.models.chats")
+        modules["open_webui.models.chats"].Chats = Chats
+        upserts = {}
+
+        async def upsert(chat_id, message_id, fields):
+            upserts[message_id] = fields
+            return True
+        writer = openclaw_pipe._TurnWriter.__new__(openclaw_pipe._TurnWriter)
+        writer.closed, writer._done = False, asyncio.Event()
+        conn._turn_writers[(self.CHAT, refs[2]["message_id"])] = writer
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(openclaw_pipe, "_owui_upsert_message", upsert):
+            settle = asyncio.ensure_future(openclaw_pipe._settle_steered_replies(conn, sk, [refs[1], refs[3]]))
+            await self._spin()
+            self.assertEqual(upserts, {}, "not while tomato's writer is open")
+            writer._done.set()
+            await settle
+        self.assertEqual(list(upserts), [refs[1]["message_id"]], upserts)
+        self.assertEqual(openclaw_pipe._settle_text(upserts[refs[1]["message_id"]]["content"]),
+                         "E2E_LATE_PART_1E2E_LATE_PART_2")
 
 
 class UnpublishedInputResendTests(_TurnCase):

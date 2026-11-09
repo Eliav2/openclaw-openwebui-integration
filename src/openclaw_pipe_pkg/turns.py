@@ -15,6 +15,8 @@
 TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")
 ACTION_RUN_PREFIX = "owui-action-"
 _UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# `parse_pipe_run_id`'s kind of a run that writes a reply.
+PIPE_RUN_REPLY = "reply"
 _PIPE_RUN_RE = re.compile(rf"^msg-(?P<chat>{_UUID_RE})-(?P<message>{_UUID_RE})-(?P<rest>.+)$")
 
 
@@ -29,7 +31,7 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
     if not m:
         return None
     head = m.group("rest").split("-", 1)[0]
-    kind = head if head in ("input", "resume") else "reply"
+    kind = head if head in ("input", "resume") else PIPE_RUN_REPLY
     return {"chat": m.group("chat"), "message": m.group("message"), "kind": kind}
 
 
