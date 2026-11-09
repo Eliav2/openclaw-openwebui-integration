@@ -151,32 +151,81 @@ async def _clear_response_stream(task_id: str | None) -> None:
 # Open WebUI's event names are a closed catalog, so consumers tell the Pipe's
 # `chat.finished` from the middleware's by `source`.
 CHAT_FINISHED_SOURCE = "openclaw-pipe"
-# Meta key so a reply is published once however many paths finish it.
-CHAT_FINISHED_META = "openclaw_chat_finished"
+# Claims, one per reply, so a reply is published once however many paths
+# finish it (a request can run twice, in any worker). Kept off the chat row,
+# whose every write rewrites the whole chat: Open WebUI's Redis when it has
+# one (its workers share it), else a set on this worker (Open WebUI without
+# Redis runs one worker). After a restart no path re-finishes a reply it
+# already published, so the claims need not outlive the process.
+CHAT_FINISHED_CLAIMS_KEY = "openclaw:chat_finished"
+_CHAT_FINISHED_CLAIMS_ATTR = "_openclaw_chat_finished_claims"
+_chat_finished_claims_local: set = set()
 
 
-async def _claim_chat_finished(chat_id: str, message_id: str) -> dict | None:
-    """The message if saved whole and not yet published, marked published
-    under the row lock (a request can run twice, in any worker). Uncancellable."""
-    return await _uncancellable(_claim_chat_finished_now(chat_id, message_id))
+def _chat_finished_claims() -> set:
+    """This worker's claims, on Open WebUI's socket module so a Pipe reload
+    keeps them."""
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return _chat_finished_claims_local
+    claims = getattr(_owui_socket_main, _CHAT_FINISHED_CLAIMS_ATTR, None)
+    if claims is None:
+        claims = set()
+        setattr(_owui_socket_main, _CHAT_FINISHED_CLAIMS_ATTR, claims)
+    return claims
 
 
-async def _claim_chat_finished_now(chat_id: str, message_id: str) -> dict | None:
-    from open_webui.models.chats import Chats
-    from sqlalchemy.orm.attributes import flag_modified
+def _chat_finished_redis_key() -> str:
+    from open_webui.env import REDIS_KEY_PREFIX
+    return f"{REDIS_KEY_PREFIX}:{CHAT_FINISHED_CLAIMS_KEY}"
 
-    async with Chats._chat_transaction(chat_id) as (db, chat):
-        if chat is None:
-            return None
-        data = chat.chat or {}
-        history = data.get("history") or {}
-        msg = (history.get("messages") or {}).get(message_id)
-        if msg is None or msg.get("done") is not True or (msg.get("meta") or {}).get(CHAT_FINISHED_META):
-            return None
-        msg["meta"] = {**(msg.get("meta") or {}), CHAT_FINISHED_META: True}
-        chat.chat = {**data, "history": history}
-        flag_modified(chat, "chat")
-        return dict(msg)
+
+async def _claim_chat_finished(chat_id: str, message_id: str) -> bool:
+    """Whether this caller is the reply's one publisher: an atomic test-and-set
+    (Redis HSETNX across workers, else one set on this event loop)."""
+    claim = f"{chat_id}:{message_id}"
+    redis = _owui_redis()
+    if redis is not None:
+        return bool(await redis.hsetnx(_chat_finished_redis_key(), claim, "1"))
+    claims = _chat_finished_claims()
+    if claim in claims:
+        return False
+    claims.add(claim)
+    return True
+
+
+async def _release_chat_finished_claims() -> None:
+    """Drop the claims of chats with no live Open WebUI task (requests and
+    turn writers file theirs under the chat id): no path can still finish
+    their replies. Run after each publish and once per Pipe load."""
+    try:
+        from open_webui.tasks import list_task_ids_by_item_id
+
+        redis = _owui_redis()
+        if redis is not None:
+            key = _chat_finished_redis_key()
+            claims = [c.decode() if isinstance(c, bytes) else c for c in await redis.hkeys(key)]
+        else:
+            claims = list(_chat_finished_claims())
+        by_chat: dict = {}
+        for claim in claims:
+            by_chat.setdefault(claim.rsplit(":", 1)[0], []).append(claim)
+        for chat_id, held in by_chat.items():
+            if await list_task_ids_by_item_id(redis, chat_id):
+                continue
+            if redis is not None:
+                await redis.hdel(key, *held)
+            else:
+                _chat_finished_claims().difference_update(held)
+    except Exception as ex:
+        pipe_log(f"  releasing chat.finished claims failed: {ex!r}")
+
+
+async def _finished_message(chat_id: str, message_id: str):
+    """The reply's own chat_message row, not the whole chat."""
+    from open_webui.models.chat_messages import ChatMessages
+    return await ChatMessages.get_message_by_id(f"{chat_id}-{message_id}")
 
 
 async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
@@ -196,11 +245,11 @@ async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
 
         if not is_saved_chat_id(chat_id):
             return
-        row = await _claim_chat_finished(chat_id, message_id)
-        if row is None:
+        row = await _finished_message(chat_id, message_id)
+        if row is None or row.done is not True or not await _claim_chat_finished(chat_id, message_id):
             return
         if text is None:
-            text = row.get("content") or ""
+            text = _coerce_text(row.content)
         title = await Chats.get_chat_title_by_id(chat_id) or ""
         user = await Users.get_user_by_id(user_id)
         try:
@@ -216,11 +265,12 @@ async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
             actor=user or {"id": user_id}, subject_id=chat_id, subject_type="chat",
             source=CHAT_FINISHED_SOURCE,
             data={"user_id": user_id, "chat_id": chat_id, "message_id": message_id,
-                  "model_id": row.get("model"), "title": title,
+                  "model_id": row.model_id, "title": title,
                   "url": f"{base}/c/{chat_id}", "message": text},
             message=title or "Chat finished")
     except Exception as ex:
         pipe_log(f"  turn writer: publishing chat.finished for {message_id[:8]}... failed: {ex!r}")
+    await _release_chat_finished_claims()
 
 
 def _owui_request_task(task_id: str | None):
@@ -3116,6 +3166,8 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     except Exception as ex:
         pipe_log(f"  orphan stub reconcile could not start: {ex}")
         return
+    # Claims left by a worker that died with its chats' tasks.
+    await _release_chat_finished_claims()
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")

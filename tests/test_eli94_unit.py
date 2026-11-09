@@ -36,6 +36,10 @@ def _closed_history(closed_ms=CLOSED_MS, run=RUN):
     return hist
 
 
+async def _no_stubs():
+    return []
+
+
 def _cards(output):
     return sum(1 for i in output or [] if i.get("type") == "function_call")
 
@@ -178,6 +182,30 @@ class EndedWhileDownTests(_EndedWhileDownCase):
             await self.startup()
         self.assertEqual(self.msg()["content"], "Reading them.\n\nFound it.")
         self.assertEqual(published, [(CHAT, M, USER)])
+
+    async def test_after_a_restart_a_published_whole_reply_is_not_published_again(self):
+        """B, paths 3 and 4 (a lost claim can't publish twice): a reply published before the
+        restart holds its whole run, so the ended-while-down pass leaves it alone, and the
+        orphan-stub pass takes only done:false replies."""
+        published = []
+
+        async def publish(chat_id, message_id, user_id, text=None):
+            published.append((chat_id, message_id))
+
+        async def the_stub(prefixes):
+            return [(CHAT, M)]
+        self.msg().update(content="Reading them.\n\nFound it.", output=[
+            {"type": "function_call", "id": "fc1", "call_id": "toolu_1", "name": "Bash", "arguments": "{}",
+             "status": "completed"},
+            {"type": "message", "role": "assistant", "id": "o1", "status": "completed",
+             "content": [{"type": "output_text", "text": "Reading them.\n\nFound it."}]}])
+        self.conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main", PUBLISH_CHAT_FINISHED=True)
+        for stubs in (False, True):
+            with self.subTest(orphan_stub_pass=stubs), \
+                    mock.patch.object(openclaw_pipe, "_publish_chat_finished", publish), \
+                    mock.patch("openclaw_pipe._orphan_stub_ids", the_stub if stubs else (lambda p: _no_stubs())):
+                await self.startup()
+        self.assertEqual((self.writes, published), ([], []))
 
     async def test_a_run_that_closed_before_the_chat_was_last_written_is_left_alone(self):
         """The reply was written after its run closed: it already holds the end."""
