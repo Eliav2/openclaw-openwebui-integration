@@ -120,8 +120,9 @@ jobs:
           [ "$rc" -eq 0 ] || { [ -n "$TESTS" ] && [ "$rc" -eq 5 ]; }  # -k matched nothing here
 
       - name: Fixtures still match the installed OpenClaw
-        # The unit suite pins two Gateway source lines the Pipe matches on
-        # (the claude-cli exit error, the cron wake prompt). With OPENCLAW_DIST
+        # The unit suite pins Gateway source the Pipe depends on (the
+        # claude-cli exit error, the cron wake prompt, the Claude thinking
+        # profiles behind the claude-cli `off` clamp). With OPENCLAW_DIST
         # set these checks fail rather than skip when the dist is missing.
         run: |
           OPENCLAW_DIST="$(npm root -g)/openclaw/dist" uv run --with-requirements requirements-dev.txt \

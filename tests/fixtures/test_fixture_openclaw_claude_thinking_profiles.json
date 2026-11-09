@@ -1,0 +1,22 @@
+{
+ "openclaw_version": "2026.10.10",
+ "file": "anthropic-B3HirzdP.mjs",
+ "profiles": {
+  "claude-sonnet-5-5": [
+   "off",
+   "low",
+   "medium",
+   "high",
+   "xhigh",
+   "max"
+  ],
+  "claude-haiku-5-5": [
+   "off",
+   "low",
+   "medium",
+   "high",
+   "xhigh",
+   "max"
+  ]
+ }
+}

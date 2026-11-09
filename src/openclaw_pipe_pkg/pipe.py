@@ -1319,6 +1319,10 @@ class _PipeTurn:
             effective_ladder = (_read_model_thinking_ladder(self.model_override, _state_dir_valve)
                                 or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
                                 or self.session_thinking_ladder)
+            model_key = self.model_override or self.session_model_key
+            effective_ladder = _honoured_thinking_ladder(
+                effective_ladder, model_key,
+                self.session_runtime or _read_model_runtime(model_key, _state_dir_valve))
             self.resolved_thinking, thinking_note = clamp_to_ladder(
                 self.requested_thinking, effective_ladder)
             # Held until `visible_message_text` exists, so the note persists on reload.
@@ -2236,6 +2240,8 @@ class _PipeTurn:
             # for claude-cli/claude-opus-5, real ladder ["off"]). Good for the
             # dropdown, not for clamping once the Gateway has ruled.
             self.session_model_key = _session_model_key(row)
+            _record_model_runtime(self.session_model_key, (row.get("agentRuntime") or {}).get("id"),
+                                  getattr(self.pipe.valves, "STATE_DIR", ""))
             ladder = _session_thinking_ladder(desc)
             if ladder:
                 self.session_thinking_ladder = ladder
