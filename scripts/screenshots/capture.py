@@ -547,12 +547,19 @@ class Shooter:
         self.out, self.only = out, only
         self.failures: list = []
         self.written: list = []
+        self.ran: set = set()   # scenes run, for a selection or as a prerequisite
         self.quiet = False   # running a scene only as another one's prerequisite
         self.host = socket.gethostname()
         os.makedirs(os.path.join(out, "debug"), exist_ok=True)
 
     def wanted(self, name: str) -> bool:
         return not self.only or name in self.only
+
+    def fail_unrun_selection(self) -> None:
+        """A selected scene that never ran (unknown, removed, or skipped
+        because what it needs is missing) wrote nothing: that fails the run."""
+        for name in sorted((self.only or set()) - self.ran):
+            self.failures.append(f"{name}: selected with --only but never ran")
 
     def check_text(self, page: Page, name: str, selector: str | None, allow: tuple = ()) -> None:
         text = visible_text(page, selector)
@@ -594,6 +601,7 @@ class Shooter:
         print(f"[{name}]" + (" (for " + ", ".join(n for n in needed_by if self.wanted(n)) + ")"
                              if prerequisite else ""), flush=True)
         page = args[0]
+        self.ran.add(name)
         self.quiet = prerequisite
         try:
             fn(*args)
@@ -1639,6 +1647,7 @@ def main(argv=None) -> int:
             shooter.run("queued-together-desktop", scenes.queued_together_desktop, qpage)
         finally:
             browser.close()
+    shooter.fail_unrun_selection()
     print(f"\n{len(shooter.written)} images written")
     for f in shooter.failures:
         print(f"FAILED {f}")

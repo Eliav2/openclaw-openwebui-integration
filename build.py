@@ -275,7 +275,16 @@ def render_configuration() -> str:
     return "\n".join(lines) + "\n"
 
 
+# Every flag main() reads. Anything else (a removed flag such as `--check-filter`)
+# is refused, so a script that still passes it fails instead of passing unchecked.
+FLAGS = ("--all", "--check-all", "--action", "--check-action", "--check")
+
+
 def main():
+    unknown = [a for a in sys.argv[1:] if a not in FLAGS]
+    if unknown:
+        print(f"unknown flag(s): {' '.join(unknown)}; use one of {', '.join(FLAGS)}", file=sys.stderr)
+        sys.exit(2)
     do_all = "--all" in sys.argv or "--check-all" in sys.argv
     action = "--action" in sys.argv or "--check-action" in sys.argv
     checking = any(a in sys.argv for a in ("--check", "--check-action", "--check-all"))

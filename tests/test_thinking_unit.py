@@ -84,11 +84,31 @@ class DropdownTests(_StateDirCase):
         self.assertEqual(self._choices(self._load("{ not json")), FALLBACK)
         self.assertEqual(self._choices(self._load(json.dumps({"levels": []}))), FALLBACK)
 
+    def test_a_cache_that_is_not_an_object_degrades_to_the_fallback(self):
+        """CodeRabbit (#388): valid JSON of another shape must not break the Valves dialog."""
+        for text in ('["low", "high"]', '"low"', "7", "true"):
+            mod = self._load(text)
+            self.assertEqual(self._choices(mod), FALLBACK, text)
+            self.assertIsNone(mod._read_model_thinking_ladder("anthropic/claude-opus-5-5"), text)
+            # A write replaces it with a valid cache.
+            self.assertTrue(mod._record_thinking_ladder(["low"], model_key="anthropic/claude-opus-5-5"))
+            self.assertEqual(mod._read_model_thinking_ladder("anthropic/claude-opus-5-5"), ["low"])
+
     def test_levels_learned_after_load_are_listed(self):
         """No re-save of the Pipe: the cache is read when the valves are shown."""
         cache = Path(os.environ["OPENCLAW_BRIDGE_STATE_DIR"]) / "thinking-ladders.json"
         cache.write_text(json.dumps({"levels": ["low", "high", "xhigh"]}))
         self.assertEqual(self._choices(self.mod), ["default", "low", "high", "xhigh"])
+
+    def test_an_admins_new_state_dir_is_read_before_the_next_model_list(self):
+        """Open WebUI swaps `valves` on the Pipe when an admin saves them; the dropdown reads
+        that STATE_DIR at once, not the one the last `pipes()` saw (CodeRabbit, #388)."""
+        pipe = self.mod.Pipe()
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        (Path(other.name) / "thinking-ladders.json").write_text(json.dumps({"levels": ["low", "xhigh"]}))
+        pipe.valves = self.mod.Pipe.Valves(STATE_DIR=other.name)
+        self.assertEqual(self._choices(self.mod), ["default", "low", "xhigh"])
 
     def test_the_default_is_unset_so_no_saved_valve_changes(self):
         self.assertEqual(self.mod.Pipe.UserValves().thinking_default, "default")

@@ -52,6 +52,15 @@ class BuildTests(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, f"drift detected:\n{r.stdout}\n{r.stderr}")
 
+    def test_a_removed_or_unknown_flag_is_refused(self):
+        """`--check-filter` (the filter is gone, #388) must not rebuild the Pipe and pass."""
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "build.py"), "--check-filter"],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--check-filter", r.stderr)
+
     def test_frontmatter_is_first(self):
         """OWUI reads title and requirements from the leading docstring, which
         must be the first statement."""

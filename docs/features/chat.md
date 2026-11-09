@@ -97,11 +97,11 @@ How hard the agent thinks before answering, set in Open WebUI's own controls. Tw
 - `off` is an explicit instruction not to think, and it does override the agent's setting.
 - `ultra` is sent as `max`.
 
-The valve's list offers only levels a model on your Gateway supports. The Pipe reads each session's real ladder from the `sessions.describe` it already makes before every send, so this costs no extra round trip. Until the Pipe has run once, the list falls back to the five levels every observed provider supports (`off` to `high`). The list is the union across your Gateway's models, not the ladder of the model you picked, and it is read each time you open Valves, so a new model's levels show after its first chat.
+The valve's list offers the levels the Pipe has seen your Gateway's models offer. The Pipe reads each session's ladder from the `sessions.describe` it already makes before every send, so this costs no extra round trip. Until the Pipe has run once, the list falls back to the five levels every observed provider supports (`off` to `high`). The list is the union across your Gateway's models, not the ladder of the model you picked, and it is read each time you open Valves, so a new model's levels show after its first chat. A model's `sessions.describe` can list a level the model then rejects. The list keeps it; a send the Gateway rejects for its level is sent once more with no level (neither the chat's nor your default), and the Pipe says which level was dropped.
 
 At send time the Pipe clamps the request to the nearest level the current model supports and says so once in the chat:
 
-> _This model does not support thinking level 'ultra', using 'high' instead._
+> _This model does not support thinking level 'max', using 'high' instead._
 
 Clamping lands on the nearest level at or below what you asked for, since quietly asking for more shows up on someone's bill. The one exception: if a model has nothing at or below the request, it uses that model's lowest level, which can be higher than what you asked for. Opus 5.5 has no `off`, so `off` there is sent as `low`.
 

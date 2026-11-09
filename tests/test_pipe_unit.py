@@ -17703,6 +17703,10 @@ class UnpublishedInputResendTests(_TurnCase):
         self.assertEqual(self.rpc.count("chat.send"), 1)
 
 
+async def _drain_text(gen):
+    return "".join([c async for c in gen if isinstance(c, str)])
+
+
 class ClaudeCliThinkingOffTests(_TurnCase):
     """Thinking 'off' on claude-cli is MAX_THINKING_TOKENS=0, which Claude Code ignores on Sonnet 5.5
     and Haiku 5.5: live off turns on both still held signed thinking blocks (W8, 2026-11-09), while
@@ -17790,6 +17794,51 @@ class ClaudeCliThinkingOffTests(_TurnCase):
 
     async def test_ultra_as_the_users_default_is_sent_as_max(self):
         self.assertEqual(await self._sent_for_ultra(None, "ultra"), "max")
+
+    async def test_a_rejected_user_default_is_not_sent_again_on_the_retry(self):
+        """A rejected level is retried once with no level. The retry drops the chat's level and
+        the user's `thinking_default` both: with the ladder unrecorded (an unwritable state dir),
+        the default would otherwise go out again and be rejected again (CodeRabbit, #388)."""
+        rejection = ('Thinking level "high" is not supported for claude-cli/claude-sonnet-5-5. '
+                     'Use one of: off, low.')
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td)
+        env = mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td})
+        env.start()
+        self.addCleanup(env.stop)
+        self.runtime = "claude-cli"
+        self.describe_extra = {"modelProvider": "anthropic", "model": "claude-sonnet-5-5",
+                               "thinkingLevels": [{"id": lv} for lv in self.GATEWAY_55]}
+        sent, plain = [], self.conn.send_request
+
+        async def record(method, params, timeout=10):
+            if method == "chat.send":
+                sent.append(params.get("thinking"))
+            return await plain(method, params, timeout)
+        self.conn.send_request = record
+
+        async def recovered(turn):
+            # The Gateway rejects every send that carries a level.
+            return rejection if sent and sent[-1] else None
+        for p in (mock.patch.object(self.ocp._PipeTurn, "recover_from_transcript", recovered),
+                  mock.patch.object(self.ocp, "_record_thinking_ladder", lambda *a, **k: None)):
+            p.start()
+            self.addCleanup(p.stop)
+        gen = self._reply("hi", "m1", user_valves=self.ocp.Pipe.UserValves(thinking_default="high"))
+        reading = asyncio.ensure_future(_drain_text(gen))
+        for run in ("run-1", "run-2"):
+            await self._until_registered(run)
+            # The run started (a bare first final means a queued message), then ended with no
+            # text: the rejection is only in the transcript.
+            self._queue(run).put_nowait({"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": run, "stream": "lifecycle",
+                "data": {"phase": "start"}}})
+            self._queue(run).put_nowait(self._final(run))
+        # Bounds the test only.
+        done, _ = await asyncio.wait({reading}, timeout=5)
+        reading.cancel()
+        self.assertEqual(sent, ["high", None])
+        self.assertTrue(done, "the retry ended the reply")
 
     async def test_off_on_opus_5_5_is_sent_as_low_with_the_note(self):
         """Opus 5.5's ladder has no off (the Gateway's own profile)."""
