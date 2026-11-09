@@ -479,21 +479,32 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
     from open_webui.socket.main import get_event_emitter
 
     try:
-        hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
-        refs = _steer_chain(hist, refs)
-        for ref in refs:
-            # A reply a turn writer still has is read once it is saved.
-            writer = conn._turn_writers.get((ref["chat_id"], ref["message_id"]))
-            if writer is not None and not writer.closed:
+        while True:
+            # A reply a turn writer still has is read once it is saved, and
+            # the transcript after it: the writer ends when the session settled.
+            open_writers = [w for w in (conn._turn_writers.get((r["chat_id"], r["message_id"])) for r in refs)
+                            if w is not None and not w.closed]
+            for writer in open_writers:
                 await writer.wait_done()
+            hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+            chain = _steer_chain(hist, refs)
+            if chain == refs:
+                break
+            refs = chain  # replies the transcript added: their writers too
         spans = [_history_span_messages(hist, r["span_run"]) for r in refs]
         if any(s is None for s in spans):
+            pipe_log(f"  replies around a steer left as they are: the transcript closes no span of "
+                     f"{', '.join(r['span_run'][:24] + '...' for r, s in zip(refs, spans) if s is None)}")
             return
         parts = [_history_renderer(s) for s in spans]
         saved = [await Chats.get_message_by_id_and_message_id(r["chat_id"], r["message_id"]) or {}
                  for r in refs]
         texts = [(m.get("content") or "") for m in saved]
-        if not _settle_misplaced([_settle_text(t) for t in texts], [_settle_text(p.text) for p in parts]):
+        shown, truth = [_settle_text(t) for t in texts], [_settle_text(p.text) for p in parts]
+        if not _settle_misplaced(shown, truth):
+            if shown != truth:
+                pipe_log(f"  replies around a steer left as they are: {len(refs)} replies hold more "
+                         "than the transcript's text of the run")
             return
         user_id = (conn.parse_owui_session_key(session_key) or (None, None))[0]
         for ref, part, was, message in zip(refs, parts, texts, saved):

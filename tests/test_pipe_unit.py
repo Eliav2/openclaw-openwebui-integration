@@ -16644,22 +16644,28 @@ class MidRunSteeringTests(_TurnCase):
         self.assertTrue(any("not the session's running run" in line for line in logged), logged)
         self.assertEqual(settled, [(sk, [self._ref(self.R1), self._ref(self.R2)])])
 
-    async def test_the_settle_finds_a_reply_steered_in_late_from_the_transcript(self):
-        """Blue's reply settles [first, blue]; tomato, steered in between, is not in its chain
-        because its steer came late. The transcript shows it: the first reply is cut at tomato's
-        commit, once tomato's writer, still open, is done."""
+    async def test_a_late_steers_settle_waits_for_the_transcript_and_takes_the_whole_chain(self):
+        """The late steer's settle (`_on_user_message_committed`) starts from [first, tomato]:
+        it reads the replies once tomato's writer, still open, is done, which is when the
+        transcript closed the run; blue, steered in after tomato, joins from the transcript. The
+        first reply is cut at tomato's commit."""
         conn, sk = self.conn, self.SK
         refs = {n: self._ref(r) for n, r in ((1, self.R1), (2, self.R2), (3, self.R3))}
         user = SteeredTranscriptSpanTests._user
         said = SteeredTranscriptSpanTests._said
         tool = {"role": "toolResult", "content": "done"}
-        conn.session_history = mock.AsyncMock(return_value={"messages": [
+        closed = {"messages": [
             user(self.R1, "E2E_CLI_LATE_STEER x"), said("E2E_LATE_PART_1", stop="toolUse"), tool,
             said("E2E_LATE_PART_2", stop="toolUse"), tool,
             user(self.R2, "say tomato"), said("E2E_CLI_STEERED: tomato", stop="end_turn"),
             user(self.R3, "say blue"), said("E2E_CLI_REPLY", stop="end_turn"),
             said("E2E_LATE_PART_1\n\nE2E_LATE_PART_2\n\nE2E_CLI_STEERED: tomato\n\nE2E_CLI_REPLY",
-                 run=self.R1, key=f"cli-assistant:{self.R1}")]})
+                 run=self.R1, key=f"cli-assistant:{self.R1}")]}
+        writer = openclaw_pipe._TurnWriter.__new__(openclaw_pipe._TurnWriter)
+        writer.closed, writer._done = False, asyncio.Event()
+        # Until the session settled, which ends tomato's writer, the run's closing message is not in.
+        conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: closed if writer._done.is_set()
+                                              else {"messages": closed["messages"][:-1]})
         saved = {refs[1]["message_id"]: "E2E_LATE_PART_1\n\nE2E_LATE_PART_2\n\nE2E_CLI_STEERED: tomato",
                  refs[2]["message_id"]: "E2E_CLI_STEERED: tomato",
                  refs[3]["message_id"]: "E2E_CLI_REPLY"}
@@ -16680,12 +16686,10 @@ class MidRunSteeringTests(_TurnCase):
         async def upsert(chat_id, message_id, fields):
             upserts[message_id] = fields
             return True
-        writer = openclaw_pipe._TurnWriter.__new__(openclaw_pipe._TurnWriter)
-        writer.closed, writer._done = False, asyncio.Event()
         conn._turn_writers[(self.CHAT, refs[2]["message_id"])] = writer
         with mock.patch.dict(sys.modules, modules), \
                 mock.patch.object(openclaw_pipe, "_owui_upsert_message", upsert):
-            settle = asyncio.ensure_future(openclaw_pipe._settle_steered_replies(conn, sk, [refs[1], refs[3]]))
+            settle = asyncio.ensure_future(openclaw_pipe._settle_steered_replies(conn, sk, [refs[1], refs[2]]))
             await self._spin()
             self.assertEqual(upserts, {}, "not while tomato's writer is open")
             writer._done.set()
