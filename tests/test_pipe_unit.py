@@ -13075,6 +13075,36 @@ class ToolStatusEventTests(_TurnCase):
                                            ("function_call_output", "completed")])
 
 
+class ModelSilenceTests(unittest.TestCase):
+    """ELI-336 (CodeRabbit, #389): with fallback models, each candidate that ends silent fails as
+    an empty response, and the Gateway sums the chain up (2026.10.10 model-fallback-runner:
+    `All models failed (N): provider/model: error (reason) | ...`). Silent only when every leg
+    is that silence."""
+
+    EMPTY = "CLI backend returned an empty response."
+
+    def test_the_exact_error_is_silence(self):
+        self.assertTrue(openclaw_pipe._is_model_silence(f" {self.EMPTY}\n"))
+
+    def test_a_chain_where_every_model_was_silent_is_silence(self):
+        chain = (f"All models failed (2): anthropic/claude-opus-5-5: {self.EMPTY} (empty_response) | "
+                 f"anthropic/claude-sonnet-5-5: {self.EMPTY} (empty_response)")
+        self.assertTrue(openclaw_pipe._is_model_silence(chain))
+
+    def test_a_chain_with_a_real_failure_is_not_silence(self):
+        chain = (f"All models failed (2): anthropic/claude-opus-5-5: {self.EMPTY} (empty_response) | "
+                 "openai/gpt-5.5: 429 rate limited (rate_limit)")
+        self.assertFalse(openclaw_pipe._is_model_silence(chain))
+
+    def test_a_chain_whose_count_does_not_match_its_legs_is_not_silence(self):
+        chain = f"All models failed (3): anthropic/claude-opus-5-5: {self.EMPTY} (empty_response)"
+        self.assertFalse(openclaw_pipe._is_model_silence(chain))
+
+    def test_other_errors_are_not_silence(self):
+        for err in ("429 rate limited", f"{self.EMPTY} Retry later.", "", None):
+            self.assertFalse(openclaw_pipe._is_model_silence(err), err)
+
+
 class SilentTurnTests(_TurnCase):
     """ELI-336 (OpenClaw 2026.10.10, live chat bf04938b): a turn the model ends with a bare
     NO_REPLY. A claude-cli run whose reply is required (trigger `user`) and whose final text is
@@ -13145,6 +13175,19 @@ class SilentTurnTests(_TurnCase):
         self.EMPTY = "429 rate limited"
         text, _items = await self._silent_turn()
         self.assertIn(RUN_ERROR_SENTENCE, text)
+
+    async def test_a_fallback_chain_where_every_model_was_silent_shows_nothing(self):
+        self.EMPTY = (f"All models failed (2): anthropic/claude-opus-5-5: {SilentTurnTests.EMPTY} (empty_response)"
+                      f" | anthropic/claude-sonnet-5-5: {SilentTurnTests.EMPTY} (empty_response)")
+        text, _items = await self._silent_turn()
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_fallback_chain_with_a_real_failure_shows_the_card(self):
+        self.EMPTY = (f"All models failed (2): anthropic/claude-opus-5-5: {SilentTurnTests.EMPTY} (empty_response)"
+                      " | openai/gpt-5.5: 429 rate limited (rate_limit)")
+        text, _items = await self._silent_turn()
+        self.assertIn(RUN_ERROR_SENTENCE, text)
+        self.assertIn("429 rate limited", text)
 
 
 class InlineOwnerRuleTests(_TurnCase):
