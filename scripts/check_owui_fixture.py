@@ -15,7 +15,7 @@ Usage:
   python3 scripts/check_owui_fixture.py --ref v0.12.0
   python3 scripts/check_owui_fixture.py --ref main   # what the next release ships
   python3 scripts/check_owui_fixture.py --ref v0.12.0 --print-upstream  # re-extract
-  python3 scripts/check_owui_fixture.py --ref v0.12.5 --copy pinned  # CI: the copy the tests run
+  python3 scripts/check_owui_fixture.py --ref v0.13.2 --copy pinned  # CI: the copy the tests run
 
 Exit status: 0 match, 1 drift, 2 could not fetch or find the handler.
 """

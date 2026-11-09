@@ -8,7 +8,7 @@ Applies to: Pipe, Action, Filter
 
 | | Minimum | Tested in CI |
 |---|---|---|
-| Open WebUI | 0.12.4 | 0.13.0 |
+| Open WebUI | 0.12.4 | 0.13.2 |
 | OpenClaw Gateway | 2026.9.3 | 2026.10.10, and 2026.10.5 as the oldest supported |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
