@@ -37,7 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: oven-sh/setup-bun@v2
+      # Bun at the pinned .bun-version, from the Actions cache (.github/actions/tools).
+      - uses: ./.github/actions/tools
+        with:
+          bun: "true"
 
       - run: bun install --frozen-lockfile
 

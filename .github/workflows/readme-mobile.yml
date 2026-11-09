@@ -30,7 +30,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: ./.github/actions/tools
+        with:
+          uv: "true"
 
       - name: Install Chromium for Playwright
         run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium

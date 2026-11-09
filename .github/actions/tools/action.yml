@@ -1,0 +1,101 @@
+name: Pinned CI tools
+description: >
+  The CLI tools CI downloads (uv, Bun, gitleaks, actionlint), at pinned versions and restored from
+  the Actions cache. A cache hit makes no request to github.com/releases or the uv mirror: those
+  downloads returned 504 several times a day and failed jobs before any test ran (main adaef12,
+  #381 8bc766b, #383 a91ddff). A miss downloads once and saves for every later run.
+
+# One place for the versions. Bun's is in .bun-version (also what a contributor's `bun` should be).
+inputs:
+  uv:
+    description: Install uv (setup-uv, with its dependency cache).
+    default: "false"
+  bun:
+    description: Install Bun (setup-bun, its own cache keyed on the pinned version).
+    default: "false"
+  gitleaks:
+    description: Put gitleaks on PATH.
+    default: "false"
+  actionlint:
+    description: Put actionlint on PATH.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Tool versions
+      shell: bash
+      run: |
+        {
+          echo "UV_VERSION=0.13.7"
+          echo "GITLEAKS_VERSION=8.30.1"
+          echo "GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          echo "ACTIONLINT_VERSION=1.7.12"
+          echo "ACTIONLINT_SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          echo "TOOLS_BIN=$HOME/.local/ci-tools/bin"
+        } >> "$GITHUB_ENV"
+        mkdir -p "$HOME/.local/ci-tools/bin"
+        echo "$HOME/.local/ci-tools/bin" >> "$GITHUB_PATH"
+
+    # uv: an exact version skips setup-uv's manifest lookup, and a uv already in the runner's tool
+    # cache is used as is ("Found uv in tool-cache"); this restores that directory.
+    - name: Cache uv ${{ env.UV_VERSION }}
+      if: inputs.uv == 'true'
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.tool_cache }}/uv/${{ env.UV_VERSION }}
+        key: uv-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.UV_VERSION }}
+    - if: inputs.uv == 'true'
+      uses: astral-sh/setup-uv@v10.3.3
+      with:
+        version: ${{ env.UV_VERSION }}
+
+    # Bun: an exact version builds the download URL without asking the GitHub API, and setup-bun's
+    # own cache is keyed on that URL ("Using a cached version of Bun"). Unpinned, every new Bun
+    # release was a cache miss and a download (bun-v1.4.4, the 504s on adaef12).
+    - if: inputs.bun == 'true'
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version-file: .bun-version
+
+    - name: Cache gitleaks ${{ env.GITLEAKS_VERSION }}
+      if: inputs.gitleaks == 'true'
+      id: gitleaks
+      uses: actions/cache@v6
+      with:
+        path: ~/.local/ci-tools/gitleaks-${{ env.GITLEAKS_VERSION }}
+        key: gitleaks-${{ runner.os }}-${{ runner.arch }}-${{ env.GITLEAKS_VERSION }}
+    - name: Download gitleaks (cache miss only)
+      if: inputs.gitleaks == 'true' && steps.gitleaks.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        dir="$HOME/.local/ci-tools/gitleaks-$GITLEAKS_VERSION"
+        mkdir -p "$dir"
+        tgz="$RUNNER_TEMP/gitleaks.tar.gz"
+        curl -fsSL -o "$tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        echo "$GITLEAKS_SHA256  $tgz" | sha256sum -c -
+        tar -xzf "$tgz" -C "$dir" gitleaks
+    - if: inputs.gitleaks == 'true'
+      shell: bash
+      run: ln -sf "$HOME/.local/ci-tools/gitleaks-$GITLEAKS_VERSION/gitleaks" "$TOOLS_BIN/gitleaks"
+
+    - name: Cache actionlint ${{ env.ACTIONLINT_VERSION }}
+      if: inputs.actionlint == 'true'
+      id: actionlint
+      uses: actions/cache@v6
+      with:
+        path: ~/.local/ci-tools/actionlint-${{ env.ACTIONLINT_VERSION }}
+        key: actionlint-${{ runner.os }}-${{ runner.arch }}-${{ env.ACTIONLINT_VERSION }}
+    - name: Download actionlint (cache miss only)
+      if: inputs.actionlint == 'true' && steps.actionlint.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        dir="$HOME/.local/ci-tools/actionlint-$ACTIONLINT_VERSION"
+        mkdir -p "$dir"
+        tgz="$RUNNER_TEMP/actionlint.tar.gz"
+        curl -fsSL -o "$tgz" "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+        echo "$ACTIONLINT_SHA256  $tgz" | sha256sum -c -
+        tar -xzf "$tgz" -C "$dir" actionlint
+    - if: inputs.actionlint == 'true'
+      shell: bash
+      run: ln -sf "$HOME/.local/ci-tools/actionlint-$ACTIONLINT_VERSION/actionlint" "$TOOLS_BIN/actionlint"
