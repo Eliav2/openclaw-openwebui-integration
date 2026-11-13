@@ -1,6 +1,7 @@
 """capture.py: the usage-goal scene ends the session's goal at the Gateway (ELI-361,
 review on #348): the session is found by key past the first page, the wait is for an
 idle row that was seen, and a failed reply wait clears the goal too."""
+import time
 import unittest
 from unittest import mock
 
@@ -8,26 +9,43 @@ from _paged_sessions import PagedSessions, crowd
 from test_screenshot_selection_unit import capture
 
 KEY = "agent:main:openwebui-user-me-chat1"
+REAL_SLEEP = time.sleep   # the patched one in the tests below does nothing
+
+
+class FakeClock:
+    """capture's `time`: sleep advances it, nothing else does."""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def time(self):
+        return self.now
+
+    monotonic = time
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 class Gateway:
     """sessions.list and sessions.goal.clear over a PagedSessions: a clear ends the
     goal at once, the session's last turn a few reads later."""
 
-    def __init__(self, *, goal=True, busy_reads=2, rows=None):
+    def __init__(self, *, goal=True, busy_reads=2, rows=None, read_s=0.0):
         row = {"key": KEY, "hasActiveRun": True, "status": "running"}
         if goal:
             row["goal"] = {"id": "g1", "status": "active"}
         self.sessions = PagedSessions(rows if rows is not None else crowd(KEY, busy=True))
         self.row = next(r for r in self.sessions.rows if r["key"] == KEY)
         self.row.update(row)
-        self.busy_reads, self.cleared = busy_reads, []
+        self.busy_reads, self.cleared, self.read_s = busy_reads, [], read_s
 
     def __call__(self, method, params):
         if method == "sessions.goal.clear":
             self.cleared.append(params)
             self.row.pop("goal", None)
             return {}
+        REAL_SLEEP(self.read_s)   # a Gateway that takes real time to answer, as on a busy CI runner
         out = self.sessions.list(params)
         if not self.row.get("goal") and self.row["hasActiveRun"] and "search" in params:
             self.busy_reads -= 1
@@ -39,7 +57,10 @@ class Gateway:
 class UsageGoalScene(unittest.TestCase):
 
     def setUp(self):
-        for patch in (mock.patch.object(capture.time, "sleep"), mock.patch.object(capture, "TURN_TIMEOUT_MS", 50)):
+        # A clock that only the waiters' own sleeps move: the wait ends by the number of polls it made, never by
+        # how long the machine took (a 50 ms wall-clock deadline timed the wait out on a busy CI runner).
+        clock = FakeClock()
+        for patch in (mock.patch.object(capture, "time", clock), mock.patch.object(capture, "TURN_TIMEOUT_MS", 60_000)):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -54,6 +75,13 @@ class UsageGoalScene(unittest.TestCase):
         with mock.patch.object(capture, "gateway_call", gateway):
             capture.end_goal(KEY)
         self.assertEqual([c["goalId"] for c in gateway.cleared], ["g1"])
+        self.assertFalse(gateway.row["hasActiveRun"])
+
+    def test_a_slow_gateway_does_not_run_the_wait_out(self):
+        # Three reads of 30 ms each: the wait is counted in polls (the fake clock), never in the wall clock.
+        gateway = Gateway(busy_reads=3, read_s=0.03)
+        with mock.patch.object(capture, "gateway_call", gateway):
+            capture.end_goal(KEY)
         self.assertFalse(gateway.row["hasActiveRun"])
 
     def test_no_row_is_not_an_idle_session(self):
