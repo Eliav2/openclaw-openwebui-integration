@@ -111,6 +111,8 @@ SHARDS = {
         f"{E2E}::test_an_approval_that_expires_takes_the_card_away_and_a_late_answer_is_harmless",
         f"{E2E}::test_a_guest_cannot_approve_a_plugin_approval",
         f"{E2E}::test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply",
+        f"{E2E}::test_a_socket_drop_mid_run_the_pipe_did_not_start_ends_the_run_whole",
+        f"{E2E}::test_a_socket_drop_mid_cron_wake_leaves_the_wake_whole",
         f"{E2E}::test_a_media_line_from_the_agent_is_uploaded_attached_and_linked",
         f"{E2E}::test_a_file_named_by_path_shows_as_the_image_the_gateway_stored",
         f"{E2E}::test_the_thinking_level_reaches_the_model_and_a_clamp_says_so",
