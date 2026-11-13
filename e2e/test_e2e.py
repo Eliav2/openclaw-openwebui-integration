@@ -2982,6 +2982,78 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     assert msg.get("content", "").strip() == "E2E_AFTER_RESTART", msg.get("content")
 
 
+# ── ELI-369: the Pipe's Gateway socket drops mid run ─────────────────────────
+# The live gate used to drop the LIVE Pipe's socket for these two cases, which cut real chats'
+# runs too (~27 "WS disconnected" a day, all gate runs). They run here, on the stack's own Open
+# WebUI and Gateway, with the drop from outside (socket_drop.py: no close frame, the Gateway
+# process untouched), as the gate's ws-reconnect and wake-reconnect cases did.
+
+DROP_WORDS = 20
+
+
+def _the_pipes_socket_drops_and_it_reconnects() -> None:
+    import socket_drop
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    dropped = [d for d in socket_drop.drop() if "fd" in d]
+    assert dropped, "no Gateway connection of Open WebUI was dropped"
+    _until("the Pipe to reconnect to the same Gateway",
+           lambda: "reconnected to the same Gateway" in _pipe_log_since(since))
+    log = _pipe_log_since(since)
+    assert "WS disconnected" in log, f"the drop was not seen by the Pipe: {log[-600:]}"
+
+
+def _one_whole_message(msgs: dict, token_word: str) -> None:
+    """One assistant message holds the run, with every word in order up to the last: a word in
+    flight during the drop is filled in from the run's transcript at its end."""
+    holders = [m for m in msgs.values() if m.get("role") == "assistant"
+               and (m.get("content") or "").startswith(token_word)]
+    assert len(holders) == 1, f"{token_word} in {len(holders)} messages: {json.dumps(holders)[:1500]}"
+    assert holders[0]["content"].strip() == _slow_words(token_word, DROP_WORDS), holders[0]["content"]
+
+
+def _slow_words(token_word: str, n: int) -> str:
+    return token_word + " " + " ".join(f"slow-{i}" for i in range(1, n + 1))
+
+
+DROP_AFTER_WORDS = 3
+
+
+def _wait_part_way(token: str, chat_id: str, token_word: str) -> None:
+    """The reply streamed so far, as the scripted model sends it: `TOKEN slow-1 slow-2 slow-3`
+    (the prefix, not a lone `TOKEN slow-3`)."""
+    prefix = _slow_words(token_word, DROP_AFTER_WORDS)
+    _until(f"{token_word} part way through",
+           lambda: any(prefix in (m.get("content") or "") for m in _chat_messages(token, chat_id).values()))
+
+
+def test_a_socket_drop_mid_run_the_pipe_did_not_start_ends_the_run_whole(token):
+    """ws-reconnect: a run started from outside the Pipe (what sessions_send does) is streaming
+    into the chat when the Pipe's Gateway socket drops. The events sent while it was down are
+    lost; after the reconnect the run ends whole, in its one message."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_DROP_CHAT")
+    key = _session_key(token, chat_id)
+    _gw("chat.send", {"sessionKey": key, "message": f"E2E_SLOW:{DROP_WORDS} DROP_RUN",
+                      "idempotencyKey": f"e2e-drop-{uuid.uuid4().hex[:8]}", "deliver": False})
+    _wait_part_way(token, chat_id, "DROP_RUN")
+    _the_pipes_socket_drops_and_it_reconnects()
+    msgs = _wait_for(token, chat_id, [f"slow-{DROP_WORDS}"])
+    _one_whole_message(msgs, "DROP_RUN")
+    _assert_clean(token, chat_id, msgs)
+
+
+def test_a_socket_drop_mid_cron_wake_leaves_the_wake_whole(token):
+    """wake-reconnect (review 2af1 R1): the Pipe's Gateway socket drops in the middle of a cron
+    wake. The reconnect's resync must not cut the wake's message: it ends with the whole wake."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_DROP_WAKE_CHAT")
+    key = _session_key(token, chat_id)
+    _schedule_wake(key, f"E2E_SLOW:{DROP_WORDS} DROP_WAKE", 2)
+    _wait_part_way(token, chat_id, "DROP_WAKE")
+    _the_pipes_socket_drops_and_it_reconnects()
+    msgs = _wait_for(token, chat_id, [f"slow-{DROP_WORDS}"])
+    _one_whole_message(msgs, "DROP_WAKE")
+    _assert_clean(token, chat_id, msgs)
+
+
 # ── MEDIA out and the thinking level (ELI-179) ───────────────────────────────
 # Two flows a user sees in the reply that had no end-to-end test: a file the
 # agent sends with a `MEDIA:<file>` line, and the thinking level (Advanced
