@@ -12967,6 +12967,8 @@ def _owui_history_rows(chat_id: str):
 
 FILE_CONTEXT_DIR = "file-context"
 FILE_CONTEXT_CHUNK_MAX = 100_000
+# Open WebUI's source type of a chat referenced in a message.
+FILE_CONTEXT_CHAT_TYPE = "chat"
 # An opening <source> tag; a quoted attribute may hold ">" (a chat named "...</br>").
 _FILE_CONTEXT_TAG = r'<source\b(?:[^>"]|"[^"]*")*>'
 # (session_key, sha256 of the sent text) -> record to commit once sent, oldest first.
@@ -13036,7 +13038,7 @@ def _file_context_note(names: list) -> str:
 
 def _file_context_cut(text: str, name: str, about: dict) -> str:
     """The head of an oversize chunk and one line saying where the rest is."""
-    if about.get("type") == "chat" and about.get("id"):
+    if about.get("type") == FILE_CONTEXT_CHAT_TYPE and about.get("id"):
         messages = len(re.findall(r"^#### \w+$", text, re.M))
         line = (f"[chat {about['id']}: {messages} messages, cut here to its first {FILE_CONTEXT_CHUNK_MAX} "
                 f"characters; read it whole with sessions_history (its session key ends with {about['id']})]")
