@@ -27,7 +27,7 @@ import pytest
 # Runs only against a stack this machine started (stack.sh up); the unit job skips it.
 if not os.environ.get("WEB_PUSH_E2E"):
     pytest.skip("set WEB_PUSH_E2E=1 with push/e2e/stack.sh up", allow_module_level=True)
-from playwright.sync_api import sync_playwright  # noqa: E402
+from playwright.sync_api import Error as PlaywrightError, sync_playwright  # noqa: E402
 
 OWUI = os.environ.get("E2E_OWUI", "http://127.0.0.1:18780")
 BASE = os.environ.get("E2E_BASE", "http://localhost:18787")   # the Worker
@@ -117,6 +117,22 @@ def seen_for(page, chat_id, n=1):
     return page.evaluate("(c) => window.ocPushSeen.filter(d => d.payload.chat_id === c)", chat_id)
 
 
+BEHIND_RELEASE = []   # what each behind() of the running test must give back
+
+
+@pytest.fixture(autouse=True)
+def release_behind():
+    """behind() holds a DevTools session and a tab for the test; both go when it ends. A session left attached
+    to the shared page makes navigator.onLine stay true after a reload with the network off, so a later test
+    never sees the offline pill (ELI-365: test_offline_is_read_only... failed after test_enable_subscribe)."""
+    yield
+    while BEHIND_RELEASE:
+        try:
+            BEHIND_RELEASE.pop()()
+        except PlaywrightError:
+            pass   # the test closed its own context
+
+
 def behind(ctx, page):
     """Another tab in front, so Open WebUI's page loses focus, as on a phone's home screen. A real
     tab through CDP, with Playwright's focus emulation off (it keeps every page focused). Call the result again to
@@ -127,6 +143,12 @@ def behind(ctx, page):
         cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": False})   # bring_to_front turns it on again
         cdp.send("Target.activateTarget", {"targetId": tab})
         page.wait_for_function("() => !document.hasFocus()", timeout=WAIT_MS)
+    def release():
+        try:
+            cdp.send("Target.closeTarget", {"targetId": tab})
+        finally:
+            cdp.detach()
+    BEHIND_RELEASE.append(release)
     front()
     return front
 
@@ -238,10 +260,10 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     if os.environ.get("E2E_SHOTS"):
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)   # Open WebUI drawn around it
         page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offer.png"))
-    # What the user's Allow in the prompt does: notifications and push for this origin.
+    # What the user's Allow in the prompt does. Playwright's grant is all the subscription needs; a DevTools
+    # Browser.setPermission for push would need a session kept attached, which breaks the offline pill of
+    # the tests after this one (ELI-365).
     ctx.grant_permissions(["notifications"], origin=BASE)
-    ctx.new_cdp_session(page).send("Browser.setPermission", {
-        "permission": {"name": "push", "userVisibleOnly": True}, "setting": "granted", "origin": BASE})
     page.get_by_role("button", name="Enable notifications for replies").click()
     page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
     assert page.evaluate("() => window.ocPushState") == "saved"
