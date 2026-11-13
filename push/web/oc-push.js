@@ -916,16 +916,23 @@
   navigator.serviceWorker?.controller?.postMessage({ type: "oc-version-check" });
 })();
 
-// --- Open WebUI's start reads after a network change (ELI-362). A change of
+// --- Open WebUI's start reads after a network change (ELI-362, ELI-374). A change of
 // network fails every request on its way (ERR_NETWORK_CHANGED), and Open WebUI
 // asks its start reads (config, user, settings, models, the chat list, the chat)
-// only once: one that fails leaves the app half drawn for good, with no error
-// page to recover from. A start read that fails on the network (no answer, not an
-// HTTP error) is asked once more at once, on the new network. With offline open
-// on, the service worker already does the same (oc-sw.js again()), and its failure
-// is final: the page does not ask a third and fourth time. This covers offline open
-// off (or no worker yet), where the worker answers nothing itself. Only these
-// reads, only GET, and only once each.
+// only once: one that fails leaves the app half drawn for good, or sends it to
+// /error ("Backend Required"), a page that never recovers. A start read that
+// fails on the network (no answer, not an HTTP error) is asked once more.
+//   - No worker keeping the app: at once, on the new network.
+//   - A worker keeping the app (offline open on) has already asked twice, at once
+//     (oc-sw.js again()), and both asks can fall in the same dead moment between
+//     the old network and the new one: a Wi-Fi switch that leaves no connection
+//     for a second (ELI-374: /api/config answered Response.error() and the app
+//     stopped at /error). A page cannot read the network from a timer, so the
+//     read waits for the signal: the next 'online' or network change, then is asked
+//     once more. It waits only when the network is gone (navigator.onLine false)
+//     or changed while the read was on its way; a read that failed on a network
+//     that is up and did not change (the server is down) goes to Open WebUI as ever.
+// Only these reads, only GET, and the one ask after the failure each.
 (() => {
   const START_READS = [
     /^\/api\/config$/, /^\/api\/version$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
@@ -945,14 +952,38 @@
   // worker drops every cache when it starts.
   const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
   const workerRetried = async () => !!navigator.serviceWorker?.controller && !!(await globalThis.caches?.has(KEPT_APP));
+  // The network signals: how many have come, and who waits for the next one.
+  let signals = 0;
+  const waiting = new Set();
+  const signal = () => {
+    signals += 1;
+    for (const release of [...waiting]) release();
+  };
+  addEventListener("online", signal);
+  navigator.connection?.addEventListener?.("change", signal);
+  // Resolves on the next network signal; rejects `abort` when Open WebUI cancels the read meanwhile.
+  const nextSignal = (cancel) => new Promise((resolve, reject) => {
+    const done = () => { waiting.delete(done); cancel?.removeEventListener?.("abort", stop); resolve(); };
+    const stop = () => { waiting.delete(done); reject(cancel.reason ?? new DOMException("Aborted", "AbortError")); };
+    waiting.add(done);
+    cancel?.addEventListener?.("abort", stop);
+  });
   const original = window.fetch;
   window.fetch = function (input, init) {
     if (!startRead(input, init)) return original.call(this, input, init);
     // A Request's body is used once: the second attempt gets a fresh copy.
     const again = input instanceof Request ? input.clone() : input;
+    const cancel = init?.signal || (input instanceof Request ? input.signal : undefined);
+    const seen = signals;
     return original.call(this, input, init).catch(async (e) => {
-      if (init?.signal?.aborted || (input instanceof Request && input.signal.aborted)) throw e;   // Open WebUI cancelled it
-      if (await workerRetried()) throw e;
+      if (cancel?.aborted) throw e;   // Open WebUI cancelled it
+      if (await workerRetried()) {
+        // Asked twice at once already: ask again on the next signal, if the network is gone or moved.
+        if (signals === seen) {
+          if (navigator.onLine !== false) throw e;
+          await nextSignal(cancel);
+        }
+      }
       return original.call(this, again, init);
     });
   };

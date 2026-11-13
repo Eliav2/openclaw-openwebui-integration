@@ -1238,6 +1238,30 @@ OUTER_FETCH = """(path) => {
 
 
 @needs_offline
+def test_start_reads_that_fail_with_no_network_are_asked_when_it_returns(owui, browser):
+    """ELI-374: a network change can leave no connection for a moment (Wi-Fi off, mobile data not up
+    yet). The kept app opens, the worker asks each start read twice at once and both fail, and the app
+    went to Open WebUI's /error ("Backend Required"), a page that never recovers. The page now waits for
+    the network ('online') and asks the reads once more: the chat opens, no error page."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Net Gone")
+    opened(page, chat)
+    settled(page, f"() => caches.has({json.dumps(KEPT_APP)})")
+    page.evaluate(NO_API_CACHES)   # no kept answer to fall back on: the failure reaches the page
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)   # the kept app opens; its start reads fail with no network
+        page.wait_for_function("() => navigator.onLine === false", timeout=WAIT_MS)
+    finally:
+        ctx.set_offline(False)   # the network is back: 'online'
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    sidebar_link(page, chat).wait_for(timeout=WAIT_MS)   # the chat list's entry: its reads were asked again
+    assert not page.evaluate(ERROR_PAGE), "Open WebUI's error page"
+    assert "/error" not in page.url, page.url
+
+
+@needs_offline
 def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui, pw):
     """Offline open on: the worker already asks a cut start read once more (oc-sw.js again()). A
     read that fails both times is final: the page script does not ask it again (two more
