@@ -12959,7 +12959,18 @@ def _owui_history_rows(chat_id: str):
 # compaction changes neither, so after it the agent has only its summary of a
 # file until /new.
 
+#
+# Each chunk's text also goes at most once per message (ELI-465): a chat quoted
+# twice keeps its second tag empty, and a chunk over FILE_CONTEXT_CHUNK_MAX (a
+# whole quoted chat: 1387 messages) goes as its head and one line saying where
+# the rest is.
+
 FILE_CONTEXT_DIR = "file-context"
+FILE_CONTEXT_CHUNK_MAX = 100_000
+# Open WebUI's source type of a chat referenced in a message.
+FILE_CONTEXT_CHAT_TYPE = "chat"
+# An opening <source> tag; a quoted attribute may hold ">" (a chat named "...</br>").
+_FILE_CONTEXT_TAG = r'<source\b(?:[^>"]|"[^"]*")*>'
 # (session_key, sha256 of the sent text) -> record to commit once sent, oldest first.
 _file_context_pending: dict = {}
 _file_context_pruned = False
@@ -12977,17 +12988,20 @@ def _file_context_digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _file_context_chunks(sources) -> list[tuple[str, str, str]]:
-    """(hash, file name, text) of each retrieved chunk in Open WebUI's sources."""
+def _file_context_chunks(sources) -> list[tuple[str, str, str, dict]]:
+    """(hash, file name, text, Open WebUI's description of its file) of each
+    retrieved chunk in Open WebUI's sources."""
     chunks = []
     for source in sources or []:
         if not isinstance(source, dict):
             continue
         about = source.get("source") or {}
+        if not isinstance(about, dict):
+            about = {}
         name = about.get("name") or about.get("id") or "a file"
         for text in source.get("document") or []:
             if isinstance(text, str) and text:
-                chunks.append((_file_context_digest(text), name, text))
+                chunks.append((_file_context_digest(text), name, text, about))
     return chunks
 
 
@@ -13022,15 +13036,40 @@ def _file_context_note(names: list) -> str:
             "cite them.)")
 
 
-def _file_context_strip(context: str, texts: list) -> str | None:
-    """`context` with the text of each <source> tag in `texts` taken out, the
-    tag kept; None if one is not found."""
-    for text in texts:
-        context, n = re.subn(r"(<source\b[^>]*>)" + re.escape(text) + r"</source>",
-                             lambda m: m.group(1) + "</source>", context, count=1)
+def _file_context_cut(text: str, name: str, about: dict) -> str:
+    """The head of an oversize chunk and one line saying where the rest is."""
+    if about.get("type") == FILE_CONTEXT_CHAT_TYPE and about.get("id"):
+        messages = len(re.findall(r"^#### \w+$", text, re.M))
+        line = (f"[chat {about['id']}: {messages} messages, cut here to its first {FILE_CONTEXT_CHUNK_MAX} "
+                f"characters; read it whole with sessions_history (its session key ends with {about['id']})]")
+    else:
+        line = f"[{name}: cut here to its first {FILE_CONTEXT_CHUNK_MAX} of {len(text)} characters]"
+    return text[:FILE_CONTEXT_CHUNK_MAX] + "\n" + line + "\n"
+
+
+def _file_context_strip(context: str, chunks: list, old: set) -> tuple[str, list]:
+    """`context` with the text of each chunk going at most once: taken out of
+    every tag when its hash is in `old` (the session has it), else kept in its
+    first tag only, cut to its head when oversize. Each tag stays. Returns the
+    names of the files whose text the session had and was taken out."""
+    names, done = [], set()
+    for h, name, text, about in chunks:
+        if h in done:
+            continue
+        done.add(h)
+        keep = None if h in old else (text if len(text) <= FILE_CONTEXT_CHUNK_MAX
+                                      else _file_context_cut(text, name, about))
+        bodies = [keep or ""]  # the first tag's text; the later ones go empty
+
+        def body(m, bodies=bodies):
+            return m.group(1) + (bodies.pop() if bodies else "") + "</source>"
+
+        context, n = re.subn("(" + _FILE_CONTEXT_TAG + ")" + re.escape(text) + "</source>", body, context)
         if not n:
-            return None
-    return context
+            pipe_log(f"[file context] a chunk of {name} was not found in Open WebUI's context, sent as is")
+        elif h in old:
+            names.append(name)
+    return context, names
 
 
 async def _file_context_message(conn, state_dir: str, session_key: str, reply_id, context: str,
@@ -13041,19 +13080,16 @@ async def _file_context_message(conn, state_dir: str, session_key: str, reply_id
     chunks = [c for c in _file_context_chunks(sources) if c[2] in context]
     epoch = await _session_epoch(conn, session_key) if chunks else None
     if epoch is None:
-        return context, None
+        return _file_context_strip(context, chunks, set())[0], None
     # Without a message id no other call can be this reply's twin.
     reply_id = reply_id or f"request-{uuid.uuid4().hex}"
     sent = _file_context_sent(_read_json_file(_file_context_path(state_dir, session_key)) or {}, epoch)
-    old = [c for c in chunks if sent.get(c[0], reply_id) != reply_id]
-    record = {"epoch": epoch, "hashes": [c[0] for c in chunks], "reply": reply_id}
-    if not old:
+    old = {c[0] for c in chunks if sent.get(c[0], reply_id) != reply_id}
+    record = {"epoch": epoch, "hashes": list(dict.fromkeys(c[0] for c in chunks)), "reply": reply_id}
+    context, names = _file_context_strip(context, chunks, old)
+    if not names:
         return context, record
-    stripped = _file_context_strip(context, [text for _, _, text in old])
-    if stripped is None:
-        pipe_log("[file context] a chunk was not found in Open WebUI's context, sent whole")
-        return context, record
-    return stripped + "\n" + _file_context_note(list(dict.fromkeys(name for _, name, _ in old))), record
+    return context + "\n" + _file_context_note(list(dict.fromkeys(names))), record
 
 
 def _file_context_hold(session_key: str, text: str, record: dict | None) -> None:
