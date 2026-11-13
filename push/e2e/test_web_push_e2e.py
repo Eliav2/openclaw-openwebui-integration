@@ -1156,6 +1156,9 @@ def test_the_error_page_after_a_network_change_reloads_once_into_the_chat(owui, 
 BOOT_READS = ("**/api/v1/users/user/settings", "**/api/v1/chats/?page=1", "**/api/v1/chats/pinned")
 PINNED_PATH = "/api/v1/chats/pinned"
 KEPT_APP = "oc-shell-v1"   # oc-sw.js SHELL
+# The worker keeps /api/config with the app (oc-sw.js: public reads go with the app); Open WebUI's root layout
+# needs it, and goes to /error when it cannot get it (ELI-374).
+DROP_KEPT_CONFIG = "() => caches.open('oc-shell-v1').then((c) => c.delete(location.origin + '/api/config'))"
 NO_API_CACHES = "() => caches.keys().then((ks) => Promise.all(ks.filter((k) => k.startsWith('oc-api-')).map((k) => caches.delete(k))))"
 
 
@@ -1249,6 +1252,7 @@ def test_start_reads_that_fail_with_no_network_are_asked_when_it_returns(owui, b
     opened(page, chat)
     settled(page, f"() => caches.has({json.dumps(KEPT_APP)})")
     page.evaluate(NO_API_CACHES)   # no kept answer to fall back on: the failure reaches the page
+    page.evaluate(DROP_KEPT_CONFIG)   # /api/config is kept with the app: without it, Open WebUI's root layout has nothing
     ctx.set_offline(True)
     try:
         page.reload(timeout=WAIT_MS)   # the kept app opens; its start reads fail with no network
