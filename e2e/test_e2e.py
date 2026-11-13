@@ -3014,10 +3014,15 @@ def _slow_words(token_word: str, n: int) -> str:
     return token_word + " " + " ".join(f"slow-{i}" for i in range(1, n + 1))
 
 
+DROP_AFTER_WORDS = 3
+
+
 def _wait_part_way(token: str, chat_id: str, token_word: str) -> None:
+    """The reply streamed so far, as the scripted model sends it: `TOKEN slow-1 slow-2 slow-3`
+    (the prefix, not a lone `TOKEN slow-3`)."""
+    prefix = _slow_words(token_word, DROP_AFTER_WORDS)
     _until(f"{token_word} part way through",
-           lambda: any(f"{token_word} slow-3" in (m.get("content") or "")
-                       for m in _chat_messages(token, chat_id).values()))
+           lambda: any(prefix in (m.get("content") or "") for m in _chat_messages(token, chat_id).values()))
 
 
 def test_a_socket_drop_mid_run_the_pipe_did_not_start_ends_the_run_whole(token):
