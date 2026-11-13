@@ -3005,7 +3005,8 @@ def _the_pipes_socket_drops_and_it_reconnects() -> None:
 def _one_whole_message(msgs: dict, token_word: str) -> None:
     """One assistant message holds the run, with every word in order up to the last: a word in
     flight during the drop is filled in from the run's transcript at its end."""
-    holders = [m for m in msgs.values() if m.get("role") == "assistant" and token_word in (m.get("content") or "")]
+    holders = [m for m in msgs.values() if m.get("role") == "assistant"
+               and (m.get("content") or "").startswith(token_word)]
     assert len(holders) == 1, f"{token_word} in {len(holders)} messages: {json.dumps(holders)[:1500]}"
     assert holders[0]["content"].strip() == _slow_words(token_word, DROP_WORDS), holders[0]["content"]
 
