@@ -2,6 +2,8 @@
 
 Web Push sends a notification to your phone or computer when a reply finishes, also when Open WebUI is closed. It shows the chat's title and opens the chat on a tap. You can answer from the notification and mute a chat. The reply itself stays on your server unless you turn on the [preview](#preview).
 
+Push is optional: the Pipe works without it. It is also a separate project, [open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push), which works with any Open WebUI and adds offline open and instant chat open. With OpenClaw models it needs the Pipe's [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished), as below.
+
 Applies to: Web Push function, Pipe
 
 Valves: the function's own (below), and the Pipe's [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished)

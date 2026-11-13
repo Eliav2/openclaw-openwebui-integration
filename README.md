@@ -92,6 +92,16 @@ With the Status Action installed, one click shows context used, rate limits and 
 - **[Every Gateway model](https://eliav2.github.io/openclaw-openwebui-integration/features/sessions-and-models#model-picker):** the model picker lists the models your Gateway allows, one session per chat.
 - **[Channels](https://eliav2.github.io/openclaw-openwebui-integration/features/channels):** mention the agent in a channel and it answers in a thread, then follows it, answering what is meant for it without a new mention.
 
+## Optional add-on: push notifications and offline open
+
+[open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push) is a separate project, not part of this install, and nothing here needs it. It adds three things to any Open WebUI, whatever models you use:
+
+- **Push notifications** when a reply finishes, also when Open WebUI is closed.
+- **Offline open** of the chats you read last.
+- **Instant chat open** from the copy kept on the device.
+
+With OpenClaw models, turn on the Pipe's [`PUBLISH_CHAT_FINISHED`](https://eliav2.github.io/openclaw-openwebui-integration/configuration#publish_chat_finished) so each reply is notified once it is saved, including the replies the agent starts. To install it, follow [its README](https://github.com/Eliav2/open-webui-pwa-push#install).
+
 ## Docs
 
 Everything else is on the docs site: **[eliav2.github.io/openclaw-openwebui-integration](https://eliav2.github.io/openclaw-openwebui-integration/)**, from [why this exists](https://eliav2.github.io/openclaw-openwebui-integration/why) to [configuration](https://eliav2.github.io/openclaw-openwebui-integration/configuration), [troubleshooting](https://eliav2.github.io/openclaw-openwebui-integration/troubleshooting) and [versions](https://eliav2.github.io/openclaw-openwebui-integration/versions). For agents: [llms.txt](https://eliav2.github.io/openclaw-openwebui-integration/llms.txt) and [llms-full.txt](https://eliav2.github.io/openclaw-openwebui-integration/llms-full.txt). The same pages are in [docs/](./docs/index.md) here.
