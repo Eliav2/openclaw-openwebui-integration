@@ -1103,7 +1103,8 @@ RELOADED_FLAG = "() => sessionStorage.getItem('ocReloadedAfterError')"
 DROP_APP_FILE = """() => caches.open('oc-shell-v1').then(async (c) => {
     for (const k of await c.keys()) if (k.url.includes('/nodes/0.')) await c.delete(k); })"""
 SHELL_VERSION = "() => caches.open('oc-shell-v1').then((c) => c.match('/_oc/version')).then((r) => r ? r.text() : null)"
-NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-')))"
+# Only the offline-open caches (the kill switch drops those); oc-push-own-closes belongs to the push feature and stays.
+NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k === 'oc-shell-v1' || k.startsWith('oc-api-')))"
 
 
 def offline_on():
