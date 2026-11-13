@@ -202,6 +202,7 @@ export default withMermaid(defineConfig({
           { text: "All features", link: "/features/" },
           { text: "Chat", link: "/features/chat" },
           { text: "Questions", link: "/features/questions" },
+          { text: "Maps", link: "/features/map" },
           { text: "Status", link: "/features/status" },
           { text: "Sessions and models", link: "/features/sessions-and-models" },
           { text: "Replies from the agent", link: "/features/agent-turns" },

@@ -1518,6 +1518,10 @@ class _PipeTurn:
         self.end_history = None
         # Codex images: attached to the stored message after the final (ELI-322).
         self.images_made = 0
+        # The reply's maps: page by map id, and the ids the chat was shown (`show_maps`).
+        self.map_pages: dict = {}
+        self.live_view_embed: str | None = None
+        self.maps_shown: set[str] = set()
         # Paths the reply named: the Gateway stores each as an image block after
         # the final (ELI-328).
         self.gateway_media: set[str] = set()
@@ -1659,6 +1663,7 @@ class _PipeTurn:
                                 )
                                 for event in events:
                                     yield event
+                                await self.show_maps()
                                 if _is_background_agent_launch(name, _tool_result_text(data.get("result", {})),
                                                                data.get("isError") is True):
                                     self.background_agents += 1
@@ -1693,6 +1698,7 @@ class _PipeTurn:
                         yield chunk
                     async for chunk in self.close_open_cards():
                         yield chunk
+                    await self.show_maps()
 
         finally:
             if all(live_key) and _live_replies().get(live_key) is self.renderer:
@@ -2636,6 +2642,31 @@ class _PipeTurn:
         else:
             self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
 
+    async def show_maps(self):
+        """Embed the reply's maps once each. The chat replaces its embeds list with an
+        event's, so the event carries the whole list; with Open WebUI's own emitter it also
+        saves it, so a reload shows the map. A map that could not be fetched is tried again
+        by the next call (the reply's end makes the last one)."""
+        if not self.__event_emitter__:
+            return
+        await _map_embeds(self.conn, self.renderer.output, self.map_pages)
+        ids = [i for i in _map_ids(self.renderer.output) if self.map_pages.get(i)]
+        if all(i in self.maps_shown for i in ids):
+            return
+        if await self.emit_embeds():
+            self.maps_shown.update(ids)
+
+    async def emit_embeds(self) -> bool:
+        """The reply's whole `embeds` (the live view, then its maps) to the chat."""
+        pages = [self.map_pages[i] for i in _map_ids(self.renderer.output) if self.map_pages.get(i)]
+        embeds = ([self.live_view_embed] if self.live_view_embed else []) + pages
+        try:
+            await self.__event_emitter__({"type": "embeds", "data": {"embeds": embeds, "replace": True}})
+        except Exception as ex:
+            pipe_log(f"  embeds failed: {ex!r}")
+            return False
+        return True
+
     async def maybe_show_live_view(self, tool_name, args):
         """Embed LIVE_VIEW_URL once, at the first browser tool call."""
         if getattr(self, "live_view_shown", False) or not self.__event_emitter__:
@@ -2648,11 +2679,9 @@ class _PipeTurn:
         if not url:
             return
         self.live_view_shown = True
-        try:
-            await self.__event_emitter__({"type": "embeds", "data": {"embeds": [url]}})
+        self.live_view_embed = url
+        if await self.emit_embeds():
             pipe_log(f"  live view embed added: {url}")
-        except Exception as ex:
-            pipe_log(f"  live view embed failed: {ex!r}")
 
     async def show_text(self, text: str):
         """New run text through the reply's text hooks: held while it may open
