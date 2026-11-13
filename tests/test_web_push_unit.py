@@ -168,18 +168,33 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
     """`event` with Open WebUI's Functions stubbed and the send recorded."""
 
     async def asyncSetUp(self):
+        # The function's state, in the user's settings (ELI-442); `legacy` is what
+        # earlier versions kept in its user valves.
         self.store = {"subscriptions": json.dumps([{"endpoint": "https://push.example/1",
                                                     "keys": {"p256dh": "k", "auth": "a"}}])}
-        store = self.store
+        self.legacy = {}
+        self.settings = {"ui": {"theme": "dark"}, web_push.state_key("openclaw_web_push"): self.store,
+                         web_push.state_key("web_push"): self.store}
+        settings, legacy = self.settings, self.legacy
 
         class Functions:
             @staticmethod
             async def get_user_valves_by_id_and_user_id(fid, user_id):
-                return dict(store)
+                return dict(legacy)
 
             @staticmethod
             async def update_user_valves_by_id_and_user_id(fid, user_id, valves):
-                store.update(valves)
+                raise AssertionError("the state is no longer written to user valves")
+
+        class Users:
+            @staticmethod
+            async def get_user_by_id(user_id):
+                return types.SimpleNamespace(settings=types.SimpleNamespace(model_dump=lambda: json.loads(json.dumps(settings))))
+
+            @staticmethod
+            async def update_user_settings_by_id(user_id, updated):
+                # Open WebUI 0.13: a top-level key replaces that key only.
+                settings.update(json.loads(json.dumps(updated)))
         # c1 is in folder "qa-old", inside "qa".
         self.folder_reads = []
         reads = self.folder_reads
@@ -197,8 +212,10 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         mods = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
                 "open_webui.models.functions": types.ModuleType("open_webui.models.functions"),
                 "open_webui.models.chats": types.ModuleType("open_webui.models.chats"),
-                "open_webui.models.folders": types.ModuleType("open_webui.models.folders")}
+                "open_webui.models.folders": types.ModuleType("open_webui.models.folders"),
+                "open_webui.models.users": types.ModuleType("open_webui.models.users")}
         mods["open_webui.models.functions"].Functions = Functions
+        mods["open_webui.models.users"].Users = Users
         mods["open_webui.models.chats"].Chats = Chats
         mods["open_webui.models.folders"].Folders = Folders
         p = mock.patch.dict(sys.modules, mods)
@@ -219,19 +236,46 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((key, subject), (b"PEM", "mailto:a@example.com"))
         self.assertNotIn("SECRET-REPLY-TEXT", body)
 
-    async def test_swipe_read_is_on_unless_the_user_turned_it_off(self):
-        """The user's swipe_read valve reaches the device: unset (default on) sends nothing
-        extra, off sends swipe_read: false (the service worker then only hides a swiped one)."""
-        await self.fn.event(finished(), __id__="web_push")
+    async def test_swipe_read_is_on_unless_turned_off(self):
+        """SWIPE_READ (an admin valve) reaches the device: on (default) sends nothing extra,
+        off sends swipe_read: false (the service worker then only hides a swiped one). A
+        user's own swipe_read from before ELI-442 still counts."""
+        await self.fn.event(finished())
         self.assertNotIn("swipe_read", json.loads(self.sent[-1][1]))
-        for off in (False, "false"):
-            self.store["swipe_read"] = off
-            await self.fn.event(finished(), __id__="web_push")
-            self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
-        self.store["swipe_read"] = True
-        await self.fn.event(finished(), __id__="web_push")
-        self.assertNotIn("swipe_read", json.loads(self.sent[-1][1]))
-        self.assertTrue(web_push.Event.UserValves().swipe_read)
+        self.fn.valves.SWIPE_READ = False
+        await self.fn.event(finished())
+        self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
+        self.fn.valves.SWIPE_READ = True
+        self.legacy["swipe_read"] = False
+        await self.fn.event(finished())
+        self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
+
+    async def test_swipe_read_off_wins_over_a_users_old_on(self):
+        """An administrator's SWIPE_READ=False applies to every user, a migrated user's
+        swipe_read: true included (CodeRabbit on #393)."""
+        self.legacy["swipe_read"] = True
+        self.fn.valves.SWIPE_READ = False
+        await self.fn.event(finished())
+        self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
+
+    async def test_no_user_valves_so_no_valves_button(self):
+        """ELI-442: the subscriptions and mutes are the function's state, not settings
+        a user edits: without UserValves Open WebUI shows no valves for it."""
+        self.assertFalse(hasattr(web_push.Event, "UserValves"))
+
+    async def test_state_kept_in_user_valves_by_an_earlier_version_still_counts(self):
+        self.settings.pop(web_push.state_key("openclaw_web_push"))
+        self.legacy.update(self.store, mutes=json.dumps({"c1": 0}))
+        await self.fn.event(finished(chat_id="c2"))
+        self.assertEqual(len(self.sent), 1, "the legacy subscription is used")
+        await self.fn.event(finished(chat_id="c1"))
+        self.assertEqual(len(self.sent), 1, "the legacy mute holds")
+
+    async def test_the_settings_key_wins_over_the_legacy_valves(self):
+        self.legacy["mutes"] = json.dumps({"c1": 0})
+        self.store["mutes"] = "{}"
+        await self.fn.event(finished(chat_id="c1"))
+        self.assertEqual(len(self.sent), 1, "unmuted in the new store")
 
     async def test_no_send_without_the_key_file(self):
         self.fn.valves.VAPID_PRIVATE_KEY_FILE = "/nonexistent/vapid.pem"

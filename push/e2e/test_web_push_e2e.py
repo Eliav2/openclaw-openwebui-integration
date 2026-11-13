@@ -100,7 +100,7 @@ def reply(token, model, chat_id, message_id):
 def subscriptions(token, page):
     """This browser's entries in the user's subscription list."""
     device = page.evaluate("() => localStorage.getItem('ocPushDevice')")
-    return [s for s in json.loads(api("/api/v1/functions/id/web_push/valves/user", token=token)["subscriptions"])
+    return [s for s in json.loads(state(token)["subscriptions"])
             if s.get("device") == device]
 
 
@@ -334,8 +334,17 @@ def owui_log(since):
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout
 
 
-def valves(token):
-    return api("/api/v1/functions/id/web_push/valves/user", token=token)
+# The function's state: the user's settings under its key (ELI-442), not user valves.
+STATE_KEY = "web_push:web_push"
+SETTINGS = "/api/v1/users/user/settings"
+
+
+def state(token):
+    return api(SETTINGS, token=token).get(STATE_KEY) or {}
+
+
+def put_state(token, value):
+    api(SETTINGS + "/update", {STATE_KEY: value}, token)
 
 
 def test_preview_reply_mute_and_the_bell(owui, browser):
@@ -397,9 +406,9 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
     assert not [m for m in history(token, f_chat)["messages"].values() if m.get("content") == "keep this text"]
 
     # D. Mute 8 h from the notification: kept server-side beside the subscriptions; nothing is sent.
-    before = valves(token)["subscriptions"]
+    before = state(token)["subscriptions"]
     assert act(page, "mute", data) == "muted"
-    v = valves(token)
+    v = state(token)
     assert v["subscriptions"] == before
     until = json.loads(v["mutes"])[p_chat]
     assert 8 * 3600 - 60 < until - time.time() <= 8 * 3600
@@ -431,11 +440,11 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
     bell.click()
     page.get_by_role("menuitem", name="Unmute").click()
     page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Notifications on'", timeout=WAIT_MS)
-    assert p_chat not in json.loads(valves(token)["mutes"])
+    assert p_chat not in json.loads(state(token)["mutes"])
     bell.click()
     page.get_by_role("menuitem", name="Mute always").click()
     page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Muted'", timeout=WAIT_MS)
-    assert json.loads(valves(token)["mutes"])[p_chat] == 0
+    assert json.loads(state(token)["mutes"])[p_chat] == 0
     if os.environ.get("E2E_SHOTS"):
         bell.click()
         page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-bell.png"))
@@ -452,8 +461,8 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
     page.keyboard.press("Escape")
     assert page.locator("#oc-push-mute-menu").count() == 0
     page.evaluate("() => document.documentElement.removeAttribute('dir')")
-    ocp = valves(token)
-    api("/api/v1/functions/id/web_push/valves/user/update", {**ocp, "mutes": "{}"}, token)
+    ocp = state(token)
+    put_state(token, {**ocp, "mutes": "{}"})
     other()
 
 
@@ -491,7 +500,7 @@ def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
     child = api("/api/v1/folders/", {"name": "Child", "parent_id": parent}, token)["id"]
     q_chat, _ = new_chat(token, "stub", "Chat Q")
     api(f"/api/v1/chats/{q_chat}/folder", {"folder_id": child}, token)
-    before = valves(token)["subscriptions"]
+    before = state(token)["subscriptions"]
 
     def answer_and_check(muted_by):
         t = time.time()
@@ -516,13 +525,13 @@ def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
     bell.click()
     page.get_by_role("menuitem", name="Mute folder always").click()
     page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Muted (folder Child)'", timeout=WAIT_MS)
-    v = valves(token)
+    v = state(token)
     assert json.loads(v["folder_mutes"]) == {child: 0} and v["subscriptions"] == before
     other()
     answer_and_check(child)
 
     # A mute of the folder above covers it; the menu offers to unmute that folder.
-    api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "folder_mutes": json.dumps({parent: 0})}, token)
+    put_state(token, {**state(token), "folder_mutes": json.dumps({parent: 0})})
     answer_and_check(parent)
     page.bring_to_front()
     page.goto(f"{BASE}/c/{q_chat}")
@@ -533,7 +542,7 @@ def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
         page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-folder-mute.png"))
     page.get_by_role("menuitem", name="Unmute folder Parent").click()
     page.wait_for_function("() => document.getElementById('oc-push-bell').title === 'Notifications on'", timeout=WAIT_MS)
-    assert json.loads(valves(token)["folder_mutes"]) == {}
+    assert json.loads(state(token)["folder_mutes"]) == {}
     other()
     answer_and_check(None)
 
@@ -843,7 +852,7 @@ def test_mute_from_open_webuis_own_menus(owui, browser):
         shot(page, "web-push-g-folder-mute-menu")
         mm.get_by_role("menuitem", name="Mute folder always").click()
         page.wait_for_function(f"() => window.ocPushMuted?.id === {json.dumps(folder)}", timeout=WAIT_MS)
-        assert json.loads(valves(token)["folder_mutes"]) == {folder: 0}
+        assert json.loads(state(token)["folder_mutes"]) == {folder: 0}
         # Muted: the item says so the next time.
         menu = native_menu(page, FOLDER_ROW_TRIGGER, folder)
         menu.get_by_role("menuitem", name="Muted").wait_for(timeout=WAIT_MS)
@@ -879,7 +888,7 @@ def test_mute_from_open_webuis_own_menus(owui, browser):
         assert "This chat" in mm.inner_text() and mm.locator("bdi").count() >= 1
         mm.get_by_role("menuitem", name="Mute for 1 hour").click()
         page.wait_for_function(f"() => window.ocPushMuted?.id === {json.dumps(g_chat)}", timeout=WAIT_MS)
-        assert abs(json.loads(valves(token)["mutes"])[g_chat] - (time.time() + 3600)) < 60
+        assert abs(json.loads(state(token)["mutes"])[g_chat] - (time.time() + 3600)) < 60
         # Moved to another folder: the chat's menu offers the new folder, not the one it was in.
         second = api("/api/v1/folders/", {"name": "Second " + uuid.uuid4().hex[:4]}, token)
         api(f"/api/v1/chats/{g_chat}/folder", {"folder_id": second["id"]}, token)
@@ -909,7 +918,7 @@ def test_mute_from_open_webuis_own_menus(owui, browser):
         assert len([l for l in logs if "folder menu" in l]) == 1, logs
         page.evaluate("() => document.querySelectorAll('#bad-folder, #bad-folder-2, #folder-fake-button').forEach(e => e.remove())")
     finally:
-        api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "mutes": "{}", "folder_mutes": "{}"}, token)
+        put_state(token, {**state(token), "mutes": "{}", "folder_mutes": "{}"})
         page.set_viewport_size({"width": 390, "height": 844})
 
 def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
@@ -956,8 +965,7 @@ def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
 
         # H5: a mute that ends on another day says which day.
         later = int(time.time()) + 2 * 86400
-        api("/api/v1/functions/id/web_push/valves/user/update",
-            {**valves(token), "mutes": json.dumps({g_chat: later}), "folder_mutes": "{}"}, token)
+        put_state(token, {**state(token), "mutes": json.dumps({g_chat: later}), "folder_mutes": "{}"})
         page.goto(f"{BASE}/c/{g_chat}")
         page.wait_for_function("() => (document.getElementById('oc-push-bell')?.title || '').startsWith('Muted until')", timeout=WAIT_MS)
         day = page.evaluate("(t) => new Date(t * 1000).toLocaleString([], {weekday: 'short'})", later)
@@ -984,7 +992,7 @@ def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
         close_menus(page)
         assert not broken, broken
     finally:
-        api("/api/v1/functions/id/web_push/valves/user/update", {**valves(token), "mutes": "{}", "folder_mutes": "{}"}, token)
+        put_state(token, {**state(token), "mutes": "{}", "folder_mutes": "{}"})
         page.set_viewport_size({"width": 390, "height": 844})
 
 
@@ -1405,14 +1413,16 @@ def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
         srv.shutdown()
 
 
-VALVES_READ = "/api/v1/functions/id/web_push/valves/user"
+# The page script's own reads carry this header (oc-push.js OWN_READ); Open WebUI
+# reads the same settings route on its own while it starts.
+OWN_READ = "x-oc-own"
 
 
 def test_a_load_reads_the_users_valves_once(owui, pw):
-    """Open WebUI navigates a few times while it starts; the page script reads the user's valves
-    (mutes, devices) once for all of them. Notifications not asked yet (no subscription to save)."""
+    """Open WebUI navigates a few times while it starts; the page script reads the function's
+    state (mutes, devices) once for all of them. Notifications not asked yet (no subscription to save)."""
     chat, _ = new_chat(owui, "stub", "Chat One Read")
-    body = json.dumps(api(VALVES_READ, token=owui)).encode()
+    body = json.dumps(api(SETTINGS, token=owui)).encode()
     reads, answered = [], threading.Event()
     def answer(path):
         reads.append(path)
@@ -1426,11 +1436,11 @@ def test_a_load_reads_the_users_valves_once(owui, pw):
         page.goto(f"{BASE}/c/{chat}")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         # A slow answer (a slow network): Open WebUI's start navigations come while it is on its way.
-        ctx.route(f"**{VALVES_READ}", lambda route: route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}/")
-                  if route.request.method == "GET" else route.fallback())
+        ctx.route(f"**{SETTINGS}", lambda route: route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}/")
+                  if route.request.method == "GET" and OWN_READ in route.request.headers else route.fallback())
         page.reload()
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        assert answered.wait(WAIT_MS / 1000), "the page script never read the valves"
+        assert answered.wait(WAIT_MS / 1000), "the page script never read its state"
         # Open WebUI's start navigations all came while that first read was on its way.
         assert len(reads) == 1, reads
     finally:

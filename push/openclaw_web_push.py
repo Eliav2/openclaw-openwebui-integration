@@ -2,13 +2,14 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.4.1
+version: 0.5.0
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
 # Docs: docs/install/web-push.md. The page script (push/web/oc-push.js) keeps
-# each device's subscription in this function's user valves; the service
-# worker (push/web/oc-sw.js) shows the notification.
+# each device's subscription in the user's Open WebUI settings, under this
+# function's key (state_key); the service worker (push/web/oc-sw.js) shows the
+# notification.
 import asyncio
 import base64
 import hashlib
@@ -36,8 +37,16 @@ GONE_STATUSES = (404, 410)
 # The notification's buttons the service worker knows (push/web/oc-sw.js):
 # reply in the shade, mark the chat read, mute it for 8 hours.
 KNOWN_ACTIONS = ("reply", "read", "mute")
-# Mute writes this function's user valves, so it needs the function's id.
+# Mute writes this function's state (state_key), so it needs the function's id.
 NEEDS_FUNCTION_ID = ("mute",)
+# The subscriptions and mutes are this function's state, not settings a user
+# edits: they live in the user's Open WebUI settings under this key, which no
+# Open WebUI page shows. They used to be user valves, and a function with user
+# valves gets a valves button and a Controls panel entry whose save could write
+# stale values back (ELI-442). Open WebUI 0.13's settings update replaces only
+# the top-level keys it is sent, so the page script, the service worker and this
+# function each write this one key.
+STATE_KEY_PREFIX = "web_push:"
 DEFAULT_KEY_FILE = os.path.join(os.environ.get("DATA_DIR", "/app/backend/data"), "web-push", "vapid_private.pem")
 
 
@@ -93,7 +102,7 @@ def parse_actions(raw: str) -> list:
 def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: list | None = None,
                   swipe_read: bool = True) -> dict:
     """What the device gets: the chat's title and where to open it, the id of
-    this function (the service worker's Mute writes its user valves), and, only
+    this function (the service worker's Mute writes its state), and, only
     with `preview_chars`, the start of the reply. `data.message` holds the whole
     reply (Open WebUI 0.13.0 and the Pipe); it is never sent whole."""
     data = event.get("data") or {}
@@ -194,6 +203,25 @@ def should_send(event: dict, pipe_prefixes: list) -> bool:
     return True
 
 
+def state_key(fid: str) -> str:
+    return STATE_KEY_PREFIX + fid
+
+
+def merge_state(settings, legacy, fid: str) -> dict:
+    """The function's state for one user: its key in the user's settings over
+    what an earlier version kept in its user valves (field by field, so a
+    device that has not written since the update still counts)."""
+    own = (settings or {}).get(state_key(fid))
+    return {**(legacy if isinstance(legacy, dict) else {}), **(own if isinstance(own, dict) else {})}
+
+
+def _settings_dict(user) -> dict:
+    raw = getattr(user, "settings", None) if user else None
+    if raw is None:
+        return {}
+    return raw.model_dump() if hasattr(raw, "model_dump") else dict(raw)
+
+
 class Event:
     class Valves(BaseModel):
         VAPID_PRIVATE_KEY_FILE: str = Field(
@@ -226,22 +254,14 @@ class Event:
                         "in the notification. 0: off, the body says 'New reply'. The text shows on "
                         "the lock screen and in the notification shade of every subscribed device.")
 
-    class UserValves(BaseModel):
-        subscriptions: str = Field(
-            default="[]",
-            description="Written by the page script: one Web Push subscription per device.")
-        mutes: str = Field(
-            default="{}",
-            description="Written by the page script and the service worker: chats that send no "
-                        "notification, {chat_id: until} in epoch seconds, 0 for always.")
-        folder_mutes: str = Field(
-            default="{}",
-            description="Written by the page script: folders whose chats send no notification, "
-                        "folders inside them included, {folder_id: until} as in mutes.")
-        swipe_read: bool = Field(
+        SWIPE_READ: bool = Field(
             default=True,
             description="A notification swiped away marks its chat read (Android Chrome; "
                         "'Clear all' marks every chat in it read). Off: a swipe only hides it.")
+
+    # No UserValves: the state (subscriptions: one per device; mutes and
+    # folder_mutes: {id: until} in epoch seconds, 0 for always) is in the user's
+    # settings under state_key(), see STATE_KEY_PREFIX.
 
     def __init__(self):
         self.valves = self.Valves()
@@ -257,7 +277,7 @@ class Event:
         from open_webui.models.functions import Functions
 
         fid = __id__ or "openclaw_web_push"
-        valves = await Functions.get_user_valves_by_id_and_user_id(fid, user_id) or {}
+        valves = await self._state(Functions, fid, user_id)
         subs = parse_subscriptions(valves.get("subscriptions"))
         if not subs:
             return
@@ -276,11 +296,19 @@ class Event:
         subject = await self._subject()
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
-                                            swipe_read=is_on(valves.get("swipe_read"), True)))
+                                            swipe_read=self.valves.SWIPE_READ and is_on(valves.get("swipe_read"), True)))
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject, chat_id)
         if gone:
             await self._drop(Functions, fid, user_id, gone)
+
+    @staticmethod
+    async def _state(Functions, fid: str, user_id: str) -> dict:
+        from open_webui.models.users import Users
+
+        user = await Users.get_user_by_id(user_id)
+        legacy = await Functions.get_user_valves_by_id_and_user_id(fid, user_id)
+        return merge_state(_settings_dict(user), legacy, fid)
 
     @staticmethod
     async def _muted_folder(raw, chat_id: str, user_id: str):
@@ -349,12 +377,14 @@ class Event:
         return gone
 
     async def _drop(self, Functions, fid: str, user_id: str, gone: set) -> None:
+        from open_webui.models.users import Users
+
         # Read again: a device may have saved its subscription meanwhile.
-        valves = await Functions.get_user_valves_by_id_and_user_id(fid, user_id) or {}
-        subs = parse_subscriptions(valves.get("subscriptions"))
+        state = await self._state(Functions, fid, user_id)
+        subs = parse_subscriptions(state.get("subscriptions"))
         keep = [s for s in subs if s["endpoint"] not in gone]
         if len(keep) != len(subs):
-            await Functions.update_user_valves_by_id_and_user_id(fid, user_id, {**valves, "subscriptions": json.dumps(keep)})
+            await Users.update_user_settings_by_id(user_id, {state_key(fid): {**state, "subscriptions": json.dumps(keep)}})
 
 
 def _host(sub: dict) -> str:
