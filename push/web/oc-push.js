@@ -39,11 +39,12 @@
   // The function's state: the user's settings under its key, not its user valves
   // (ELI-442: those get a valves button and a Controls panel that writes them).
   // What an earlier version kept in the user valves is read under it, field by
-  // field, so it carries over on the first write.
+  // field, so it carries over on the first write. A failed read of those fails
+  // the write too: they may hold the only copy of the devices and mutes.
   const KEY = "web_push:" + FN;
   const loadState = () => Promise.all([
     call("/api/v1/users/user/settings"),
-    call("/api/v1/functions/id/" + FN + "/valves/user").catch(() => null),
+    call("/api/v1/functions/id/" + FN + "/valves/user"),
   ]).then(([settings, legacy]) => ({ ...(legacy || {}), ...(settings?.[KEY] || {}) }));
   // Open WebUI 0.13's settings update replaces only the keys it is sent: read the
   // state right before the write and change one field. Two devices writing at the

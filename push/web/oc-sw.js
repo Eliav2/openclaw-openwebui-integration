@@ -150,12 +150,13 @@ async function sendReply(chatId, text) {
 // under its own key, not in its user valves (ELI-442). Open WebUI 0.13's
 // settings update replaces only the top-level keys it is sent. What an earlier
 // version kept in the user valves is read under it, field by field, so it
-// carries over on the first write.
+// carries over on the first write. A failed read of those fails the write too:
+// they may hold the only copy of the devices (a user with no record gets null).
 const STATE_KEY_PREFIX = "web_push:";
 async function loadState(fn, signal) {
   const [settings, legacy] = await Promise.all([
     api("/api/v1/users/user/settings", undefined, signal),
-    api("/api/v1/functions/id/" + fn + "/valves/user", undefined, signal).catch(() => null),
+    api("/api/v1/functions/id/" + fn + "/valves/user", undefined, signal),
   ]);
   return { ...(legacy || {}), ...(settings?.[STATE_KEY_PREFIX + fn] || {}) };
 }

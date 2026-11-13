@@ -250,6 +250,14 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         await self.fn.event(finished())
         self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
 
+    async def test_swipe_read_off_wins_over_a_users_old_on(self):
+        """An administrator's SWIPE_READ=False applies to every user, a migrated user's
+        swipe_read: true included (CodeRabbit on #393)."""
+        self.legacy["swipe_read"] = True
+        self.fn.valves.SWIPE_READ = False
+        await self.fn.event(finished())
+        self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
+
     async def test_no_user_valves_so_no_valves_button(self):
         """ELI-442: the subscriptions and mutes are the function's state, not settings
         a user edits: without UserValves Open WebUI shows no valves for it."""

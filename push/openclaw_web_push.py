@@ -296,7 +296,7 @@ class Event:
         subject = await self._subject()
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
-                                            swipe_read=is_on(valves.get("swipe_read"), self.valves.SWIPE_READ)))
+                                            swipe_read=self.valves.SWIPE_READ and is_on(valves.get("swipe_read"), True)))
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject, chat_id)
         if gone:

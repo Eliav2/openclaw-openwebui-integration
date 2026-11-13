@@ -45,7 +45,7 @@ function worker() {
   // Open WebUI's API: every call recorded; the user's settings and the function's
   // legacy user valves answer from `server` (a test sets them).
   const calls = [];
-  const server = { settings: {}, legacyValves: null };
+  const server = { settings: {}, legacyValves: null, legacyStatus: 200 };
   const fetch = async (path, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : undefined;
     calls.push({ path: String(path), method: init.method || "GET", body });
@@ -54,7 +54,9 @@ function worker() {
       Object.assign(server.settings, body);   // Open WebUI 0.13: the keys sent replace those keys only
       return new Response(JSON.stringify(server.settings), { status: 200 });
     }
-    if (/\/valves\/user$/.test(String(path))) return new Response(JSON.stringify(server.legacyValves), { status: 200 });
+    if (/\/valves\/user$/.test(String(path))) {
+      return new Response(JSON.stringify(server.legacyValves), { status: server.legacyStatus || 200 });
+    }
     return new Response(JSON.stringify({ token: "t" }), { status: 200 });
   };
   const registration = {
@@ -232,4 +234,14 @@ test("Mute writes the function's state in the user's settings, never its user va
   assert.equal(state.subscriptions, "[{\"endpoint\":\"e1\"}]", "the devices are kept");
   assert.equal(state.folder_mutes, "{\"f1\":0}", "a field only the legacy valves had is carried over");
   assert.deepEqual(w.server.settings.ui, { theme: "dark" }, "the rest of the settings is untouched");
+});
+
+test("Mute writes nothing when the old user valves cannot be read (they may hold the devices)", async () => {
+  const w = worker();
+  w.server.legacyValves = { subscriptions: "[{\"endpoint\":\"e1\"}]" };
+  w.server.legacyStatus = 503;
+  await w.push({ ...reply("a", "one"), fn: "fn1", actions: ["mute"] });
+  await w.fire("notificationclick", w.tag("a"), { action: "mute" });
+  assert.ok(!w.calls.some((c) => c.method === "POST" && /settings\/update/.test(c.path)),
+    "a write with the legacy devices missing would wipe them");
 });

@@ -344,7 +344,7 @@ def state(token):
 
 
 def put_state(token, value):
-    api(SETTINGS + "/update", {STATE_KEY: value})
+    api(SETTINGS + "/update", {STATE_KEY: value}, token)
 
 
 def test_preview_reply_mute_and_the_bell(owui, browser):

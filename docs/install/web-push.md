@@ -142,7 +142,7 @@ On Android, a notification you swipe away marks its chat read, as **Mark as read
 
 Why a swipe and not only the button: on current Chrome for Android (149 and later), tapping any button of a site's notification closes the shade, whatever the site does. A swipe reaches the browser without that (Android sends it as a broadcast), so the shade stays open for the next one.
 
-It is the function's `SWIPE_READ` valve, on by default; turn it off and a swipe only hides the notification (a user who turned the old `swipe_read` user valve off keeps it off). A notification the app closes itself (you opened the chat, you tapped it, a newer reply replaced it) never marks anything read.
+It is the function's `SWIPE_READ` valve, on by default; turn it off and a swipe only hides the notification, for every user (a user who turned the old `swipe_read` user valve off keeps it off). A notification the app closes itself (you opened the chat, you tapped it, a newer reply replaced it) never marks anything read.
 
 ### Mark a chat read from the chat list
 
