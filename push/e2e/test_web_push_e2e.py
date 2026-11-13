@@ -13,6 +13,7 @@ a saved subscription. None waits on time.
 import http.server
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -1103,8 +1104,14 @@ RELOADED_FLAG = "() => sessionStorage.getItem('ocReloadedAfterError')"
 DROP_APP_FILE = """() => caches.open('oc-shell-v1').then(async (c) => {
     for (const k of await c.keys()) if (k.url.includes('/nodes/0.')) await c.delete(k); })"""
 SHELL_VERSION = "() => caches.open('oc-shell-v1').then((c) => c.match('/_oc/version')).then((r) => r ? r.text() : null)"
-# Only the offline-open caches (the kill switch drops those); oc-push-own-closes belongs to the push feature and stays.
-NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k === 'oc-shell-v1' || k.startsWith('oc-api-')))"
+
+
+def no_offline_caches():
+    """JS: no worker cache is left except the push feature's, whose names oc-sw.js declares (DRAFTS,
+    OWN_CLOSES; the kill switch keeps those). Any other oc- cache, a new offline one included, must be gone."""
+    src = urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
+    push = [re.search(rf'^const {n} = "([^"]+)"', src, re.M).group(1) for n in ("DRAFTS", "OWN_CLOSES")]
+    return f"() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-') && !{json.dumps(push)}.includes(k)))"
 
 
 def offline_on():
@@ -1891,7 +1898,7 @@ def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
             r.active && r.active.state === 'activated' && !r.waiting && !r.installing)""")
         page.reload()   # the next open
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        settled(page, NO_OFFLINE_CACHES)
+        settled(page, no_offline_caches())
         ctx.set_offline(True)
         with pytest.raises(Exception, match="ERR_INTERNET_DISCONNECTED"):
             page.reload(timeout=WAIT_MS)
