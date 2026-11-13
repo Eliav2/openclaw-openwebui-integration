@@ -146,15 +146,28 @@ async function sendReply(chatId, text) {
   return uid;
 }
 
-// Mute a chat in the function's user valves: read, merge, write the whole set
-// (Open WebUI's update replaces every user valve).
+// The function's state (devices, mutes) is in the user's Open WebUI settings
+// under its own key, not in its user valves (ELI-442). Open WebUI 0.13's
+// settings update replaces only the top-level keys it is sent. What an earlier
+// version kept in the user valves is read under it, field by field, so it
+// carries over on the first write.
+const STATE_KEY_PREFIX = "web_push:";
+async function loadState(fn, signal) {
+  const [settings, legacy] = await Promise.all([
+    api("/api/v1/users/user/settings", undefined, signal),
+    api("/api/v1/functions/id/" + fn + "/valves/user", undefined, signal).catch(() => null),
+  ]);
+  return { ...(legacy || {}), ...(settings?.[STATE_KEY_PREFIX + fn] || {}) };
+}
+
+// Mute a chat: read the state, change the mutes, write the state back.
 async function mute(fn, chatId, seconds, signal) {
-  const path = "/api/v1/functions/id/" + fn + "/valves/user";
-  const valves = (await api(path, undefined, signal)) || {};
+  const state = await loadState(fn, signal);
   let mutes = {};
-  try { mutes = JSON.parse(valves.mutes || "{}") || {}; } catch (_) {}
+  try { mutes = JSON.parse(state.mutes || "{}") || {}; } catch (_) {}
   mutes[chatId] = seconds ? Math.floor(Date.now() / MS_PER_S) + seconds : 0;
-  await api(path + "/update", { ...valves, mutes: JSON.stringify(mutes) }, signal);
+  await api("/api/v1/users/user/settings/update",
+    { [STATE_KEY_PREFIX + fn]: { ...state, mutes: JSON.stringify(mutes) } }, signal);
 }
 
 // Mark a chat read, as opening it does: Open WebUI 0.13 keeps the sidebar's

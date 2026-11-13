@@ -42,7 +42,21 @@ function worker() {
     }
     close() {}
   }
-  const fetch = async () => new Response(JSON.stringify({ token: "t" }), { status: 200 });
+  // Open WebUI's API: every call recorded; the user's settings and the function's
+  // legacy user valves answer from `server` (a test sets them).
+  const calls = [];
+  const server = { settings: {}, legacyValves: null };
+  const fetch = async (path, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ path: String(path), method: init.method || "GET", body });
+    if (String(path) === "/api/v1/users/user/settings") return new Response(JSON.stringify(server.settings), { status: 200 });
+    if (String(path) === "/api/v1/users/user/settings/update") {
+      Object.assign(server.settings, body);   // Open WebUI 0.13: the keys sent replace those keys only
+      return new Response(JSON.stringify(server.settings), { status: 200 });
+    }
+    if (/\/valves\/user$/.test(String(path))) return new Response(JSON.stringify(server.legacyValves), { status: 200 });
+    return new Response(JSON.stringify({ token: "t" }), { status: 200 });
+  };
   const registration = {
     async getNotifications({ tag } = {}) {
       return [...shown.values()].filter((n) => !tag || n.tag === tag);
@@ -74,7 +88,7 @@ function worker() {
   }
   // A swipe: Android removes the notification, then Chrome fires notificationclose.
   const swipe = (n) => { n.close(); return fire("notificationclose", n); };
-  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches };
+  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches, calls, server };
 }
 
 const reply = (chat, body, title = "Trip plan") => ({ chat_id: chat, title, body, url: "/c/" + chat });
@@ -204,4 +218,18 @@ test("a swipe, then the chat's next notification before the worker handles the c
   await w.push(reply("a", "two"));     // the next reply's notification, first
   await w.fire("notificationclose", swiped);
   assert.deepEqual(w.reads, ["a"]);
+});
+
+test("Mute writes the function's state in the user's settings, never its user valves (ELI-442)", async () => {
+  const w = worker();
+  w.server.settings = { ui: { theme: "dark" }, "web_push:fn1": { subscriptions: "[{\"endpoint\":\"e1\"}]", mutes: "{}" } };
+  w.server.legacyValves = { folder_mutes: "{\"f1\":0}", mutes: "{\"old\":0}" };
+  await w.push({ ...reply("a", "one"), fn: "fn1", actions: ["mute"] });
+  await w.fire("notificationclick", w.tag("a"), { action: "mute" });
+  assert.ok(!w.calls.some((c) => c.method === "POST" && /valves/.test(c.path)), "no write to user valves");
+  const state = w.server.settings["web_push:fn1"];
+  assert.ok(JSON.parse(state.mutes).a > 0, "the chat is muted");
+  assert.equal(state.subscriptions, "[{\"endpoint\":\"e1\"}]", "the devices are kept");
+  assert.equal(state.folder_mutes, "{\"f1\":0}", "a field only the legacy valves had is carried over");
+  assert.deepEqual(w.server.settings.ui, { theme: "dark" }, "the rest of the settings is untouched");
 });

@@ -293,3 +293,9 @@ The notification's buttons, in order: reply (a text field in the notification, s
 Type: `int`. Default: `0`.
 
 Show the start of the reply (plain text, at most this many characters) in the notification. 0: off, the body says 'New reply'. The text shows on the lock screen and in the notification shade of every subscribed device.
+
+### SWIPE_READ
+
+Type: `bool`. Default: `True`.
+
+A notification swiped away marks its chat read (Android Chrome; 'Clear all' marks every chat in it read). Off: a swipe only hides it.

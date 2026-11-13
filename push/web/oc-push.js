@@ -3,8 +3,9 @@
 // append it to yours. Replace the two placeholders when you serve it:
 //   __VAPID_PUBLIC_KEY__  the VAPID public key, base64url (not a secret)
 //   __FUNCTION_ID__       the id of the Web Push event function in Open WebUI
-// It registers /oc-sw.js and keeps this device's push subscription in that
-// function's user valves, through Open WebUI's own API with the user's token.
+// It registers /oc-sw.js and keeps this device's push subscription in the
+// function's state (the user's Open WebUI settings, under "web_push:" + its id),
+// through Open WebUI's own API with the user's token.
 // In a chat it adds a bell (mute this chat for every device of the user) and
 // puts a reply that could not be sent from a notification into the message box.
 (() => {
@@ -35,14 +36,22 @@
     headers: { Authorization: "Bearer " + store.get("token"), "Content-Type": "application/json", [OWN_READ]: own },
     body: body ? JSON.stringify(body) : undefined,
   }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(path + " " + r.status))));
-  const valves = (suffix, body) => call("/api/v1/functions/id/" + FN + "/valves/user" + suffix, body);
-  // Open WebUI's update replaces every user valve: read them all right before
-  // the write and change one. Two devices writing at the same moment can still
-  // lose one write; the next write of either heals it.
-  async function updateValves(change) {
-    const now = (await valves("")) || {};
+  // The function's state: the user's settings under its key, not its user valves
+  // (ELI-442: those get a valves button and a Controls panel that writes them).
+  // What an earlier version kept in the user valves is read under it, field by
+  // field, so it carries over on the first write.
+  const KEY = "web_push:" + FN;
+  const loadState = () => Promise.all([
+    call("/api/v1/users/user/settings"),
+    call("/api/v1/functions/id/" + FN + "/valves/user").catch(() => null),
+  ]).then(([settings, legacy]) => ({ ...(legacy || {}), ...(settings?.[KEY] || {}) }));
+  // Open WebUI 0.13's settings update replaces only the keys it is sent: read the
+  // state right before the write and change one field. Two devices writing at the
+  // same moment can still lose one write; the next write of either heals it.
+  async function updateState(change) {
+    const now = await loadState();
     const next = { ...now, ...change(now) };
-    await valves("/update", next);
+    await call("/api/v1/users/user/settings/update", { [KEY]: next });
     return next;
   }
   const parse = (raw, empty) => { try { return JSON.parse(raw || empty) || JSON.parse(empty); } catch (_) { return JSON.parse(empty); } };
@@ -52,7 +61,7 @@
     let result = "kept";
     let device = store.get("ocPushDevice");
     if (!device) { device = crypto.randomUUID(); store.set("ocPushDevice", device); }
-    await updateValves((now) => {
+    await updateState((now) => {
       let list = parse(now.subscriptions, "[]");
       if (list.some((x) => x.endpoint === s.endpoint)) return {};
       result = "saved";
@@ -294,7 +303,7 @@
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
   const VISIBLE = "visible";
-  // The two mute lists in the function's user valves, {id: until} (0 always):
+  // The two mute lists in the function's state, {id: until} (0 always):
   // chats, and folders (a folder's mute covers the folders inside it).
   const CHATS = "mutes", FOLDERS = "folder_mutes";
   const HOUR_S = 3600;
@@ -320,7 +329,7 @@
   // share the one read on its way instead of each asking the server.
   let loadingMutes = null;
   function loadMutes() {
-    return loadingMutes ||= valves("").then((v) => {
+    return loadingMutes ||= loadState().then((v) => {
       v ||= {};
       mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
       hasDevices = parse(v.subscriptions, "[]").length > 0;
@@ -340,7 +349,7 @@
 
   // seconds: 0 always, null unmute.
   async function setMute(list, id, seconds) {
-    const next = await updateValves((now) => {
+    const next = await updateState((now) => {
       const m = parse(now[list], "{}");
       const nowS = Math.floor(Date.now() / 1000);
       for (const k of Object.keys(m)) if (m[k] !== 0 && m[k] <= nowS) delete m[k];   // expired

@@ -50,8 +50,9 @@ Its valves:
 | [`PIPE_MODEL_PREFIXES`](../configuration.md#pipe_model_prefixes) | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
 | [`PREVIEW_CHARS`](../configuration.md#preview_chars) | `0` (off) | Up to this many characters of the reply, as plain text, in the notification. Read the [privacy note](#preview) first. |
 | [`NOTIFICATION_ACTIONS`](../configuration.md#notification_actions) | `reply,mute` | The notification's buttons, in order, from `reply`, `read`, `mute`; see [Buttons](#buttons). |
+| [`SWIPE_READ`](../configuration.md#swipe_read) | `true` | A notification swiped away marks its chat read; see [Swipe to read](#swipe-to-read). |
 
-Its user valves are written by the page script and the service worker, not by hand: `subscriptions` (one entry per device) and `mutes` (muted chats).
+The function has no user valves, so Open WebUI shows no valves button or Controls entry for it. Each user's devices and mutes are the function's state, written by the page script, the service worker and the function itself: the user's Open WebUI settings hold them under the key `web_push:<function id>` (`subscriptions`, one entry per device; `mutes`; `folder_mutes`), which no Open WebUI page shows. Open WebUI 0.13's settings update replaces only the keys it is sent, so the rest of the user's settings are never written. Versions before 0.5.0 kept them in the function's user valves; they are still read, field by field under the new key, and move over on the next write.
 
 ## 3. Turn on the Pipe's event
 
@@ -141,7 +142,7 @@ On Android, a notification you swipe away marks its chat read, as **Mark as read
 
 Why a swipe and not only the button: on current Chrome for Android (149 and later), tapping any button of a site's notification closes the shade, whatever the site does. A swipe reaches the browser without that (Android sends it as a broadcast), so the shade stays open for the next one.
 
-It is the `swipe_read` user valve of the Web Push function, on by default; turn it off in your own valves of the function (Settings, Functions) and a swipe only hides the notification. A notification the app closes itself (you opened the chat, you tapped it, a newer reply replaced it) never marks anything read.
+It is the function's `SWIPE_READ` valve, on by default; turn it off and a swipe only hides the notification (a user who turned the old `swipe_read` user valve off keeps it off). A notification the app closes itself (you opened the chat, you tapped it, a newer reply replaced it) never marks anything read.
 
 ### Mark a chat read from the chat list
 
@@ -151,17 +152,17 @@ On a device with notifications on, the ⋯ menu of a chat in Open WebUI's sideba
 
 In a chat, a bell at the right of Open WebUI's header (before the chat menu ⋯, when you have one) shows whether the chat notifies, and until when it is muted. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**. A mute that ends on another day names the day ("Muted until Sat 09:05"). The same menu opens from **Mute notifications** in the chat's ⋯ menu in the sidebar, after Mark as read; when the chat is muted that item says until when. The bell and the item show only once a device of yours is enabled.
 
-A mute is kept on the server, in the function's `mutes` user valve, so it applies to every device of yours, iPhone included: the function checks it before it encrypts anything, and sends nothing for a muted chat. It is per user: muting a shared chat mutes it only for you.
+A mute is kept on the server, in the function's state (`mutes`), so it applies to every device of yours, iPhone included: the function checks it before it encrypts anything, and sends nothing for a muted chat. It is per user: muting a shared chat mutes it only for you.
 
 ### Mute a folder
 
 In a chat that is in a folder, the bell's menu has a second part for that folder: **Mute folder for 1 hour**, **for 8 hours**, **always**, or **Unmute folder**. A folder's own ⋯ menu, in the sidebar and on the folder's page, has **Mute folder** after Open WebUI's "Mark all as read" (or "Muted …" when it is muted), which opens the same choices for that folder. A folder's mute covers the chats in it and in every folder inside it, so a folder for tests or automated chats can stay quiet while you keep your own chats. The bell of a chat muted through its folder says so, for example "Muted (folder QA)"; when the mute comes from a folder above, the menu names it and unmutes that one.
 
-Folder mutes are kept like chat mutes, in the `folder_mutes` user valve (`{folder id: until}`). Only while one is in effect does the function read the chat's folder and your folders before it sends.
+Folder mutes are kept like chat mutes, in `folder_mutes` (`{folder id: until}`). Only while one is in effect does the function read the chat's folder and your folders before it sends.
 
 The ⋯ menu items are added the same way as [Mark as read](#mark-a-chat-read-from-the-chat-list): to Open WebUI 0.13.0's menus, found by their structure and the "Mark as unread" or "Mark all as read" icon. A menu drawn differently gets nothing, and the console says once which menu it did not recognise (except on a folder's page, where its ⋯ cannot be told from the page's other menus, such as the icon picker: there it is only left alone); Open WebUI's own items are never changed, and ours come back if Open WebUI redraws the menu while it is open.
 
-The bell and the Mute button read all your user valves and write them back with one changed (Open WebUI replaces them all on each write). Two changes at the same time can lose one of them (see [Known limits](#known-limits)).
+The bell and the Mute button read the function's state and write it back with one field changed. Two changes at the same time can lose one of them (see [Known limits](#known-limits)).
 
 ### iPhone and iPad
 
@@ -209,7 +210,7 @@ With it on, a chat you opened before on that device opens from the copy kept of 
 
 ## Known limits
 
-- **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your user valves and write them all back with their one change, because Open WebUI's user-valve update replaces the whole set. If a second change reads them before the first one's write has landed, the second write puts back the old value of the first: the two read-and-write round trips overlap, so how long the window lasts depends on the network (longer on a slow phone connection). Any two writers can do this: two devices, two tabs, or a notification's Mute button next to an open tab. If a mute did not stick, change it again.
+- **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read the function's state and write it all back with their one change, because the state is one settings key that each write replaces whole. If a second change reads them before the first one's write has landed, the second write puts back the old value of the first: the two read-and-write round trips overlap, so how long the window lasts depends on the network (longer on a slow phone connection). Any two writers can do this: two devices, two tabs, or a notification's Mute button next to an open tab. If a mute did not stick, change it again.
 
 ## Turning it off
 
