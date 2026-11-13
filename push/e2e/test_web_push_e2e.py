@@ -1156,6 +1156,9 @@ def test_the_error_page_after_a_network_change_reloads_once_into_the_chat(owui, 
 BOOT_READS = ("**/api/v1/users/user/settings", "**/api/v1/chats/?page=1", "**/api/v1/chats/pinned")
 PINNED_PATH = "/api/v1/chats/pinned"
 KEPT_APP = "oc-shell-v1"   # oc-sw.js SHELL
+# The worker keeps /api/config with the app (oc-sw.js: public reads go with the app); Open WebUI's root layout
+# needs it, and goes to /error when it cannot get it (ELI-374).
+DROP_KEPT_CONFIG = "() => caches.open('oc-shell-v1').then((c) => c.delete(location.origin + '/api/config'))"
 NO_API_CACHES = "() => caches.keys().then((ks) => Promise.all(ks.filter((k) => k.startsWith('oc-api-')).map((k) => caches.delete(k))))"
 
 
@@ -1235,6 +1238,31 @@ OUTER_FETCH = """(path) => {
     Object.defineProperty(window, 'fetch', {configurable: true, get: () => view(layers.length - 1),
                                             set: (f) => { layers.push(f); }});
 }"""
+
+
+@needs_offline
+def test_start_reads_that_fail_with_no_network_are_asked_when_it_returns(owui, browser):
+    """ELI-374: a network change can leave no connection for a moment (Wi-Fi off, mobile data not up
+    yet). The kept app opens, the worker asks each start read twice at once and both fail, and the app
+    went to Open WebUI's /error ("Backend Required"), a page that never recovers. The page now waits for
+    the network ('online') and asks the reads once more: the chat opens, no error page."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Net Gone")
+    opened(page, chat)
+    settled(page, f"() => caches.has({json.dumps(KEPT_APP)})")
+    page.evaluate(NO_API_CACHES)   # no kept answer to fall back on: the failure reaches the page
+    page.evaluate(DROP_KEPT_CONFIG)   # /api/config is kept with the app: without it, Open WebUI's root layout has nothing
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)   # the kept app opens; its start reads fail with no network
+        page.wait_for_function("() => navigator.onLine === false", timeout=WAIT_MS)
+    finally:
+        ctx.set_offline(False)   # the network is back: 'online'
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    sidebar_link(page, chat).wait_for(timeout=WAIT_MS)   # the chat list's entry: its reads were asked again
+    assert not page.evaluate(ERROR_PAGE), "Open WebUI's error page"
+    assert "/error" not in page.url, page.url
 
 
 @needs_offline
