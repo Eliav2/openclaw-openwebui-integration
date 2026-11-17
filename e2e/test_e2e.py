@@ -1765,10 +1765,17 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
         # writer's mid-turn state, not its end.
         _until("M to read done: false in the DB after the request's save",
                lambda: _db_message(chat_id, aid).get("done") is False, timeout_s=30, every_s=0.5)
-    _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
-           timeout_s=300, every_s=3)
     if _gateway_recovers_a_crash():
+        _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
+               timeout_s=300, every_s=3)
         assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
+    else:
+        # Nothing continues the run: the request's own save already reads `done`, so only the
+        # writer's note (after its 90 s grace) says the reply is over.
+        _until("the writer's note that the Gateway did not continue the reply",
+               lambda: GATEWAY_NOT_CONTINUED in (_db_message(chat_id, aid).get("content") or ""),
+               timeout_s=300, every_s=3)
+        assert _db_message(chat_id, aid).get("done") is True
     _assert_one_reply(token, chat_id, aid)
 
 
@@ -3158,6 +3165,7 @@ SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
 # 2026.11.5 has no such phase (a crash is not resumed, `_gateway_recovers_a_crash`). After an unclean
 # stop its sessions are writable again once the agent's database has been inspected; after a clean one
 # the Gateway logs `ready` (and logs only one of the two lines).
+GATEWAY_NOT_CONTINUED = "did not continue it"   # the Pipe's note for a reply a crash cut on 2026.11.5
 GATEWAY_READY = r"agent database recovered after background inspection|\[gateway\] ready"
 
 
