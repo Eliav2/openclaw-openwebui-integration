@@ -16565,6 +16565,13 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
         self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
 
+    def test_the_built_in_runtimes_steer_is_left_in_place(self):
+        """2026.10.10's built-in runtime stores no imported copies: nothing moves."""
+        msgs = [self._user("R1", "E2E_HOLD x"), self._said("E2E_HOLD_START", stop="toolUse"),
+                {"role": "toolResult", "content": "e2e-hold-released"},
+                self._user("R2", "E2E_ECHO: w"), self._said("w", run="R1")]
+        self.assertEqual(_transcript_commit_order(msgs), msgs)
+
     def test_a_resent_text_does_not_take_the_earlier_messages_copy(self):
         """The same words sent twice: each keeps its own copy."""
         copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731

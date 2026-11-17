@@ -741,12 +741,17 @@ def test_a_message_sent_while_a_run_works_is_steered_into_it(token):
                .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=0.5)
         since = str(int(time.time()))
         aside = _post_turn(token, chat_id, f"E2E_ECHO: {word}")
-        # Sent to the Gateway while the run works, not held in the Pipe.
+        # Sent to the Gateway while the run works, not held in the Pipe. The
+        # tool is let go only once the Gateway took the send (its run id came
+        # back): the Gateway decides steer or follow-up then, and a run whose
+        # reply already ended gets a follow-up ("reply-owner-ended").
         def sent_into_run():
             log = subprocess.run(["docker", "logs", "--since", since, "owui"],
                                  capture_output=True, text=True, timeout=60)
-            return "to be steered into it" in log.stdout + log.stderr
-        _until("the Pipe sending the aside into the active run", sent_into_run, timeout_s=60, every_s=0.5)
+            text = log.stdout + log.stderr
+            at = text.find("to be steered into it")
+            return at >= 0 and f"Captured runId: msg-{chat_id}-{aside}" in text[at:]
+        _until("the Gateway taking the aside into the active run", sent_into_run, timeout_s=60, every_s=0.5)
     finally:
         open(gate, "w").close()
     _until("both replies done", lambda: all(
