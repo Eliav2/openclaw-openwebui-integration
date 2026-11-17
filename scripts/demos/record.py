@@ -444,6 +444,8 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
     except Exception:
         print(f"  frames kept in {work}", flush=True)
         await page.screenshot(path=os.path.join(work, "failed.png"))
+        # Also with the recordings, so the workflow's artifact has what the page showed when a step failed.
+        await page.screenshot(path=os.path.join(out, f"{spec['name']}-FAILED.png"))
         raise
     finally:
         if old is not None:
