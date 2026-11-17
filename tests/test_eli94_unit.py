@@ -531,6 +531,24 @@ class CronResultEndedWhileDownTests(_EndedWhileDownCase):
         await self.startup()
         self.assertIsNone(self.cron_message())
 
+    async def test_an_adopted_writers_save_is_no_proof_the_result_was_written(self):
+        """Review on #405: another unfinished reply is adopted first and saves, after the
+        result was committed; the chat's write before adoption decides."""
+        test = self
+
+        async def one_stub(prefixes):
+            return [(CHAT, "other-stub")]
+
+        async def adopted(conn, agent_id, chat_id, stub_id, wait=True):
+            test.updated_at = CLOSED_MS // 1000 + 60  # the adopted writer's own save
+            return "adopted"
+        with mock.patch("openclaw_pipe._orphan_stub_ids", one_stub), \
+                mock.patch("openclaw_pipe._reconcile_stub", adopted):
+            await self.startup()
+        m = self.cron_message()
+        self.assertIsNotNone(m, list(self.chat["history"]["messages"]))
+        self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
+
     async def test_before_2026_11_5_there_is_no_cron_result_to_write(self):
         self.conn.gateway_version = "2026.11.3"
         await self.startup()

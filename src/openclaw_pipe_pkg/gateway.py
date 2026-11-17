@@ -1521,6 +1521,15 @@ _APPROVAL_HOOKS = None
 PLUGIN_APPROVAL_CAP = "plugin-approvals"
 
 
+
+def _end_cron_run(run: dict, at_ms) -> None:
+    """Mark a recorded cron run ended. Without its duration, the end is when
+    its `finished` event or result came (the Gateway's time, else now: the
+    Gateway shares this clock), so no later run's event finds it open."""
+    if run["end"] is None:
+        run["end"] = at_ms if isinstance(at_ms, (int, float)) else time.time() * 1000
+    run["ended"].set()
+
 class _GatewayConnection:
     """Persistent WebSocket connection to the Gateway: dispatches events to
     per-run queues and reconnects with backoff."""
@@ -2122,7 +2131,7 @@ class _GatewayConnection:
         if payload.get("action") == _CRON_FINISHED:
             if isinstance(payload.get("durationMs"), (int, float)):
                 run["end"] = start + payload["durationMs"]
-            run["ended"].set()
+            _end_cron_run(run, payload.get("ts"))
 
     def _note_cron_result(self, message: dict) -> None:
         """A cron run's `automation-result` arrived: its run is over. The
@@ -2131,7 +2140,7 @@ class _GatewayConnection:
         cron = parse_cron_execution_id(cron_result_execution(message))
         for run in (r for runs in self._cron_runs.values() for r in runs):
             if cron is not None and (run["job"], run["start"]) == cron:
-                run["ended"].set()
+                _end_cron_run(run, message.get("timestamp"))
 
     def adopt_cron_run(self, session_key: str, job: str, start: int, run_id: str) -> dict:
         """The cron run an adopted message's run executes, recorded if this
@@ -2152,7 +2161,7 @@ class _GatewayConnection:
         (it may have finished since)."""
         return next((r for r in self._cron_runs.get(session_key) or []
                      if r.get("agent_run") is None and r["start"] <= at_ms
-                     and (not r["ended"].is_set() or r["end"] is None or at_ms <= r["end"])), None)
+                     and (not r["ended"].is_set() or (r["end"] is not None and at_ms <= r["end"]))), None)
 
     @staticmethod
     def may_execute_cron_run(at_ms) -> bool:
