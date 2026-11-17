@@ -1889,8 +1889,31 @@ def _subagent_task_text(text):
     if len(parts) < 2:
         return None
     task = _RUNTIME_CONTEXT_MARKER_RE.sub("", parts[-1])
-    task = task.split("Begin. Execute the assigned task", 1)[0].strip()
+    task = _without_task_suffix(task).strip()
     return task or None
+
+
+# The instruction the Gateway adds after a spawn's task.
+_TASK_SUFFIX = "Begin. Execute the assigned task to completion."
+_TASK_SUFFIX_WORDS = "Begin. Execute the assigned task"
+_TASK_SUFFIX_MIN = len("Begin.")
+# What a cut preview ends in: the Gateway's "..." or "…".
+_CUT_MARK_RE = re.compile(r"(?:\.\.\.|…)\s*$")
+
+
+def _without_task_suffix(text: str) -> str:
+    """`text` up to the closing instruction, which a preview may cut off anywhere (2026.11.5's longer
+    spawn preamble pushes it past sessions.preview's maxChars): any start of it at the end of a line
+    goes, and a task that merely ends in the word does not (the instruction follows a blank line)."""
+    whole = text.split(_TASK_SUFFIX_WORDS, 1)[0]
+    if whole != text:
+        return whole
+    bare = _CUT_MARK_RE.sub("", text)
+    for n in range(len(_TASK_SUFFIX), _TASK_SUFFIX_MIN - 1, -1):
+        head = bare[:-n] if bare.endswith(_TASK_SUFFIX[:n]) else None
+        if head is not None and head.endswith("\n\n"):
+            return head
+    return text
 
 
 # A spawn message in any whitespace form: lastMessagePreview flattens it.
