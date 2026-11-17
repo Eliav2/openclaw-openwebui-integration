@@ -70,7 +70,19 @@ def stop() -> None:
 
 
 def start() -> None:
-    """The stack's Gateway, started again as e2e/start_stack.sh does, and answering."""
+    """The stack's Gateway, started again as e2e/start_stack.sh does, and answering. Safe after
+    a stop that did not finish (it timed out, or left part of the process tree): what is left of
+    the old one is killed first, and a Gateway that already answers is left alone."""
+    if up():
+        return
+    try:
+        with open(PID_FILE) as f:
+            left = _tree(int(f.read().strip()))
+    except (OSError, ValueError):
+        left = []
+    for p in left:
+        os.kill(p, signal.SIGKILL)
+    _wait("the rest of the old Gateway to be gone", lambda: not any(_alive(p) for p in left), STOP_TIMEOUT_S)
     log = os.path.join(os.path.dirname(PID_FILE), "gateway-after-stop.log")
     env = {**os.environ, "E2E_FAKE_CLAUDE_DIR": os.path.dirname(PID_FILE)}
     proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=open(log, "a"),

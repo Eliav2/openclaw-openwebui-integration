@@ -717,16 +717,17 @@ class Pipe:
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None, _waiting=None, _send_attachments=None):
+                   _send_texts=None, _waiting=None, _send_attachments=None, _turn=None):
         """One reply: a cancel or close at any point hands what it still owes to
         the next message (`park_cancelled_turn`). `_pipe_turn` parks for itself
         while streaming; this catches every other point. OWUI ends a reply by
         cancelling its task or closing the generator.
 
         `_send_texts`, `_waiting`, `_send_attachments`: carried-over messages to
-        send instead of this request's text.
+        send instead of this request's text. `_turn`: the reply's state, kept by a caller that
+        needs to know how it ended (a kept message run again, `_pending_run`).
         """
-        turn = _TurnState(waiting=list(_waiting or []))
+        turn = _turn if _turn is not None else _TurnState(waiting=list(_waiting or []))
         emitter = None
         if __event_emitter__:
             async def emitter(event):
@@ -985,7 +986,7 @@ class _PipeTurn:
             yield f"**Gateway connection error:** {e}"
             self.ended = True
             return
-        if self.pending_sent_at is not None:
+        if self.pending_sent_at is not None and not self.body.get(THINKING_DROPPED_KEY):
             yield pending_sent_note(self.pending_sent_at, pending_lang(self.__metadata__)) + "\n\n"
 
 
@@ -1314,12 +1315,15 @@ class _PipeTurn:
         meta = self.__metadata__ or {}
         chat_id, message_id = meta["chat_id"], meta["message_id"]
         if self.pending_sent_at is not None:
-            await _pending_release(chat_id, message_id)
+            await _pending_release(chat_id, message_id, _pending_process_token())
+            if self.turn is not None:
+                self.turn.deferred = True  # `_pending_run` leaves a reply that waits again as it is
             pipe_log(f"  pending: {message_id[:8]}... waits again ({error})")
             return True
         payload = _pending_payload(self.body, meta, self.__user__)
         sent_at = pending_sent_time(meta)
-        if payload is None or not await _pending_enqueue(chat_id, message_id, payload, sent_at):
+        if payload is None or not await _pending_enqueue(
+                chat_id, message_id, payload, sent_at, meta.get("task_id")):
             return False
         await _emit_status(self.__event_emitter__, pending_status_text(pending_lang(meta)), done=False)
         if self.turn is not None:
@@ -1418,8 +1422,10 @@ class _PipeTurn:
             def new_run_key(fresh=False):
                 # A message kept for the Gateway sends again as it first would have, so a send
                 # that did arrive is never run twice (ELI-504). A spent key is replaced.
+                # A retry that drops the thinking level is a new run: its key is new too.
                 return (pipe_run_id(self.chat_id, reply_id,
-                                    at=None if fresh else self.pending_sent_at) if reply_id
+                                    at=None if fresh or self.body.get(THINKING_DROPPED_KEY)
+                                    else self.pending_sent_at) if reply_id
                         else f"msg-{self.chat_id}-{time.time()}")
             idempotency_key = new_run_key()
             # Clamp the level down to what this model supports, with a note.
@@ -1502,7 +1508,7 @@ class _PipeTurn:
             pipe_log(f"Captured runId: {self.our_run_id}")
             if self.pending_sent_at is not None:
                 # The Gateway has it: off the pending list (ELI-504).
-                await _pending_delivered(self.owui_origin_chat_id, reply_id)
+                await _pending_delivered(self.owui_origin_chat_id, reply_id, proc=_pending_process_token())
             if self.our_run_id != idempotency_key:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)

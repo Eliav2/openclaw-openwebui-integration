@@ -6,6 +6,8 @@ transaction below holds a real lock and yields between read and commit, so claim
 import asyncio
 import contextlib
 import copy
+import os
+import socket
 import sys
 import time
 import types
@@ -222,11 +224,34 @@ class ClaimTests(_Db):
         await openclaw_pipe._pending_delivered(CHAT, M1)
         self.assertEqual((await self.claim())["message_id"], M2)
 
-    async def test_a_claim_of_another_process_is_taken_over(self):
-        # After an Open WebUI restart the process that claimed it is gone.
+    def proc_id(self, pid, start, host=None):
+        return f"{host or socket.gethostname()}/{openclaw_pipe._boot_id()}/{pid}.{start}:x"
+
+    async def test_a_claim_of_a_process_that_still_runs_is_not_taken(self):
+        # Two Open WebUI processes on one database: the first still replays it.
         await self.defer(M1)
-        await self.claim(proc="old", now=200.0)
+        alive = self.proc_id(os.getppid(), openclaw_pipe._proc_start(os.getppid()))
+        await self.claim(proc=alive, now=200.0)
+        self.assertIsNone(await self.claim(proc="other", now=201.0))
+        self.assertIsNone(await self.claim(proc="other", now=200.0 + openclaw_pipe.PENDING_LEASE_S - 1))
+
+    async def test_a_claim_of_a_process_that_is_gone_is_taken_at_once(self):
+        # After an Open WebUI restart the process that claimed it no longer exists.
+        await self.defer(M1)
+        await self.claim(proc=self.proc_id(2 ** 22 - 1, 1), now=200.0)
         self.assertEqual((await self.claim(proc="new", now=201.0))["message_id"], M1)
+
+    async def test_a_claim_of_a_pid_that_another_process_reuses_is_taken(self):
+        await self.defer(M1)
+        pid = os.getppid()
+        await self.claim(proc=self.proc_id(pid, "1"), now=200.0)  # same pid, another start time
+        self.assertEqual((await self.claim(proc="new", now=201.0))["message_id"], M1)
+
+    async def test_a_claim_of_another_host_waits_for_its_lease(self):
+        await self.defer(M1)
+        await self.claim(proc=self.proc_id(1, 1, host="elsewhere"), now=200.0)
+        self.assertIsNone(await self.claim(proc="new", now=201.0))
+        self.assertIsNotNone(await self.claim(proc="new", now=200.0 + openclaw_pipe.PENDING_LEASE_S + 1))
 
     async def test_a_stuck_claim_of_this_process_is_taken_after_the_lease(self):
         await self.defer(M1)
@@ -248,6 +273,62 @@ class ClaimTests(_Db):
         del self.chat.chat["history"]["messages"][M1]
         self.assertIsNone(await self.claim())
         self.assertEqual(self.queue(), [])
+
+
+class OwnerTests(_Db):
+    async def test_a_process_does_not_release_or_finish_a_claim_another_holds(self):
+        await self.defer(M1)
+        await self.claim(proc="mine", now=200.0)
+        await openclaw_pipe._pending_release(CHAT, M1, "theirs")
+        self.assertEqual(self.msg(M1)["meta"][openclaw_pipe.PENDING_DELIVERY], "sending")
+        await openclaw_pipe._pending_delivered(CHAT, M1, proc="theirs")
+        self.assertEqual(self.msg(M1)["meta"][openclaw_pipe.PENDING_DELIVERY], "sending")
+        self.assertEqual(self.queue(), [M1])
+        await openclaw_pipe._pending_delivered(CHAT, M1, proc="mine")
+        self.assertEqual(self.msg(M1)["meta"][openclaw_pipe.PENDING_DELIVERY], "delivered")
+
+
+class QuietTests(_Db):
+    async def test_a_chat_with_nothing_waiting_is_not_rewritten(self):
+        self.rows.clear()
+        self.assertIsNone(await self.claim())
+        self.assertEqual(self.chat.updated_at, 0)
+        self.assertEqual(self.rows, {})
+        self.assertEqual(self.chat.meta, {})
+
+    async def test_only_chats_with_a_list_are_pending_work(self):
+        async def stubs(_prefixes):
+            return [(CHAT, M1), ("c-streaming", "m")]
+
+        async def waiting(chat_id):
+            return chat_id == CHAT
+
+        with mock.patch.object(openclaw_pipe, "_orphan_stub_ids", stubs), \
+                mock.patch.object(openclaw_pipe, "_pending_waiting", waiting):
+            self.assertEqual(await openclaw_pipe._pending_chats(), [CHAT])
+
+
+class RecoverTests(_Db):
+    async def test_an_entry_whose_request_ended_unarmed_is_armed(self):
+        await self.defer(M1, armed=False)
+        with mock.patch.object(openclaw_pipe, "_owui_request_task", lambda _id: None):
+            self.assertEqual(await openclaw_pipe._pending_arm_orphans(CHAT), 1)
+        self.assertIs(self.msg(M1)["done"], False)
+        self.assertTrue(self.msg(M1)["meta"][openclaw_pipe.PENDING_ARMED])
+        self.assertEqual((await self.claim())["message_id"], M1)
+
+    async def test_an_entry_whose_request_still_runs_is_left_to_it(self):
+        await self.defer(M1, armed=False)
+        running = asyncio.ensure_future(asyncio.sleep(3600))
+        self.addCleanup(running.cancel)
+        with mock.patch.object(openclaw_pipe, "_owui_request_task", lambda _id: running):
+            self.assertEqual(await openclaw_pipe._pending_arm_orphans(CHAT), 0)
+        self.assertFalse(self.msg(M1)["meta"].get(openclaw_pipe.PENDING_ARMED))
+
+    async def test_the_request_that_kept_it_is_recorded(self):
+        payload = {**PAYLOAD}
+        await openclaw_pipe._pending_enqueue(CHAT, M1, payload, 1.0, "task-1")
+        self.assertEqual(self.msg(M1)["meta"][openclaw_pipe.PENDING_REQUEST], "task-1")
 
 
 class ReleaseAndDeliveredTests(_Db):
@@ -341,24 +422,43 @@ class PassTests(_Db):
 
 
 class RunTests(_Db):
-    """`_pending_run`: the stored turn goes through the pipe again, its text into the waiting reply."""
+    """`_pending_run`: the stored turn goes through the pipe again, its text and tool cards into the
+    waiting reply, and what the turn did (not what it showed) decides how it ends."""
+
+    CARD = {"type": "response.output_item.added", "output_index": 1 << 30,
+            "item": {"type": "function_call", "id": "call-1", "call_id": "call-1", "name": "Bash",
+                     "arguments": "{}", "status": "completed"}}
 
     def setUp(self):
         super().setUp()
-        self.events = []
+        self.events, self.published, self.waited = [], [], []
 
         async def emitter(chat_id, message_id, user_id):
             async def emit(event):
                 self.events.append(event)
             return emit
 
-        p = mock.patch.object(openclaw_pipe, "_pending_emitter", emitter)
-        p.start()
-        self.addCleanup(p.stop)
+        async def publish(chat_id, message_id, user_id, text=None):
+            self.published.append((chat_id, message_id, user_id))
+
+        async def wait_writer(chat_id, message_id):
+            self.waited.append((chat_id, message_id))
+
+        for name, repl in (("_pending_emitter", emitter), ("_publish_chat_finished", publish),
+                           ("_pending_wait_writer", wait_writer)):
+            p = mock.patch.object(openclaw_pipe, name, repl)
+            p.start()
+            self.addCleanup(p.stop)
+
+    async def run_with(self, impl, publish=False):
+        await self.defer(M1, 100.0)
+        claim = await self.claim(proc=openclaw_pipe._pending_process_token())
+        pipe = Pipe()
+        pipe.valves.PUBLISH_CHAT_FINISHED = publish
+        with mock.patch.object(Pipe, "_pipe_impl", impl):
+            return await openclaw_pipe._pending_run(pipe, claim)
 
     async def test_the_text_lands_in_the_reply_and_it_is_finished(self):
-        await self.defer(M1, 100.0)
-        claim = await self.claim()
         seen = {}
 
         async def fake_impl(self_, body, emitter, **kw):
@@ -367,28 +467,83 @@ class RunTests(_Db):
             yield "answer"
             await openclaw_pipe._pending_delivered(CHAT, M1)
 
-        with mock.patch.object(Pipe, "_pipe_impl", fake_impl):
-            await openclaw_pipe._pending_run(Pipe(), claim)
+        self.assertTrue(await self.run_with(fake_impl))
         self.assertEqual(self.msg(M1)["content"], "note answer")
         self.assertIs(self.msg(M1)["done"], True)
         self.assertEqual(seen["body"], PAYLOAD["body"])
         self.assertEqual(seen["meta"][openclaw_pipe.PENDING_REPLAY_META], 100.0)
         self.assertNotIn("task_id", seen["meta"])
         self.assertIsNone(seen["request"])
-        self.assertEqual(self.events[-1]["data"], {"done": True, "content": "note answer"})
+        self.assertEqual(self.events[-1]["data"]["content"], "note answer")
+        self.assertTrue(self.events[-1]["data"]["done"])
 
-    async def test_a_turn_that_never_sent_is_released_for_the_next_pass(self):
-        await self.defer(M1)
-        claim = await self.claim()
-
+    async def test_the_tool_cards_of_the_run_are_kept(self):
         async def fake_impl(self_, body, emitter, **kw):
-            if False:
-                yield ""
+            yield "before "
+            yield self.CARD
+            yield "after"
+            await openclaw_pipe._pending_delivered(CHAT, M1)
 
-        with mock.patch.object(Pipe, "_pipe_impl", fake_impl):
-            await openclaw_pipe._pending_run(Pipe(), claim)
+        self.assertTrue(await self.run_with(fake_impl))
+        output = self.msg(M1)["output"]
+        self.assertEqual([i["type"] for i in output], ["message", "function_call", "message"])
+        self.assertEqual(output[0]["content"][0]["text"], "before ")
+        self.assertEqual(output[2]["content"][0]["text"], "after")
+        self.assertEqual(self.msg(M1)["content"], "before after")
+        relayed = [e for e in self.events if e["type"] == "response:completion"]
+        self.assertTrue(any(e["data"]["item"].get("type") == "function_call" for e in relayed
+                            if e["data"].get("type") == "response.output_item.added"))
+        self.assertEqual(self.events[-1]["data"]["output"], output)
+
+    async def test_the_finished_event_goes_out_after_a_replay_when_the_valve_is_on(self):
+        async def fake_impl(self_, body, emitter, **kw):
+            yield "answer"
+            await openclaw_pipe._pending_delivered(CHAT, M1)
+
+        await self.run_with(fake_impl, publish=True)
+        self.assertEqual(self.published, [(CHAT, M1, USER)])
+
+    async def test_no_finished_event_when_the_valve_is_off(self):
+        async def fake_impl(self_, body, emitter, **kw):
+            yield "answer"
+            await openclaw_pipe._pending_delivered(CHAT, M1)
+
+        await self.run_with(fake_impl, publish=False)
+        self.assertEqual(self.published, [])
+
+    async def test_a_reply_handed_to_the_turn_writer_is_left_open_and_waited_for(self):
+        async def fake_impl(self_, body, emitter, **kw):
+            yield "partial"
+            await openclaw_pipe._pending_delivered(CHAT, M1)
+            kw["_turn"].handed_over = True
+
+        self.assertTrue(await self.run_with(fake_impl, publish=True))
+        self.assertEqual(self.waited, [(CHAT, M1)])
+        self.assertIs(self.msg(M1)["done"], False)  # the turn writer finishes it
+        self.assertNotEqual(self.msg(M1).get("content"), "partial")
+        self.assertFalse([e for e in self.events if e["type"] == "chat:completion"])
+        self.assertEqual(self.published, [])
+
+    async def test_a_turn_that_met_a_down_gateway_after_its_note_goes_back_to_waiting(self):
+        # The note is text already, but the Gateway never had the message.
+        async def fake_impl(self_, body, emitter, **kw):
+            yield "_(Sent at 07:44, while the gateway was down. Delivered now.)_\n\n"
+            await openclaw_pipe._pending_release(CHAT, M1)
+            kw["_turn"].deferred = True
+
+        self.assertFalse(await self.run_with(fake_impl))
         self.assertEqual(self.msg(M1)["meta"][openclaw_pipe.PENDING_DELIVERY], "pending")
         self.assertIs(self.msg(M1)["done"], False)
+        self.assertEqual(self.queue(), [M1])
+
+    async def test_a_turn_that_ended_without_sending_is_shown_as_it_is_not_retried_for_ever(self):
+        async def fake_impl(self_, body, emitter, **kw):
+            yield "**Error sending message:** refused"
+
+        self.assertFalse(await self.run_with(fake_impl))
+        self.assertEqual(self.msg(M1)["meta"][openclaw_pipe.PENDING_DELIVERY], "failed")
+        self.assertIs(self.msg(M1)["done"], True)
+        self.assertEqual(self.queue(), [])
 
 
 class WorkerSlotTests(unittest.IsolatedAsyncioTestCase):
@@ -464,6 +619,7 @@ class DeferTests(unittest.IsolatedAsyncioTestCase):
         self.pipe.valves.ENABLE_FILE_SERVER = False
         self.events = []
         self.enqueued = []
+        self.request_ids = []
 
     async def _emitter(self, e):
         self.events.append(e)
@@ -472,8 +628,9 @@ class DeferTests(unittest.IsolatedAsyncioTestCase):
         async def no_gateway(_getter):
             raise error
 
-        async def enqueue(chat_id, message_id, payload, sent_at):
+        async def enqueue(chat_id, message_id, payload, sent_at, request_task_id=None):
             self.enqueued.append((chat_id, message_id, payload, sent_at))
+            self.request_ids.append(request_task_id)
             return True
 
         def arm(*_a, **_k):
@@ -496,7 +653,7 @@ class DeferTests(unittest.IsolatedAsyncioTestCase):
         return out
 
     STAMP = int(time.time()) - 130  # the wait for a reconnect has gone by since the user sent it
-    META = {"chat_id": CHAT, "message_id": M1, "user_id": USER, "session_id": "s1",
+    META = {"chat_id": CHAT, "message_id": M1, "user_id": USER, "session_id": "s1", "task_id": "t1",
             "variables": {"{{USER_LANGUAGE}}": "he-IL"}, "user_message": {"timestamp": STAMP}}
 
     async def test_a_refused_gateway_keeps_the_message_and_shows_no_error(self):
@@ -514,6 +671,7 @@ class DeferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["done"], False)
         self.assertIn("ממתין לגייטווי", status["description"])
         self.arm.assert_called_once()
+        self.assertEqual(self.request_ids, ["t1"])  # the request that kept it, for the recovery
 
     async def test_a_refusal_waiting_cannot_fix_still_shows_the_error(self):
         out = await self._run(GatewayError("The GATEWAY_TOKEN valve is empty."), self.META)
@@ -535,7 +693,7 @@ class DeferTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_replay_of_a_kept_message_that_meets_a_down_gateway_releases_it(self):
         released = []
 
-        async def release(chat_id, message_id):
+        async def release(chat_id, message_id, proc=None):
             released.append((chat_id, message_id))
 
         with mock.patch.object(openclaw_pipe, "_pending_release", release):
@@ -563,7 +721,7 @@ class SourceWiringTests(unittest.TestCase):
 
     def test_the_send_uses_the_original_time_and_marks_the_reply_delivered(self):
         p = self.src("pipe.py")
-        self.assertIn("at=None if fresh else self.pending_sent_at", p)
+        self.assertIn("at=None if fresh or self.body.get(THINKING_DROPPED_KEY)", p)
         self.assertIn("_pending_delivered(", p)
         self.assertIn("self.defer_for_gateway(", p)
 

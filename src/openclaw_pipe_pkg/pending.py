@@ -30,12 +30,18 @@ PENDING_PAYLOAD = "pending_payload"  # message meta: the turn to run again
 PENDING_SENT_AT = "pending_sent_at"  # message meta: when the user sent it
 PENDING_CLAIM = "pending_claim"  # message meta: {"proc", "at"} of the claimer
 PENDING_ARMED = "pending_armed"  # message meta: the request's own save is behind us
+PENDING_REQUEST = "pending_request"  # message meta: the Open WebUI task of the request that kept it
 # Pipe metadata of a replay: the original send time.
 PENDING_REPLAY_META = "openclaw_pending_sent_at"
 
-# A claim of this process that nobody finished is taken over after this long
-# (a claim of another process is dead, and is taken at once).
+# A claim nobody finished is taken over after this long. A claim of a process on this host that is
+# gone (checked as the turn writers' are) is taken at once; one of a process that may still run is not.
 PENDING_LEASE_S = 300
+PENDING_TEXT_ITEM_PREFIX = "msg_pending_"
+PENDING_ITEM_ADDED = "response.output_item.added"  # a Responses event the pipe yields for a card or a note
+# A reply handed to the turn writer is waited for, polling its message, up to this long.
+PENDING_WRITER_POLL_S = 5.0
+PENDING_WRITER_WAIT_S = 7200
 PENDING_BACKOFF_FIRST_S = 2.0
 PENDING_BACKOFF_MAX_S = 60.0
 PENDING_BACKOFF_FACTOR = 2
@@ -171,8 +177,11 @@ async def _pending_txn_now(chat_id: str, edit):
             return None
         data = chat.chat or {}
         history = data.get("history") or {}
-        chat_meta = dict(chat.meta or {})
+        was_meta = chat.meta or {}
+        chat_meta = dict(was_meta)
         result, saves = edit(history.get("messages") or {}, chat_meta)
+        if not saves and chat_meta == was_meta:
+            return result  # nothing changed: the chat is not rewritten
         for message_id, fields in saves.items():
             message = Chats.upsert_message_to_history(history, message_id, Chats._clean_null_bytes(fields))
             await ChatMessages.upsert_message(message_id, chat_id, message.get("user_id") or chat.user_id,
@@ -190,11 +199,18 @@ def _pending_queue_of(chat_meta: dict) -> list:
     return [e for e in queue if isinstance(e, dict) and e.get("id")] if isinstance(queue, list) else []
 
 
+def _pending_set_queue(chat_meta: dict, queue: list) -> None:
+    """The list into the chat's meta; an empty one is not written where there was none."""
+    if queue or PENDING_META_KEY in chat_meta:
+        chat_meta[PENDING_META_KEY] = queue
+
+
 def _pending_meta_without(meta: dict, *keys) -> dict:
     return {k: v for k, v in meta.items() if k not in keys}
 
 
-async def _pending_enqueue(chat_id: str, message_id: str, payload: dict, sent_at: float) -> bool:
+async def _pending_enqueue(chat_id: str, message_id: str, payload: dict, sent_at: float,
+                           request_task_id: str | None = None) -> bool:
     """Keep the message: listed in the chat and marked on its reply, with its payload."""
     def edit(messages, chat_meta):
         message = messages.get(message_id)
@@ -203,10 +219,11 @@ async def _pending_enqueue(chat_id: str, message_id: str, payload: dict, sent_at
         queue = _pending_queue_of(chat_meta)
         if not any(e["id"] == message_id for e in queue):
             queue.append({"id": message_id, "at": sent_at})
-        chat_meta[PENDING_META_KEY] = queue
+        _pending_set_queue(chat_meta, queue)
         meta = _pending_meta_without(message.get("meta") or {}, PENDING_CLAIM, PENDING_ARMED)
         return True, {message_id: {"meta": {**meta, PENDING_DELIVERY: PENDING_STATE_PENDING,
-                                            PENDING_SENT_AT: sent_at, PENDING_PAYLOAD: payload}}}
+                                            PENDING_SENT_AT: sent_at, PENDING_PAYLOAD: payload,
+                                            PENDING_REQUEST: request_task_id}}}
     try:
         return bool(await _pending_txn(chat_id, edit))
     except Exception as ex:
@@ -224,6 +241,22 @@ async def _pending_arm(chat_id: str, message_id: str) -> bool:
             return False, {}
         return True, {message_id: {"done": False, "meta": {**meta, PENDING_ARMED: True}}}
     return bool(await _pending_txn(chat_id, edit))
+
+
+def _pending_claim_stale(held: dict, proc: str, now: float) -> bool:
+    """Whether a recorded claim may be taken over: its lease ran out, or its process is gone.
+    A process of this host and boot is looked up as the turn writers' are; one elsewhere may
+    still run, so only its lease ends the claim."""
+    if now - held.get("at", 0) > PENDING_LEASE_S:
+        return True
+    owner = held.get("proc") or ""
+    if owner == proc:
+        return False
+    m = _WRITER_ID_RE.match(owner)
+    import socket
+    if not m or (m.group("host"), m.group("boot")) != (socket.gethostname(), _boot_id()):
+        return False
+    return int(m.group("pid")) == os.getpid() or _proc_start(int(m.group("pid"))) != m.group("start")
 
 
 async def _pending_claim_head(chat_id: str, proc: str, now: float) -> dict | None:
@@ -247,25 +280,30 @@ async def _pending_claim_head(chat_id: str, proc: str, now: float) -> dict | Non
                                         PENDING_DELIVERY: PENDING_STATE_STOPPED}}
                 queue.pop(0)
                 continue
-            held = meta.get(PENDING_CLAIM) or {}
             held_live = (meta.get(PENDING_DELIVERY) == PENDING_STATE_SENDING
-                         and held.get("proc") == proc and now - held.get("at", 0) <= PENDING_LEASE_S)
+                         and not _pending_claim_stale(meta.get(PENDING_CLAIM) or {}, proc, now))
             if meta.get(PENDING_ARMED) and not held_live:
                 saves[head] = {"meta": {**meta, PENDING_DELIVERY: PENDING_STATE_SENDING,
                                         PENDING_CLAIM: {"proc": proc, "at": now}}}
                 claim = {"chat_id": chat_id, "message_id": head, "payload": meta.get(PENDING_PAYLOAD),
                          "sent_at": meta.get(PENDING_SENT_AT)}
             break
-        chat_meta[PENDING_META_KEY] = queue
+        _pending_set_queue(chat_meta, queue)
         return claim, saves
     return await _pending_txn(chat_id, edit)
 
 
-async def _pending_release(chat_id: str, message_id: str) -> None:
+def _pending_held_by_other(meta: dict, proc: str | None) -> bool:
+    """The claim on the message is another process's: this one has no say."""
+    owner = (meta.get(PENDING_CLAIM) or {}).get("proc")
+    return proc is not None and owner is not None and owner != proc
+
+
+async def _pending_release(chat_id: str, message_id: str, proc: str | None = None) -> None:
     """The send did not happen (the Gateway is away again): back to waiting."""
     def edit(messages, chat_meta):
         meta = (messages.get(message_id) or {}).get("meta") or {}
-        if meta.get(PENDING_DELIVERY) != PENDING_STATE_SENDING:
+        if meta.get(PENDING_DELIVERY) != PENDING_STATE_SENDING or _pending_held_by_other(meta, proc):
             return None, {}
         return None, {message_id: {"meta": {**_pending_meta_without(meta, PENDING_CLAIM),
                                             PENDING_DELIVERY: PENDING_STATE_PENDING}}}
@@ -275,10 +313,13 @@ async def _pending_release(chat_id: str, message_id: str) -> None:
         pipe_log(f"  pending: releasing {message_id[:8]}... failed: {ex!r}")
 
 
-async def _pending_delivered(chat_id: str, message_id: str, state: str = PENDING_STATE_DELIVERED) -> None:
+async def _pending_delivered(chat_id: str, message_id: str, state: str = PENDING_STATE_DELIVERED,
+                             proc: str | None = None) -> None:
     """The message is off the list: the Gateway has it (or, for another `state`, it will not
-    be sent again)."""
+    be sent again). Left to the process that holds the claim when it is another one."""
     def edit(messages, chat_meta):
+        if _pending_held_by_other((messages.get(message_id) or {}).get("meta") or {}, proc):
+            return None, {}
         chat_meta[PENDING_META_KEY] = [e for e in _pending_queue_of(chat_meta) if e["id"] != message_id]
         message = messages.get(message_id)
         if message is None:
@@ -316,39 +357,94 @@ async def _pending_emitter(chat_id: str, message_id: str, user_id: str | None):
         {"chat_id": chat_id, "message_id": message_id, "user_id": user_id}, update_db=True)
 
 
+def _pending_fold(output: list, chunk) -> bool:
+    """Fold one thing the pipe yielded into the reply's `output`, as Open WebUI's middleware
+    does for a request: text goes into a message item, a Responses `added` event (a tool card,
+    a note) replaces its item or is appended. True when `output` changed."""
+    if isinstance(chunk, str):
+        if not chunk:
+            return False
+        last = output[-1] if output else None
+        if last and last.get("type") == OUTPUT_MESSAGE_ITEM and str(last.get("id", "")).startswith(PENDING_TEXT_ITEM_PREFIX):
+            last["content"][0]["text"] += chunk
+        else:
+            output.append({"type": OUTPUT_MESSAGE_ITEM, "id": f"{PENDING_TEXT_ITEM_PREFIX}{uuid.uuid4().hex[:12]}",
+                           "status": "completed", "role": "assistant",
+                           "content": [{"type": "output_text", "text": chunk}]})
+        return True
+    if isinstance(chunk, dict) and chunk.get("type") == PENDING_ITEM_ADDED \
+            and isinstance(chunk.get("item"), dict):
+        item = copy.deepcopy(chunk["item"])
+        at = next((n for n, i in enumerate(output) if item.get("id") and i.get("id") == item["id"]), None)
+        if at is None:
+            output.append(item)
+        else:
+            output[at] = item
+        return True
+    return False
+
+
+async def _pending_wait_writer(chat_id: str, message_id: str) -> None:
+    """The turn writer has the reply (an event gap handed it over): wait until it saves it
+    finished, so the chat's next message is not sent into the same run."""
+    from open_webui.models.chats import Chats
+    deadline = time.monotonic() + PENDING_WRITER_WAIT_S
+    while time.monotonic() < deadline:
+        message = await Chats.get_message_by_id_and_message_id(chat_id, message_id)
+        if message is None or message.get("done") is True:
+            return
+        await asyncio.sleep(PENDING_WRITER_POLL_S)
+
+
 async def _pending_run(pipe, claim: dict) -> bool:
-    """Run the kept turn through the pipe, with no request of Open WebUI's: its text streams into
-    the waiting reply, which is finished at the end. The pipe flips `delivery` itself once
-    chat.send was accepted (`_pending_delivered`); a turn that did not get that far is released."""
+    """Run the kept turn through the pipe, with no request of Open WebUI's: its text and tool cards
+    go into the waiting reply as a request's would, and the reply is finished at the end. The
+    pipe flips `delivery` itself once chat.send was accepted (`_pending_delivered`). What the turn
+    did decides the rest, not what it showed: it went back to waiting (`turn.deferred`, already
+    released), the turn writer took the reply over (`turn.handed_over`, left open), or it ended
+    here, sent or with an error."""
     chat_id, message_id = claim["chat_id"], claim["message_id"]
     payload = claim["payload"] or {}
     metadata = {**(payload.get("metadata") or {}), PENDING_REPLAY_META: claim["sent_at"]}
     user_id = metadata.get("user_id")
     emit = await _pending_emitter(chat_id, message_id, user_id)
-    text = ""
+    turn = _TurnState()
+    text, output, sent_output = "", [], []
     try:
         async with contextlib.aclosing(pipe._pipe_impl(
             payload.get("body") or {}, emit, __event_call__=None, __user__=payload.get("user") or {},
-            __metadata__=metadata, __request__=None, __task__=None,
+            __metadata__=metadata, __request__=None, __task__=None, _turn=turn,
         )) as turn_gen:
             async for chunk in turn_gen:
-                if isinstance(chunk, str):
-                    text += chunk
-                    await emit({"type": "chat:completion", "data": {"content": text}})
+                text += chunk if isinstance(chunk, str) else ""
+                if _pending_fold(output, chunk):
+                    for event in _relay_output_events(sent_output, output):
+                        await emit({"type": "response:completion", "data": event})
+                    sent_output = copy.deepcopy(output)
     except Exception as ex:
         pipe_log(f"  pending: the kept turn of {message_id[:8]}... failed: {ex!r}")
-        if not _pending_sent_event(message_id).is_set():
-            text += PENDING_ERROR_TEXT.format(error=ex)
+        if not turn.deferred and not turn.handed_over:
+            error = PENDING_ERROR_TEXT.format(error=ex)
+            text += error
+            _pending_fold(output, error)
     sent = _pending_sent_event(message_id).is_set()
     _PENDING_SENT.pop(message_id, None)
-    if not sent and not text.strip():
-        await _pending_release(chat_id, message_id)  # the Gateway went away again
-        return False
+    if turn.deferred:
+        return False  # the Gateway went away again: the pipe put it back to waiting
+    if turn.handed_over:
+        await _pending_wait_writer(chat_id, message_id)  # the turn writer finishes this reply
+        return sent
     if not sent:
-        await _pending_delivered(chat_id, message_id, PENDING_STATE_FAILED)  # shown as the error it is
-    await _owui_upsert_message(chat_id, message_id, {"content": text, "done": True} if text.strip() else {"done": True})
+        await _pending_delivered(chat_id, message_id, PENDING_STATE_FAILED, proc=_pending_process_token())
+    fields = {"done": True}
+    if text.strip() or output:
+        fields.update(content=text, output=output)
+    await _owui_upsert_message(chat_id, message_id, fields)
     await emit({"type": "status", "data": {"description": "", "done": True}})
-    await emit({"type": "chat:completion", "data": {"done": True, "content": text}})
+    await emit({"type": "chat:completion", "data": {"done": True, "content": text, **(
+        {"output": output} if output else {})}})
+    if sent and getattr(pipe.valves, "PUBLISH_CHAT_FINISHED", False):
+        await _publish_chat_finished(chat_id, message_id, user_id)
     pipe_log(f"  pending: {message_id[:8]}... in chat {chat_id[:8]}...: "
              f"{'delivered' if sent else 'ended with an error'} ({len(text)} chars)")
     return sent
@@ -379,15 +475,50 @@ def _pending_process_token() -> str:
         holder = sys.modules[__name__]
     token = getattr(holder, "_openclaw_pending_proc", None)
     if token is None:
-        token = uuid.uuid4().hex
+        token = turn_writer_id()
         setattr(holder, "_openclaw_pending_proc", token)
     return token
 
 
 async def _pending_chats() -> list:
-    """Chats with a waiting reply (an unfinished message), once each."""
+    """Chats with a message waiting, once each: those with an unfinished reply (the orphan
+    sweep's own query) whose list is not empty. A chat with only a streaming reply is not one."""
     stubs = await _orphan_stub_ids(_composer_model_prefixes(own_id=_composer_own_function_id()))
-    return list(dict.fromkeys(chat_id for chat_id, _message_id in stubs))
+    return [c for c in dict.fromkeys(chat_id for chat_id, _message_id in stubs) if await _pending_waiting(c)]
+
+
+async def _pending_arm_orphans(chat_id: str) -> int:
+    """Arm the chat's entries whose request ended before it armed them (Open WebUI went down in
+    between): none of them is discovered otherwise. A request still running in this process
+    arms its own."""
+    def edit(messages, chat_meta):
+        saves = {}
+        for entry in _pending_queue_of(chat_meta):
+            meta = (messages.get(entry["id"]) or {}).get("meta") or {}
+            if meta.get(PENDING_DELIVERY) != PENDING_STATE_PENDING or meta.get(PENDING_ARMED):
+                continue
+            request = _owui_request_task(meta.get(PENDING_REQUEST))
+            if request is None or request.done():
+                saves[entry["id"]] = {"done": False, "meta": {**meta, PENDING_ARMED: True}}
+        return len(saves), saves
+    return await _pending_txn(chat_id, edit) or 0
+
+
+async def _pending_recover() -> int:
+    """At a worker's start: arm what a stopped Open WebUI left unarmed. The one place that
+    looks at every chat's list, once per load (a list is a few bytes of its `meta`)."""
+    from sqlalchemy import String, cast, select
+    from open_webui.internal.db import get_async_db_context
+    from open_webui.models.chats import Chat
+    async with get_async_db_context() as db:
+        chat_ids = (await db.execute(
+            select(Chat.id).where(cast(Chat.meta, String).like(f"%{PENDING_META_KEY}%")))).scalars().all()
+    armed = 0
+    for chat_id in chat_ids:
+        armed += await _pending_arm_orphans(chat_id)
+    if armed:
+        pipe_log(f"[pending] armed {armed} message(s) a stopped Open WebUI left unarmed")
+    return armed
 
 
 # The delivery run of each chat that has one going. The next message of a chat goes once it
@@ -434,6 +565,10 @@ async def _pending_worker(pipe) -> None:
     proc = _pending_process_token()
     delay = PENDING_BACKOFF_FIRST_S
     pipe_log("[pending] delivery worker started")
+    try:
+        await _pending_recover()
+    except Exception as ex:
+        pipe_log(f"[pending] recovery of unarmed messages failed: {ex!r}")
     while True:
         try:
             chats = await _pending_chats()

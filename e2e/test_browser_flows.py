@@ -661,8 +661,8 @@ def test_a_message_sent_while_the_gateway_is_down_waits_in_its_bubble_and_is_ans
     """ELI-504: with the Gateway stopped, the message is in the chat and its reply says it waits
     for the gateway, with no error. Once the Gateway is back, the answer arrives in that same
     bubble with no reload, and says when the message was sent."""
-    gateway_ctl.stop()
     try:
+        gateway_ctl.stop()  # inside the recovery: a stop that times out still ends with a Gateway
         capture.new_chat(page)
         capture.send(page, "E2E_ECHO: BROWSER_KEPT")
         # The Pipe waits out its reconnect window (2 minutes) before it keeps the message.

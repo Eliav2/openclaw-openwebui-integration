@@ -1553,7 +1553,6 @@ def test_messages_sent_while_the_gateway_is_down_wait_in_the_chat_and_arrive_in_
     each, and stream into their own replies, which say when they were sent."""
     one, two = (f"E2E_KEPT_{n}_{uuid.uuid4().hex[:8]}" for n in ("ONE", "TWO"))  # the model log spans runs
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_BEFORE_OUTAGE")
-    gateway_ctl.stop()
     restarted = []
 
     def relaunch():
@@ -1561,6 +1560,7 @@ def test_messages_sent_while_the_gateway_is_down_wait_in_the_chat_and_arrive_in_
         restarted.append(True)
 
     try:
+        gateway_ctl.stop()  # inside the recovery: a stop that times out still ends with a Gateway
         _, first = _send_turn(token, f"Respond with exactly: {one}", chat_id=chat_id)
         # The Pipe waits for the reconnect (up to the Gateway-down wait) before it keeps the message.
         _until("the first message to wait in the chat", lambda: _is_kept(token, chat_id, first),
