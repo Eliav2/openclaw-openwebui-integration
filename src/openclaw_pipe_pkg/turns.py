@@ -303,6 +303,13 @@ def judges_cut_runs_after_listening(version) -> bool:
     return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
+def resumes_a_crash(version) -> bool:
+    """True for a Gateway that continues a run its crash cut (2026.11.3 and older). From 2026.11.5 only
+    a graceful restart writes a resume marker, so a crash leaves an idle session with no status and
+    nothing coming (docs/gateway/restart-recovery.md). Unknown versions count as older."""
+    return not hides_cron_run_output(version)
+
+
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
     """`gateway`, `wait`, `resume` or `finalize` for M's writer when its run settles.

@@ -12733,6 +12733,51 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         m = await self.restarted("2026.9.3", {})
         self.assertIs(m.get("done"), True, "9.3: nothing would ever close M")
 
+    async def test_on_11_5_a_crash_nothing_continues_ends_the_message_after_the_grace(self):
+        """2026.11.5 does not resume a crash: the idle session reads like one about to be recovered,
+        so M waits the grace for a recovery run, then ends as cut off (not open for ever)."""
+        self.crash("2026.11.5")
+        with mock.patch.object(openclaw_pipe, "GATEWAY_RECOVERY_GRACE_S", 0.05):
+            m = await self.restarted("2026.11.5", {})
+            self.assertIsNot(m.get("done"), True, "a recovery may still start: M waits")
+            await asyncio.sleep(0.2)
+            await self.spin()
+        m = self.owui.msgs()[turn_message_id(self.key, self.RUN, self.CHAT)]
+        self.assertIs(m.get("done"), True, "no recovery came")
+        self.assertIn("Reading them.", m.get("content", ""))
+        self.assertIn("did not continue it", m.get("content", ""))
+
+    async def test_on_11_5_a_recovery_that_starts_within_the_grace_takes_the_message_over(self):
+        self.crash("2026.11.5")
+        with mock.patch.object(openclaw_pipe, "GATEWAY_RECOVERY_GRACE_S", 0.2):
+            await self.restarted("2026.11.5", {})
+            self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.REC,
+                                            "hasActiveRun": True, "status": "running"})
+            _turn_route_now(self.conn, self.ev(self.REC, {"stream": "lifecycle", "data": {"phase": "start"}}))
+            _turn_route_now(self.conn, self.ev(self.REC, _delta(" Found it.")))
+            await self.spin()
+            self.history["messages"].append(self.recovery_turn())
+            self.conn._on_session_message({"sessionKey": self.key, "messageId": "m-2", "messageSeq": 2})
+            await self.spin()
+            await asyncio.sleep(0.4)
+            _turn_route_now(self.conn, self.ev(self.REC, {"state": "final"}))
+            self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                            "lastRunId": self.REC, "reason": "chat.run.settled"})
+            await self.spin()
+        m = self.owui.msgs()[turn_message_id(self.key, self.RUN, self.CHAT)]
+        self.assertIs(m.get("done"), True)
+        self.assertNotIn("did not continue it", m.get("content", ""))
+        self.assertIn("Found it.", m.get("content", ""), "the recovery run wrote into M")
+
+    async def test_on_11_3_the_message_waits_for_the_recovery_with_no_grace(self):
+        self.crash("2026.11.3")
+        with mock.patch.object(openclaw_pipe, "GATEWAY_RECOVERY_GRACE_S", 0.05):
+            await self.restarted("2026.11.3", {})
+            await asyncio.sleep(0.2)
+            await self.spin()
+        m = self.owui.msgs().get(turn_message_id(self.key, self.RUN, self.CHAT), {})
+        self.assertIsNot(m.get("done"), True, "2026.11.3 recovers the run: M stays open")
+
     async def test_a_run_that_ended_before_the_crash_is_not_held(self):
         """Its final arrived: no Gateway recovers a finished run."""
         self.crash("2026.10.10-beta.1")

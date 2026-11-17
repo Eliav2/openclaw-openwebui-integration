@@ -716,6 +716,13 @@ def judges_cut_runs_after_listening(version) -> bool:
     return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
+def resumes_a_crash(version) -> bool:
+    """True for a Gateway that continues a run its crash cut (2026.11.3 and older). From 2026.11.5 only
+    a graceful restart writes a resume marker, so a crash leaves an idle session with no status and
+    nothing coming (docs/gateway/restart-recovery.md). Unknown versions count as older."""
+    return not hides_cron_run_output(version)
+
+
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
     """`gateway`, `wait`, `resume` or `finalize` for M's writer when its run settles.
@@ -5126,6 +5133,7 @@ _STEERED_MARKER_TYPE = "_pipe_steered"
 # Turn pump queue items (`writer._turn_pump_loop`).
 _PUMP_EVENT = "event"
 _PUMP_STEERED_IN = "steered_in"
+_PUMP_GAVE_UP = "gave_up"
 _CHAT_FINAL = "final"
 _PHASE_END = "end"
 
@@ -9301,6 +9309,11 @@ def _owui_request_task(task_id: str | None):
         return None
     return (getattr(sys.modules.get("open_webui.tasks"), "tasks", None) or {}).get(task_id)
 
+# From 2026.11.5 a crash is not resumed: the idle session a restart leaves reads like one the Gateway is
+# about to recover, so the message waits this long for a recovery run before it ends as cut off.
+GATEWAY_RECOVERY_GRACE_S = 90
+GATEWAY_LOST_RUN_NOTE = "_(The Gateway restarted while this reply was running and did not continue it.)_"
+
 TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
@@ -11246,6 +11259,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
+            if kind == _PUMP_GAVE_UP:
+                # No recovery run came: end M as cut off (a recovery run would have taken it over).
+                if writer is not None and writer.run_id == run and writer.awaiting_row and not writer.closed:
+                    writer.awaiting_row = False
+                    pipe_log(f"  turn writer: {writer.message_id[:8]}... no recovery came in "
+                             f"{GATEWAY_RECOVERY_GRACE_S} s: ends as cut off")
+                    await writer.finalize(GATEWAY_LOST_RUN_NOTE)
+                    conn._turn_writers.pop((chat_id, writer.message_id), None)
+                    return
+                continue
             if kind == _PUMP_STEERED_IN:
                 if writer is not None:
                     writer.steered_into = item.get("run")
@@ -11284,6 +11307,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                 elif writer.awaiting_row and writer.run_id == run:
+                    if unjudged and not resumes_a_crash(conn.gateway_version):
+                        spawn_background(_give_up_on_recovery(pump))
                     continue  # R2: the next row of the session decides again
             return
     except Exception as ex:
@@ -11339,6 +11364,12 @@ async def _cron_run_of(conn: "_GatewayConnection", sess: str, run: str, at_ms: f
     cron_run = conn.adopt_cron_run(sess, job, start, run)
     spawn_background(_note_cron_run_finished(conn, cron_run))
     return cron_run
+
+
+async def _give_up_on_recovery(pump: "_RunPump") -> None:
+    """After the grace, tell the pump no recovery run came (it ignores this if one took M over)."""
+    await asyncio.sleep(GATEWAY_RECOVERY_GRACE_S)
+    pump.queue.put_nowait((_PUMP_GAVE_UP, None))
 
 
 def _cron_result_writer(conn: "_GatewayConnection", sess: str, run: str, user_id: str,

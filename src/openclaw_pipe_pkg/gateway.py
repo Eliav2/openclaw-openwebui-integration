@@ -675,6 +675,7 @@ _STEERED_MARKER_TYPE = "_pipe_steered"
 # Turn pump queue items (`writer._turn_pump_loop`).
 _PUMP_EVENT = "event"
 _PUMP_STEERED_IN = "steered_in"
+_PUMP_GAVE_UP = "gave_up"
 _CHAT_FINAL = "final"
 _PHASE_END = "end"
 

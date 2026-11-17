@@ -75,7 +75,8 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
         with action_gateway(conn), mock.patch.object(action, "_run_request", run_request), \
                 mock.patch.object(Action, "_run_status", run_status), \
-                mock.patch.object(action, "_COMPACT_POLL_S", 0), mock.patch.object(action, "_COMPACT_DEADLINE_S", 0.3):
+                mock.patch.object(action, "_COMPACT_POLL_S", 0), mock.patch.object(action, "_COMPACT_DEADLINE_S", 0.3), \
+                mock.patch.object(action, "_COMPACT_REPLY_WAIT_S", 0.3):
             result = await Action().action({"chat_id": CHAT, "mode": "compact"}, __user__={"id": USER},
                                            __event_emitter__=RecordingEmitter(emitted))
         return result, status_calls, emitted
@@ -104,6 +105,19 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
             [{"hasActiveRun": False}], [None, REFUSAL, RuntimeError("history down")])
         self.assertEqual(result["status"], "error")
         self.assertEqual(status_calls, [{"show_loading": False, "notice": "Compaction failed: the model refused"}])
+
+    async def test_a_done_row_before_the_reply_is_in_the_history_still_shows_the_refusal(self):
+        """The row says "done" while the run's reply is not committed yet: wait for it, so a
+        refused compaction is not shown as a compacted one."""
+        result, status_calls, _ = await self._compact(
+            [{"status": "done", "hasActiveRun": False}], [None, None, REFUSAL])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(status_calls, [{"show_loading": False, "notice": "Compaction failed: the model refused"}])
+
+    async def test_a_done_row_whose_reply_never_comes_is_taken_as_compacted(self):
+        result, status_calls, _ = await self._compact([{"status": "done", "hasActiveRun": False}], [None])
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(status_calls, [{"show_loading": False}])
 
     async def test_a_failed_poll_read_is_polled_again(self):
         result, status_calls, emitted = await self._compact(
