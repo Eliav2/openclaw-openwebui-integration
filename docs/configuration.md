@@ -2,7 +2,7 @@
 
 Every setting (valve) of the functions, with its type, default and what it does. Generated from the code by `python3 build.py --all`; do not edit by hand.
 
-Applies to: Pipe, Action, Web Push (event function)
+Applies to: Pipe, Action
 
 Set them in Open WebUI: **Admin Panel > Functions >** the function **> Valves** (the gear). The installer rewrites the connection valves on every run ([which ones](./install/installer.md#valves-the-installer-sets)) and keeps the rest. Changes apply on the next message, with no restart.
 
@@ -245,57 +245,3 @@ Copy this exactly from the Pipe's valves -- the same OpenClaw agent the Pipe rou
 Type: `str`. Default: empty.
 
 The address you open the OpenClaw Control UI at, e.g. https://openclaw.example.com. When set, the Status dialog and the sub-agent drawer link to the session in it. Empty: no link.
-
-## Web Push
-
-File: `push/openclaw_web_push.py`.
-
-The Web Push event function ([Push notifications](./install/web-push.md)). Its per-user valves (each device's subscription, muted chats and folders) are written by its page script and service worker, not by hand.
-
-### VAPID_PRIVATE_KEY_FILE
-
-Type: `str`. Default: `os.path.join(os.environ.get('DATA_DIR', '/app/backend/data'), 'web-push', 'vapid_private.pem')`.
-
-Path, inside the Open WebUI container, of the VAPID private key (PEM). Kept in a file because valves are stored unencrypted by default.
-
-### VAPID_SUBJECT
-
-Type: `str`. Default: empty.
-
-Contact the push services may use (mailto: or https: URL). Empty: Open WebUI's WEBUI_URL.
-
-### TTL_SECONDS
-
-Type: `int`. Default: `3600`.
-
-How long a push service keeps a notification for a device that is offline.
-
-### URGENCY
-
-Type: `str`. Default: `normal`.
-
-RFC 8030 Urgency: very-low, low, normal or high.
-
-### PIPE_MODEL_PREFIXES
-
-Type: `str`. Default: `openclaw_gateway.`.
-
-Comma list of model id prefixes whose replies come from the OpenClaw Pipe (its function id plus a dot). For these, only the Pipe's own 'chat.finished' is sent. Turn on the Pipe's PUBLISH_CHAT_FINISHED.
-
-### NOTIFICATION_ACTIONS
-
-Type: `str`. Default: `reply,mute`.
-
-The notification's buttons, in order: reply (a text field in the notification, sent as your message), read (marks the chat read), mute (this chat, 8 hours). Android Chrome shows the first two; iOS shows none.
-
-### PREVIEW_CHARS
-
-Type: `int`. Default: `0`.
-
-Show the start of the reply (plain text, at most this many characters) in the notification. 0: off, the body says 'New reply'. The text shows on the lock screen and in the notification shade of every subscribed device.
-
-### SWIPE_READ
-
-Type: `bool`. Default: `True`.
-
-A notification swiped away marks its chat read (Android Chrome; 'Clear all' marks every chat in it read). Off: a swipe only hides it.

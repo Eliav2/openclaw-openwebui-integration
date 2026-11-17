@@ -15,19 +15,6 @@
       "count": 4
     }
   },
-  "push/examples/cloudflare-worker/src/index.js": {
-    "no-restricted-syntax": {
-      "count": 2
-    }
-  },
-  "push/web/oc-push.js": {
-    "no-magic-numbers": {
-      "count": 6
-    },
-    "no-restricted-syntax": {
-      "count": 7
-    }
-  },
   "scripts/owui_live_fold.ts": {
     "no-restricted-syntax": {
       "count": 1
