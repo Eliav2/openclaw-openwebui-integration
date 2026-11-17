@@ -340,6 +340,24 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             ("Command", "ci_wake for PR 163", "failed", "exit 2 · ls: cannot access '/nope'"),
         ])
 
+    async def test_on_2026_11_5_a_process_id_carries_a_suffix_the_exec_card_does_not(self):
+        """2026.11.5 names a process `<session>:<hash>` (`amber-seaslug:f016cec5d14a`); the exec card
+        still says `(session amber-seaslug, pid N)`. A command is still found by its card, so it is
+        listed by its title, exactly as with the bare id of 2026.10."""
+        def proc(pid, name, status, **kw):
+            return {"processId": pid, "instanceId": "i-" + pid, "name": name, "status": status,
+                    "startedAt": NOW - 60_000, "tail": "", "truncated": False, "canStop": False, **kw}
+        _result, emitted = await self._open(_gateway([], unknown=("tasks.list",), processes=[
+            proc("good-lagoon:f016cec5d14a", "sleep 25;", "running", canStop=True),
+            proc("calm-reef:0a1b2c3d4e5f", "cd /home/user/.openclaw", "failed", endedAt=NOW - 50_000, exitCode=2,
+                 tail="ls: cannot access '/nope'\n"),
+        ]))
+        rows = _fills(emitted)["background"]["rows"]
+        self.assertEqual([(r["kind"], r["title"], r["status"], r["preview"]) for r in rows if r["kind"] == "Command"], [
+            ("Command", "sleep 25", "running", None),
+            ("Command", "ci_wake for PR 163", "failed", "exit 2 · ls: cannot access '/nope'"),
+        ])
+
     async def test_a_gateway_with_neither_list_says_so_and_still_lists_automations(self):
         mine = _job("mine", f"session:{KEY}")
         _result, emitted = await self._open(

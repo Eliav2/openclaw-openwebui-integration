@@ -209,6 +209,19 @@ mkdir -p "$HOME/.openclaw"
 # No heartbeat, dreaming or weekly skill review: a job the Gateway schedules
 # itself can come due mid-suite and hold a clean stop's drain for minutes
 # (test_the_stack_gateway_schedules_no_work_of_its_own).
+#
+# The heartbeat is switched off by config up to 2026.11.4. 2026.11.5 retired
+# `agents.defaults.heartbeat` (a monitor is an ordinary automation job now, and
+# the key makes the config invalid: the Gateway will not start), so there the
+# key is left out and that test proves no job of the Gateway's own is due. The
+# version gate is the key's, not a doctor --fix: a doctor run in CI would hide
+# the next schema change.
+HEARTBEAT_RETIRED_IN=2026.11.5
+if [[ "$(printf '%s\n%s\n' "$OPENCLAW_VERSION" "$HEARTBEAT_RETIRED_IN" | sort -V | head -1)" == "$HEARTBEAT_RETIRED_IN" ]]; then
+  HEARTBEAT_KEY=""
+else
+  HEARTBEAT_KEY='"heartbeat": {"agentId": "main", "every": "0m"},'
+fi
 cat >"$HOME/.openclaw/openclaw.json" <<EOF
 {
   "gateway": {
@@ -228,7 +241,7 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
       "model": {"primary": "fake/e2e-default"},
       "models": {"fake/e2e-default": {}, "fake/e2e-echo": {}, "fake/e2e-think": {},
                  "anthropic/claude-opus-5-5": {"agentRuntime": {"id": "claude-cli"}}},
-      "heartbeat": {"agentId": "main", "every": "0m"},
+      $HEARTBEAT_KEY
       "systemAgent": {"agentId": "main"}
     },
     "ownership": "explicit",

@@ -1889,8 +1889,31 @@ def _subagent_task_text(text):
     if len(parts) < 2:
         return None
     task = _RUNTIME_CONTEXT_MARKER_RE.sub("", parts[-1])
-    task = task.split("Begin. Execute the assigned task", 1)[0].strip()
+    task = _without_task_suffix(task).strip()
     return task or None
+
+
+# The instruction the Gateway adds after a spawn's task.
+_TASK_SUFFIX = "Begin. Execute the assigned task to completion."
+_TASK_SUFFIX_WORDS = "Begin. Execute the assigned task"
+_TASK_SUFFIX_MIN = len("Begin.")
+# What a cut preview ends in: the Gateway's "..." or "…".
+_CUT_MARK_RE = re.compile(r"(?:\.\.\.|…)\s*$")
+
+
+def _without_task_suffix(text: str) -> str:
+    """`text` up to the closing instruction, which a preview may cut off anywhere (2026.11.5's longer
+    spawn preamble pushes it past sessions.preview's maxChars): any start of it at the end of a line
+    goes, and a task that merely ends in the word does not (the instruction follows a blank line)."""
+    whole = text.split(_TASK_SUFFIX_WORDS, 1)[0]
+    if whole != text:
+        return whole
+    bare = _CUT_MARK_RE.sub("", text)
+    for n in range(len(_TASK_SUFFIX), _TASK_SUFFIX_MIN - 1, -1):
+        head = bare[:-n] if bare.endswith(_TASK_SUFFIX[:n]) else None
+        if head is not None and head.endswith("\n\n"):
+            return head
+    return text
 
 
 # A spawn message in any whitespace form: lastMessagePreview flattens it.
@@ -2613,6 +2636,15 @@ async def _read_background_tasks(conn, session_key: str) -> "list | None":
     return [_process_task(p, session_key) for p in (resp or {}).get("processes") or []]
 
 
+# 2026.11.5 names a process `<exec session>:<hash>`; the exec card (`(session good-lagoon, pid N)`) has the session only.
+_PROCESS_ID_SEPARATOR = ":"
+
+
+def _exec_session_of(process_id):
+    """The exec session a process id names: the id itself up to 2026.10, its part before the colon from 2026.11.5."""
+    return process_id.split(_PROCESS_ID_SEPARATOR, 1)[0] if isinstance(process_id, str) else process_id
+
+
 # A 2026.10 process's status as a task's.
 _PROCESS_STATUSES = {"running": "running", "completed": "completed", "failed": "failed", "killed": "cancelled"}
 
@@ -2624,7 +2656,7 @@ def _process_task(process: dict, session_key: str) -> dict:
     if status == "completed" and process.get("exitCode") not in (None, 0):
         status = "failed"    # 2026.10.5 says "completed" for any exit code (ELI-232)
     return {
-        "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
+        "id": process.get("processId"), "kind": "exec", "sourceId": _exec_session_of(process.get("processId")),
         "sessionKey": session_key, "title": process.get("name") or "",
         "status": status,
         "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
@@ -2897,6 +2929,28 @@ def _spawn_task_of(messages: list) -> str | None:
         if wrapped:
             return _subagent_task_text(wrapped)
     return None
+
+
+# Wait for a /compact run: poll every _COMPACT_POLL_S seconds, give up after _COMPACT_DEADLINE_S
+# (`openclaw sessions compact`'s own default RPC timeout).
+_COMPACT_POLL_S = 1.5
+_COMPACT_DEADLINE_S = 180
+_COMPACT_HISTORY_ROWS = 10
+# The row can say "done" before the run's reply is in the history (2026.11.5 commits it after the run ends):
+# wait this long for the reply before taking the run as compacted.
+_COMPACT_REPLY_WAIT_S = 10
+
+
+async def _compact_reply_in_history(conn, session_key: str, idempotency_key: str) -> str | None:
+    """The compact run's own reply when it is in the session's history yet, else None
+    (also when the read fails, so the caller polls again)."""
+    try:
+        history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=_COMPACT_HISTORY_ROWS),
+                                          timeout=8)
+    except Exception as ex:
+        pipe_log(f"[status-action] compact reply read failed: {ex}")
+        return None
+    return _compact_reply((history or {}).get("messages"), idempotency_key)
 
 
 # A /compact run always ends "done"; only its reply says whether it compacted.
@@ -3753,18 +3807,27 @@ class Action:
 
         pipe_log(f"[status-action] compact started, runId={send_resp.get('runId')}")
 
-        deadline = time.time() + 180  # matches `openclaw sessions compact`'s own default RPC timeout
+        deadline = time.time() + _COMPACT_DEADLINE_S
         status = None
+        observed_reply = None
         while time.time() < deadline:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(_COMPACT_POLL_S)
             try:
                 desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=8)
             except Exception as ex:
                 pipe_log(f"[status-action] compact poll failed: {ex}")
                 continue
-            status = ((desc or {}).get("session") or {}).get("status")
+            row = (desc or {}).get("session") or {}
+            status = row.get("status")
             if status in ("done", "failed", "cancelled"):
                 break
+            # From 2026.11.5 a compaction clears the row's run fields, so its status never says "done":
+            # the run is over when its own reply is in the history and no run is active.
+            if not status and row.get("hasActiveRun") is False:
+                observed_reply = await _compact_reply_in_history(conn, session_key, idempotency_key)
+                if observed_reply is not None:
+                    status = "done"
+                    break
 
         if status not in ("done", "failed", "cancelled"):
             await __event_emitter__({
@@ -3783,12 +3846,16 @@ class Action:
             return {"status": "error", "detail": status}
 
         # The run is done either way; its reply says whether it compacted (ELI-209).
-        try:
-            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=10), timeout=8)
-            refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
-        except Exception as ex:
-            pipe_log(f"[status-action] compact reply read failed: {ex}")
-            refusal = None
+        # The reply that ended the poll is the one classified: a second read could fail and drop the notice.
+        reply = observed_reply
+        reply_deadline = time.time() + _COMPACT_REPLY_WAIT_S
+        while reply is None:
+            reply = await _compact_reply_in_history(conn, session_key, idempotency_key)
+            if reply is None and time.time() < reply_deadline:
+                await asyncio.sleep(_COMPACT_POLL_S)
+            elif reply is None:
+                break
+        refusal = _compact_refusal(reply)
         if refusal:
             pipe_log(f"[status-action] compact refused: {refusal}")
             await self._run_status(body, __user__, __event_emitter__, show_loading=False, notice=refusal)

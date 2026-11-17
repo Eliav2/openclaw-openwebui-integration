@@ -220,6 +220,21 @@ class TaskTextTests(unittest.TestCase):
         self.assertEqual(openclaw_status_action._subagent_task_text(WRAPPED_93), "Research X and report.")
         self.assertEqual(openclaw_status_action._subagent_task_text(WRAPPED_103), "Summarise Y.")
 
+    def test_a_preview_cut_inside_the_trailing_instruction_still_gives_the_task(self):
+        """2026.11.5's spawn preamble is longer, so sessions.preview (maxChars 2000) cuts the message
+        inside the closing "Begin. Execute the assigned task to completion." (the Gateway adds "...")."""
+        cut = ("[Subagent Context] You are running as a subagent (depth 1/5).\n\n[Subagent Task]\n\n"
+               "E2E_SLOW:20 E2E_CHILDTASK\n\n\n\nBegin. Ex...")
+        self.assertEqual(openclaw_status_action._subagent_task_text(cut), "E2E_SLOW:20 E2E_CHILDTASK")
+        for tail in ("\n\nBegin.", "\n\nBegin. Execute the assigned", "\n\nBegin. Execute the assigned task to compl…"):
+            with self.subTest(tail=tail):
+                self.assertEqual(openclaw_status_action._subagent_task_text(
+                    "[Subagent Context] x.\n\n[Subagent Task]\n\nSummarise Y." + tail), "Summarise Y.")
+
+    def test_a_task_that_really_ends_in_begin_keeps_it(self):
+        text = "[Subagent Context] x.\n\n[Subagent Task]\n\nPlan how to Begin.\n\nBegin. Execute the assigned task to completion."
+        self.assertEqual(openclaw_status_action._subagent_task_text(text), "Plan how to Begin.")
+
     def test_not_a_spawn_message(self):
         self.assertIsNone(openclaw_status_action._subagent_task_text("just a follow-up"))
 

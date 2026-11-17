@@ -675,8 +675,12 @@ _STEERED_MARKER_TYPE = "_pipe_steered"
 # Turn pump queue items (`writer._turn_pump_loop`).
 _PUMP_EVENT = "event"
 _PUMP_STEERED_IN = "steered_in"
+_PUMP_GAVE_UP = "gave_up"
+_PUMP_SETTLED = "settled"  # the session went idle: its row
 _CHAT_FINAL = "final"
 _PHASE_END = "end"
+_STREAM_LIFECYCLE = "lifecycle"
+_DISPOSITION_SILENT = "silent"  # `terminalReply.disposition` of a run that ended with a silent reply
 
 
 def _settle_ref(run_id: str) -> dict | None:
@@ -1088,6 +1092,23 @@ class _TurnRenderer:
         if run_text:
             self._assistant_stream_text = run_text.get("received", "")
             self._last_item_text = run_text.get("item", "")
+
+    def restore(self, output: list, text: str) -> None:
+        """Start from what a gone writer saved: its output, with its calls
+        indexed so a call's later result completes its card, not a new one."""
+        self.output = copy.deepcopy(output or [])
+        self.text = self.visible_text = text
+        answered = {i.get("call_id") for i in self.output if i.get("type") == _CALL_OUTPUT_ITEM}
+        for item in self.output:
+            tcid = item.get("call_id") or item.get("id") if item.get("type") == _CALL_ITEM else None
+            if not tcid:
+                continue
+            self._tool_items[tcid] = item
+            if tcid in answered:
+                self._tool_results.add(tcid)
+            else:
+                self._active_tool_args[tcid] = item.get("arguments") or "{}"
+                self._active_tool_names[tcid] = item.get("name") or ""
 
     def drop_shown(self, shown: str) -> bool:
         """Drop the leading `shown` part another message already holds
@@ -1518,6 +1539,15 @@ _SLASH_PROMPTS_HOOK = None
 _APPROVAL_HOOKS = None
 PLUGIN_APPROVAL_CAP = "plugin-approvals"
 
+
+
+def _end_cron_run(run: dict, at_ms) -> None:
+    """Mark a recorded cron run ended. Without its duration, the end is when
+    its `finished` event or result came (the Gateway's time, else now: the
+    Gateway shares this clock), so no later run's event finds it open."""
+    if run["end"] is None:
+        run["end"] = at_ms if isinstance(at_ms, (int, float)) else time.time() * 1000
+    run["ended"].set()
 
 class _GatewayConnection:
     """Persistent WebSocket connection to the Gateway: dispatches events to
@@ -1991,6 +2021,7 @@ class _GatewayConnection:
         self._wake_message_waiter(key)
         if key and isinstance(payload.get("message"), dict):
             self._on_user_message_committed(key, payload["message"])
+            self._note_cron_result(payload["message"])
         if _TURNS and key:
             _TURNS.session_message(self, key)
 
@@ -2103,15 +2134,77 @@ class _GatewayConnection:
         run = next((r for runs in self._cron_runs.values() for r in runs
                     if r["job"] == job_id and r["start"] == start), None)
         if run is None:
-            if payload.get("action") != "started" or not (
-                    isinstance(target, str) and target.startswith("session:")):
+            # 2026.11.5 names the session only on `finished` (`sessionKey`).
+            session = (target[len("session:"):] if isinstance(target, str) and target.startswith("session:")
+                       else payload.get("sessionKey"))
+            if payload.get("action") not in ("started", _CRON_FINISHED) or not session:
                 return
-            runs = self._cron_runs.setdefault(target[len("session:"):], [])
-            run = {"job": job_id, "start": start, "end": None}
+            runs = self._cron_runs.setdefault(session, [])
+            # `agent_run`: the hidden agent run that executes it (2026.11.5,
+            # `claim_cron_run`); `ended`: set on its `finished`, which comes
+            # after its result is committed (server-cron-BkJWNNVt.mjs:2983).
+            run = {"job": job_id, "start": start, "end": None, "agent_run": None,
+                   "ended": asyncio.Event()}
             runs.append(run)
             del runs[:-20]
-        if payload.get("action") == "finished" and isinstance(payload.get("durationMs"), (int, float)):
-            run["end"] = start + payload["durationMs"]
+        if payload.get("action") == _CRON_FINISHED:
+            if isinstance(payload.get("durationMs"), (int, float)):
+                run["end"] = start + payload["durationMs"]
+            _end_cron_run(run, payload.get("ts"))
+
+    def _note_cron_result(self, message: dict) -> None:
+        """A cron run's `automation-result` arrived: its run is over. The
+        session's subscription brings it, unlike the session-scoped `cron`
+        event, which may not reach this connection."""
+        cron = parse_cron_execution_id(cron_result_execution(message))
+        for run in (r for runs in self._cron_runs.values() for r in runs):
+            if cron is not None and (run["job"], run["start"]) == cron:
+                _end_cron_run(run, message.get("timestamp"))
+
+    def adopt_cron_run(self, session_key: str, job: str, start: int, run_id: str) -> dict:
+        """The cron run an adopted message's run executes, recorded if this
+        connection never heard it start, so its `finished` event still lands."""
+        runs = self._cron_runs.setdefault(session_key, [])
+        run = next((r for r in runs if r["job"] == job and r["start"] == start), None)
+        if run is None:
+            run = {"job": job, "start": start, "end": None, "agent_run": run_id,
+                   "ended": asyncio.Event()}
+            runs.append(run)
+            del runs[:-20]
+        run["agent_run"] = run_id
+        return run
+
+    def _open_cron_run(self, session_key: str, at_ms: float) -> dict | None:
+        """The oldest heard cron run into `session_key` that no agent run
+        claimed and that ran at `at_ms`: started by then, not finished before
+        (it may have finished since)."""
+        return next((r for r in self._cron_runs.get(session_key) or []
+                     if r.get("agent_run") is None and r["start"] <= at_ms
+                     and (not r["ended"].is_set() or (r["end"] is not None and at_ms <= r["end"]))), None)
+
+    @staticmethod
+    def may_execute_cron_run(at_ms) -> bool:
+        """Whether an agent run first seen at `at_ms` can be checked for a cron
+        run's: only a Gateway event time counts, since a receive time can come
+        after a later job's start. 2026.11.5's `cron` event names no session
+        (server-cron-BkJWNNVt.mjs:4300-4320), so the job is found from
+        `cron.list` once the run is known hidden (`_cron_run_of`)."""
+        return isinstance(at_ms, (int, float)) and not isinstance(at_ms, bool)
+
+    def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
+        """The heard cron run into `session_key` that agent run `run_id`, first
+        seen at `at_ms`, executes: its own claim, else the oldest open one.
+        Call it only for a run known hidden (`_runs_hidden`): an ordinary run
+        queued in the lane would take a later job's record. Cron runs queued
+        in one session's lane start in order, so the oldest is this one's."""
+        mine = next((r for r in self._cron_runs.get(session_key) or []
+                     if r.get("agent_run") == run_id), None)
+        if mine is not None:
+            return mine
+        run = self._open_cron_run(session_key, at_ms)
+        if run is not None:
+            run["agent_run"] = run_id
+        return run
 
     def cron_run_at(self, session_key: str, at_ms: float) -> dict | None:
         """The newest recorded cron run into `session_key` covering `at_ms`."""
@@ -3494,6 +3587,8 @@ def _idempotency_keys(message) -> tuple[str, str]:
 
 
 _ASSISTANT_ROLE = "assistant"
+# A `cron` event's action once a job run is over.
+_CRON_FINISHED = "finished"
 # What a reply reads from its run's messages: the usage, image and
 # attachment_error blocks (ELI-322, ELI-328), and the keys that name the run.
 _DIGEST_BLOCK_TYPES = ("image", "attachment_error")
@@ -3769,6 +3864,25 @@ def _transcript_commit_order(messages: list) -> list:
         own = [i for i in range(at + 1, end) if _copy_of(out[i], message)]
         end = own[-1] if own else end
         out.insert(end - 1, out.pop(at))
+    return _sent_before_own_copy(out)
+
+
+def _sent_before_own_copy(messages: list) -> list:
+    """Move a sent message stored after its own imported copy back before it.
+    2026.11.5 claude-cli can store a steered message after the closing copy
+    of the run it went into, so its answer would read as the host's. A copy
+    right after a sent message with the same words is that message's."""
+    out = list(messages)
+    for message in [m for m in messages if _history_user_run_id(m)]:
+        at = out.index(message)
+        for j in range(at - 1, -1, -1):
+            if _history_user_run_id(out[j]):
+                break  # its copy comes after the turn before it
+            if _copy_of(out[j], message):
+                owner = next((m for m in reversed(out[:j]) if _history_user_run_id(m)), None)
+                if owner is None or not _copy_of(out[j], owner):
+                    out.insert(j, out.pop(at))
+                break
     return out
 
 
@@ -3791,12 +3905,21 @@ def _committed_after_sent(message) -> float | None:
     return committed
 
 
+# Output item types of a tool card and its result (`_tool_call_started_event`).
+_CALL_ITEM = "function_call"
+_CALL_OUTPUT_ITEM = "function_call_output"
+# The CLI runtime's imported copy puts the prompt after its metadata block and a blank line.
+_IMPORT_WRAPPER_END = "\n\n"
+
+
 def _copy_of(message, sent: dict) -> bool:
     """`message` is the CLI runtime's imported copy of `sent`."""
     if not isinstance(message, dict) or message.get("role") != "user" or _history_user_run_id(message):
         return False
     text = (_history_item(sent) or {}).get("text", "").strip()
-    return bool(text) and (_history_item(message) or {}).get("text", "").strip().endswith(text)
+    copied = (_history_item(message) or {}).get("text", "").strip()
+    # The whole prompt, after the import's metadata block: "say blue" is no copy of "blue".
+    return bool(text) and (copied == text or copied.endswith(_IMPORT_WRAPPER_END + text))
 
 
 def _history_user_run_id(message) -> str | None:
@@ -4301,13 +4424,28 @@ def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# 2026.11.5 answers a request whose session changed under it (a restart window, startup inspection) with
+# this text, as INVALID_REQUEST and not retryable by flag, though it says so itself.
+SESSION_CHANGED_REFUSAL = "session changed before"
+SESSION_CHANGED_RETRY = "retry the request"
+DEFAULT_RETRY_MS = 250
+
+
+def _session_changed_refusal(err: dict) -> bool:
+    message = str(err.get("message") or "")
+    return SESSION_CHANGED_REFUSAL in message and SESSION_CHANGED_RETRY in message
+
+
 def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
-    """Retry wait for any other UNAVAILABLE + retryable refusal, else None."""
+    """Retry wait for any other UNAVAILABLE + retryable refusal, or a request whose session changed
+    under it and says to retry it, else None."""
     err = getattr(ex, "error", None) or {}
+    if _session_changed_refusal(err):
+        return DEFAULT_RETRY_MS
     if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True:
         return None
     retry = err.get("retryAfterMs")
-    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else DEFAULT_RETRY_MS
 
 
 # ELI-359: OpenClaw 2026.10.5 commits a `chat.send` to the session's pending

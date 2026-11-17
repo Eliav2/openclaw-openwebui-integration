@@ -303,6 +303,13 @@ def judges_cut_runs_after_listening(version) -> bool:
     return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
+def resumes_a_crash(version) -> bool:
+    """True for a Gateway that continues a run its crash cut (2026.11.3 and older). From 2026.11.5 only
+    a graceful restart writes a resume marker, so a crash leaves an idle session with no status and
+    nothing coming (docs/gateway/restart-recovery.md). Unknown versions count as older."""
+    return not hides_cron_run_output(version)
+
+
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
     """`gateway`, `wait`, `resume` or `finalize` for M's writer when its run settles.
@@ -368,14 +375,62 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # 2026.10.2+ marks the wake turn by cron provenance instead and runs it under
 # its own run id: an ordinary agent turn.
 
+# 2026.11.5 hides the whole run: sourceTool "cron_execution"
+# (session-event-handoff-Ct6SCwLg.mjs:376), no assistant stream
+# (embedded-agent-subscribe-EcG91LL0.mjs:816), prompt and reply left out of
+# chat.history (chat-display-projection.history-m8O6y-mh.mjs:242, 251). Its
+# reply comes as an `automation-result` message after the run
+# (conversation-result-CfQov6Jy.mjs:6-24).
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
+_CRON_SOURCE_TOOLS = ("cron", "cron_execution")
+_CRON_PROVENANCE_KIND = "internal_system"
+_AUTOMATION_KIND_CRON = "cron"
+
+
+def hides_cron_run_output(version) -> bool:
+    """True for a 2026.11.5+ Gateway, which shows a cron run into a session
+    only by its `automation-result` message. Unknown versions count as older."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 11, 5)
+
+
+def cron_execution_id(job: str, start_ms) -> str:
+    """The Gateway's id of one cron job run (run-id-Be9gQ-r9.mjs createCronExecutionId)."""
+    return f"cron:{job}:{int(start_ms)}"
+
+
+_CRON_EXECUTION_ID_RE = re.compile(r"^cron:(?P<job>.+):(?P<start>\d+)$")
+
+
+def parse_cron_execution_id(execution_id) -> tuple[str, int] | None:
+    """(job, start ms) of a `cron:<job>:<start>` id, else None."""
+    m = _CRON_EXECUTION_ID_RE.match(str(execution_id or ""))
+    return (m.group("job"), int(m.group("start"))) if m else None
+
+
+def cron_result_execution(message) -> str | None:
+    """The cron run id an `automation-result` message reports, else None."""
+    auto = message.get("openclawAutomation") if isinstance(message, dict) else None
+    if (isinstance(auto, dict) and auto.get("kind") == _AUTOMATION_KIND_CRON
+            and message.get("role") == _ASSISTANT_ROLE and parse_cron_execution_id(auto.get("runId"))):
+        return auto["runId"]
+    return None
+
+
+def cron_result_message(messages: list, execution_id: str) -> dict | None:
+    """The `automation-result` message that cron run committed, else None."""
+    for m in reversed(messages or []):
+        if cron_result_execution(m) == execution_id:
+            return m
+    return None
 
 
 def _cron_turn_job(m: dict) -> str | None:
     """The cron job a wake turn names (provenance, else prompt header), else None."""
     prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
     if prov:
-        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+        if prov.get("kind") != _CRON_PROVENANCE_KIND or prov.get("sourceTool") not in _CRON_SOURCE_TOOLS:
             return None
         hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
         if prov.get("jobId") or hit:

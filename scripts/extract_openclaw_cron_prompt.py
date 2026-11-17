@@ -10,7 +10,9 @@ isolated-agent-C_VaOV3U.mjs:1066 and the `commandBody` line that puts `base`
 first). From 2026.10 the prefix is its own line (`sourcePromptPrefix`, also
 stored as the turn's provenance) and each wake has its own run id, so the pipe
 no longer reads the text there; the prefix is pinned all the same, because
-the end-to-end test reads it.
+the end-to-end test reads it. From 2026.11.5 the builder is `buildCronCommandBody`
+in run-prompt-*.mjs, with minified variable names, so its lines are pinned with
+the names and `${...}` placeholders normalized (a "minified" form).
 
 The fixture keeps one entry per form ("forms"), and
 test_pipe_unit.CronPromptFixtureTest re-extracts from the installed dist when
@@ -24,6 +26,7 @@ usage: extract_openclaw_cron_prompt.py [DIST_DIR] [--write]
 import glob
 import json
 import os
+import re
 import sys
 
 from openclaw_dist import default_dist
@@ -35,6 +38,21 @@ FORMS = [
     {"prefix": "const sourcePromptPrefix = `[cron:", "base": "const base = `${sourcePromptPrefix}",
      "command_body": "commandBody = `${base}"},
 ]
+# 2026.11.5 on: run-prompt-*.mjs, variable names minified. Each part is a pattern; the pinned source is the
+# line with its variable names and placeholders normalized (`_`, `${job.id}`, `${}`).
+MINIFIED_FILES = "run-prompt-*.mjs"
+MINIFIED_FORM = {
+    "prefix": r"const [\w$]+ = `\[cron:\$\{[\w$]+\.id\} \$\{[\w$]+\.name\}\]`;",
+    "base": r"const [\w$]+ = `\$\{[\w$]+\} \$\{[\w$]+\}`\.trim\(\);",
+    "command_body": r"\} else [\w$]+ = `\$\{[\w$]+\}\\n\$\{[\w$]+\}`\.trim\(\);",
+}
+
+
+def normalize(line: str) -> str:
+    """A minified dist line with its variable names taken out: `const _ = ...`, `${job.id}`, `${}`."""
+    line = re.sub(r"\b(const|else)\s+[\w$]+\s*=", r"\1 _ =", line)
+    line = re.sub(r"\$\{[\w$]+\.(id|name)\}", r"${job.\1}", line)
+    return re.sub(r"\$\{[\w$]+\}", "${}", line)
 FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures",
                        "test_fixture_openclaw_cron_prompt.json")
 
@@ -52,6 +70,14 @@ def extract(dist_dir: str) -> dict | None:
                         found[name] = {"line": n, "source": line.strip()}
             if len(found) == len(needles):
                 return {"openclaw_version": version, "file": os.path.basename(path), **found}
+    for path in sorted(glob.glob(os.path.join(dist_dir, MINIFIED_FILES))):
+        found = {}
+        for n, line in enumerate(open(path, encoding="utf-8"), 1):
+            for name, pattern in MINIFIED_FORM.items():
+                if name not in found and re.search(pattern, line):
+                    found[name] = {"line": n, "source": normalize(line.strip())}
+        if len(found) == len(MINIFIED_FORM):
+            return {"openclaw_version": version, "file": os.path.basename(path), "minified": True, **found}
     return None
 
 
@@ -59,7 +85,7 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     got = extract(args[0] if args else default_dist())
     if got is None:
-        sys.exit(f"no isolated-agent-*.mjs holds any of {FORMS}")
+        sys.exit(f"no isolated-agent-*.mjs holds any of {FORMS}, and no {MINIFIED_FILES} holds {MINIFIED_FORM}")
     if "--write" in sys.argv:
         fixture = json.load(open(FIXTURE)) if os.path.exists(FIXTURE) else {}
         forms = [f for f in fixture.get("forms", []) if f.get("openclaw_version") != got["openclaw_version"]]

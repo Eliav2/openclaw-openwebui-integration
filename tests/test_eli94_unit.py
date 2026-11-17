@@ -463,5 +463,107 @@ class ShutdownCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(openclaw_pipe.owui_shutting_down())
 
 
+class CronResultEndedWhileDownTests(_EndedWhileDownCase):
+    """2026.11.5: a cron wake that ended while Open WebUI was down left its reply
+    only as an `automation-result` message (its run's transcript is hidden).
+    The restart writes it into the cron run's message, once."""
+
+    EXEC = "cron:job-1:1791880020000"
+
+    def setUp(self):
+        super().setUp()
+        self.conn.gateway_version = "2026.11.5"
+        self.history = {"messages": [self.result("E2E_CLI_WAKE_TWO", CLOSED_MS)]}
+        test = self
+
+        async def claim(chat_id, user_id, message_id, run_id, writer_id, takeover=False):
+            msgs = test.chat["history"]["messages"]
+            msgs[message_id] = {"id": message_id, "role": "assistant", "parentId": M, "childrenIds": [],
+                                "content": "", "output": [], "done": False,
+                                "meta": {"openclaw_run": run_id, "openclaw_writer": writer_id}}
+            msgs[M]["childrenIds"] = [message_id]
+            return {"claimed": True, "how": "new", "message_id": message_id, "parent": M,
+                    "messages": {message_id: copy.deepcopy(msgs[message_id])}}
+        p = mock.patch("openclaw_pipe._claim_turn_message", claim)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def result(self, text, at, execution=None):
+        execution = execution or self.EXEC
+        return {"role": "assistant", "content": [{"type": "text", "text": text}],
+                "provider": "openclaw", "model": "automation-result", "timestamp": at,
+                "idempotencyKey": f"cron-current-completion:{execution}",
+                "openclawAutomation": {"kind": "cron", "jobId": "job-1", "runId": execution}}
+
+    def cron_message(self):
+        return self.chat["history"]["messages"].get(turn_message_id(self.key, self.EXEC, CHAT))
+
+    async def test_a_wake_that_ran_whole_while_down_gets_its_own_message(self):
+        await self.startup()
+        m = self.cron_message()
+        self.assertIsNotNone(m, list(self.chat["history"]["messages"]))
+        self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
+        self.assertEqual(self.msg()["content"], "Reading them.", "the earlier reply is untouched")
+
+    async def test_a_wake_cut_by_the_stop_keeps_its_cards_and_gets_its_result(self):
+        mid = turn_message_id(self.key, self.EXEC, CHAT)
+        card = {"type": "function_call", "id": "fc1", "call_id": "toolu_1", "name": "Bash",
+                "arguments": "{}", "status": "completed"}
+        self.chat["history"]["messages"][mid] = {
+            "id": mid, "role": "assistant", "parentId": M, "childrenIds": [], "done": True,
+            "content": "", "output": [card]}
+        await self.startup()
+        m = self.cron_message()
+        self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
+        self.assertEqual([i["type"] for i in m["output"]], ["function_call", "message"])
+
+    async def test_a_second_restart_writes_nothing_again(self):
+        await self.startup()
+        writes = len(self.writes)
+        self.updated_at = T0  # Open WebUI's row as it was: the pass reads the transcript again
+        await self.startup()
+        self.assertEqual(len(self.writes), writes)
+        self.assertEqual(self.cron_message()["content"], "E2E_CLI_WAKE_TWO")
+
+    async def test_a_result_open_webui_already_wrote_is_not_written_again(self):
+        """Committed before the chat's last write: its live writer showed it."""
+        self.history = {"messages": [self.result("E2E_CLI_WAKE_TWO", T0 * 1000 - 500)]}
+        await self.startup()
+        self.assertIsNone(self.cron_message())
+
+    async def test_an_adopted_writers_save_is_no_proof_the_result_was_written(self):
+        """Review on #405: another unfinished reply is adopted first and saves, after the
+        result was committed; the chat's write before adoption decides."""
+        test = self
+
+        async def one_stub(prefixes):
+            return [(CHAT, "other-stub")]
+
+        async def adopted(conn, agent_id, chat_id, stub_id, wait=True):
+            test.updated_at = CLOSED_MS // 1000 + 60  # the adopted writer's own save
+            return "adopted"
+        with mock.patch("openclaw_pipe._orphan_stub_ids", one_stub), \
+                mock.patch("openclaw_pipe._reconcile_stub", adopted):
+            await self.startup()
+        m = self.cron_message()
+        self.assertIsNotNone(m, list(self.chat["history"]["messages"]))
+        self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
+
+    async def test_a_task_in_the_chat_does_not_keep_a_separate_cron_result_out(self):
+        """Review on #405: an adopted writer's task (or any request) writes its own message,
+        never the cron run's: the cron result is still written."""
+        self.live_task = True
+        await self.startup()
+        m = self.cron_message()
+        self.assertIsNotNone(m, list(self.chat["history"]["messages"]))
+        self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
+        self.assertEqual(self.msg()["content"], "Reading them.", "the live reply is left to its request")
+
+    async def test_before_2026_11_5_there_is_no_cron_result_to_write(self):
+        self.conn.gateway_version = "2026.11.3"
+        await self.startup()
+        self.assertIsNone(self.cron_message())
+
+
 if __name__ == "__main__":
     unittest.main()

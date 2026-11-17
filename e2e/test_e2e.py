@@ -463,6 +463,23 @@ def _openclaw_release() -> tuple:
     return _openclaw_version()[:2]
 
 
+def _hides_cron_run_output() -> bool:
+    """2026.11.5+ runs a cron job into a chat's session as a hidden automation
+    run: its prompt, text and closing stay out of `chat.history`
+    (chat-display-projection.history-m8O6y-mh.mjs:242, 251), and its reply is
+    an `automation-result` message (conversation-result-CfQov6Jy.mjs)."""
+    return _openclaw_version() >= (2026, 11, 5)
+
+
+def _empty_reply_error() -> str:
+    """The Gateway's text for a run whose model answered nothing: 2026.11.5
+    words it as the missing-reply notice (embedded-agent-h4DBNIHG.mjs
+    resolveIncompleteTurnPayloadText, MISSING_REPLY_NOTICE_TEXT)."""
+    if _openclaw_version() >= (2026, 11, 5):
+        return "No answer was returned"
+    return "couldn't generate a response"
+
+
 def _skip_known_105_gap(issue: str, what: str) -> None:
     """A known gap of the Pipe on OpenClaw 2026.10 before 2026.10.10 (the
     pinned lane, the version live runs): skipped there under its issue, so the
@@ -527,7 +544,8 @@ def _wake_messages(key: str) -> dict:
     wake has its own run id, an agent turn like any other: its message comes
     from that run id, and `chat.history` shows the wake's prompt turn as a
     forwarded "assistant" message with the cron prefix moved into its
-    provenance (GH #24)."""
+    provenance (GH #24). From 2026.11.5 the wake's turn is hidden and its
+    reply is an `automation-result` message: the message is its cron run's."""
     hist = _gw("chat.history", {"sessionKey": key, "limit": 100})
     session_id, turn, out = hist.get("sessionId"), None, {}
     for m in hist.get("messages") or []:
@@ -539,6 +557,13 @@ def _wake_messages(key: str) -> dict:
             cron = (str(text).lstrip().startswith("[cron:")
                     or (m.get("provenance") or {}).get("sourceTool") == "cron")
             turn = ikey[:-len(":user")] if cron else None
+            continue
+        auto = m.get("openclawAutomation") or {}
+        if auto.get("kind") == "cron" and auto.get("runId"):
+            # 2026.11.5: the wake's message is its cron run's result.
+            for tok in ("WAKE_ONE", "WAKE_TWO", "WAKE_SLOW"):
+                if tok in str(text):
+                    out[tok] = str(uuid.uuid5(TURN_NS, f"{key}:{auto['runId']}"))
             continue
         run = meta.get("runId")
         for tok in ("WAKE_ONE", "WAKE_TWO", "WAKE_SLOW"):
@@ -716,12 +741,17 @@ def test_a_message_sent_while_a_run_works_is_steered_into_it(token):
                .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=0.5)
         since = str(int(time.time()))
         aside = _post_turn(token, chat_id, f"E2E_ECHO: {word}")
-        # Sent to the Gateway while the run works, not held in the Pipe.
+        # Sent to the Gateway while the run works, not held in the Pipe. The
+        # tool is let go only once the Gateway took the send (its run id came
+        # back): the Gateway decides steer or follow-up then, and a run whose
+        # reply already ended gets a follow-up ("reply-owner-ended").
         def sent_into_run():
             log = subprocess.run(["docker", "logs", "--since", since, "owui"],
                                  capture_output=True, text=True, timeout=60)
-            return "to be steered into it" in log.stdout + log.stderr
-        _until("the Pipe sending the aside into the active run", sent_into_run, timeout_s=60, every_s=0.5)
+            text = log.stdout + log.stderr
+            at = text.find("to be steered into it")
+            return at >= 0 and f"Captured runId: msg-{chat_id}-{aside}" in text[at:]
+        _until("the Gateway taking the aside into the active run", sent_into_run, timeout_s=60, every_s=0.5)
     finally:
         open(gate, "w").close()
     _until("both replies done", lambda: all(
@@ -1279,6 +1309,16 @@ import sqlite3  # noqa: E402
 GATEWAY_AGENT_DB = os.path.expanduser("~/.openclaw/agents/main/agent/openclaw-agent.sqlite")
 
 
+# 2026.11.5 does not resume a run after a crash or SIGKILL: only a graceful restart writes the resume
+# marker (docs/gateway/restart-recovery.md: "crashes are deliberately lossy"). Before it, the Gateway's
+# startup recovery continued the run.
+CRASH_RECOVERY_RETIRED_IN = (2026, 11, 5)
+
+
+def _gateway_recovers_a_crash() -> bool:
+    return _openclaw_version() < CRASH_RECOVERY_RETIRED_IN
+
+
 def _crash_recoverable(key: str) -> bool:
     """The session's stored entry holds what the Gateway's startup recovery
     needs to continue its run after a SIGKILL. `hasActiveRun` turns true about
@@ -1287,13 +1327,17 @@ def _crash_recoverable(key: str) -> bool:
     (main-session-restart-recovery-marking-CvQ2iWW3.mjs:241); 2026.10.10
     stores no status mid-run and recovers an open `restartRecoveryRuns`
     claim (store-maintenance-DW8Mtgc_.mjs:277), written at the run's start
-    (agent-command-CKyIJ22z.mjs:3853)."""
+    (agent-command-CKyIJ22z.mjs:3853). From 2026.11.5 there is no claim to wait for and nothing
+    recovers: the run is stored once its entry names it (`activeWriterRunId`)."""
     db = sqlite3.connect(f"file:{GATEWAY_AGENT_DB}?mode=ro", uri=True)
     try:
         row = db.execute("SELECT entry_json FROM session_nodes WHERE session_key = ?", (key,)).fetchone()
     finally:
         db.close()
     entry = json.loads(row[0]) if row else {}
+    if not _gateway_recovers_a_crash():
+        # 2026.11.5 retired the claim: the entry holds the run it is writing, and a crash is not resumed.
+        return bool(entry.get("activeWriterRunId"))
     ended = set(entry.get("restartRecoveryTerminalRunIds") or [])
     return entry.get("status") == "running" or any(
         r.get("runId") not in ended for r in entry.get("restartRecoveryRuns") or [])
@@ -1644,7 +1688,7 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
             turns = _user_turns(key)
         except AssertionError:
             return False   # chat.history refuses until the restarted Gateway's agent is up
-        if len(turns) < 2:
+        if _gateway_recovers_a_crash() and len(turns) < 2:
             return False
         msg = _chat_messages(guest_token, chat_id).get(aid) or {}
         return msg.get("done") is True and not _session_row(key).get("hasActiveRun")
@@ -1653,9 +1697,13 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
     except pytest.fail.Exception as ex:
         pytest.fail(f"{ex}\n{_down_state(guest_token, chat_id, key)}")
     turns = _user_turns(key)
-    # Precondition: something continued the run after the crash (the
-    # Gateway's recovery or the pipe's resume), so its turn is checked too.
-    assert len(turns) >= 2, f"no turn after the crash, nothing to check: {turns}\n{_down_state(guest_token, chat_id, key)}"
+    if _gateway_recovers_a_crash():
+        # Precondition: something continued the run after the crash (the
+        # Gateway's recovery or the pipe's resume), so its turn is checked too.
+        assert len(turns) >= 2, f"no turn after the crash, nothing to check: {turns}\n{_down_state(guest_token, chat_id, key)}"
+    else:
+        # Nothing resumes the run: the cut reply ends as it is, and nothing runs in its place.
+        assert len(turns) == 1, f"a turn after a crash 2026.11.5 does not resume: {turns}"
     assert not any(o is True for _t, o in turns), f"an owner turn in a guest chat: {turns}"
     _assert_one_reply(guest_token, chat_id, aid)
 
@@ -1717,13 +1765,22 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
         assert status == 200, got
         return request_task not in got["tasks"]
     _until("the request's task to end", request_ended, timeout_s=120)
-    # The reply is still being written (40 slow words): `done` here is the
-    # writer's mid-turn state, not its end.
-    _until("M to read done: false in the DB after the request's save",
-           lambda: _db_message(chat_id, aid).get("done") is False, timeout_s=30, every_s=0.5)
-    _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
-           timeout_s=300, every_s=3)
-    assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
+    if _gateway_recovers_a_crash():
+        # The reply is still being written (40 slow words): `done` here is the
+        # writer's mid-turn state, not its end.
+        _until("M to read done: false in the DB after the request's save",
+               lambda: _db_message(chat_id, aid).get("done") is False, timeout_s=30, every_s=0.5)
+    if _gateway_recovers_a_crash():
+        _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
+               timeout_s=300, every_s=3)
+        assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
+    else:
+        # Nothing continues the run: the request's own save already reads `done`, so only the
+        # writer's note (after its 90 s grace) says the reply is over.
+        _until("the writer's note that the Gateway did not continue the reply",
+               lambda: GATEWAY_NOT_CONTINUED in (_db_message(chat_id, aid).get("content") or ""),
+               timeout_s=300, every_s=3)
+        assert _db_message(chat_id, aid).get("done") is True
     _assert_one_reply(token, chat_id, aid)
 
 
@@ -2092,12 +2149,12 @@ def test_a_reply_the_agent_starts_that_errors_still_finishes(token):
     OpenClaw 2026.10.5 fails it ("Agent couldn't generate a response") and
     pushes no settle for it (its last push is `phase: error` with
     hasActiveRun true), so its message stayed generating (ELI-217). It
-    finishes with the run's error."""
+    finishes with the run's error, in the wording of the Gateway's version."""
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_AGENT_CHAT")
     key = _session_key(token, chat_id)
     _gw("agent", {"sessionKey": key, "message": "E2E_EMPTY_REPLY",
                   "idempotencyKey": f"e2e-empty-{uuid.uuid4().hex[:8]}"})
-    msgs = _wait_for(token, chat_id, ["couldn't generate a response"])
+    msgs = _wait_for(token, chat_id, [_empty_reply_error()])
     _assert_clean(token, chat_id, msgs)
 
 
@@ -2358,9 +2415,71 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     _assert_clean(token, chat_id, msgs)
 
 
+def _wakes_ended_while_down_get_their_results(token: str) -> None:
+    """2026.11.5 keeps a cron run's transcript out of `chat.history`: a wake
+    that ends while Open WebUI is down is rebuilt from its `automation-result`
+    message instead. The first wake keeps what it showed (a card, if one
+    streamed before the stop) and gets its result; the second, run whole while
+    down, gets a message of its own. Each result is in its cron run's message,
+    once."""
+    log = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    key = _session_key(token, chat_id)
+    hold_token = f"cli{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+
+    def results():
+        """{job id: (cron run id, text)} of the automation-result messages."""
+        out = {}
+        for m in _gw("chat.history", {"sessionKey": key, "limit": 100}).get("messages") or []:
+            auto = m.get("openclawAutomation") or {}
+            if auto.get("kind") == "cron":
+                text = " ".join(b.get("text") or "" for b in m.get("content") or [] if isinstance(b, dict))
+                out[auto.get("jobId")] = (auto.get("runId"), text)
+        return out
+
+    one = _schedule_wake(key, f"E2E_CLI_TOOL_HOLD {hold_token}", 2)
+    try:
+        _until("the first wake's Claude Code turn holding", lambda: os.path.exists(log)
+               and f"holding {hold_token}" in open(log, encoding="utf-8").read(), every_s=0.2)
+        subprocess.run(["docker", "stop", "-t", "30", "owui"], check=True, capture_output=True)
+        two = _schedule_wake(key, "Reply with exactly: E2E_CLI_WAKE_TWO", 2)
+        _until("the second wake to fire while the first works", lambda: any(
+            j.get("id") == two and (j.get("state") or {}).get("runningAtMs")
+            for j in _gw("cron.list", {"includeDisabled": True}).get("jobs") or []))
+        open(gate, "w").close()
+        got = _until("both wakes' results", lambda: (lambda r: r if {one, two} <= set(r) else None)(results()),
+                     timeout_s=120)
+    finally:
+        open(gate, "w").close()
+        subprocess.run(["docker", "start", "owui"], check=True, capture_output=True)
+    _until("Open WebUI to come back", _owui_up, timeout_s=300, every_s=2)
+    status, _models = _request("GET", "/api/models", token=token)  # runs the startup reconcile
+    assert status == 200
+    mids = {job: str(uuid.uuid5(TURN_NS, f"{key}:{run}")) for job, (run, _text) in got.items()}
+
+    def written():
+        msgs = _chat_messages(token, chat_id)
+        return msgs if all(msgs.get(mids[j], {}).get("done") is True and got[j][1].strip()
+                           in (msgs[mids[j]].get("content") or "") for j in (one, two)) else None
+    try:
+        msgs = _until("each wake's result in its cron run's message", written)
+    except pytest.fail.Exception as ex:
+        pytest.fail(f"{ex}: {json.dumps(_chat_messages(token, chat_id))[:2500]}")
+    for job in (one, two):
+        text = got[job][1].strip()
+        holders = [k for k, m in msgs.items() if text in (m.get("content") or "") and k != first["id"]]
+        assert holders == [mids[job]], f"{text!r} in {holders}, not only in {mids[job]}"
+        assert msgs[mids[job]]["content"].count(text) == 1, msgs[mids[job]]["content"]
+    os.remove(gate)
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 @pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a wake after the run")
 def test_a_cron_wake_a_second_wake_fired_into_is_completed_whole_on_start(token):
+    if _hides_cron_run_output():
+        return _wakes_ended_while_down_get_their_results(token)
     """Two cron wakes, the second fired while the first's claude-cli run works:
     2026.10.10 runs the second after the first's run, and its prompt carries
     the time it fired; the first's messages, imported with Claude Code's own
@@ -3048,6 +3167,11 @@ def _pipe_log_since(since: str) -> str:
 # The Gateway's startup trace line once restart recovery of sub-agents ended
 # (`startup phase: <name> <ms>ms total=...`, server-startup-trace).
 SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
+# 2026.11.5 has no such phase (a crash is not resumed, `_gateway_recovers_a_crash`). After an unclean
+# stop its sessions are writable again once the agent's database has been inspected; after a clean one
+# the Gateway logs `ready` (and logs only one of the two lines).
+GATEWAY_NOT_CONTINUED = "did not continue it"   # the Pipe's note for a reply a crash cut on 2026.11.5
+GATEWAY_READY = r"agent database recovered after background inspection|\[gateway\] ready"
 
 
 def _read_from(path: str, offset: int) -> str:
@@ -3076,8 +3200,9 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     # the agent's database fails (SessionEntryChangedDuringReadError, run
     # 42610236049); 2026.10.10 dropped that check. This test is about the
     # Pipe's backoff, so it sends once that recovery has ended.
+    recovered = SUBAGENT_RECOVERY_DONE if _gateway_recovers_a_crash() else GATEWAY_READY
     _until("the Gateway's sub-agent recovery to end", lambda: re.search(
-        SUBAGENT_RECOVERY_DONE, _read_from(restart_log, offset)), timeout_s=180)
+        recovered, _read_from(restart_log, offset)), timeout_s=180)
     log = _pipe_log_since(since)
     assert log.rfind("reconnect in ") > log.rfind("Connected to Gateway (persistent)"), \
         "precondition: the Pipe reconnected before the message went out"

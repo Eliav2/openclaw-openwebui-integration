@@ -12,6 +12,11 @@
 # chat as generating and its Stop button reaches it.
 
 
+# A cron-run message's meta: the `cron:<job>:<start>` id it shows the result of.
+OPENCLAW_CRON_META = "openclaw_cron"
+# Bound on waiting for a cron job's `finished` event, which normally follows
+# its run's end within a second; a lost event (a Gateway restart) ends here.
+CRON_RESULT_WAIT_S = 120
 # Opens tried at a run's end while Open WebUI's DB is locked (ELI-167). Each
 # waits out sqlite's busy_timeout (5 s), so 6 is about 30 s.
 OPEN_AT_END_LOCKED_TRIES = 6
@@ -309,6 +314,11 @@ def _owui_request_task(task_id: str | None):
     if not task_id:
         return None
     return (getattr(sys.modules.get("open_webui.tasks"), "tasks", None) or {}).get(task_id)
+
+# From 2026.11.5 a crash is not resumed: the idle session a restart leaves reads like one the Gateway is
+# about to recover, so the message waits this long for a recovery run before it ends as cut off.
+GATEWAY_RECOVERY_GRACE_S = 90
+GATEWAY_LOST_RUN_NOTE = "_(The Gateway restarted while this reply was running and did not continue it.)_"
 
 TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
@@ -816,6 +826,15 @@ class _TurnWriter:
         self.thinking = thinking  # ELI-85: a resume keeps the user's level
         # A cron wake (ELI-103): its transcript span is a time window.
         self.wake = wake
+        # The heard cron run a hidden 2026.11.5 run executes: M is its
+        # `automation-result` message (`_adopt_cron_result`).
+        self.cron_run: dict | None = None
+        # The result is rendered (once: an answer's input run ends M again),
+        # and whether a history read for it succeeded (a failed one leaves it
+        # to finalize's own read).
+        self.cron_adopted = False
+        self.cron_result_read = False
+        self.cron_shown_restored = False  # an adopted cron writer started from its saved row
         # What earlier replies showed of an adopted run (ELI-147).
         self.shown = {run_id: shown} if shown else {}
         self.opened = False
@@ -836,6 +855,7 @@ class _TurnWriter:
         # M's message was steered into another run (2026.10.10+): its own run
         # gets only a `chat` final with no message.
         self.steered_message = False
+        self.silent_announce = False    # an announce run the parent answered with silence
         # Images of a steered reply are that run's (`finish_final_images`).
         self.steered_into: str | None = None
         # A later run works: M's end leaves the active state to its reply.
@@ -902,6 +922,9 @@ class _TurnWriter:
         if self.wake is not None:
             # For a successor to adopt this message (ELI-103 step 4).
             meta["openclaw_wake"] = {k: self.wake.get(k) for k in ("key", "at", "job")}
+        if self.cron_run is not None:
+            # For a successor to finish it from the cron run's result.
+            meta[OPENCLAW_CRON_META] = cron_execution_id(self.cron_run["job"], self.cron_run["start"])
         await _set_turn_meta(self.chat_id, self.message_id, meta)
         self.opened = True
         try:
@@ -973,6 +996,7 @@ class _TurnWriter:
             return
         try:
             if payload is not None:
+                await self._restore_shown()
                 data = payload.get("data") or {}
                 if payload.get("stream") == "lifecycle" and data.get("phase") == "start" \
                         and isinstance(data.get("startedAt"), (int, float)) and payload.get("runId"):
@@ -988,8 +1012,15 @@ class _TurnWriter:
                     self.images_made += 1
                 elif (payload.get("state") == "final" and not payload.get("message")
                       and payload.get("runId") == self.run_id and not self.renderer.output
+                      and self.cron_run is None and not self.silent_announce
                       and steers_mid_run_messages(self.conn.gateway_version)):
                     self.steered_message = True
+                if (payload.get("stream") == _STREAM_LIFECYCLE and data.get("phase") == _PHASE_END
+                        and (data.get("terminalReply") or {}).get("disposition") == _DISPOSITION_SILENT
+                        and parse_announce_run_id(payload.get("runId")) is not None):
+                    # 2026.11.5 writes nothing of a silent reply (no NO_REPLY delta): its final carries no
+                    # message either, like a steered message's, so the run's own end says which it is.
+                    self.silent_announce = True
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
@@ -1237,11 +1268,58 @@ class _TurnWriter:
             if not _is_model_silence(row["lastRunError"]):
                 request = self.request or (await self._run_request())[0]
                 note = _plain_error(ERROR_RUN, row["lastRunError"], request)
+        if self.cron_run is not None and not self.cron_adopted:
+            await self._adopt_cron_result()
         if note is None and await self._ask_question():
             return
         if not self._showable():
             await self._await_steered_answer()
         await self.finalize(note)
+
+    async def _adopt_cron_result(self) -> None:
+        """M shows the cron run's `automation-result` message, committed before
+        its job's `finished` event and after the run's own end. Its tool cards
+        streamed (only its text is held back), so the result follows them."""
+        job = self.cron_run["job"]
+        try:
+            await asyncio.wait_for(self.cron_run["ended"].wait(), CRON_RESULT_WAIT_S)
+        except asyncio.TimeoutError:
+            pipe_log(f"  turn writer: cron job {job[:8]}... sent no finished event in "
+                     f"{CRON_RESULT_WAIT_S} s; reading its result anyway")
+        try:
+            hist = await _history_once_connected(
+                self.conn, self.session_key, f"turn writer: {self.message_id[:8]}...",
+                limit=RUN_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for cron job {job[:8]}...'s result failed: {ex!r}")
+            return
+        self.cron_result_read = True
+        if await self._render_cron_result(hist):
+            await self.feed(None)
+
+    async def _restore_shown(self) -> None:
+        """Once, before an adopted cron writer shows anything: start from what
+        the gone writer saved (its cards), which the transcript has none of."""
+        if not (self.adopted and self.cron_run is not None) or self.cron_shown_restored:
+            return
+        # Marked only once restored: a locked DB fails the open, and the next event tries again.
+        if await self.open(takeover=True):
+            shown = self._claim["messages"].get(self.message_id) or {}
+            self.renderer.restore(shown.get("output") or [], _coerce_text(shown.get("content")))
+            self.cron_shown_restored = True
+
+    async def _render_cron_result(self, hist: dict) -> bool:
+        """Feed the cron run's result from `hist` into M once; whether it did.
+        None in `hist` is a quiet run (NO_REPLY, no_change): nothing to show."""
+        execution = cron_execution_id(self.cron_run["job"], self.cron_run["start"])
+        result = cron_result_message((hist or {}).get("messages") or [], execution)
+        if result is None or self.cron_adopted:
+            return False
+        await self._restore_shown()
+        for ev in _history_events([result]):
+            self.renderer.feed(ev)
+        self.cron_adopted = True
+        return True
 
     async def _await_steered_answer(self) -> None:
         """Wait for the transcript to hold the answer of the run M's message
@@ -1393,6 +1471,14 @@ class _TurnWriter:
                 self.renderer.flush()
             elif self.wake is not None:
                 self._rebuild_wake(hist)
+                self.renderer.flush()
+            elif self.cron_run is not None:
+                # Its transcript is hidden: what it showed is its result, read
+                # here when the read at its end failed.
+                if hist and not self.cron_result_read:
+                    await self._render_cron_result(hist)
+                if hist:
+                    self._note_transcript_answers(hist.get("messages") or [])
                 self.renderer.flush()
             else:
                 if hist:
@@ -1828,8 +1914,11 @@ class _RunPump:
         self.handover: dict | None = None  # {message_id, renderer} of a request that ended early
         self.stop_notice_before = False
         self.wake = False               # a cron wake: runId is the sessionId (ELI-103)
+        self.cron_run: dict | None = None  # the heard cron run a hidden 2026.11.5 run executes
+        self.cron_at: float | None = None  # its first event's time, while that is not known yet
         self.held: list = []            # a wake's events before its turn is known
         self.restarts_before = 0        # conn.gateway_restarts when the pump began
+        self.grace_armed = False        # the wait for a recovery after a restart has started (`_arm_recovery_grace`)
         self.terminal = asyncio.Event()  # the run's terminal event was queued
         # Sent more than a lone message-less final (`_steer`).
         self.started = False
@@ -1884,6 +1973,9 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     if pump is None:
         pump = conn._turn_pumps[(sess, run)] = _RunPump()
         pump.restarts_before = conn.gateway_restarts
+        if (hides_cron_run_output(conn.gateway_version) and parse_pipe_run_id(run) is None
+                and conn.may_execute_cron_run(payload.get("ts"))):
+            pump.cron_at = payload["ts"]  # the pump asks the Gateway (`_runs_hidden`)
         target = conn._run_targets.get(f"{sess}:{run}")
         if target is not None:
             # DESIGN 2.6: continue from the shadow renderer, which holds this event.
@@ -2073,7 +2165,7 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
                  f"{str(row.get('lastRunId'))[-24:]}): {len(pumps)} turn writer run(s)")
     for (sess, _run), pump in list(conn._turn_pumps.items()):
         if sess == session_key:
-            pump.queue.put_nowait(("settled", row))
+            pump.queue.put_nowait((_PUMP_SETTLED, row))
 
 
 def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
@@ -2089,7 +2181,7 @@ def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
             if pump.writer is not None:
                 pump.writer.newer_run = True
             pipe_log(f"  next run {str(run_id)[:24]}... started: run {run[:24]}... ends from the transcript")
-            pump.queue.put_nowait(("settled", None))
+            pump.queue.put_nowait((_PUMP_SETTLED, None))
 
 
 async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
@@ -2174,6 +2266,9 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 await pump.writer.hold_open()
             else:
                 spawn_background(pump.writer.show_running())
+        elif pump.cron_at is not None and (cron_run := await _hidden_cron_run(conn, sess, run, pump)) is not None:
+            pump.cron_run = cron_run
+            pump.writer = _cron_result_writer(conn, sess, run, user_id, chat_id, cron_run)
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
         else:
@@ -2186,6 +2281,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     return
                 continue
             writer = pump.writer
+            if kind == _PUMP_GAVE_UP:
+                # No recovery run came: end M as cut off (a recovery run would have taken it over).
+                if writer is not None and writer.run_id == run and not writer.closed:
+                    writer.awaiting_row = False
+                    pipe_log(f"  turn writer: {writer.message_id[:8]}... no recovery came in "
+                             f"{GATEWAY_RECOVERY_GRACE_S} s: ends as cut off")
+                    await writer.finalize(GATEWAY_LOST_RUN_NOTE)
+                    conn._turn_writers.pop((chat_id, writer.message_id), None)
+                    return
+                continue
             if kind == _PUMP_STEERED_IN:
                 if writer is not None:
                     writer.steered_into = item.get("run")
@@ -2215,6 +2320,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 # 2026.10.5 pushes no settle for a Gateway-started run (ELI-215),
                 # so its clean final ends it.
                 item = None
+            if kind == _PUMP_SETTLED and pump.cron_run is not None and not pump.terminal.is_set():
+                continue  # the row is about the session's visible runs; the hidden run goes on
             # Only the pump of the writer's current run ends it.
             if writer is not None and writer.run_id == run:
                 unjudged = (conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set()
@@ -2224,6 +2331,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                 elif writer.awaiting_row and writer.run_id == run:
+                    if unjudged:
+                        _arm_recovery_grace(conn, pump)
                     continue  # R2: the next row of the session decides again
             return
     except Exception as ex:
@@ -2237,6 +2346,112 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+async def _runs_hidden(conn: "_GatewayConnection", sess: str, run: str,
+                       at_ms: float | None = None) -> bool | None:
+    """Whether agent run `run` is a hidden cron run, None when the row cannot
+    tell. 2026.11.5 never names a hidden cron run in its session's row
+    (agent-runner-run-CheQLqEU.mjs:3645-3648), active or last. Any other run
+    is in the row's `activeRunIds` from its first event, and stays its
+    `lastRunId` once over. The chat's reply can still show active when the
+    cron run's first event comes (its settle follows): a row naming that run
+    tells; an active row naming none does not. Nor does a row sampled before
+    the run's first event at `at_ms` (a cached row keeps its `snapshotAt`)."""
+    try:
+        row = (await conn.send_request("sessions.describe", {"key": sess}, timeout=10)).get("session") or {}
+    except Exception as ex:
+        pipe_log(f"  turn writer: row read for run {run[:24]}...'s kind failed: {ex!r}; an ordinary run")
+        return False
+    active = row.get("activeRunIds") or []
+    if run in active or row.get("lastRunId") == run:
+        return False
+    sampled = row.get("snapshotAt")
+    if at_ms is not None and isinstance(sampled, (int, float)) and sampled < at_ms:
+        return None
+    return None if row.get("hasActiveRun") and not active else True
+
+
+async def _hidden_cron_run(conn: "_GatewayConnection", sess: str, run: str, pump: "_RunPump") -> dict | None:
+    """The cron run that `run` executes, None for an ordinary run. While the
+    row cannot tell and a cron job into `sess` runs, the row is read again on
+    the run's next event or the session's settle; what came meanwhile stays
+    queued first, in order."""
+    held: list = []
+    try:
+        if (hidden := await _runs_hidden(conn, sess, run, pump.cron_at)) is None and (
+                conn._open_cron_run(sess, pump.cron_at) is None
+                and not await _running_cron_jobs(conn, sess, run, pump.cron_at)):
+            return None
+        while hidden is None:
+            held.append(await pump.queue.get())
+            hidden = await _runs_hidden(conn, sess, run, pump.cron_at)
+        return await _cron_run_of(conn, sess, run, pump.cron_at) if hidden else None
+    finally:
+        rest = [pump.queue.get_nowait() for _ in range(pump.queue.qsize())]
+        for item in held + rest:
+            pump.queue.put_nowait(item)
+
+
+async def _running_cron_jobs(conn: "_GatewayConnection", sess: str, run: str, at_ms: float) -> list:
+    """`(runningAtMs, job id)` of each job into `sess` that `cron.list` shows
+    running since before `at_ms` and no other run took, oldest first."""
+    try:
+        jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
+    except Exception as ex:
+        pipe_log(f"  turn writer: cron.list for hidden run {run[:24]}... failed: {ex!r}")
+        return []
+    taken = {(r["job"], r["start"]) for r in conn._cron_runs.get(sess) or []
+             if r.get("agent_run") not in (None, run)}
+    return sorted((j["state"]["runningAtMs"], j["id"]) for j in jobs or []
+                  if j.get("sessionTarget") == f"session:{sess}"
+                  and isinstance((j.get("state") or {}).get("runningAtMs"), (int, float))
+                  and j["state"]["runningAtMs"] <= at_ms
+                  and (j["id"], j["state"]["runningAtMs"]) not in taken)
+
+
+async def _cron_run_of(conn: "_GatewayConnection", sess: str, run: str, at_ms: float) -> dict | None:
+    """The cron run hidden run `run`, first seen at `at_ms`, executes: a heard
+    one, else the oldest job into `sess` that `cron.list` shows running since
+    before `at_ms` and no other run took. Recorded, so its `finished` lands."""
+    heard = conn.claim_cron_run(sess, run, at_ms)
+    if heard is not None:
+        return heard
+    running = await _running_cron_jobs(conn, sess, run, at_ms)
+    if not running:
+        pipe_log(f"  turn writer: hidden run {run[:24]}... has no running cron job; an ordinary run")
+        return None
+    start, job = running[0]
+    cron_run = conn.adopt_cron_run(sess, job, start, run)
+    spawn_background(_note_cron_run_finished(conn, cron_run))
+    return cron_run
+
+
+async def _give_up_on_recovery(pump: "_RunPump") -> None:
+    """After the grace, tell the pump no recovery run came (it ignores this if one took M over)."""
+    await asyncio.sleep(GATEWAY_RECOVERY_GRACE_S)
+    pump.queue.put_nowait((_PUMP_GAVE_UP, None))
+
+
+def _arm_recovery_grace(conn: "_GatewayConnection", pump: _RunPump) -> None:
+    """Once per pump: the Gateway that restarted does not continue a crash (2026.11.5+), and it may push
+    no row for the session either, so a reply left open waits only the grace for a recovery run."""
+    if pump.grace_armed or pump.wake or resumes_a_crash(conn.gateway_version):
+        return
+    pump.grace_armed = True
+    spawn_background(_give_up_on_recovery(pump))
+
+
+def _cron_result_writer(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
+                        chat_id: str, cron_run: dict) -> "_TurnWriter":
+    """The writer of a hidden 2026.11.5 cron run: its message is the cron run's,
+    so the result found from chat.history alone names the same one."""
+    mid = turn_message_id(sess, cron_execution_id(cron_run["job"], cron_run["start"]), chat_id)
+    writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
+                         run_id=run, message_id=mid)
+    writer.cron_run = cron_run
+    conn._turn_writers[(chat_id, mid)] = writer
+    return writer
 
 
 def _ends_on_own_final(run: str, payload) -> bool:
@@ -2450,6 +2665,13 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
                               run_id=run, message_id=message_id, takeover=True,
                               wake=dict(wake) if pump.wake else None)
     pump.writer.adopted = True
+    # An ended-while-down write claims M by the cron run's id (`_reconcile_cron_results`).
+    cron = parse_cron_execution_id(meta.get(OPENCLAW_CRON_META) or run)
+    if cron is not None:
+        # Its hidden run never shows in the row: the cron run's end ends M, not an idle row.
+        pump.cron_run = pump.writer.cron_run = conn.adopt_cron_run(session_key, *cron, run)
+        spawn_background(_note_cron_run_finished(conn, pump.cron_run))
+        spawn_background(_end_adopted_cron_run(pump))
     conn._turn_writers[(chat_id, message_id)] = pump.writer
     pump.task = spawn_background(_turn_pump_loop(conn, session_key, run, (user_id, chat_id), pump))
     spawn_background(conn.ensure_message_subscription(session_key))
@@ -2466,8 +2688,30 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
         return "adopted"
     row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
     if row is not None and not row.get("hasActiveRun"):
-        pump.queue.put_nowait(("settled", row))
+        pump.queue.put_nowait((_PUMP_SETTLED, row))
     return "adopted"
+
+
+async def _end_adopted_cron_run(pump: "_RunPump") -> None:
+    """Wake an adopted cron run's pump once the cron run ended (its `finished`
+    event, its result, or `cron.runs`): the pump then ends M with the result."""
+    await pump.cron_run["ended"].wait()
+    pump.terminal.set()
+    pump.queue.put_nowait((_PUMP_SETTLED, {"status": "done", "hasActiveRun": False}))
+
+
+async def _note_cron_run_finished(conn: "_GatewayConnection", cron_run: dict) -> None:
+    """Mark an adopted cron run ended when `cron.runs` already holds its
+    finish (it may have finished before this process heard events)."""
+    try:
+        runs = (await conn.send_request("cron.runs", {"id": cron_run["job"], "limit": 20},
+                                        timeout=15)).get("entries")
+    except Exception as ex:
+        pipe_log(f"  turn writer: cron.runs for adopted cron job {cron_run['job'][:8]}... failed: {ex!r}")
+        return
+    if any(e.get("action") == _CRON_FINISHED and e.get("runAtMs") == cron_run["start"]
+           for e in runs or []):
+        cron_run["ended"].set()
 
 
 async def _turn_after_hello(conn: "_GatewayConnection") -> None:
@@ -2475,6 +2719,9 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
     for writer in list(conn._turn_writers.values()):
         if writer.pending_resume:
             await writer.on_hello()
+    for pump in list(conn._turn_pumps.values()):
+        if conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set():
+            _arm_recovery_grace(conn, pump)
     await _turn_resync(conn, skip=set(conn.active_run_snapshot))
     await _wake_resync(conn)
 
@@ -3190,6 +3437,9 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")
+    # Each chat's last write before this process adopts anything: an adopted
+    # writer's own saves are no proof that a result reached Open WebUI.
+    written_before = {chat_id: await _chat_written_at(chat_id) for chat_id in {c for c, _ in stubs}}
     # One at a time: SQLite rejects concurrent chat writes.
     counts: dict = {}
     for chat_id, stub_id in stubs:
@@ -3200,7 +3450,7 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {counts}")
     try:
-        await _reconcile_ended_while_down(conn, agent_id)
+        await _reconcile_ended_while_down(conn, agent_id, written_before)
     except Exception as ex:
         pipe_log(f"  ended-while-down reconcile failed: {ex!r}")
 
@@ -3233,7 +3483,19 @@ def _settled_run_span(history: dict, run_id: str) -> list | None:
     return None
 
 
-async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str) -> None:
+async def _chat_written_at(chat_id: str) -> int | None:
+    """The chat's `updated_at` (seconds), None when it cannot be read."""
+    try:
+        from open_webui.models.chats import Chats
+        chat = await Chats.get_chat_by_id(chat_id)
+    except Exception as ex:
+        pipe_log(f"  chat {chat_id[:8]}...'s last write could not be read: {ex!r}")
+        return None
+    return int(getattr(chat, "updated_at", 0) or 0) if chat is not None else None
+
+
+async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str,
+                                     written_before: dict | None = None) -> None:
     """ELI-94 (agent-turns.md case 4): a graceful stop saves a reply `done:
     true`, and its run closes while Open WebUI is down. Chats whose session
     `updatedAt` is newer than their `updated_at` get those runs rebuilt."""
@@ -3256,6 +3518,8 @@ async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str)
         if chat is None or chat.user_id != user_id:
             continue
         written = int(getattr(chat, "updated_at", 0) or 0)
+        if (written_before or {}).get(chat_id) is not None:
+            written = written_before[chat_id]
         if int(updated // 1000) <= written:
             continue
         fixed += await _reconcile_chat_ended_runs(conn, key, chat_id, written,
@@ -3273,11 +3537,18 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
     less than the transcript. `lastRunId` counts as closed at `settled_ms`
     (the embedded runtime writes no closer). Returns how many."""
     from open_webui.models.chats import Chats
-    if await _owui_chat_has_live_task(chat_id):
+    live = await _owui_chat_has_live_task(chat_id)
+    if live and not hides_cron_run_output(conn.gateway_version):
         return 0  # a reply is streaming: its own request finishes it
     hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
                                       timeout=ORPHAN_HISTORY_TIMEOUT_S)
     messages = (hist or {}).get("messages") or []
+    # A cron result has a message of its own, which no request writes (an
+    # adopted writer's task is no reason to skip it); one still open is skipped.
+    cron_fixed = (await _reconcile_cron_results(conn, session_key, chat_id, written, messages)
+                  if hides_cron_run_output(conn.gateway_version) else 0)
+    if live:
+        return cron_fixed  # a reply is streaming: its own request finishes it
     closed = _history_closed_runs(messages)
     if last_run and settled_ms and last_run not in {r for r, _ms in closed}:
         closed.append((last_run, settled_ms))
@@ -3332,6 +3603,59 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
         pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "
                  f"{len(runs)} run(s) ({len(text)} chars, {cards} tool card(s), "
                  f"held {held_cards}) (ELI-94)")
+        fixed += 1
+    return fixed + cron_fixed
+
+
+async def _reconcile_cron_results(conn: "_GatewayConnection", session_key: str, chat_id: str,
+                                  written: int, messages: list) -> int:
+    """2026.11.5: a cron run that ended while Open WebUI was down left its
+    reply only as an `automation-result` message. Write it into the cron
+    run's message: a new one, or after what a stopped writer saved (its tool
+    cards). A message that already holds the result is left alone. Returns
+    how many were written."""
+    from open_webui.models.chats import Chats
+    user_id = session_key.rsplit("openwebui-", 1)[-1][:36]
+    fixed = 0
+    for message in messages:
+        execution = cron_result_execution(message)
+        at = message.get("timestamp") if isinstance(message, dict) else None
+        if execution is None or not isinstance(at, (int, float)) or int(at // 1000) <= written:
+            continue  # committed while Open WebUI still wrote this chat: its writer showed it
+        result = _history_renderer([message])
+        result_text = result.text.strip()
+        if not _relay_content_is_showable(result_text):
+            continue
+        mid = turn_message_id(session_key, execution, chat_id)
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            if chat is None:
+                return fixed
+            current = (((chat.chat or {}).get("history") or {}).get("messages") or {}).get(mid)
+            if current is None:
+                claim = await _claim_turn_message(chat_id, user_id, mid, execution, conn.writer_id)
+                if not claim["claimed"]:
+                    continue
+                current = claim["messages"][mid]
+            elif (current.get("role") != _ASSISTANT_ROLE or current.get("done") is not True
+                  or _ended_by_stop(current)):
+                continue  # still generating (the ELI-90 pass owns it), or stopped by the user
+            held_text = _coerce_text(current.get("content")).strip()
+            if result_text in held_text:
+                continue  # written already
+            text = held_text + _message_boundary_separator(held_text, result_text) + result_text \
+                if held_text else result_text
+            output = [*copy.deepcopy(current.get("output") or []), *result.finished_output()]
+            if await _owui_upsert_message(
+                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
+                pipe_log(f"  ended-while-down cron result {mid[:8]}... in chat {chat_id[:8]}...: "
+                         "Open WebUI did not save the write")
+                continue
+        await _relay_emit_event(user_id, chat_id, mid, {"type": "chat:completion", "data": {"output": output}})
+        if getattr(conn._valves(), "PUBLISH_CHAT_FINISHED", False):
+            await _publish_chat_finished(chat_id, mid, user_id)
+        pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: cron run "
+                 f"{execution[:24]}...'s result written ({len(result_text)} chars)")
         fixed += 1
     return fixed
 
