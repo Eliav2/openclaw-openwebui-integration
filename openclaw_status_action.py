@@ -3245,17 +3245,34 @@ class _GatewayConnection:
         run["agent_run"] = run_id
         return run
 
+    def _open_cron_run(self, session_key: str, at_ms: float) -> dict | None:
+        """The oldest heard cron run into `session_key` that no agent run
+        claimed and that ran at `at_ms`: started by then, not finished before
+        (it may have finished since)."""
+        return next((r for r in self._cron_runs.get(session_key) or []
+                     if r.get("agent_run") is None and r["start"] <= at_ms
+                     and (not r["ended"].is_set() or r["end"] is None or at_ms <= r["end"])), None)
+
+    def may_execute_cron_run(self, session_key: str, run_id: str, at_ms) -> bool:
+        """Whether agent run `run_id`, first seen at the event time `at_ms`,
+        could be a cron run's: one into its session is open. Only a Gateway
+        event time counts: a receive time can come after a later job's start."""
+        if not isinstance(at_ms, (int, float)) or isinstance(at_ms, bool):
+            return False
+        return (any(r.get("agent_run") == run_id for r in self._cron_runs.get(session_key) or [])
+                or self._open_cron_run(session_key, at_ms) is not None)
+
     def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
         """The heard cron run into `session_key` that agent run `run_id`, first
-        seen at `at_ms`, executes: its own claim, else the oldest unclaimed one
-        started by then and not finished. Runs queued in one session's lane
-        start in order, so the oldest is this one's."""
-        runs = self._cron_runs.get(session_key) or []
-        mine = next((r for r in runs if r.get("agent_run") == run_id), None)
+        seen at `at_ms`, executes: its own claim, else the oldest open one.
+        Call it only for a run known hidden (`_runs_hidden`): an ordinary run
+        queued in the lane would take a later job's record. Cron runs queued
+        in one session's lane start in order, so the oldest is this one's."""
+        mine = next((r for r in self._cron_runs.get(session_key) or []
+                     if r.get("agent_run") == run_id), None)
         if mine is not None:
             return mine
-        run = next((r for r in runs if r.get("agent_run") is None and r["start"] <= at_ms
-                    and not r["ended"].is_set()), None)
+        run = self._open_cron_run(session_key, at_ms)
         if run is not None:
             run["agent_run"] = run_id
         return run

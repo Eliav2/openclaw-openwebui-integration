@@ -18107,6 +18107,22 @@ class CronResultTurnTests(_RoutingCase):
         await super().asyncSetUp()
         self.conn.gateway_version = "2026.11.5"
         self.history = {"messages": []}
+        # The session row: 2026.11.5 shows an ordinary run as active and then
+        # as last; a hidden cron run never.
+        self.row = {"hasActiveRun": False, "activeRunIds": [], "lastRunId": "r-earlier"}
+        self.history_fails = 0
+        plain = self.conn.send_request
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.describe":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"session": copy.deepcopy(test.row)}
+            if method == "chat.history" and test.history_fails:
+                test.history_fails -= 1
+                raise GatewayError("chat.history: connection reset")
+            return await plain(method, params, timeout)
+        self.conn.send_request = send_request
 
     def cron(self, action, job=None, start=None, **extra):
         job, start = job or self.JOB, start or self.START
@@ -18239,6 +18255,73 @@ class CronResultTurnTests(_RoutingCase):
         m = self.owui.msgs()[mid]
         self.assertEqual((m["content"].strip(), m["done"]), ("E2E_HOLD_END", True))
         self.assertEqual([i["type"] for i in m["output"]][0], "function_call")
+
+    async def test_an_ordinary_run_queued_in_the_lane_does_not_take_the_cron_run(self):
+        """Review on #405: a run queued ahead of the cron run (sessions_send, a command's
+        notice) starts after the job's `started` event. The row shows it active, so it is
+        written as an ordinary run, and the cron run's own run takes the cron run."""
+        other = "0b0b0b0b-0000-4000-8000-00000000000b"
+        self.cron("started")
+        self.row = {"hasActiveRun": True, "activeRunIds": [other], "lastRunId": "r-earlier"}
+        self.history = _turn_history(run=other)
+        await self.run_turn(other)
+        self.assertNotIn(self.message_of(), self.new_messages())
+        self.assertIn(turn_message_id(self.key, other, self.CHAT), self.new_messages())
+        self.row = {"hasActiveRun": False, "activeRunIds": [], "lastRunId": other}
+        self.hidden_run(self.RUN, self.START)
+        await self.spin()
+        self.history = {"messages": [self.result("E2E_WAKE_CHAT")]}
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        self.assertEqual(self.new_messages()[self.message_of()]["content"].strip(), "E2E_WAKE_CHAT")
+
+    async def test_a_short_ordinary_run_already_over_is_not_taken_for_the_cron_run(self):
+        """Over before its row was read: the row names it last."""
+        other = "0c0c0c0c-0000-4000-8000-00000000000c"
+        self.cron("started")
+        self.row = {"hasActiveRun": False, "activeRunIds": [], "lastRunId": other}
+        self.history = _turn_history(run=other)
+        await self.run_turn(other)
+        self.assertNotIn(self.message_of(), self.new_messages())
+
+    async def test_an_event_without_a_gateway_time_never_claims_a_cron_run(self):
+        """Review on #405: a receive time can come after a later job's start."""
+        self.cron("started")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"stream": "run_status", "data": {"phase": "x"}}))
+        await self.spin()
+        self.assertIsNone(self.conn._cron_runs[self.key][0]["agent_run"])
+        self.assertNotIn("sessions.describe", [m for m, _ in self.sent])
+
+    async def test_a_result_ending_in_a_question_is_shown_once_after_the_answer(self):
+        """Review on #405: the answer's input run ends M again (`end`); the result is
+        rendered once, so it is not added after the answer."""
+        self.cron("started")
+        self.cron("finished", durationMs=1011)
+        self.history = {"messages": [self.result("Which color?")]}
+        writer = openclaw_pipe._cron_result_writer(self.conn, self.key, self.RUN, self.USER, self.CHAT,
+                                                   self.conn._cron_runs[self.key][0])
+        await writer._adopt_cron_result()
+        writer.adopt("msg-input-run")  # the answer's run continues M
+        await writer._adopt_cron_result()
+        await self.spin()
+        self.assertEqual(writer.renderer.text.count("Which color?"), 1, writer.renderer.text)
+
+    async def test_a_failed_read_at_the_end_leaves_the_result_to_finalizes_read(self):
+        """Review on #405: chat.history failed once at the run's end; finalize's own read
+        brings the result."""
+        self.cron("started")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 700, "stream": "run_status",
+                                                      "data": {"phase": "starting_model"}}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 800, **_tool("start", tcid="toolu_1")}))
+        await self.spin()
+        self.history = {"messages": [self.result("E2E_HOLD_END")]}
+        self.history_fails = 1
+        self.hidden_run(self.RUN, self.START)
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        m = self.new_messages()[self.message_of()]
+        self.assertEqual((m["content"].strip(), m["done"]), ("E2E_HOLD_END", True))
+        self.assertEqual(m["content"].count("E2E_HOLD_END"), 1)
 
     async def test_before_2026_11_5_a_cron_run_is_an_ordinary_agent_run(self):
         """2026.11.3 streams a cron run like any agent run: its message is its run's."""
