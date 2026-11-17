@@ -1015,8 +1015,8 @@ class _TurnWriter:
                       and self.cron_run is None and not self.silent_announce
                       and steers_mid_run_messages(self.conn.gateway_version)):
                     self.steered_message = True
-                if (payload.get("stream") == "lifecycle" and data.get("phase") == "end"
-                        and (data.get("terminalReply") or {}).get("disposition") == "silent"
+                if (payload.get("stream") == _STREAM_LIFECYCLE and data.get("phase") == _PHASE_END
+                        and (data.get("terminalReply") or {}).get("disposition") == _DISPOSITION_SILENT
                         and parse_announce_run_id(payload.get("runId")) is not None):
                     # 2026.11.5 writes nothing of a silent reply (no NO_REPLY delta): its final carries no
                     # message either, like a steered message's, so the run's own end says which it is.

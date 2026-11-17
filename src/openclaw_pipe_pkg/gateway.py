@@ -679,6 +679,8 @@ _PUMP_GAVE_UP = "gave_up"
 _PUMP_SETTLED = "settled"  # the session went idle: its row
 _CHAT_FINAL = "final"
 _PHASE_END = "end"
+_STREAM_LIFECYCLE = "lifecycle"
+_DISPOSITION_SILENT = "silent"  # `terminalReply.disposition` of a run that ended with a silent reply
 
 
 def _settle_ref(run_id: str) -> dict | None:
