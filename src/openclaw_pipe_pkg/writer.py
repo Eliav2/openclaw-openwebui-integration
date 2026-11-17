@@ -3036,6 +3036,8 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         stub = msgs.get(stub_id) or {}
         if stub.get("role") != "assistant" or stub.get("done") is not False:
             return "skip"  # gone or finished meanwhile
+        if _pending_owns(stub):
+            return "skip"  # kept for a Gateway that is down: the pending worker delivers it (ELI-504)
         if _ended_by_stop(stub):
             # Stopped by the user: closed as it is, never rebuilt.
             async with conn._chat_write_lock(chat_id):

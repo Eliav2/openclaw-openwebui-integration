@@ -20,9 +20,10 @@ PIPE_RUN_REPLY = "reply"
 _PIPE_RUN_RE = re.compile(rf"^msg-(?P<chat>{_UUID_RE})-(?P<message>{_UUID_RE})-(?P<rest>.+)$")
 
 
-def pipe_run_id(chat_id: str, message_id: str, kind: str | None = None) -> str:
-    """Run id for a pipe run writing into `message_id`; `_run_id_sent_at` reads the trailing time."""
-    return f"msg-{chat_id}-{message_id}-{kind + '-' if kind else ''}{time.time()}"
+def pipe_run_id(chat_id: str, message_id: str, kind: str | None = None, at: float | None = None) -> str:
+    """Run id for a pipe run writing into `message_id`; `_run_id_sent_at` reads the trailing time.
+    `at` is the send time: a message kept for later sends again under its first id (ELI-504)."""
+    return f"msg-{chat_id}-{message_id}-{kind + '-' if kind else ''}{time.time() if at is None else at}"
 
 
 def parse_pipe_run_id(run_id: str) -> dict | None:

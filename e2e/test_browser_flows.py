@@ -30,6 +30,9 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "screenshots"))
 import capture  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(__file__))
+import gateway_ctl  # noqa: E402
+
 TURN_MS = 120_000
 
 
@@ -651,6 +654,32 @@ def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page, token):
     # until its end, which the Pipe writes from the run's transcript.
     _wait(page, _reply_js(0, f"r.text.includes({json.dumps(run)})"), "the running reply whole", 30_000)
     _both_answered(page, token, run, "BROWSER_DROP_ANSWER")
+
+
+@pytest.mark.skipif(not gateway_ctl.available(), reason="needs the e2e stack's own Gateway (E2E_GATEWAY_PID_FILE)")
+def test_a_message_sent_while_the_gateway_is_down_waits_in_its_bubble_and_is_answered_there(page):
+    """ELI-504: with the Gateway stopped, the message is in the chat and its reply says it waits
+    for the gateway, with no error. Once the Gateway is back, the answer arrives in that same
+    bubble with no reload, and says when the message was sent."""
+    gateway_ctl.stop()
+    try:
+        capture.new_chat(page)
+        capture.send(page, "E2E_ECHO: BROWSER_KEPT")
+        # The Pipe waits out its reconnect window (2 minutes) before it keeps the message.
+        _wait(page, _reply_js(0, "r.text.includes('Waiting for the gateway')"),
+              "the reply saying it waits for the gateway", 240_000)
+        assert "Gateway connection error" not in _replies(page)[0]["text"], _replies(page)[0]["text"]
+        assert page.evaluate(f"() => {_user_message_js('BROWSER_KEPT')}"), "the message is in the chat"
+    finally:
+        gateway_ctl.start()
+    _wait(page, _reply_js(0, "r.done && r.text.includes('BROWSER_KEPT')"), "the answer in the waiting bubble",
+          240_000)
+    replies = _replies(page)
+    assert len(replies) == 1, [r["text"][-80:] for r in replies]
+    assert "Waiting for the gateway" not in replies[0]["text"], replies[0]["text"]
+    assert "Sent at" in replies[0]["text"], replies[0]["text"]
+    _reload(page)
+    _wait(page, _reply_js(0, "r.done && r.text.includes('BROWSER_KEPT')"), "the answer after a reload", 60_000)
 
 
 def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):

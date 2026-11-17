@@ -127,6 +127,8 @@ SHARDS = {
         f"{E2E}::test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start",
         f"{E2E}::test_a_plain_redeploy_mid_reply_leaves_the_reply_whole",
         f"{E2E}::test_a_cancelled_chat_write_leaves_the_database_writable",
+        f"{E2E}::test_messages_sent_while_the_gateway_is_down_wait_in_the_chat_and_arrive_in_order_once",
+        f"{BROWSER}::test_a_message_sent_while_the_gateway_is_down_waits_in_its_bubble_and_is_answered_there",
         f"{BROWSER}::test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once",
         f"{BROWSER}::test_a_message_queued_behind_a_run_waits_out_a_socket_drop",
     ],

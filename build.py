@@ -65,7 +65,7 @@ PIPE = Artifact(
     frontmatter=ROOT / "src" / "frontmatter.txt",
     out=ROOT / "openclaw_pipe.py",
     module_order=("_prelude", "identity", "state", "turns", "thinking", "media", "images", "emit",
-                  "composer", "composer_watch", "askuser", "approvals", "gateway", "errors", "writer", "models",
+                  "composer", "composer_watch", "askuser", "approvals", "gateway", "errors", "writer", "pending", "models",
                   "history", "filecontext", "slash_prompts", "channels", "pipe"),
 )
 

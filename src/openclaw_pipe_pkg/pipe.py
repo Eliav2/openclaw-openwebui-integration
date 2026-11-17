@@ -161,7 +161,8 @@ class _TurnState:
     `unsent`: accepted user messages not yet sent. `run_id` / `queue`: the run
     being consumed. `waiting`: earlier cancelled replies whose messages are in
     `unsent`, each ended with a note once those are sent or dropped (ELI-188).
-    `handed_over`: the turn writer took the message over.
+    `handed_over`: the turn writer took the message over. `deferred`: the Gateway
+    was unreachable, so the message waits in the chat for the pending worker (ELI-504).
     """
     conn: object = None
     session_key: str | None = None
@@ -170,6 +171,7 @@ class _TurnState:
     waiting: list = field(default_factory=list)
     status_open: bool = False
     handed_over: bool = False
+    deferred: bool = False
     unsent: list = field(default_factory=list)
     attachments: list = field(default_factory=list)
     run_id: str | None = None
@@ -501,6 +503,7 @@ class Pipe:
         # watchers after an Open WebUI restart or redeploy.
         _ensure_composer_watcher(lambda: self.valves)
         _ensure_orphan_reconcile(lambda: self.valves)
+        _ensure_pending_delivery(self)
         _ensure_channel_watcher(lambda: self.valves)
         _ensure_slash_prompts(lambda: self.valves, force=True)
         models, source = await _discover_models_with_source(self.valves)
@@ -736,6 +739,8 @@ class Pipe:
                 # Open WebUI ended the request with this reply's status line
                 # open and nobody else owns the message, so nothing would close
                 # it (ELI-200). See `_close_reply_status`.
+                if turn.deferred:
+                    return  # waiting for the Gateway: its status line stays open
                 if ((turn.status_open or _task.cancelled()) and not turn.parked
                         and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
@@ -825,6 +830,7 @@ class _PipeTurn:
         self.ended = False
         self._our_run_id = None
         self.system_note = ""
+        self.pending_sent_at = None
         # The final status lines, shown unsaved until the end snapshot saves them.
         self.final_statuses = []
 
@@ -865,6 +871,8 @@ class _PipeTurn:
             _start_file_server()
         else:
             _stop_file_server()
+        # A message that waited for the Gateway runs again with its first send time (ELI-504).
+        self.pending_sent_at = (self.__metadata__ or {}).get(PENDING_REPLAY_META)
         preset = self.pipe._selected_preset(self.body)
         self.model_override = self.pipe._model_override_for_preset(preset)
 
@@ -944,6 +952,7 @@ class _PipeTurn:
             )
 
         _ensure_orphan_reconcile(lambda: self.pipe.valves)
+        _ensure_pending_delivery(self.pipe)
         # Follows the channel threads again after an Open WebUI restart.
         _ensure_channel_watcher(lambda: self.pipe.valves)
         await _emit_status(self.__event_emitter__, "Thinking...", done=False)
@@ -964,12 +973,20 @@ class _PipeTurn:
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 
         try:
+            if self.pending_sent_at is None and await self.queued_behind_pending():
+                raise GatewayError("an earlier message of this chat still waits for the gateway",
+                                   error={"code": PENDING_BEHIND_CODE})
             self.conn = await _get_gateway_connection(lambda: self.pipe.valves)
         except GatewayError as e:
             await _emit_status(self.__event_emitter__, "", done=True)
+            if await self.defer_for_gateway(e):
+                self.ended = True
+                return
             yield f"**Gateway connection error:** {e}"
             self.ended = True
             return
+        if self.pending_sent_at is not None:
+            yield pending_sent_note(self.pending_sent_at, pending_lang(self.__metadata__)) + "\n\n"
 
 
         if self.__metadata__:
@@ -1032,6 +1049,8 @@ class _PipeTurn:
         # it is added when the message goes out, and to a resume.
         self.system_note = "" if self.channel_id else await _system_prompt_note(
             self.__metadata__ or {}, self.owui_origin_chat_id, self.owui_origin_user_id)
+        if self.pending_sent_at is not None:
+            self.system_note += pending_agent_note(self.pending_sent_at)
         if not self.channel_id and self.owui_origin_chat_id and self.owui_origin_user_id:
             # A temporary chat's session is the Pipe's to delete once Open WebUI forgets the chat.
             spawn_background(_temporary_sessions_tend(
@@ -1270,6 +1289,47 @@ class _PipeTurn:
                 return
         self.register_target()
 
+    async def queued_behind_pending(self) -> bool:
+        """Whether an earlier message of this chat still waits for the Gateway: this one goes
+        behind it, to keep the order (ELI-504)."""
+        meta = self.__metadata__ or {}
+        return bool(self.can_defer() and await _pending_waiting(meta["chat_id"]))
+
+    def can_defer(self) -> bool:
+        """A message of a saved chat, not a channel mention or an Open WebUI background task."""
+        meta = self.__metadata__ or {}
+        chat_id = meta.get("chat_id")
+        return bool(chat_id and meta.get("message_id") and not _channel_id_of(chat_id)
+                    and not self.__task__)
+
+    async def defer_for_gateway(self, error, *, sending: bool = False) -> bool:
+        """Keep this message in the chat for the pending worker instead of showing an error:
+        its reply waits, marked, and the worker sends it once the Gateway is back (ELI-504).
+        False when it cannot wait: the error is shown as before. A kept message that meets a
+        down Gateway again goes back to waiting."""
+        if not self.can_defer() or not pending_retryable(error):
+            return False
+        if sending and (self.turn.waiting or len(self.turn.unsent) > 1):
+            return False  # several messages go as one send: shown, not kept
+        meta = self.__metadata__ or {}
+        chat_id, message_id = meta["chat_id"], meta["message_id"]
+        if self.pending_sent_at is not None:
+            await _pending_release(chat_id, message_id)
+            pipe_log(f"  pending: {message_id[:8]}... waits again ({error})")
+            return True
+        payload = _pending_payload(self.body, meta, self.__user__)
+        sent_at = pending_sent_time(meta)
+        if payload is None or not await _pending_enqueue(chat_id, message_id, payload, sent_at):
+            return False
+        await _emit_status(self.__event_emitter__, pending_status_text(pending_lang(meta)), done=False)
+        if self.turn is not None:
+            self.turn.deferred = True
+        ref = {"chat_id": chat_id, "message_id": message_id, "user_id": meta.get("user_id"),
+               "request_task_id": meta.get("task_id")}
+        spawn_background(_pending_arm_after_request(self.pipe, ref))
+        pipe_log(f"  pending: {message_id[:8]}... kept for the gateway ({error})")
+        return True
+
     def end_waiting_replies_unsent(self) -> None:
         """The send carrying `turn.waiting`'s messages failed: those replies say so."""
         _end_unsent_replies(self.conn, self.turn.waiting, sent=False, note=REPLY_SEND_FAILED_NOTE)
@@ -1355,8 +1415,11 @@ class _PipeTurn:
 
             # The OWUI message id in the run id ties a reply orphaned by a
             # restart to its run (ELI-90, `_stub_turn`).
-            def new_run_key():
-                return (pipe_run_id(self.chat_id, reply_id) if reply_id
+            def new_run_key(fresh=False):
+                # A message kept for the Gateway sends again as it first would have, so a send
+                # that did arrive is never run twice (ELI-504). A spent key is replaced.
+                return (pipe_run_id(self.chat_id, reply_id,
+                                    at=None if fresh else self.pending_sent_at) if reply_id
                         else f"msg-{self.chat_id}-{time.time()}")
             idempotency_key = new_run_key()
             # Clamp the level down to what this model supports, with a note.
@@ -1413,7 +1476,7 @@ class _PipeTurn:
                         # Committed but never published, and its key is spent (ELI-359): once
                         # more under a new key, which runs it once. A second refusal is shown.
                         self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
-                        idempotency_key = new_run_key()
+                        idempotency_key = new_run_key(fresh=True)
                         self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
                         pipe_log(f"  chat.send: {ex}; sending once more as {idempotency_key}")
                         send_params = {**send_params, "idempotencyKey": idempotency_key}
@@ -1427,12 +1490,19 @@ class _PipeTurn:
             except Exception as e:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
+                if await self.defer_for_gateway(e, sending=True):
+                    self.end_waiting_replies_unsent()
+                    self.ended = True
+                    return
                 yield _plain_error(ERROR_SEND, f"Error sending message: {e}", self.text)
                 self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             self.our_run_id = send_resp.get("runId") or idempotency_key
             pipe_log(f"Captured runId: {self.our_run_id}")
+            if self.pending_sent_at is not None:
+                # The Gateway has it: off the pending list (ELI-504).
+                await _pending_delivered(self.owui_origin_chat_id, reply_id)
             if self.our_run_id != idempotency_key:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
