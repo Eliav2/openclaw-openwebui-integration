@@ -251,6 +251,9 @@ class Demo:
     async def point_of(self, selector: str) -> tuple[float, float]:
         loc = self.page.locator(selector).first
         await loc.wait_for(state="visible", timeout=60_000)
+        # A target inside a scrolling box (the Status dialog, once its sections outgrow the screen) is brought
+        # into view first: its box lies outside the visible box otherwise, and the click lands on the backdrop.
+        await loc.scroll_into_view_if_needed()
         box = await loc.bounding_box()
         return box["x"] + min(box["width"] / 2, 60), box["y"] + box["height"] / 2
 
