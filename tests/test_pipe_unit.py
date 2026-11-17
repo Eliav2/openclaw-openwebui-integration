@@ -18111,6 +18111,7 @@ class CronResultTurnTests(_RoutingCase):
         # as last; a hidden cron run never.
         self.row = {"hasActiveRun": False, "activeRunIds": [], "lastRunId": "r-earlier"}
         self.history_fails = 0
+        self.jobs, self.cron_runs = [], []
         plain = self.conn.send_request
         test = self
 
@@ -18118,6 +18119,10 @@ class CronResultTurnTests(_RoutingCase):
             if method == "sessions.describe":
                 test.sent.append((method, copy.deepcopy(params)))
                 return {"session": copy.deepcopy(test.row)}
+            if method == "cron.list":
+                return {"jobs": copy.deepcopy(test.jobs)}
+            if method == "cron.runs":
+                return {"entries": [e for e in test.cron_runs if e["jobId"] == params.get("id")]}
             if method == "chat.history" and test.history_fails:
                 test.history_fails -= 1
                 raise GatewayError("chat.history: connection reset")
@@ -18125,9 +18130,19 @@ class CronResultTurnTests(_RoutingCase):
         self.conn.send_request = send_request
 
     def cron(self, action, job=None, start=None, **extra):
+        """A job run as 2026.11.5 shows it: `cron.list` holds its target and
+        `runningAtMs`; the `cron` event names neither (server-cron-BkJWNNVt.mjs:4300-4320)."""
         job, start = job or self.JOB, start or self.START
+        if action == "started":
+            self.jobs.append({"id": job, "sessionTarget": f"session:{self.key}",
+                              "state": {"runningAtMs": start}})
+        elif action == "finished":
+            self.jobs = [j for j in self.jobs if j["id"] != job]
+            self.cron_runs.append({"action": "finished", "jobId": job, "runAtMs": start, "status": "ok"})
+            extra = {"sessionKey": self.key, **extra}
         self.conn.note_cron_event({"jobId": job, "action": action, "runAtMs": start,
-                                   "job": {"id": job, "sessionTarget": f"session:{self.key}"}, **extra})
+                                   "job": {"id": job, "agentId": "main", "state": {"runningAtMs": start}},
+                                   **extra})
 
     def result(self, text, job=None, start=None):
         job, start = job or self.JOB, start or self.START
@@ -18289,7 +18304,7 @@ class CronResultTurnTests(_RoutingCase):
         self.cron("started")
         _turn_route_now(self.conn, self.ev(self.RUN, {"stream": "run_status", "data": {"phase": "x"}}))
         await self.spin()
-        self.assertIsNone(self.conn._cron_runs[self.key][0]["agent_run"])
+        self.assertFalse([r for r in self.conn._cron_runs.get(self.key) or [] if r.get("agent_run")])
         self.assertNotIn("sessions.describe", [m for m, _ in self.sent])
 
     async def test_a_result_ending_in_a_question_is_shown_once_after_the_answer(self):
@@ -18298,8 +18313,10 @@ class CronResultTurnTests(_RoutingCase):
         self.cron("started")
         self.cron("finished", durationMs=1011)
         self.history = {"messages": [self.result("Which color?")]}
+        cron_run = self.conn.adopt_cron_run(self.key, self.JOB, self.START, self.RUN)
+        cron_run["ended"].set()
         writer = openclaw_pipe._cron_result_writer(self.conn, self.key, self.RUN, self.USER, self.CHAT,
-                                                   self.conn._cron_runs[self.key][0])
+                                                   cron_run)
         await writer._adopt_cron_result()
         writer.adopt("msg-input-run")  # the answer's run continues M
         await writer._adopt_cron_result()

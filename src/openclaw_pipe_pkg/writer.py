@@ -1952,7 +1952,7 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
         pump = conn._turn_pumps[(sess, run)] = _RunPump()
         pump.restarts_before = conn.gateway_restarts
         if (hides_cron_run_output(conn.gateway_version) and parse_pipe_run_id(run) is None
-                and conn.may_execute_cron_run(sess, run, payload.get("ts"))):
+                and conn.may_execute_cron_run(payload.get("ts"))):
             pump.cron_at = payload["ts"]  # the pump asks the Gateway (`_runs_hidden`)
         target = conn._run_targets.get(f"{sess}:{run}")
         if target is not None:
@@ -2245,7 +2245,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             else:
                 spawn_background(pump.writer.show_running())
         elif pump.cron_at is not None and await _runs_hidden(conn, sess, run) and (
-                cron_run := conn.claim_cron_run(sess, run, pump.cron_at)) is not None:
+                cron_run := await _cron_run_of(conn, sess, run, pump.cron_at)) is not None:
             pump.cron_run = cron_run
             pump.writer = _cron_result_writer(conn, sess, run, user_id, chat_id, cron_run)
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
@@ -2325,6 +2325,34 @@ async def _runs_hidden(conn: "_GatewayConnection", sess: str, run: str) -> bool:
         return False
     return not (row.get("hasActiveRun") or run in (row.get("activeRunIds") or [])
                 or row.get("lastRunId") == run)
+
+
+async def _cron_run_of(conn: "_GatewayConnection", sess: str, run: str, at_ms: float) -> dict | None:
+    """The cron run hidden run `run`, first seen at `at_ms`, executes: a heard
+    one, else the oldest job into `sess` that `cron.list` shows running since
+    before `at_ms` and no other run took. Recorded, so its `finished` lands."""
+    heard = conn.claim_cron_run(sess, run, at_ms)
+    if heard is not None:
+        return heard
+    try:
+        jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
+    except Exception as ex:
+        pipe_log(f"  turn writer: cron.list for hidden run {run[:24]}... failed: {ex!r}")
+        return None
+    taken = {(r["job"], r["start"]) for r in conn._cron_runs.get(sess) or []
+             if r.get("agent_run") not in (None, run)}
+    running = sorted((j["state"]["runningAtMs"], j["id"]) for j in jobs or []
+                     if j.get("sessionTarget") == f"session:{sess}"
+                     and isinstance((j.get("state") or {}).get("runningAtMs"), (int, float))
+                     and j["state"]["runningAtMs"] <= at_ms
+                     and (j["id"], j["state"]["runningAtMs"]) not in taken)
+    if not running:
+        pipe_log(f"  turn writer: hidden run {run[:24]}... has no running cron job; an ordinary run")
+        return None
+    start, job = running[0]
+    cron_run = conn.adopt_cron_run(sess, job, start, run)
+    spawn_background(_note_cron_run_finished(conn, cron_run))
+    return cron_run
 
 
 def _cron_result_writer(conn: "_GatewayConnection", sess: str, run: str, user_id: str,

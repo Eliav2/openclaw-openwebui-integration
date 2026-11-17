@@ -1991,6 +1991,7 @@ class _GatewayConnection:
         self._wake_message_waiter(key)
         if key and isinstance(payload.get("message"), dict):
             self._on_user_message_committed(key, payload["message"])
+            self._note_cron_result(payload["message"])
         if _TURNS and key:
             _TURNS.session_message(self, key)
 
@@ -2103,10 +2104,12 @@ class _GatewayConnection:
         run = next((r for runs in self._cron_runs.values() for r in runs
                     if r["job"] == job_id and r["start"] == start), None)
         if run is None:
-            if payload.get("action") != "started" or not (
-                    isinstance(target, str) and target.startswith("session:")):
+            # 2026.11.5 names the session only on `finished` (`sessionKey`).
+            session = (target[len("session:"):] if isinstance(target, str) and target.startswith("session:")
+                       else payload.get("sessionKey"))
+            if payload.get("action") not in ("started", _CRON_FINISHED) or not session:
                 return
-            runs = self._cron_runs.setdefault(target[len("session:"):], [])
+            runs = self._cron_runs.setdefault(session, [])
             # `agent_run`: the hidden agent run that executes it (2026.11.5,
             # `claim_cron_run`); `ended`: set on its `finished`, which comes
             # after its result is committed (server-cron-BkJWNNVt.mjs:2983).
@@ -2118,6 +2121,15 @@ class _GatewayConnection:
             if isinstance(payload.get("durationMs"), (int, float)):
                 run["end"] = start + payload["durationMs"]
             run["ended"].set()
+
+    def _note_cron_result(self, message: dict) -> None:
+        """A cron run's `automation-result` arrived: its run is over. The
+        session's subscription brings it, unlike the session-scoped `cron`
+        event, which may not reach this connection."""
+        cron = parse_cron_execution_id(cron_result_execution(message))
+        for run in (r for runs in self._cron_runs.values() for r in runs):
+            if cron is not None and (run["job"], run["start"]) == cron:
+                run["ended"].set()
 
     def adopt_cron_run(self, session_key: str, job: str, start: int, run_id: str) -> dict:
         """The cron run an adopted message's run executes, recorded if this
@@ -2140,14 +2152,14 @@ class _GatewayConnection:
                      if r.get("agent_run") is None and r["start"] <= at_ms
                      and (not r["ended"].is_set() or r["end"] is None or at_ms <= r["end"])), None)
 
-    def may_execute_cron_run(self, session_key: str, run_id: str, at_ms) -> bool:
-        """Whether agent run `run_id`, first seen at the event time `at_ms`,
-        could be a cron run's: one into its session is open. Only a Gateway
-        event time counts: a receive time can come after a later job's start."""
-        if not isinstance(at_ms, (int, float)) or isinstance(at_ms, bool):
-            return False
-        return (any(r.get("agent_run") == run_id for r in self._cron_runs.get(session_key) or [])
-                or self._open_cron_run(session_key, at_ms) is not None)
+    @staticmethod
+    def may_execute_cron_run(at_ms) -> bool:
+        """Whether an agent run first seen at `at_ms` can be checked for a cron
+        run's: only a Gateway event time counts, since a receive time can come
+        after a later job's start. 2026.11.5's `cron` event names no session
+        (server-cron-BkJWNNVt.mjs:4300-4320), so the job is found from
+        `cron.list` once the run is known hidden (`_cron_run_of`)."""
+        return isinstance(at_ms, (int, float)) and not isinstance(at_ms, bool)
 
     def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
         """The heard cron run into `session_key` that agent run `run_id`, first
