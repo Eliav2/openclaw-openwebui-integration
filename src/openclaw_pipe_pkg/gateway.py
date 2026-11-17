@@ -676,6 +676,7 @@ _STEERED_MARKER_TYPE = "_pipe_steered"
 _PUMP_EVENT = "event"
 _PUMP_STEERED_IN = "steered_in"
 _PUMP_GAVE_UP = "gave_up"
+_PUMP_SETTLED = "settled"  # the session went idle: its row
 _CHAT_FINAL = "final"
 _PHASE_END = "end"
 

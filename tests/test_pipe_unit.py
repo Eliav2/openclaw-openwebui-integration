@@ -45,7 +45,7 @@ from openclaw_pipe import (
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
-    _turn_route_now, _turn_after_hello, _turn_resync, _history_span_messages,
+    _turn_route_now, _turn_after_hello, _turn_resync, _history_span_messages, _turn_settled,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
     _GatewayConnection,
     GatewayError,
@@ -18292,6 +18292,105 @@ class CronResultTurnTests(_RoutingCase):
         m = self.new_messages()[self.message_of()]
         self.assertEqual([i.get("type") for i in m["output"]], ["function_call", "function_call_output", "message"])
         self.assertTrue(m["content"].rstrip().endswith("E2E_HOLD_END"), m["content"])
+        self.assertIs(m["done"], True)
+
+    async def test_a_pipe_note_in_a_cron_run_stays_beside_its_result(self):
+        """A guest's secret request in a wake is cancelled with a Pipe note
+        (ELI-229); the note has no Gateway time, and the result keeps it."""
+        self.cron("started")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 800,
+                                                      **_tool("start", tcid="toolu_1", name="secrets")}))
+        await self.conn.dispatch_run_event({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.key, "runId": self.RUN, "stream": openclaw_pipe.PIPE_NOTE_STREAM,
+            "data": {"id": "msg_note_secret_q1", "text": "NEEDS_THE_OWNER"}}})
+        await self.spin()
+        self.hidden_run(self.RUN, self.START)
+        self.history = {"messages": [self.result("E2E_SECRET_RESULT no_answer")]}
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        m = self.new_messages()[self.message_of()]
+        texts = [i["content"][0]["text"] for i in m["output"] if i.get("type") == "message"]
+        self.assertEqual(texts, ["NEEDS_THE_OWNER", "E2E_SECRET_RESULT no_answer"], m["output"])
+        self.assertIs(m["done"], True)
+
+    async def test_a_cron_run_starting_as_the_chats_reply_settles_is_the_cron_run(self):
+        """The chat's reply has ended but its row still shows it active (the
+        settle comes after the cron run's first event): the row names that
+        run, not this one, so this one is the hidden cron run."""
+        self.cron("started")
+        self.row = {"hasActiveRun": True, "activeRunIds": ["r-earlier"], "lastRunId": None}
+        self.hidden_run(self.RUN, self.START)
+        await self.spin()
+        self.history = {"messages": [self.result("E2E_WAKE_CHAT")]}
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        self.assertEqual(self.new_messages()[self.message_of()]["content"].strip(), "E2E_WAKE_CHAT")
+
+    async def test_a_row_active_with_no_run_ids_is_read_again_at_the_settle(self):
+        """As 2026.11.5 showed it on CI: at the cron run's first event the row
+        is active, names no run and the chat's reply as last. It cannot tell the
+        runs apart; the settle's row can, and the run's events all land."""
+        self.cron("started")
+        self.row = {"status": "running", "hasActiveRun": True, "activeRunIds": None, "lastRunId": "r-earlier"}
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 700, "stream": "run_status",
+                                                      "data": {"phase": "preparing_workspace"}}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 800,
+                                                      **_tool("start", tcid="toolu_1", name="secrets")}))
+        await self.spin()
+        self.row = {"status": "done", "hasActiveRun": False, "activeRunIds": [], "lastRunId": "r-earlier"}
+        _turn_settled(self.conn, self.key, self.row)
+        await self.spin()
+        self.hidden_run(self.RUN, self.START)
+        self.history = {"messages": [self.result("E2E_WAKE_CHAT")]}
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        msgs = self.new_messages()
+        self.assertEqual(list(msgs), [self.message_of()], msgs)
+        m = msgs[self.message_of()]
+        self.assertEqual([i["type"] for i in m["output"]][0], "function_call", m["output"])
+        self.assertEqual((m["content"].strip().endswith("E2E_WAKE_CHAT"), m["done"]), (True, True))
+
+    async def test_an_ordinary_run_on_a_row_with_no_run_ids_stays_ordinary(self):
+        """An active row naming no run, then naming this run last: ordinary,
+        though a cron job into the session runs."""
+        other = "0d0d0d0d-0000-4000-8000-00000000000d"
+        self.cron("started")
+        self.row = {"status": "running", "hasActiveRun": True, "activeRunIds": None, "lastRunId": "r-earlier"}
+        _turn_route_now(self.conn, self.ev(other, {"ts": self.START + 700, **_delta("ORDINARY_TEXT")}))
+        await self.spin()
+        self.row = {"status": "done", "hasActiveRun": False, "activeRunIds": [], "lastRunId": other}
+        self.history = _turn_history(run=other)
+        _turn_route_now(self.conn, self.ev(other, {"ts": self.START + 900, "state": "final"}))
+        _turn_settled(self.conn, self.key, self.row)
+        await self.spin()
+        self.assertNotIn(self.message_of(), self.new_messages())
+        self.assertIn(turn_message_id(self.key, other, self.CHAT), self.new_messages())
+
+    async def test_the_settle_of_the_chats_earlier_reply_does_not_end_a_cron_message(self):
+        """The session's idle row is about its visible runs: the hidden cron
+        run goes on, and what it streams after lands in its message."""
+        self.cron("started")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 800,
+                                                      **_tool("start", tcid="toolu_1", name="secrets")}))
+        await self.spin()
+        _turn_settled(self.conn, self.key, {"status": "done", "lastRunId": "r-earlier"})
+        await self.spin()
+        await self.conn.dispatch_run_event({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.key, "runId": self.RUN, "stream": openclaw_pipe.PIPE_NOTE_STREAM,
+            "data": {"id": "msg_note_secret_q1", "text": "NEEDS_THE_OWNER"}}})
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 850,
+                                                      **_tool("result", tcid="toolu_1", name="secrets")}))
+        await self.spin()
+        self.assertIs(self.new_messages()[self.message_of()]["done"], False)
+        self.hidden_run(self.RUN, self.START)
+        self.history = {"messages": [self.result("E2E_SECRET_RESULT no_answer")]}
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        m = self.new_messages()[self.message_of()]
+        self.assertEqual([i["type"] for i in m["output"]],
+                         ["function_call", "message", "function_call_output", "message"], m["output"])
+        self.assertNotIn("the run ended first", json.dumps(m["output"]))
+        self.assertIn("NEEDS_THE_OWNER", json.dumps(m["output"]))
         self.assertIs(m["done"], True)
 
     async def test_a_successor_finishes_a_cron_message_a_retired_writer_left_open(self):

@@ -471,6 +471,15 @@ def _hides_cron_run_output() -> bool:
     return _openclaw_version() >= (2026, 11, 5)
 
 
+def _empty_reply_error() -> str:
+    """The Gateway's text for a run whose model answered nothing: 2026.11.5
+    words it as the missing-reply notice (embedded-agent-h4DBNIHG.mjs
+    resolveIncompleteTurnPayloadText, MISSING_REPLY_NOTICE_TEXT)."""
+    if _openclaw_version() >= (2026, 11, 5):
+        return "No answer was returned"
+    return "couldn't generate a response"
+
+
 def _skip_known_105_gap(issue: str, what: str) -> None:
     """A known gap of the Pipe on OpenClaw 2026.10 before 2026.10.10 (the
     pinned lane, the version live runs): skipped there under its issue, so the
@@ -2128,12 +2137,12 @@ def test_a_reply_the_agent_starts_that_errors_still_finishes(token):
     OpenClaw 2026.10.5 fails it ("Agent couldn't generate a response") and
     pushes no settle for it (its last push is `phase: error` with
     hasActiveRun true), so its message stayed generating (ELI-217). It
-    finishes with the run's error."""
+    finishes with the run's error, in the wording of the Gateway's version."""
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_AGENT_CHAT")
     key = _session_key(token, chat_id)
     _gw("agent", {"sessionKey": key, "message": "E2E_EMPTY_REPLY",
                   "idempotencyKey": f"e2e-empty-{uuid.uuid4().hex[:8]}"})
-    msgs = _wait_for(token, chat_id, ["couldn't generate a response"])
+    msgs = _wait_for(token, chat_id, [_empty_reply_error()])
     _assert_clean(token, chat_id, msgs)
 
 
