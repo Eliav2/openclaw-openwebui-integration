@@ -2293,7 +2293,8 @@ class _GatewayConnection:
                 if not waiter.done():
                     waiter.cancel()
                     if self._event_loop_task.done():
-                        raise GatewayError("gateway connection stopped while reconnecting")
+                        raise GatewayError("gateway connection stopped while reconnecting",
+                                           error={"code": GATEWAY_STOPPED_CODE})
                     raise refusal
                 error = waiter.result()
                 if error is None:
@@ -2312,7 +2313,8 @@ class _GatewayConnection:
         """Send a request and wait for the response."""
         # None while reconnecting; raise a readable error, not AttributeError.
         if self._ws is None:
-            raise GatewayError("gateway connection not ready (reconnecting)")
+            raise GatewayError("gateway connection not ready (reconnecting)",
+                               error={"code": GATEWAY_NOT_READY_CODE})
         req_id = str(self._next_req_id)
         self._next_req_id += 1
         fut = asyncio.get_running_loop().create_future()
@@ -3157,7 +3159,8 @@ class _GatewayConnection:
                 f"No response from the OpenClaw Gateway at {host}:{port} within "
                 f"{_GATEWAY_CONNECT_TIMEOUT_S:.0f}s. Check the GATEWAY_URL valve, "
                 "and that the Open WebUI backend can reach that host (Open WebUI "
-                "resolves it, not your browser)."
+                "resolves it, not your browser).",
+                error={"code": GATEWAY_TIMEOUT_CODE},
             )
         except (OSError, ValueError, websockets.exceptions.WebSocketException) as ex:
             # WebSocketException is not an OSError (a non-Gateway answering).
@@ -3450,7 +3453,8 @@ class _GatewayConnection:
                 pass
             self._reconnect_now.clear()
             if self._stopped:
-                self._answer_reconnect_waiters(GatewayError("gateway connection stopped"))
+                self._answer_reconnect_waiters(
+                    GatewayError("gateway connection stopped", error={"code": GATEWAY_STOPPED_CODE}))
                 return
             try:
                 await self._connect_once_started()
@@ -4209,6 +4213,12 @@ RETRYABLE_REFUSAL_WAIT_S = 30
 # Wait for a restarting Gateway that refuses connections.
 GATEWAY_DOWN_WAIT_S = 120
 GATEWAY_REFUSED_CODE = "connection-refused"
+# Connect failures that waiting can fix (ELI-504): a message meeting one is kept for later.
+GATEWAY_TIMEOUT_CODE = "connect-timeout"
+GATEWAY_NOT_READY_CODE = "not-ready"
+GATEWAY_STOPPED_CODE = "stopped"
+GATEWAY_UNREACHABLE_CODES = frozenset({GATEWAY_REFUSED_CODE, GATEWAY_TIMEOUT_CODE,
+                                       GATEWAY_NOT_READY_CODE, GATEWAY_STOPPED_CODE})
 
 
 async def _connect_response(ws, req_id: str, timeout: float = 10) -> dict:

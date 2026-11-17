@@ -30,6 +30,7 @@ import uuid
 
 import pytest
 
+import gateway_ctl
 import transcript_scan
 
 pytestmark = pytest.mark.skipif(
@@ -84,6 +85,25 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
     request, as the browser adds them (`params` for Advanced Params).
     `created`: gets a new chat's id as soon as it exists, for a turn run in a
     thread."""
+    chat_id, aid = _send_turn(token, prompt, model, chat_id, extra, created, folder_id)
+    deadline = time.time() + TURN_TIMEOUT_S
+    msg: dict = {}
+    while time.time() < deadline:
+        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+        assert status == 200, f"chat read failed: {status} {got}"
+        msg = got["chat"]["history"]["messages"].get(aid, {})
+        if msg.get("done"):
+            return chat_id, msg
+        time.sleep(1.5)
+    pytest.fail(f"turn did not finish within {TURN_TIMEOUT_S:.0f}s; last saved state: "
+                f"{json.dumps(msg)[:1500]}")
+
+
+def _send_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
+               chat_id: str | None = None, extra: dict | None = None,
+               created: list | None = None, folder_id: str | None = None) -> tuple[str, str]:
+    """(chat id, assistant message id) of a turn as the browser sends it, once Open WebUI
+    accepted it: the reply is in the persisted chat from then on."""
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     if chat_id:
@@ -133,18 +153,7 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
     # With a chat_id Open WebUI runs the turn as a background task and returns
     # an ack at once; the reply only exists in the persisted chat.
     assert status == 200, f"completion request failed: {status} {ack}"
-
-    deadline = time.time() + TURN_TIMEOUT_S
-    msg: dict = {}
-    while time.time() < deadline:
-        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
-        assert status == 200, f"chat read failed: {status} {got}"
-        msg = got["chat"]["history"]["messages"].get(aid, {})
-        if msg.get("done"):
-            return chat_id, msg
-        time.sleep(1.5)
-    pytest.fail(f"turn did not finish within {TURN_TIMEOUT_S:.0f}s; last saved state: "
-                f"{json.dumps(msg)[:1500]}")
+    return chat_id, aid
 
 
 def test_both_functions_installed_and_active(token):
@@ -1504,6 +1513,100 @@ def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
     gave_up = [line for line in _pipe_log_since(since).splitlines()
                if "sessions.messages.subscribe" in line and " failed: " in line]
     assert not gave_up, f"transcript subscriptions given up after the restart: {gave_up[:3]}"
+
+
+def _chat_pending_ids(token: str, chat_id: str) -> list:
+    """The chat's list of messages waiting for the Gateway (ELI-504), in order."""
+    status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    assert status == 200, got
+    return [e["id"] for e in (got.get("meta") or {}).get("openclaw_pending") or []]
+
+
+def _is_kept(token: str, chat_id: str, message_id: str) -> bool:
+    """The reply waits for the Gateway: marked, unfinished, and its status says so."""
+    msg = _chat_messages(token, chat_id).get(message_id) or {}
+    return ((msg.get("meta") or {}).get("delivery") == "pending" and msg.get("done") is False
+            and bool((msg.get("meta") or {}).get("pending_armed")))
+
+
+def _model_turns_with(marker: str) -> list:
+    """The fake model's requests whose current turn holds `marker`, in the order they came."""
+    out = []
+    with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
+        for line in f:
+            messages = (json.loads(line).get("request") or {}).get("messages") or []
+            last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"
+                        and not m.get("tool_calls")), default=-1)
+            if marker in "\n".join(_content_text(m.get("content")) for m in messages[last + 1:]
+                                   if m.get("role") == "user"):
+                out.append(line)
+    return out
+
+
+@pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None or shutil.which("docker") is None,
+                    reason="needs the e2e stack's Gateway (E2E_GATEWAY_PID_FILE) and Open WebUI container")
+def test_messages_sent_while_the_gateway_is_down_wait_in_the_chat_and_arrive_in_order_once(token):
+    """ELI-504: the Gateway stops (a real stop of the stack's own Gateway) and two messages are
+    sent. The first outlasts the Pipe's wait for a reconnect, so it is kept: its reply says it
+    waits, the chat lists it. The second goes behind it at once. Open WebUI restarts meanwhile
+    (the state is in its DB). Once the Gateway is back both reach the agent, in order and once
+    each, and stream into their own replies, which say when they were sent."""
+    one, two = (f"E2E_KEPT_{n}_{uuid.uuid4().hex[:8]}" for n in ("ONE", "TWO"))  # the model log spans runs
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_BEFORE_OUTAGE")
+    restarted = []
+
+    def relaunch():
+        gateway_ctl.start()
+        restarted.append(True)
+
+    try:
+        gateway_ctl.stop()  # inside the recovery: a stop that times out still ends with a Gateway
+        _, first = _send_turn(token, f"Respond with exactly: {one}", chat_id=chat_id)
+        # The Pipe waits for the reconnect (up to the Gateway-down wait) before it keeps the message.
+        _until("the first message to wait in the chat", lambda: _is_kept(token, chat_id, first),
+               timeout_s=240, every_s=2)
+        _, second = _send_turn(token, f"Respond with exactly: {two}", chat_id=chat_id)
+        _until("the second message to wait behind it", lambda: _is_kept(token, chat_id, second),
+               timeout_s=60, every_s=1)
+        assert _chat_pending_ids(token, chat_id) == [first, second]
+        msgs = _chat_messages(token, chat_id)
+        for mid in (first, second):
+            last = (msgs[mid].get("statusHistory") or [{}])[-1]
+            assert "Waiting for the gateway" in (last.get("description") or "") and last.get("done") is False, last
+            assert not (msgs[mid].get("content") or "").strip(), "a waiting reply shows no error text"
+
+        # The state is in Open WebUI's DB: a restart loses nothing.
+        subprocess.run(["docker", "restart", "-t", "30", "owui"], check=True, capture_output=True)
+        _until("Open WebUI to come back", _owui_up, timeout_s=300, every_s=2)
+        status, _models = _request("GET", "/api/models", token=token)  # starts the pending worker
+        assert status == 200
+        assert _chat_pending_ids(token, chat_id) == [first, second]
+        assert _is_kept(token, chat_id, first) and _is_kept(token, chat_id, second)
+        relaunch()
+    finally:
+        if not restarted:
+            relaunch()
+
+    _until("both messages to be answered", lambda: all(
+        _chat_messages(token, chat_id)[m].get("done") for m in (first, second)), timeout_s=300, every_s=2)
+    msgs = _chat_messages(token, chat_id)
+    reply_one, reply_two = msgs[first], msgs[second]
+    assert reply_one["content"].strip().endswith(one), reply_one["content"]
+    assert reply_two["content"].strip().endswith(two), reply_two["content"]
+    assert one not in reply_two["content"] and two not in reply_one["content"], "answers merged in one reply"
+    assert "Sent at" in reply_one["content"] and "gateway was down" in reply_one["content"], reply_one["content"]
+    assert [(m["meta"] or {}).get("delivery") for m in (reply_one, reply_two)] == ["delivered", "delivered"]
+    assert not any("pending_payload" in (m["meta"] or {}) for m in (reply_one, reply_two)), "a kept payload was left"
+    assert _chat_pending_ids(token, chat_id) == []
+    assert len([m for m in msgs.values() if m.get("role") == "assistant"]) == 3, "a second reply appeared"
+    # Once each, in order: the agent's own request log.
+    asked = {w: _model_turns_with(w) for w in (one, two)}
+    assert {k: len(v) for k, v in asked.items()} == {one: 1, two: 1}, asked
+    with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
+        lines = f.readlines()
+    assert lines.index(asked[one][0]) < lines.index(asked[two][0])
+    # The agent was told the message is old.
+    assert "The Gateway was down" in _model_prompt(one)
 
 
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,

@@ -63,6 +63,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 ## Reliability
 
 - [**Persistent connection**](./reliability.md#persistent-connection): one shared WebSocket, reconnecting on its own with backoff
+- [**Messages kept while the Gateway is down**](./reliability.md#messages-kept-while-the-gateway-is-down): a message sent while the Gateway is down waits in the chat ("Waiting for the gateway…") and is delivered, in order and once, with the time you sent it, when the Gateway is back, also across an Open WebUI restart
 - [**Messages while the agent works**](./reliability.md#messages-sent-while-the-agent-works): a message you send mid-run is in the chat at once, with no queue to click, and gets a real reply once the current work is done; several waiting messages are answered together, in one turn
 - [**Reload and restart safety**](./reliability.md#reload-mid-reply): reload mid-reply and the partial answer is still there; a restart of [Open WebUI](./reliability.md#open-webui-restarts) or [the Gateway](./reliability.md#gateway-restarts) mid-reply continues the same reply
 - [**No split replies**](./reliability.md#a-reply-that-ends-before-its-run): a reply whose stream ends early is finished in place, rebuilt from the run's transcript, instead of leaving its tail in a second message
