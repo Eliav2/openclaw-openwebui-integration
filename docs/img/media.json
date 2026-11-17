@@ -197,24 +197,24 @@
       }
     },
     "demos/status-dialog.gif": {
-      "sha": "d1a7edd61bb64ec6",
+      "sha": "5d4ff5b077a36378",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "demos/status-dialog.mp4": {
-      "sha": "0c5648e8ef9a0b1f",
+      "sha": "8a9fed79a58b8c4a",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "demos/status-dialog.webm": {
-      "sha": "bb1ee7de0093da0d",
+      "sha": "7616d101a7fc9782",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "demos/stop.gif": {
@@ -443,10 +443,10 @@
       }
     },
     "tile-status-dialog.jpg": {
-      "sha": "ede1c9cd9bd133ce",
+      "sha": "d490b6a860866f70",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "tile-sub-agents.jpg": {
