@@ -369,59 +369,59 @@
       }
     },
     "status-dialog-background-light.png": {
-      "sha": "a11427fd87b65869",
+      "sha": "0405d219f5291f66",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "status-dialog-folded-light.png": {
-      "sha": "324ce8f8ae2d565f",
+      "sha": "edf18c4870a4845b",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "status-dialog-light.png": {
-      "sha": "2c2244e117c92c08",
+      "sha": "db2ad93535a426a6",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "status-dialog-loading-light.png": {
-      "sha": "f6c00abf2541e507",
+      "sha": "a0115b53856ade2b",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "status-dialog-scheduled-light.png": {
-      "sha": "c22559022dc43d0c",
+      "sha": "159619a32ecdc36f",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "status-dialog-scrolled-light.png": {
-      "sha": "5fb13a7423ffe0cc",
+      "sha": "88d63284bbf6c698",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "status-subagents-retry-light.png": {
-      "sha": "4277605aff89b4ed",
+      "sha": "a3ad1cf7f95b6e89",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "subagent-drawer-light.png": {
-      "sha": "46d3adda4ca35116",
+      "sha": "b9e3cbec921d9f9d",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "57fa7492dc80cd7d"
+        "status": "6f74775720c35f8d"
       }
     },
     "subagent-result-light.png": {
@@ -431,7 +431,7 @@
       }
     },
     "thinking-level-light.png": {
-      "sha": "555bbfbec07bf5e8",
+      "sha": "8fbe44f3f125e826",
       "groups": {
         "chrome": "40732052bff72db4"
       }
