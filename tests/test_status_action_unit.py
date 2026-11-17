@@ -703,9 +703,11 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "following")
         codes = _emitted_codes(emitted)
-        # open + 6 fills; the follow's re-read (ELI-127) found the same rows,
-        # so it is not sent (ELI-268)
-        self.assertEqual(len(codes), 7)
+        # open + 7 fills (the Thinking level among them, ELI-442); the follow's re-read
+        # (ELI-127) found the same rows, so it is not sent (ELI-268)
+        self.assertEqual(len(codes), 8)
+        thinking_code = next(c for c in codes if "getElementById('openclaw-status-section-thinking')" in c)
+        self.assertIn('"current": "default"', thinking_code)
 
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
         self.assertIn("anthropic", context_code)

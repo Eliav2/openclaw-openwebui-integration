@@ -3,7 +3,7 @@
 What a reply looks like in the chat: live text, the agent's tool calls as real cards, failures marked, images and files both ways, a usage line under each reply, and chat titles. Everything here works as soon as the Pipe is installed, except where a section says otherwise.
 
 Applies to: Pipe
-Valves: `thinking_default` (per user), `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`, `SYNC_SLASH_COMMANDS`, `SLASH_COMMANDS_EXCLUDE`, `PROMPT_PREFIX`, `SYNC_INTERVAL_MIN`
+Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`, `SYNC_SLASH_COMMANDS`, `SLASH_COMMANDS_EXCLUDE`, `PROMPT_PREFIX`, `SYNC_INTERVAL_MIN`
 
 ## Streaming
 
@@ -89,15 +89,15 @@ Off by default.
 How hard the agent thinks before answering, set in Open WebUI's own controls. Two places, the first one set wins:
 
 1. **The chat:** **Advanced Params** → **Reasoning Effort** (Chat Controls, or the model's settings for every chat with it). It is free text: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, in any case.
-2. **Your default:** the per-user valve [`thinking_default`](../configuration.md#thinking_default), in **Valves**: under **Model controls**, the sliders button next to the model's name (Open WebUI 0.13), or in **Chat Controls** (0.12). It applies to every chat that sets no level of its own.
+2. **Your default:** the **Thinking level** in the Status dialog (the Status icon under a reply, or the Claw button in the composer), a list of the levels. It is kept in your own Open WebUI settings, so it applies to every chat that sets no level of its own, on every device. It is not a valve: a Pipe with valves of its own makes Open WebUI draw a second Valves button in the composer. An earlier version's `thinking_default` valve is read until you change it here, and copied over the first time a message finds it.
 
-<img src="../img/thinking-level-light.png" alt="The thinking_default valve in Valves, its choices listed: default, off, minimal, low, medium, high" width="320">
+<img src="../img/thinking-level-light.png" alt="The Status dialog's Thinking level section: a list of the levels, default, off, minimal, low, medium, high" width="320">
 
-- `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies. It is the valve's default, and an empty Reasoning Effort means the same.
+- `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies. It is the starting value, and an empty Reasoning Effort means the same.
 - `off` is an explicit instruction not to think, and it does override the agent's setting.
 - `ultra` is sent as `max`.
 
-The valve's list offers the levels the Pipe has seen your Gateway's models offer. The Pipe reads each session's ladder from the `sessions.describe` it already makes before every send, so this costs no extra round trip. Until the Pipe has run once, the list falls back to the five levels every observed provider supports (`off` to `high`). The list is the union across your Gateway's models, not the ladder of the model you picked, and it is read each time you open Valves, so a new model's levels show after its first chat. A model's `sessions.describe` can list a level the model then rejects. The list keeps it; a send the Gateway rejects for its level is sent once more with no level (neither the chat's nor your default), and the Pipe says which level was dropped.
+The list offers the levels the Pipe has seen your Gateway's models offer. The Pipe reads each session's ladder from the `sessions.describe` it already makes before every send, so this costs no extra round trip. Until the Pipe has run once, the list falls back to the five levels every observed provider supports (`off` to `high`). The list is the union across your Gateway's models, not the ladder of the model you picked, and it is read each time you open the Status dialog, so a new model's levels show after its first chat. A model's `sessions.describe` can list a level the model then rejects. The list keeps it; a send the Gateway rejects for its level is sent once more with no level (neither the chat's nor your default), and the Pipe says which level was dropped.
 
 At send time the Pipe clamps the request to the nearest level the current model supports and says so once in the chat:
 

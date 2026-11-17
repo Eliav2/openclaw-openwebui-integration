@@ -3244,21 +3244,34 @@ PIPE_FUNCTION_ID = "openclaw_gateway"   # install.py FUNCTION_ID
 
 @pytest.fixture
 def think_model(token):
-    """The e2e-think model and a setter for the user's `thinking_default`
-    valve, as a user sets it (Valves, next to the model's name). Undone
-    afterwards."""
+    """The e2e-think model and a setter for the user's thinking default, as the Status dialog sets it:
+    the `openclaw_gateway:prefs` key in the user's own settings (ELI-442). Undone afterwards."""
     status, body = _request("GET", "/api/models", token=token)
     assert status == 200, body
     model = next(m["id"] for m in body["data"]
                  if m["id"].startswith("openclaw_gateway.") and m["id"].endswith("/e2e-think"))
+    key = f"{PIPE_FUNCTION_ID}:prefs"
 
     def set_default(level: str) -> None:
-        status, got = _request("POST", f"/api/v1/functions/id/{PIPE_FUNCTION_ID}/valves/user/update",
-                               {"thinking_default": level}, token)
-        assert status == 200 and got.get("thinking_default") == level, got
+        status, got = _request("POST", "/api/v1/users/user/settings/update", {key: {"thinking_default": level}}, token)
+        assert status == 200 and got.get(key, {}).get("thinking_default") == level, got
 
     yield model, set_default
     set_default("default")
+
+
+def test_the_pipes_models_have_no_user_valves_so_no_valves_button(token):
+    """ELI-442: Open WebUI draws its own Valves button in the composer, beside Model controls, for a model
+    whose function has user valves. The user's thinking default is in their settings, not a valve."""
+    status, body = _request("GET", "/api/models", token=token)
+    assert status == 200, body
+    ours = [m for m in body["data"] if m["id"].startswith(f"{PIPE_FUNCTION_ID}.")]
+    assert ours, "no model of the Pipe"
+    assert not [m["id"] for m in ours if m.get("has_user_valves")], ours[0]
+    status, spec = _request("GET", f"/api/v1/functions/id/{PIPE_FUNCTION_ID}/valves/user/spec", token=token)
+    assert status in (200, 404), (status, spec)
+    if status == 200:   # a 404's body is text: only a spec has fields to read
+        assert not (spec or {}).get("properties"), spec
 
 
 def test_the_thinking_level_reaches_the_model_and_a_clamp_says_so(token, think_model):
