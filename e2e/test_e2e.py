@@ -3155,9 +3155,10 @@ def _pipe_log_since(since: str) -> str:
 # The Gateway's startup trace line once restart recovery of sub-agents ended
 # (`startup phase: <name> <ms>ms total=...`, server-startup-trace).
 SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
-# 2026.11.5 has no such phase (a crash is not resumed, `_gateway_recovers_a_crash`): the Gateway is up
-# when it logs `ready`.
-GATEWAY_READY = r"\[gateway\] ready"
+# 2026.11.5 has no such phase (a crash is not resumed, `_gateway_recovers_a_crash`). After an unclean
+# stop its sessions are writable again once the agent's database has been inspected; after a clean one
+# the Gateway logs `ready` (and logs only one of the two lines).
+GATEWAY_READY = r"agent database recovered after background inspection|\[gateway\] ready"
 
 
 def _read_from(path: str, offset: int) -> str:

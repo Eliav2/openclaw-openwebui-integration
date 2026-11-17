@@ -12768,6 +12768,21 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         self.assertIn("Reading them.", m.get("content", ""))
         self.assertIn("did not continue it", m.get("content", ""))
 
+    async def test_on_11_5_a_restart_with_no_row_push_still_ends_the_message_after_the_grace(self):
+        """CI: after a crash the 11.5 Gateway pushed no row for the session and the row read after the
+        hello found none, so no settle came: the reconnect itself starts the wait."""
+        self.crash("2026.11.5")
+        await self.spin()
+        self.conn.gateway_version = "2026.11.5"
+        with mock.patch.object(openclaw_pipe, "GATEWAY_RECOVERY_GRACE_S", 0.05):
+            self.conn._note_gateway_boot("boot-b")
+            await openclaw_pipe._turn_after_hello(self.conn)
+            await asyncio.sleep(0.2)
+            await self.spin()
+        m = self.owui.msgs()[turn_message_id(self.key, self.RUN, self.CHAT)]
+        self.assertIs(m.get("done"), True)
+        self.assertIn("did not continue it", m.get("content", ""))
+
     async def test_on_11_5_a_recovery_that_starts_within_the_grace_takes_the_message_over(self):
         self.crash("2026.11.5")
         with mock.patch.object(openclaw_pipe, "GATEWAY_RECOVERY_GRACE_S", 0.2):

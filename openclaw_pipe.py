@@ -10904,6 +10904,7 @@ class _RunPump:
         self.cron_at: float | None = None  # its first event's time, while that is not known yet
         self.held: list = []            # a wake's events before its turn is known
         self.restarts_before = 0        # conn.gateway_restarts when the pump began
+        self.grace_armed = False        # the wait for a recovery after a restart has started (`_arm_recovery_grace`)
         self.terminal = asyncio.Event()  # the run's terminal event was queued
         # Sent more than a lone message-less final (`_steer`).
         self.started = False
@@ -11268,7 +11269,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             writer = pump.writer
             if kind == _PUMP_GAVE_UP:
                 # No recovery run came: end M as cut off (a recovery run would have taken it over).
-                if writer is not None and writer.run_id == run and writer.awaiting_row and not writer.closed:
+                if writer is not None and writer.run_id == run and not writer.closed:
                     writer.awaiting_row = False
                     pipe_log(f"  turn writer: {writer.message_id[:8]}... no recovery came in "
                              f"{GATEWAY_RECOVERY_GRACE_S} s: ends as cut off")
@@ -11316,8 +11317,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                 elif writer.awaiting_row and writer.run_id == run:
-                    if unjudged and not resumes_a_crash(conn.gateway_version):
-                        spawn_background(_give_up_on_recovery(pump))
+                    if unjudged:
+                        _arm_recovery_grace(conn, pump)
                     continue  # R2: the next row of the session decides again
             return
     except Exception as ex:
@@ -11411,6 +11412,15 @@ async def _give_up_on_recovery(pump: "_RunPump") -> None:
     """After the grace, tell the pump no recovery run came (it ignores this if one took M over)."""
     await asyncio.sleep(GATEWAY_RECOVERY_GRACE_S)
     pump.queue.put_nowait((_PUMP_GAVE_UP, None))
+
+
+def _arm_recovery_grace(conn: "_GatewayConnection", pump: _RunPump) -> None:
+    """Once per pump: the Gateway that restarted does not continue a crash (2026.11.5+), and it may push
+    no row for the session either, so a reply left open waits only the grace for a recovery run."""
+    if pump.grace_armed or pump.wake or pump.cron_run is not None or resumes_a_crash(conn.gateway_version):
+        return
+    pump.grace_armed = True
+    spawn_background(_give_up_on_recovery(pump))
 
 
 def _cron_result_writer(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
@@ -11679,6 +11689,9 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
     for writer in list(conn._turn_writers.values()):
         if writer.pending_resume:
             await writer.on_hello()
+    for pump in list(conn._turn_pumps.values()):
+        if conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set():
+            _arm_recovery_grace(conn, pump)
     await _turn_resync(conn, skip=set(conn.active_run_snapshot))
     await _wake_resync(conn)
 
