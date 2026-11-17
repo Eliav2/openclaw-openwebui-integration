@@ -46,6 +46,7 @@ from openclaw_pipe import (
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     _turn_route_now, _turn_after_hello, _turn_resync, _history_span_messages, _turn_settled,
+    _transcript_commit_order,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
     _GatewayConnection,
     GatewayError,
@@ -16552,6 +16553,24 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
             self._said("E2E_CLI_STEERED: aside", run="R1", key="cli-assistant:R1")]}
         self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
+
+    def test_claude_cli_steered_message_stored_after_the_hosts_closer(self):
+        """2026.11.5 (oc-11-5d/f, local repro): the steered message's own turn can be stored after
+        the host's closing copy, behind its imported copy. It belongs before that copy."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        hist = {"messages": _transcript_commit_order([
+            self._user("R1", "hold"), copy("hold"), self._said("E2E_CLI_HOLD_START", stop="end_turn"),
+            copy("aside"), self._said("E2E_CLI_STEERED: aside", run="R1", key="cli-assistant:R1"),
+            self._user("R2", "aside")])}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
+
+    def test_a_resent_text_does_not_take_the_earlier_messages_copy(self):
+        """The same words sent twice: each keeps its own copy."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        msgs = [self._user("R1", "again"), copy("again"), self._said("ONE", run="R1", key="cli-assistant:R1"),
+                self._user("R2", "again"), copy("again"), self._said("TWO", run="R2", key="cli-assistant:R2")]
+        self.assertEqual(_transcript_commit_order(msgs), msgs)
 
     def test_a_cron_prompt_recorded_mid_run_is_not_steered_into_it(self):
         """A wake's prompt recorded mid-run (2026.10.10 claude-cli) is not a steer: the run keeps

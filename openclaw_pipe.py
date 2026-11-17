@@ -8305,6 +8305,25 @@ def _transcript_commit_order(messages: list) -> list:
         own = [i for i in range(at + 1, end) if _copy_of(out[i], message)]
         end = own[-1] if own else end
         out.insert(end - 1, out.pop(at))
+    return _sent_before_own_copy(out)
+
+
+def _sent_before_own_copy(messages: list) -> list:
+    """Move a sent message stored after its own imported copy back before it.
+    2026.11.5 claude-cli can store a steered message after the closing copy
+    of the run it went into, so its answer would read as the host's. A copy
+    right after a sent message with the same words is that message's."""
+    out = list(messages)
+    for message in [m for m in messages if _history_user_run_id(m)]:
+        at = out.index(message)
+        for j in range(at - 1, -1, -1):
+            if _history_user_run_id(out[j]):
+                break  # its copy comes after the turn before it
+            if _copy_of(out[j], message):
+                owner = next((m for m in reversed(out[:j]) if _history_user_run_id(m)), None)
+                if owner is None or not _copy_of(out[j], owner):
+                    out.insert(j, out.pop(at))
+                break
     return out
 
 
