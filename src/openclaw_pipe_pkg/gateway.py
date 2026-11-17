@@ -4324,13 +4324,28 @@ def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# 2026.11.5 answers a request whose session changed under it (a restart window, startup inspection) with
+# this text, as INVALID_REQUEST and not retryable by flag, though it says so itself.
+SESSION_CHANGED_REFUSAL = "session changed before"
+SESSION_CHANGED_RETRY = "retry the request"
+DEFAULT_RETRY_MS = 250
+
+
+def _session_changed_refusal(err: dict) -> bool:
+    message = str(err.get("message") or "")
+    return SESSION_CHANGED_REFUSAL in message and SESSION_CHANGED_RETRY in message
+
+
 def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
-    """Retry wait for any other UNAVAILABLE + retryable refusal, else None."""
+    """Retry wait for any other UNAVAILABLE + retryable refusal, or a request whose session changed
+    under it and says to retry it, else None."""
     err = getattr(ex, "error", None) or {}
+    if _session_changed_refusal(err):
+        return DEFAULT_RETRY_MS
     if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True:
         return None
     retry = err.get("retryAfterMs")
-    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else DEFAULT_RETRY_MS
 
 
 # ELI-359: OpenClaw 2026.10.5 commits a `chat.send` to the session's pending

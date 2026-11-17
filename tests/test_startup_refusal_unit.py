@@ -97,6 +97,33 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slept, [0.001, 0.25], "the named wait, then the startup refusal's 250 ms")
         self.assertEqual(len([line for line in self.logged if "refused as retryable" in line]), 1)
 
+    def session_changed(self):
+        """2026.11.5's chat.send during a restart window: the session's row changed under it. The Gateway
+        answers INVALID_REQUEST with `String(error)` (chat-send-handler-1ttdLzXo.mjs:3543: the error is not
+        the class its handler checks), and says "retry the request"."""
+        text = "SessionMutationAuthorizationChangedError: session changed before chat.send; retry the request"
+        return ocp.GatewayError(text, error={"code": "INVALID_REQUEST", "message": text})
+
+    async def test_a_send_refused_because_its_session_changed_is_sent_again(self):
+        conn = FakeConn([self.session_changed(), self.session_changed(), {"runId": "run-1"}])
+        slept = []
+
+        async def sleep(s):
+            slept.append(s)
+        with mock.patch.object(ocp.asyncio, "sleep", sleep):
+            got = await ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True, timeout=30)
+        self.assertEqual(got, {"runId": "run-1"})
+        self.assertEqual([p for _m, p in conn.sent], [self.PARAMS] * 3, "the same request, same key")
+        self.assertEqual(slept, [0.25, 0.25])
+        self.assertEqual(len([line for line in self.logged if "refused as retryable" in line]), 1)
+
+    async def test_an_invalid_request_that_does_not_say_retry_is_raised_at_once(self):
+        err = ocp.GatewayError("Invalid session key", error={"code": "INVALID_REQUEST", "message": "Invalid session key"})
+        conn = FakeConn([err, {"runId": "never"}])
+        with self.assertRaises(ocp.GatewayError):
+            await ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True)
+        self.assertEqual(len(conn.sent), 1)
+
     async def test_a_refusal_that_stays_retryable_fails_the_request_sooner(self):
         conn = FakeConn([self.patch_failed()] * 1000)
         with mock.patch.object(ocp, "RETRYABLE_REFUSAL_WAIT_S", 0.05):

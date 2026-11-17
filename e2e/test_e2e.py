@@ -1295,6 +1295,16 @@ import sqlite3  # noqa: E402
 GATEWAY_AGENT_DB = os.path.expanduser("~/.openclaw/agents/main/agent/openclaw-agent.sqlite")
 
 
+# 2026.11.5 does not resume a run after a crash or SIGKILL: only a graceful restart writes the resume
+# marker (docs/gateway/restart-recovery.md: "crashes are deliberately lossy"). Before it, the Gateway's
+# startup recovery continued the run.
+CRASH_RECOVERY_RETIRED_IN = (2026, 11, 5)
+
+
+def _gateway_recovers_a_crash() -> bool:
+    return _openclaw_version() < CRASH_RECOVERY_RETIRED_IN
+
+
 def _crash_recoverable(key: str) -> bool:
     """The session's stored entry holds what the Gateway's startup recovery
     needs to continue its run after a SIGKILL. `hasActiveRun` turns true about
@@ -1303,13 +1313,17 @@ def _crash_recoverable(key: str) -> bool:
     (main-session-restart-recovery-marking-CvQ2iWW3.mjs:241); 2026.10.10
     stores no status mid-run and recovers an open `restartRecoveryRuns`
     claim (store-maintenance-DW8Mtgc_.mjs:277), written at the run's start
-    (agent-command-CKyIJ22z.mjs:3853)."""
+    (agent-command-CKyIJ22z.mjs:3853). From 2026.11.5 there is no claim to wait for and nothing
+    recovers: the run is stored once its entry names it (`activeWriterRunId`)."""
     db = sqlite3.connect(f"file:{GATEWAY_AGENT_DB}?mode=ro", uri=True)
     try:
         row = db.execute("SELECT entry_json FROM session_nodes WHERE session_key = ?", (key,)).fetchone()
     finally:
         db.close()
     entry = json.loads(row[0]) if row else {}
+    if not _gateway_recovers_a_crash():
+        # 2026.11.5 retired the claim: the entry holds the run it is writing, and a crash is not resumed.
+        return bool(entry.get("activeWriterRunId"))
     ended = set(entry.get("restartRecoveryTerminalRunIds") or [])
     return entry.get("status") == "running" or any(
         r.get("runId") not in ended for r in entry.get("restartRecoveryRuns") or [])
@@ -1660,7 +1674,7 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
             turns = _user_turns(key)
         except AssertionError:
             return False   # chat.history refuses until the restarted Gateway's agent is up
-        if len(turns) < 2:
+        if _gateway_recovers_a_crash() and len(turns) < 2:
             return False
         msg = _chat_messages(guest_token, chat_id).get(aid) or {}
         return msg.get("done") is True and not _session_row(key).get("hasActiveRun")
@@ -1669,9 +1683,13 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
     except pytest.fail.Exception as ex:
         pytest.fail(f"{ex}\n{_down_state(guest_token, chat_id, key)}")
     turns = _user_turns(key)
-    # Precondition: something continued the run after the crash (the
-    # Gateway's recovery or the pipe's resume), so its turn is checked too.
-    assert len(turns) >= 2, f"no turn after the crash, nothing to check: {turns}\n{_down_state(guest_token, chat_id, key)}"
+    if _gateway_recovers_a_crash():
+        # Precondition: something continued the run after the crash (the
+        # Gateway's recovery or the pipe's resume), so its turn is checked too.
+        assert len(turns) >= 2, f"no turn after the crash, nothing to check: {turns}\n{_down_state(guest_token, chat_id, key)}"
+    else:
+        # Nothing resumes the run: the cut reply ends as it is, and nothing runs in its place.
+        assert len(turns) == 1, f"a turn after a crash 2026.11.5 does not resume: {turns}"
     assert not any(o is True for _t, o in turns), f"an owner turn in a guest chat: {turns}"
     _assert_one_reply(guest_token, chat_id, aid)
 
@@ -1733,13 +1751,15 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
         assert status == 200, got
         return request_task not in got["tasks"]
     _until("the request's task to end", request_ended, timeout_s=120)
-    # The reply is still being written (40 slow words): `done` here is the
-    # writer's mid-turn state, not its end.
-    _until("M to read done: false in the DB after the request's save",
-           lambda: _db_message(chat_id, aid).get("done") is False, timeout_s=30, every_s=0.5)
+    if _gateway_recovers_a_crash():
+        # The reply is still being written (40 slow words): `done` here is the
+        # writer's mid-turn state, not its end.
+        _until("M to read done: false in the DB after the request's save",
+               lambda: _db_message(chat_id, aid).get("done") is False, timeout_s=30, every_s=0.5)
     _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
            timeout_s=300, every_s=3)
-    assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
+    if _gateway_recovers_a_crash():
+        assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
     _assert_one_reply(token, chat_id, aid)
 
 
