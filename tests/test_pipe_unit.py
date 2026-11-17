@@ -8153,6 +8153,11 @@ def _installed_dist(test) -> str:
     return dist
 
 
+def _message_templates(source: str) -> list:
+    """The template literals of a dist source line, each placeholder as `${}`."""
+    return [re.sub(r"\$\{[^}]*\}", "${}", t) for t in re.findall(r"`([^`]*)`", source)]
+
+
 class ExitTextFixtureTest(unittest.TestCase):
     """The owner rule matches the Gateway's exit-error TEXT (no structured field, DESIGN 2.7). The
     fixture is the dist's exact source line; this fails if an installed dist changed it."""
@@ -8192,7 +8197,9 @@ class ExitTextFixtureTest(unittest.TestCase):
             from extract_openclaw_exit_errors import extract
         got = extract(dist)
         self.assertIsNotNone(got, "the exit-error line is gone from the dist: re-check the owner rule")
-        self.assertEqual(got["source"], self.fx["source"],
+        # The message text is what the rule matches. A newer dist's bundler renames the variables
+        # (2026.11.5: `e !== 0`, `${t}`, `${e}`), which says nothing about the text.
+        self.assertEqual(_message_templates(got["source"]), _message_templates(self.fx["source"]),
                          f"OpenClaw {got['openclaw_version']} changed the exit-error text "
                          f"(fixture: {self.fx['openclaw_version']}); re-check turn_owner, then "
                          "re-extract with scripts/extract_openclaw_exit_errors.py --write")
@@ -8225,15 +8232,32 @@ class CronPromptFixtureTest(unittest.TestCase):
     def turn(self, text):
         return {"role": "user", "content": text, "idempotencyKey": "turn-1:user", "timestamp": 5}
 
-    def test_both_openclaw_lines_are_pinned(self):
-        self.assertEqual(sorted(f["openclaw_version"].split(".")[1] for f in self.forms), ["10", "9"])
+    def test_the_openclaw_lines_are_pinned(self):
+        self.assertEqual(sorted(f["openclaw_version"].split(".")[1] for f in self.forms), ["10", "11", "9"])
 
     def test_a_rendered_wake_prompt_is_a_wake_turn_of_its_job(self):
         for form in self.forms:
+            if form.get("minified"):
+                continue   # its lines are normalized: test_the_minified_form_... renders it
             for name in ("eli103-wake", "nightly digest (v2)"):
                 with self.subTest(form["openclaw_version"], name=name):
                     got = wake_turns([self.turn(self.render(form, name, "Check the queue."))])
                     self.assertEqual([t["job"] for t in got], [self.JOB])
+
+    def test_the_minified_form_renders_the_prefix_the_pipe_reads(self):
+        """2026.11.5: `[cron:<id> <name>] <message>`, a line with the time, then an unattended-run
+        preamble the older forms lack."""
+        forms = [f for f in self.forms if f.get("minified")]
+        self.assertTrue(forms)
+        for form in forms:
+            tpl = re.search(r"`([^`]*)`", form["prefix"]["source"]).group(1)
+            self.assertEqual(tpl, "[cron:${job.id} ${job.name}]")
+            for name in ("eli103-wake", "nightly digest (v2)"):
+                with self.subTest(form["openclaw_version"], name=name):
+                    prefix = tpl.replace("${job.id}", self.JOB).replace("${job.name}", name)
+                    text = (f"{prefix} Check the queue.\nCurrent time: x\n\nThis is an unattended scheduled run. "
+                            "Nobody is present to clarify or approve, so complete the task with what you have.")
+                    self.assertEqual([t["job"] for t in wake_turns([self.turn(text)])], [self.JOB])
 
     def test_the_text_seen_live_is_a_wake_turn(self):
         for label, text in self.fx["observed_turn_texts"].items():

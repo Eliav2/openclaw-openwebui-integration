@@ -8944,6 +8944,15 @@ async def _read_background_tasks(conn, session_key: str) -> "list | None":
     return [_process_task(p, session_key) for p in (resp or {}).get("processes") or []]
 
 
+# 2026.11.5 names a process `<exec session>:<hash>`; the exec card (`(session good-lagoon, pid N)`) has the session only.
+_PROCESS_ID_SEPARATOR = ":"
+
+
+def _exec_session_of(process_id):
+    """The exec session a process id names: the id itself up to 2026.10, its part before the colon from 2026.11.5."""
+    return process_id.split(_PROCESS_ID_SEPARATOR, 1)[0] if isinstance(process_id, str) else process_id
+
+
 # A 2026.10 process's status as a task's.
 _PROCESS_STATUSES = {"running": "running", "completed": "completed", "failed": "failed", "killed": "cancelled"}
 
@@ -8955,7 +8964,7 @@ def _process_task(process: dict, session_key: str) -> dict:
     if status == "completed" and process.get("exitCode") not in (None, 0):
         status = "failed"    # 2026.10.5 says "completed" for any exit code (ELI-232)
     return {
-        "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
+        "id": process.get("processId"), "kind": "exec", "sourceId": _exec_session_of(process.get("processId")),
         "sessionKey": session_key, "title": process.get("name") or "",
         "status": status,
         "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
@@ -9228,6 +9237,24 @@ def _spawn_task_of(messages: list) -> str | None:
         if wrapped:
             return _subagent_task_text(wrapped)
     return None
+
+
+# Wait for a /compact run: poll every _COMPACT_POLL_S seconds, give up after _COMPACT_DEADLINE_S
+# (`openclaw sessions compact`'s own default RPC timeout).
+_COMPACT_POLL_S = 1.5
+_COMPACT_DEADLINE_S = 180
+_COMPACT_HISTORY_ROWS = 10
+
+
+async def _compact_reply_in_history(conn, session_key: str, idempotency_key: str) -> bool:
+    """Whether the compact run's own reply is in the session's history yet."""
+    try:
+        history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=_COMPACT_HISTORY_ROWS),
+                                          timeout=8)
+    except Exception as ex:
+        pipe_log(f"[status-action] compact reply read failed: {ex}")
+        return False
+    return _compact_reply((history or {}).get("messages"), idempotency_key) is not None
 
 
 # A /compact run always ends "done"; only its reply says whether it compacted.
@@ -10084,17 +10111,24 @@ class Action:
 
         pipe_log(f"[status-action] compact started, runId={send_resp.get('runId')}")
 
-        deadline = time.time() + 180  # matches `openclaw sessions compact`'s own default RPC timeout
+        deadline = time.time() + _COMPACT_DEADLINE_S
         status = None
         while time.time() < deadline:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(_COMPACT_POLL_S)
             try:
                 desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=8)
             except Exception as ex:
                 pipe_log(f"[status-action] compact poll failed: {ex}")
                 continue
-            status = ((desc or {}).get("session") or {}).get("status")
+            row = (desc or {}).get("session") or {}
+            status = row.get("status")
             if status in ("done", "failed", "cancelled"):
+                break
+            # From 2026.11.5 a compaction clears the row's run fields, so its status never says "done":
+            # the run is over when its own reply is in the history and no run is active.
+            if not status and row.get("hasActiveRun") is False and await _compact_reply_in_history(
+                    conn, session_key, idempotency_key):
+                status = "done"
                 break
 
         if status not in ("done", "failed", "cancelled"):
@@ -10115,7 +10149,8 @@ class Action:
 
         # The run is done either way; its reply says whether it compacted (ELI-209).
         try:
-            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=10), timeout=8)
+            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=_COMPACT_HISTORY_ROWS),
+                                              timeout=8)
             refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
         except Exception as ex:
             pipe_log(f"[status-action] compact reply read failed: {ex}")

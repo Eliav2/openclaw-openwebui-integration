@@ -20,6 +20,23 @@
    }
   },
   {
+   "openclaw_version": "2026.11.5",
+   "file": "run-prompt-CaP6WG2C.mjs",
+   "minified": true,
+   "prefix": {
+    "line": 40,
+    "source": "const _ = `[cron:${job.id} ${job.name}]`;"
+   },
+   "base": {
+    "line": 41,
+    "source": "const _ = `${} ${}`.trim();"
+   },
+   "command_body": {
+    "line": 60,
+    "source": "} else _ = `${}\\n${}`.trim();"
+   }
+  },
+  {
    "openclaw_version": "2026.9.3",
    "file": "isolated-agent-C_VaOV3U.mjs",
    "base": {
