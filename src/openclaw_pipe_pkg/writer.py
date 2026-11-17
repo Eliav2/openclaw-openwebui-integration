@@ -854,6 +854,7 @@ class _TurnWriter:
         # M's message was steered into another run (2026.10.10+): its own run
         # gets only a `chat` final with no message.
         self.steered_message = False
+        self.silent_announce = False    # an announce run the parent answered with silence
         # Images of a steered reply are that run's (`finish_final_images`).
         self.steered_into: str | None = None
         # A later run works: M's end leaves the active state to its reply.
@@ -1009,9 +1010,15 @@ class _TurnWriter:
                     self.images_made += 1
                 elif (payload.get("state") == "final" and not payload.get("message")
                       and payload.get("runId") == self.run_id and not self.renderer.output
-                      and self.cron_run is None
+                      and self.cron_run is None and not self.silent_announce
                       and steers_mid_run_messages(self.conn.gateway_version)):
                     self.steered_message = True
+                if (payload.get("stream") == "lifecycle" and data.get("phase") == "end"
+                        and (data.get("terminalReply") or {}).get("disposition") == "silent"
+                        and parse_announce_run_id(payload.get("runId")) is not None):
+                    # 2026.11.5 writes nothing of a silent reply (no NO_REPLY delta): its final carries no
+                    # message either, like a steered message's, so the run's own end says which it is.
+                    self.silent_announce = True
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")

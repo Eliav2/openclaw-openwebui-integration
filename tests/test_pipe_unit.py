@@ -12127,6 +12127,27 @@ class SilentAnnounceTests(_RoutingCase):
         self.assertIn("R10 probe sub-agent", calls[0]["arguments"])
         self.assertIn("SUB-DONE-R10", json.dumps(outputs))
 
+    async def test_on_11_5_a_silent_announce_with_no_text_at_all_shows_the_childs_result_as_a_card(self):
+        """2026.11.5 writes nothing of a silent announce: no delta, no assistant message in the parent's
+        history; only the run's lifecycle (`terminalReply: silent`) and a final with no message."""
+        self.conn.gateway_version = "2026.11.5"
+        self.history = self.parent_history("NO_REPLY")
+        self.history["messages"].pop()          # the silent reply is not in the transcript
+        for ev in ({"stream": "lifecycle", "data": {"phase": "start"}},
+                   {"stream": "lifecycle", "data": {"phase": "model", "provider": "fake", "model": "e2e-default"}},
+                   {"stream": "lifecycle", "data": {"phase": "end", "executionSettled": True,
+                                                    "terminalReply": {"disposition": "silent"}}},
+                   {"state": "final", "stopReason": "stop"}):
+            _turn_route_now(self.conn, self.ev(self.announce, ev))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        calls = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertEqual(len(calls), 1, m)
+        self.assertIn("SUB-DONE-R10", json.dumps([i for i in m["output"] if i["type"] == "function_call_output"]))
+
     async def test_the_card_of_an_unlabelled_child_is_named_after_its_tasks_first_sentence(self):
         """ELI-155: with no spawn label the card's label was the whole task."""
         task = ("Benchmark the forecasters against the baseline on the hourly data. "

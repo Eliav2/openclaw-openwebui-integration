@@ -3146,6 +3146,9 @@ def _pipe_log_since(since: str) -> str:
 # The Gateway's startup trace line once restart recovery of sub-agents ended
 # (`startup phase: <name> <ms>ms total=...`, server-startup-trace).
 SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
+# 2026.11.5 has no such phase (a crash is not resumed, `_gateway_recovers_a_crash`): the Gateway is up
+# when it logs `ready`.
+GATEWAY_READY = r"\[gateway\] ready"
 
 
 def _read_from(path: str, offset: int) -> str:
@@ -3174,8 +3177,9 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     # the agent's database fails (SessionEntryChangedDuringReadError, run
     # 42610236049); 2026.10.10 dropped that check. This test is about the
     # Pipe's backoff, so it sends once that recovery has ended.
+    recovered = SUBAGENT_RECOVERY_DONE if _gateway_recovers_a_crash() else GATEWAY_READY
     _until("the Gateway's sub-agent recovery to end", lambda: re.search(
-        SUBAGENT_RECOVERY_DONE, _read_from(restart_log, offset)), timeout_s=180)
+        recovered, _read_from(restart_log, offset)), timeout_s=180)
     log = _pipe_log_since(since)
     assert log.rfind("reconnect in ") > log.rfind("Connected to Gateway (persistent)"), \
         "precondition: the Pipe reconnected before the message went out"
