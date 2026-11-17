@@ -12,6 +12,8 @@
 # chat as generating and its Stop button reaches it.
 
 
+# A cron-run message's meta: the `cron:<job>:<start>` id it shows the result of.
+OPENCLAW_CRON_META = "openclaw_cron"
 # Bound on waiting for a cron job's `finished` event, which normally follows
 # its run's end within a second; a lost event (a Gateway restart) ends here.
 CRON_RESULT_WAIT_S = 120
@@ -908,6 +910,9 @@ class _TurnWriter:
         if self.wake is not None:
             # For a successor to adopt this message (ELI-103 step 4).
             meta["openclaw_wake"] = {k: self.wake.get(k) for k in ("key", "at", "job")}
+        if self.cron_run is not None:
+            # For a successor to finish it from the cron run's result.
+            meta[OPENCLAW_CRON_META] = cron_execution_id(self.cron_run["job"], self.cron_run["start"])
         await _set_turn_meta(self.chat_id, self.message_id, meta)
         self.opened = True
         try:
@@ -1272,6 +1277,11 @@ class _TurnWriter:
         result = cron_result_message(hist.get("messages") or [], cron_execution_id(job, start))
         if result is None:
             return  # a quiet run (NO_REPLY, no_change): nothing to show
+        if self.adopted and not self.renderer.output and await self.open(takeover=True):
+            # What the gone writer showed (its cards): the transcript has none of it.
+            shown = self._claim["messages"].get(self.message_id) or {}
+            self.renderer.output = copy.deepcopy(shown.get("output") or [])
+            self.renderer.text = self.renderer.visible_text = _coerce_text(shown.get("content"))
         for ev in _history_events([result]):
             self.renderer.feed(ev)
         await self.feed(None)
@@ -2505,6 +2515,10 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
                               run_id=run, message_id=message_id, takeover=True,
                               wake=dict(wake) if pump.wake else None)
     pump.writer.adopted = True
+    cron = parse_cron_execution_id(meta.get(OPENCLAW_CRON_META))
+    if cron is not None:
+        pump.writer.cron_run = conn.adopt_cron_run(session_key, *cron, run)
+        spawn_background(_note_cron_run_finished(conn, pump.writer.cron_run))
     conn._turn_writers[(chat_id, message_id)] = pump.writer
     pump.task = spawn_background(_turn_pump_loop(conn, session_key, run, (user_id, chat_id), pump))
     spawn_background(conn.ensure_message_subscription(session_key))
@@ -2523,6 +2537,20 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
     if row is not None and not row.get("hasActiveRun"):
         pump.queue.put_nowait(("settled", row))
     return "adopted"
+
+
+async def _note_cron_run_finished(conn: "_GatewayConnection", cron_run: dict) -> None:
+    """Mark an adopted cron run ended when `cron.runs` already holds its
+    finish (it may have finished before this process heard events)."""
+    try:
+        runs = (await conn.send_request("cron.runs", {"id": cron_run["job"], "limit": 20},
+                                        timeout=15)).get("entries")
+    except Exception as ex:
+        pipe_log(f"  turn writer: cron.runs for adopted cron job {cron_run['job'][:8]}... failed: {ex!r}")
+        return
+    if any(e.get("action") == _CRON_FINISHED and e.get("runAtMs") == cron_run["start"]
+           for e in runs or []):
+        cron_run["ended"].set()
 
 
 async def _turn_after_hello(conn: "_GatewayConnection") -> None:
@@ -3333,6 +3361,8 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
     hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
                                       timeout=ORPHAN_HISTORY_TIMEOUT_S)
     messages = (hist or {}).get("messages") or []
+    cron_fixed = (await _reconcile_cron_results(conn, session_key, chat_id, written, messages)
+                  if hides_cron_run_output(conn.gateway_version) else 0)
     closed = _history_closed_runs(messages)
     if last_run and settled_ms and last_run not in {r for r, _ms in closed}:
         closed.append((last_run, settled_ms))
@@ -3387,6 +3417,59 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
         pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "
                  f"{len(runs)} run(s) ({len(text)} chars, {cards} tool card(s), "
                  f"held {held_cards}) (ELI-94)")
+        fixed += 1
+    return fixed + cron_fixed
+
+
+async def _reconcile_cron_results(conn: "_GatewayConnection", session_key: str, chat_id: str,
+                                  written: int, messages: list) -> int:
+    """2026.11.5: a cron run that ended while Open WebUI was down left its
+    reply only as an `automation-result` message. Write it into the cron
+    run's message: a new one, or after what a stopped writer saved (its tool
+    cards). A message that already holds the result is left alone. Returns
+    how many were written."""
+    from open_webui.models.chats import Chats
+    user_id = session_key.rsplit("openwebui-", 1)[-1][:36]
+    fixed = 0
+    for message in messages:
+        execution = cron_result_execution(message)
+        at = message.get("timestamp") if isinstance(message, dict) else None
+        if execution is None or not isinstance(at, (int, float)) or int(at // 1000) <= written:
+            continue  # committed while Open WebUI still wrote this chat: its writer showed it
+        result = _history_renderer([message])
+        result_text = result.text.strip()
+        if not _relay_content_is_showable(result_text):
+            continue
+        mid = turn_message_id(session_key, execution, chat_id)
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            if chat is None:
+                return fixed
+            current = (((chat.chat or {}).get("history") or {}).get("messages") or {}).get(mid)
+            if current is None:
+                claim = await _claim_turn_message(chat_id, user_id, mid, execution, conn.writer_id)
+                if not claim["claimed"]:
+                    continue
+                current = claim["messages"][mid]
+            elif (current.get("role") != _ASSISTANT_ROLE or current.get("done") is not True
+                  or _ended_by_stop(current)):
+                continue  # still generating (the ELI-90 pass owns it), or stopped by the user
+            held_text = _coerce_text(current.get("content")).strip()
+            if result_text in held_text:
+                continue  # written already
+            text = held_text + _message_boundary_separator(held_text, result_text) + result_text \
+                if held_text else result_text
+            output = [*copy.deepcopy(current.get("output") or []), *result.finished_output()]
+            if await _owui_upsert_message(
+                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
+                pipe_log(f"  ended-while-down cron result {mid[:8]}... in chat {chat_id[:8]}...: "
+                         "Open WebUI did not save the write")
+                continue
+        await _relay_emit_event(user_id, chat_id, mid, {"type": "chat:completion", "data": {"output": output}})
+        if getattr(conn._valves(), "PUBLISH_CHAT_FINISHED", False):
+            await _publish_chat_finished(chat_id, mid, user_id)
+        pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: cron run "
+                 f"{execution[:24]}...'s result written ({len(result_text)} chars)")
         fixed += 1
     return fixed
 

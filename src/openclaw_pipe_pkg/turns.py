@@ -393,12 +393,28 @@ def cron_execution_id(job: str, start_ms) -> str:
     return f"cron:{job}:{int(start_ms)}"
 
 
+_CRON_EXECUTION_ID_RE = re.compile(r"^cron:(?P<job>.+):(?P<start>\d+)$")
+
+
+def parse_cron_execution_id(execution_id) -> tuple[str, int] | None:
+    """(job, start ms) of a `cron:<job>:<start>` id, else None."""
+    m = _CRON_EXECUTION_ID_RE.match(str(execution_id or ""))
+    return (m.group("job"), int(m.group("start"))) if m else None
+
+
+def cron_result_execution(message) -> str | None:
+    """The cron run id an `automation-result` message reports, else None."""
+    auto = message.get("openclawAutomation") if isinstance(message, dict) else None
+    if (isinstance(auto, dict) and auto.get("kind") == _AUTOMATION_KIND_CRON
+            and message.get("role") == _ASSISTANT_ROLE and parse_cron_execution_id(auto.get("runId"))):
+        return auto["runId"]
+    return None
+
+
 def cron_result_message(messages: list, execution_id: str) -> dict | None:
     """The `automation-result` message that cron run committed, else None."""
     for m in reversed(messages or []):
-        auto = m.get("openclawAutomation") if isinstance(m, dict) else None
-        if (isinstance(auto, dict) and auto.get("kind") == _AUTOMATION_KIND_CRON
-                and auto.get("runId") == execution_id and m.get("role") == _ASSISTANT_ROLE):
+        if cron_result_execution(m) == execution_id:
             return m
     return None
 

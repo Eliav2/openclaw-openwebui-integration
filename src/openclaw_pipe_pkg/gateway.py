@@ -2119,6 +2119,19 @@ class _GatewayConnection:
                 run["end"] = start + payload["durationMs"]
             run["ended"].set()
 
+    def adopt_cron_run(self, session_key: str, job: str, start: int, run_id: str) -> dict:
+        """The cron run an adopted message's run executes, recorded if this
+        connection never heard it start, so its `finished` event still lands."""
+        runs = self._cron_runs.setdefault(session_key, [])
+        run = next((r for r in runs if r["job"] == job and r["start"] == start), None)
+        if run is None:
+            run = {"job": job, "start": start, "end": None, "agent_run": run_id,
+                   "ended": asyncio.Event()}
+            runs.append(run)
+            del runs[:-20]
+        run["agent_run"] = run_id
+        return run
+
     def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
         """The heard cron run into `session_key` that agent run `run_id`, first
         seen at `at_ms`, executes: its own claim, else the oldest unclaimed one

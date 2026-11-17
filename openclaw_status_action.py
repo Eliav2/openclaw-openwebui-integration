@@ -800,12 +800,28 @@ def cron_execution_id(job: str, start_ms) -> str:
     return f"cron:{job}:{int(start_ms)}"
 
 
+_CRON_EXECUTION_ID_RE = re.compile(r"^cron:(?P<job>.+):(?P<start>\d+)$")
+
+
+def parse_cron_execution_id(execution_id) -> tuple[str, int] | None:
+    """(job, start ms) of a `cron:<job>:<start>` id, else None."""
+    m = _CRON_EXECUTION_ID_RE.match(str(execution_id or ""))
+    return (m.group("job"), int(m.group("start"))) if m else None
+
+
+def cron_result_execution(message) -> str | None:
+    """The cron run id an `automation-result` message reports, else None."""
+    auto = message.get("openclawAutomation") if isinstance(message, dict) else None
+    if (isinstance(auto, dict) and auto.get("kind") == _AUTOMATION_KIND_CRON
+            and message.get("role") == _ASSISTANT_ROLE and parse_cron_execution_id(auto.get("runId"))):
+        return auto["runId"]
+    return None
+
+
 def cron_result_message(messages: list, execution_id: str) -> dict | None:
     """The `automation-result` message that cron run committed, else None."""
     for m in reversed(messages or []):
-        auto = m.get("openclawAutomation") if isinstance(m, dict) else None
-        if (isinstance(auto, dict) and auto.get("kind") == _AUTOMATION_KIND_CRON
-                and auto.get("runId") == execution_id and m.get("role") == _ASSISTANT_ROLE):
+        if cron_result_execution(m) == execution_id:
             return m
     return None
 
@@ -3215,6 +3231,19 @@ class _GatewayConnection:
             if isinstance(payload.get("durationMs"), (int, float)):
                 run["end"] = start + payload["durationMs"]
             run["ended"].set()
+
+    def adopt_cron_run(self, session_key: str, job: str, start: int, run_id: str) -> dict:
+        """The cron run an adopted message's run executes, recorded if this
+        connection never heard it start, so its `finished` event still lands."""
+        runs = self._cron_runs.setdefault(session_key, [])
+        run = next((r for r in runs if r["job"] == job and r["start"] == start), None)
+        if run is None:
+            run = {"job": job, "start": start, "end": None, "agent_run": run_id,
+                   "ended": asyncio.Event()}
+            runs.append(run)
+            del runs[:-20]
+        run["agent_run"] = run_id
+        return run
 
     def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
         """The heard cron run into `session_key` that agent run `run_id`, first

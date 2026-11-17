@@ -2394,12 +2394,71 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     _assert_clean(token, chat_id, msgs)
 
 
+def _wakes_ended_while_down_get_their_results(token: str) -> None:
+    """2026.11.5 keeps a cron run's transcript out of `chat.history`: a wake
+    that ends while Open WebUI is down is rebuilt from its `automation-result`
+    message instead. The first wake keeps what it showed (a card, if one
+    streamed before the stop) and gets its result; the second, run whole while
+    down, gets a message of its own. Each result is in its cron run's message,
+    once."""
+    log = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    key = _session_key(token, chat_id)
+    hold_token = f"cli{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+
+    def results():
+        """{job id: (cron run id, text)} of the automation-result messages."""
+        out = {}
+        for m in _gw("chat.history", {"sessionKey": key, "limit": 100}).get("messages") or []:
+            auto = m.get("openclawAutomation") or {}
+            if auto.get("kind") == "cron":
+                text = " ".join(b.get("text") or "" for b in m.get("content") or [] if isinstance(b, dict))
+                out[auto.get("jobId")] = (auto.get("runId"), text)
+        return out
+
+    one = _schedule_wake(key, f"E2E_CLI_TOOL_HOLD {hold_token}", 2)
+    try:
+        _until("the first wake's Claude Code turn holding", lambda: os.path.exists(log)
+               and f"holding {hold_token}" in open(log, encoding="utf-8").read(), every_s=0.2)
+        subprocess.run(["docker", "stop", "-t", "30", "owui"], check=True, capture_output=True)
+        two = _schedule_wake(key, "Reply with exactly: E2E_CLI_WAKE_TWO", 2)
+        _until("the second wake to fire while the first works", lambda: any(
+            j.get("id") == two and (j.get("state") or {}).get("runningAtMs")
+            for j in _gw("cron.list", {"includeDisabled": True}).get("jobs") or []))
+        open(gate, "w").close()
+        got = _until("both wakes' results", lambda: (lambda r: r if {one, two} <= set(r) else None)(results()),
+                     timeout_s=120)
+    finally:
+        open(gate, "w").close()
+        subprocess.run(["docker", "start", "owui"], check=True, capture_output=True)
+    _until("Open WebUI to come back", _owui_up, timeout_s=300, every_s=2)
+    status, _models = _request("GET", "/api/models", token=token)  # runs the startup reconcile
+    assert status == 200
+    mids = {job: str(uuid.uuid5(TURN_NS, f"{key}:{run}")) for job, (run, _text) in got.items()}
+
+    def written():
+        msgs = _chat_messages(token, chat_id)
+        return msgs if all(msgs.get(mids[j], {}).get("done") is True and got[j][1].strip()
+                           in (msgs[mids[j]].get("content") or "") for j in (one, two)) else None
+    try:
+        msgs = _until("each wake's result in its cron run's message", written)
+    except pytest.fail.Exception as ex:
+        pytest.fail(f"{ex}: {json.dumps(_chat_messages(token, chat_id))[:2500]}")
+    for job in (one, two):
+        text = got[job][1].strip()
+        holders = [k for k, m in msgs.items() if text in (m.get("content") or "") and k != first["id"]]
+        assert holders == [mids[job]], f"{text!r} in {holders}, not only in {mids[job]}"
+        assert msgs[mids[job]]["content"].count(text) == 1, msgs[mids[job]]["content"]
+    os.remove(gate)
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 @pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a wake after the run")
 def test_a_cron_wake_a_second_wake_fired_into_is_completed_whole_on_start(token):
     if _hides_cron_run_output():
-        pytest.skip("OpenClaw 2026.11.5+ keeps a cron run's transcript out of chat.history: "
-                    "no wake reply is rebuilt from it")
+        return _wakes_ended_while_down_get_their_results(token)
     """Two cron wakes, the second fired while the first's claude-cli run works:
     2026.10.10 runs the second after the first's run, and its prompt carries
     the time it fired; the first's messages, imported with Claude Code's own

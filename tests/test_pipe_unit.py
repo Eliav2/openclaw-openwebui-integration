@@ -18197,6 +18197,49 @@ class CronResultTurnTests(_RoutingCase):
         self.assertTrue(m["content"].rstrip().endswith("E2E_HOLD_END"), m["content"])
         self.assertIs(m["done"], True)
 
+    async def test_a_successor_finishes_a_cron_message_a_retired_writer_left_open(self):
+        """Open WebUI went away mid-wake, leaving M done:false with its card: the next
+        process adopts M by its meta and ends it with the cron run's result."""
+        self.cron("started")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 700, "stream": "run_status",
+                                                      "data": {"phase": "starting_model"}}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 800, **_tool("start", tcid="toolu_1")}))
+        await self.spin()
+        await self.conn.retire()
+        await self.spin()
+        mid = self.message_of()
+        self.assertIs(self.owui.msgs()[mid]["done"], False)
+        # The row as saved before the process went (a handover's write): its card.
+        card = {"type": "function_call", "id": "fc1", "call_id": "toolu_1", "name": "Bash",
+                "arguments": "{}", "status": "completed"}
+        self.owui.chat.chat["history"]["messages"][mid]["output"] = [card]
+        self.history = {"messages": [self.result("E2E_HOLD_END")]}
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                return {"sessions": [{"key": test.key, "hasActiveRun": False, "status": "done",
+                                      "lastRunId": test.RUN}]}
+            if method == "cron.runs":
+                return {"entries": [{"action": "finished", "jobId": test.JOB, "runAtMs": test.START,
+                                     "status": "ok"}]}
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "sessions.messages.subscribe":
+                return {}
+            raise AssertionError(method)
+        b = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        b.gateway_version = "2026.11.5"
+        b.send_request = send_request
+        got = await openclaw_pipe._adopt_turn_message(
+            b, chat_id=self.CHAT, user_id=self.USER, session_key=self.key, message_id=mid,
+            meta=self.owui.msgs()[mid]["meta"])
+        self.assertEqual(got, "adopted")
+        await self.spin()
+        m = self.owui.msgs()[mid]
+        self.assertEqual((m["content"].strip(), m["done"]), ("E2E_HOLD_END", True))
+        self.assertEqual([i["type"] for i in m["output"]][0], "function_call")
+
     async def test_before_2026_11_5_a_cron_run_is_an_ordinary_agent_run(self):
         """2026.11.3 streams a cron run like any agent run: its message is its run's."""
         self.conn.gateway_version = "2026.11.3"
