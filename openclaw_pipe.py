@@ -876,6 +876,77 @@ UNSET = "default"
 # Levels sent as another (Eliav, 2026-11-09: `ultra` goes out as `max`).
 LEVEL_SENT_AS = {"ultra": "max"}
 
+# The user's own preferences (today the thinking default) are one key in their Open WebUI settings, not a
+# user valve (ELI-442): a Pipe with UserValves makes Open WebUI draw its own Valves button in the composer,
+# beside Model controls. The key is `<function id>:prefs`; the Status dialog changes it. Open WebUI's settings
+# update replaces only the top-level keys it is sent, so this key is written alone. What the 0.x Pipe kept in
+# its `thinking_default` user valve is read under it, and copied to the key the first time a turn finds it
+# there (the old valve is left as it was, for a rollback).
+PIPE_FUNCTION_ID = "openclaw_gateway"
+PREFS_SUFFIX = ":prefs"
+THINKING_PREF = "thinking_default"
+
+
+def function_id_of(model):
+    """The function an Open WebUI model id belongs to: `openclaw_gateway.default` -> `openclaw_gateway`."""
+    return str(model or "").split(".")[0] or PIPE_FUNCTION_ID
+
+
+def prefs_key(function_id):
+    return (function_id or PIPE_FUNCTION_ID) + PREFS_SUFFIX
+
+
+def merge_prefs(settings, legacy, function_id):
+    """The user's prefs: their settings' key over the old user valve, field by field."""
+    own = (settings or {}).get(prefs_key(function_id)) if isinstance(settings, dict) else None
+    return {**(legacy if isinstance(legacy, dict) else {}), **(own if isinstance(own, dict) else {})}
+
+
+def _settings_of(user):
+    """The `settings` of an Open WebUI user, a dict (`__user__`) or a model."""
+    raw = user.get("settings") if isinstance(user, dict) else getattr(user, "settings", None)
+    if raw is not None and hasattr(raw, "model_dump"):
+        raw = raw.model_dump()
+    return raw if isinstance(raw, dict) else {}
+
+
+async def _legacy_valves(function_id, user_id):
+    from open_webui.models.functions import Functions
+    return await Functions.get_user_valves_by_id_and_user_id(function_id, user_id)
+
+
+async def write_prefs(user_id, function_id, change):
+    """Read the prefs again (the old valve under them), change these fields, write the key. A failed read
+    of the old valve fails the write: it may hold a value this write would replace without knowing it."""
+    from open_webui.models.users import Users
+    current = merge_prefs(_settings_of(await Users.get_user_by_id(user_id)),
+                          await _legacy_valves(function_id, user_id), function_id)
+    await Users.update_user_settings_by_id(user_id, {prefs_key(function_id): {**current, **change}})
+
+
+async def thinking_default_of(user, function_id):
+    """The user's thinking default (UNSET when none): their settings key, else the 0.x user valve, which is
+    copied to the key once. Never raises: a turn must not fail on a preference."""
+    own = merge_prefs(_settings_of(user), None, function_id)
+    if THINKING_PREF in own:
+        return own[THINKING_PREF]
+    user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+    if not user_id:
+        return UNSET
+    try:
+        legacy = await _legacy_valves(function_id, user_id)
+    except Exception as ex:
+        pipe_log(f"[prefs] could not read the old thinking_default valve: {ex}")
+        return UNSET
+    level = (legacy or {}).get(THINKING_PREF) if isinstance(legacy, dict) else None
+    if not isinstance(level, str) or level == UNSET:
+        return UNSET
+    try:
+        await write_prefs(user_id, function_id, {THINKING_PREF: level})
+    except Exception as ex:
+        pipe_log(f"[prefs] could not move the old thinking_default valve: {ex}")
+    return level
+
 
 def normalize_thinking_level(value):
     """A level as typed (Advanced Params is free text) or picked: lowercased,
@@ -14219,7 +14290,7 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
 
 
 # Marks a retry body after a thinking-level rejection: it sends no level, not
-# even the user's `thinking_default`.
+# even the user's thinking default.
 THINKING_DROPPED_KEY = "openclaw_thinking_dropped"
 
 
@@ -14368,14 +14439,6 @@ class _TurnState:
     queue: object = None
     run_text: dict | None = None
     parked: bool = False
-
-
-class _UserValvesBase(BaseModel):
-    @classmethod
-    def get_thinking_levels(cls):
-        """The `thinking_default` dropdown. Open WebUI calls this each time it
-        shows the valves, so levels learned since the Pipe loaded are listed."""
-        return [{"value": lv, "label": lv} for lv in _thinking_default_levels(Pipe._current_state_dir())]
 
 
 class Pipe:
@@ -14650,29 +14713,10 @@ class Pipe:
                 "queues behind your conversation."
         )
 
-    # Each user's own (Open WebUI: Valves next to the model's name). The chat's
-    # Advanced Params reasoning effort wins; this applies to a chat without one.
-    UserValves = create_model(
-        "UserValves",
-        thinking_default=(
-            str,
-            Field(
-                default=UNSET,
-                description=(
-                    "Your thinking level for chats that set none in Advanced Params "
-                    "(Reasoning Effort). '" + UNSET + "' sends nothing and keeps the "
-                    "model's own level. A level a model does not support is clamped "
-                    "down, and the chat says so."
-                ),
-                json_schema_extra={"input": {"type": "select", "options": "get_thinking_levels"}},
-            ),
-        ),
-        __base__=_UserValvesBase,
-    )
-
-    # The dropdowns are classmethods, with no valves of their own. They read
-    # STATE_DIR off the live Pipe, whose `valves` Open WebUI replaces when an
-    # admin saves them.
+    # The Pipe has no user valves: Open WebUI draws its own Valves button in the composer for a Pipe that has
+    # them (ELI-442). The user's thinking default is a key in their settings (thinking.py), changed in the
+    # Status dialog. Some readers are classmethods with no valves of their own: they read STATE_DIR off the live
+    # Pipe, whose `valves` Open WebUI replaces when an admin saves them.
     _instance = None
 
     def __init__(self):
@@ -15061,11 +15105,10 @@ class _PipeTurn:
         self.model_override = self.pipe._model_override_for_preset(preset)
 
         # Thinking level (ELI-85): the chat's `reasoning_effort` (Open WebUI's
-        # Advanced Params), else the user's `thinking_default`. Absent means the
+        # Advanced Params), else the user's thinking default. Absent means the
         # agent's own level; it is checked against the ladder after describe.
-        user_valves = (self.__user__ or {}).get("valves")
-        user_default = (user_valves.get("thinking_default") if isinstance(user_valves, dict)
-                        else getattr(user_valves, "thinking_default", None))
+        user_default = await thinking_default_of(
+            self.__user__ or {}, function_id_of(self.body.get("model")))
         self.requested_thinking = None if self.body.get(THINKING_DROPPED_KEY) else (
             normalize_thinking_level(self.body.get("reasoning_effort"))
             or normalize_thinking_level(user_default))

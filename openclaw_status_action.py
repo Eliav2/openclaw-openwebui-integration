@@ -870,6 +870,77 @@ UNSET = "default"
 # Levels sent as another (Eliav, 2026-11-09: `ultra` goes out as `max`).
 LEVEL_SENT_AS = {"ultra": "max"}
 
+# The user's own preferences (today the thinking default) are one key in their Open WebUI settings, not a
+# user valve (ELI-442): a Pipe with UserValves makes Open WebUI draw its own Valves button in the composer,
+# beside Model controls. The key is `<function id>:prefs`; the Status dialog changes it. Open WebUI's settings
+# update replaces only the top-level keys it is sent, so this key is written alone. What the 0.x Pipe kept in
+# its `thinking_default` user valve is read under it, and copied to the key the first time a turn finds it
+# there (the old valve is left as it was, for a rollback).
+PIPE_FUNCTION_ID = "openclaw_gateway"
+PREFS_SUFFIX = ":prefs"
+THINKING_PREF = "thinking_default"
+
+
+def function_id_of(model):
+    """The function an Open WebUI model id belongs to: `openclaw_gateway.default` -> `openclaw_gateway`."""
+    return str(model or "").split(".")[0] or PIPE_FUNCTION_ID
+
+
+def prefs_key(function_id):
+    return (function_id or PIPE_FUNCTION_ID) + PREFS_SUFFIX
+
+
+def merge_prefs(settings, legacy, function_id):
+    """The user's prefs: their settings' key over the old user valve, field by field."""
+    own = (settings or {}).get(prefs_key(function_id)) if isinstance(settings, dict) else None
+    return {**(legacy if isinstance(legacy, dict) else {}), **(own if isinstance(own, dict) else {})}
+
+
+def _settings_of(user):
+    """The `settings` of an Open WebUI user, a dict (`__user__`) or a model."""
+    raw = user.get("settings") if isinstance(user, dict) else getattr(user, "settings", None)
+    if raw is not None and hasattr(raw, "model_dump"):
+        raw = raw.model_dump()
+    return raw if isinstance(raw, dict) else {}
+
+
+async def _legacy_valves(function_id, user_id):
+    from open_webui.models.functions import Functions
+    return await Functions.get_user_valves_by_id_and_user_id(function_id, user_id)
+
+
+async def write_prefs(user_id, function_id, change):
+    """Read the prefs again (the old valve under them), change these fields, write the key. A failed read
+    of the old valve fails the write: it may hold a value this write would replace without knowing it."""
+    from open_webui.models.users import Users
+    current = merge_prefs(_settings_of(await Users.get_user_by_id(user_id)),
+                          await _legacy_valves(function_id, user_id), function_id)
+    await Users.update_user_settings_by_id(user_id, {prefs_key(function_id): {**current, **change}})
+
+
+async def thinking_default_of(user, function_id):
+    """The user's thinking default (UNSET when none): their settings key, else the 0.x user valve, which is
+    copied to the key once. Never raises: a turn must not fail on a preference."""
+    own = merge_prefs(_settings_of(user), None, function_id)
+    if THINKING_PREF in own:
+        return own[THINKING_PREF]
+    user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+    if not user_id:
+        return UNSET
+    try:
+        legacy = await _legacy_valves(function_id, user_id)
+    except Exception as ex:
+        pipe_log(f"[prefs] could not read the old thinking_default valve: {ex}")
+        return UNSET
+    level = (legacy or {}).get(THINKING_PREF) if isinstance(legacy, dict) else None
+    if not isinstance(level, str) or level == UNSET:
+        return UNSET
+    try:
+        await write_prefs(user_id, function_id, {THINKING_PREF: level})
+    except Exception as ex:
+        pipe_log(f"[prefs] could not move the old thinking_default valve: {ex}")
+    return level
+
 
 def normalize_thinking_level(value):
     """A level as typed (Advanced Params is free text) or picked: lowercased,
@@ -7700,6 +7771,56 @@ _AGENTS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
+# The Thinking level section (ELI-442): the user's own default for chats that set none in Advanced Params.
+# It is a key in their Open WebUI settings (thinking.py), not a user valve, so Open WebUI draws no Valves
+# button of its own in the composer. A change is saved at once by the Action's `thinking-default` mode.
+_THINKING_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const S = window.__openclawStatus;
+  const section = document.getElementById('openclaw-status-section-thinking');
+  if (!section || !S) return;
+  if (DATA.error) {
+    S.sectionError('thinking', DATA.error);
+    return;
+  }
+  section.innerHTML = '';
+  section.className = 'mb-4';
+  section.appendChild(S.sectionHeader('Thinking level'));
+  const select = document.createElement('select');
+  select.id = 'openclaw-thinking-default';
+  select.className = 'w-full text-sm rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-200 '
+    + 'dark:border-gray-700 px-2 py-1.5 mb-1';
+  (DATA.levels || []).forEach(function(level) {
+    const option = document.createElement('option');
+    option.value = level;
+    option.textContent = level;
+    select.appendChild(option);
+  });
+  select.value = DATA.current;
+  const note = S.noteEl('Your default for chats that set no level in Advanced Params (Reasoning Effort). '
+    + DATA.unset + ' keeps the model\'s own level; a level a model does not support is clamped down.');
+  select.onchange = function() {
+    const level = select.value;
+    select.disabled = true;
+    note.textContent = 'Saving...';
+    S.askAction({ mode: 'thinking-default', level: level })
+      .then(function(r) { return r.json(); })
+      .then(function(r) {
+        if (!r || r.status !== 'ok') throw new Error((r && r.detail) || 'not saved');
+        note.textContent = 'Saved: ' + level + '.';
+      })
+      .catch(function(err) {
+        note.textContent = 'Could not save: ' + err.message;
+        select.value = DATA.current;
+      })
+      .then(function() { select.disabled = false; });
+  };
+  section.appendChild(select);
+  section.appendChild(note);
+})();
+"""
+
 # The Background section (ELI-163): this chat's background work and bound
 # automations. A missing or failed source says so in a note.
 _BACKGROUND_FILL_JS_TEMPLATE = r"""
@@ -8436,6 +8557,10 @@ async def _changed_or_ended(changed: asyncio.Event, dialog: dict) -> bool:
     return changed.is_set() and not dialog["closed"].is_set()
 
 
+def _render_thinking_fill_js(data: dict) -> str:
+    return _THINKING_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js({"unset": UNSET, **data}))
+
+
 def _render_agents_fill_js(data: dict) -> str:
     return _AGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
@@ -8449,6 +8574,7 @@ def _render_section_error_js(section: str, message: str) -> str:
 # The dialog's sections in order: id suffix and title.
 _DIALOG_SECTIONS = (
     ("context", "Context"),
+    ("thinking", "Thinking level"),
     ("limits", "Rate limits"),
     ("background", "Background"),
     ("scheduled", "Scheduled"),
@@ -8514,6 +8640,8 @@ def _subagent_previews(previews_resp) -> tuple:
 
 # The page's ask for the section's next fill (`_run_scheduled_rows`).
 _SCHEDULED_ROWS_MODE = "scheduled-rows"
+# The Thinking level section's save (`_save_thinking_default`).
+THINKING_DEFAULT_MODE = "thinking-default"
 # A page of `cron.list`: the Gateway's largest `limit`.
 _CRON_PAGE_LIMIT = 200
 # A job's message as its row shows it: the first line, at most this long.
@@ -9301,6 +9429,8 @@ class Action:
                 _open_dialogs.pop(body["dialogId"], None)
                 dialog["closed"].set()
             return {"status": "ok"}
+        if mode == THINKING_DEFAULT_MODE:
+            return await self._save_thinking_default(body, __user__)
         if mode == "subagent-rows":
             return await self._run_subagent_rows(body, __user__, __event_emitter__)
         if mode == "background-rows":
@@ -9327,6 +9457,36 @@ class Action:
                 chat_id=body.get("chat_id") if ours else None,
                 chat_model=model if ours else None,
             )
+
+    async def _save_thinking_default(self, body: dict, __user__):
+        """The dialog's Thinking level: a known level, saved in the user's own settings (thinking.py)."""
+        level = body.get("level")
+        levels = _thinking_default_levels(self.valves.STATE_DIR)
+        if not isinstance(level, str) or level not in levels:
+            return {"status": "error", "detail": "not a thinking level"}
+        user_id = (__user__ or {}).get("id")
+        if not user_id:
+            return {"status": "error", "detail": "no user"}
+        try:
+            await write_prefs(user_id, function_id_of(body.get("model")), {THINKING_PREF: level})
+        except Exception as ex:
+            pipe_log(f"[status-action] could not save the thinking level: {ex}")
+            return {"status": "error", "detail": "could not save it, try again"}
+        return {"status": "ok", "level": level}
+
+    async def _fill_thinking(self, body: dict, __user__, emit) -> None:
+        """The Thinking level section: the levels and the user's current one. Open WebUI only, so it
+        fills even with no Gateway."""
+        try:
+            fid = function_id_of(body.get("model"))
+            current = await thinking_default_of(__user__ or {}, fid)
+            levels = _thinking_default_levels(self.valves.STATE_DIR)
+            if current not in levels:
+                levels = levels + [current]
+            await emit(_render_thinking_fill_js({"levels": levels, "current": current}))
+        except Exception as ex:
+            pipe_log(f"[status-action] thinking level failed: {ex}")
+            await emit(_render_section_error_js("thinking", f"Could not read your thinking level: {ex}"))
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True, notice=None):
         """Open the dialog with every section's title, then fill each section
@@ -9369,6 +9529,8 @@ class Action:
             # Post-compact refresh: put the sections back first.
             await emit(_RESET_SECTIONS_JS.replace("__OPENCLAW_DIALOG_ID__", _json_for_js(dialog_id)))
 
+        thinking_ready = asyncio.ensure_future(self._fill_thinking(body, __user__, emit))
+
         # Open WebUI only, so this section fills even with no Gateway.
         chat_task = asyncio.ensure_future(_load_owui_recent(chat_id, user_id))
 
@@ -9389,7 +9551,7 @@ class Action:
             pipe_log(f"[status-action] connect failed: {ex}")
             for section in _GATEWAY_SECTIONS:
                 await emit(_render_section_error_js(section, f"Could not connect: {ex}"))
-            await agents_ready
+            await asyncio.gather(agents_ready, thinking_ready, return_exceptions=True)
             return {"status": "error", "detail": str(ex)}
 
         # Followed while the chat runs (ELI-260); taken before the reads they guard.
@@ -9633,7 +9795,8 @@ class Action:
         scheduled_ready = asyncio.ensure_future(fill_scheduled())
 
         results = await asyncio.gather(context_ready, limits_ready, background_ready, subagents_ready,
-                                       agents_ready, scheduled_ready, return_exceptions=True)
+                                       agents_ready, scheduled_ready, thinking_ready,
+                                       return_exceptions=True)
         for name, result in zip(("context", "limits", "background", "subagents", "agents", "scheduled"), results):
             if isinstance(result, BaseException):
                 pipe_log(f"[status-action] {name} section failed: {result!r}")

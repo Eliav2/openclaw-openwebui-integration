@@ -1835,9 +1835,11 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
 
-    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None, user_valves=None):
-        """`image`: base64 data of a PNG attached to the message. `user_valves`: the user's Pipe
-        UserValves, as Open WebUI passes them in `__user__`."""
+    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None, user_valves=None,
+               user_settings=None):
+        """`image`: base64 data of a PNG attached to the message. `user_valves`: the user's valves as
+        Open WebUI passes them in `__user__`. `user_settings`: the user's Open WebUI settings (the
+        Pipe's own key is in them, ELI-442), also in `__user__`."""
         self.emitted = getattr(self, "emitted", [])
 
         async def emitter(event):
@@ -1855,7 +1857,9 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
         if thinking:
             body["reasoning_effort"] = thinking
         meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id}
-        user = {"id": "u1", "valves": user_valves} if user_valves is not None else None
+        user = ({"id": "u1", **({"valves": user_valves} if user_valves is not None else {}),
+                 **({"settings": user_settings} if user_settings is not None else {})}
+                if user_valves is not None or user_settings is not None else None)
         return self.pipe._pipe_impl(body, emitter, __metadata__=meta, __user__=user,
                                     __event_call__=event_call if intent else None)
 
@@ -17851,9 +17855,9 @@ class ClaudeCliThinkingOffTests(_TurnCase):
                 sent.append(params.get("thinking"))
             return await plain(method, params, timeout)
         self.conn.send_request = record
-        valves = (self.ocp.Pipe.UserValves(thinking_default=user_default)
-                  if user_default is not None else None)
-        gen = self._reply("hi", "m1", thinking=level, user_valves=valves)
+        settings = ({self.ocp.prefs_key("openclaw_gateway"): {"thinking_default": user_default}}
+                    if user_default is not None else None)
+        gen = self._reply("hi", "m1", thinking=level, user_settings=settings)
 
         async def read_all():
             # The clamp note comes before the send: keep reading while the run starts.
@@ -17943,7 +17947,7 @@ class ClaudeCliThinkingOffTests(_TurnCase):
                   mock.patch.object(self.ocp, "_record_thinking_ladder", lambda *a, **k: None)):
             p.start()
             self.addCleanup(p.stop)
-        gen = self._reply("hi", "m1", user_valves=self.ocp.Pipe.UserValves(thinking_default="high"))
+        gen = self._reply("hi", "m1", user_settings={self.ocp.prefs_key("openclaw_gateway"): {"thinking_default": "high"}})
         reading = asyncio.ensure_future(_drain_text(gen))
         for run in ("run-1", "run-2"):
             await self._until_registered(run)

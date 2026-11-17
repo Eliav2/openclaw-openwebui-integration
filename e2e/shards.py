@@ -115,6 +115,7 @@ SHARDS = {
         f"{E2E}::test_a_socket_drop_mid_cron_wake_leaves_the_wake_whole",
         f"{E2E}::test_a_media_line_from_the_agent_is_uploaded_attached_and_linked",
         f"{E2E}::test_a_file_named_by_path_shows_as_the_image_the_gateway_stored",
+        f"{E2E}::test_the_pipes_models_have_no_user_valves_so_no_valves_button",
         f"{E2E}::test_the_thinking_level_reaches_the_model_and_a_clamp_says_so",
         f"{E2E}::test_two_pipe_models_side_by_side_answer_in_their_own_sessions",
         f"{E2E}::test_a_pipe_model_next_to_another_provider_keeps_the_chats_session",

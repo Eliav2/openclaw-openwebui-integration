@@ -28,10 +28,10 @@ Updated the skills too? See [agent skills](./agent-skills.md#update-them).
 
 ### The thinking filter
 
-Earlier versions set the thinking level with a separate Filter function, `openclaw_thinking`. The Pipe now reads the level itself: the chat's **Advanced Params** → **Reasoning Effort**, else your [`thinking_default`](../configuration.md#thinking_default) valve ([Thinking level](../features/chat.md#thinking-level)). If you installed the filter:
+Earlier versions set the thinking level with a separate Filter function, `openclaw_thinking`. The Pipe now reads the level itself: the chat's **Advanced Params** → **Reasoning Effort**, else your default from the Status dialog ([Thinking level](../features/chat.md#thinking-level)). If you installed the filter:
 
 1. Update the Pipe.
-2. Copy each user's filter `level` into the Pipe's `thinking_default` (**Valves**, next to the model's name).
+2. Have each user pick their level in the Status dialog's **Thinking level**.
 3. Delete `openclaw_thinking` in **Admin Panel** → **Functions**.
 
 Until you delete it, a chat with its toggle on still writes the filter's level into Reasoning Effort, which the Pipe reads like any other.

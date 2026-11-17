@@ -58,14 +58,11 @@ class _StateDirCase(unittest.TestCase):
 
 
 class DropdownTests(_StateDirCase):
-    """The `thinking_default` user valve's choices: the levels the Gateway's
+    """The thinking default's choices in the Status dialog: the levels the Gateway's
     models offer, from the ladder cache the Pipe writes."""
 
     def _choices(self, mod):
-        # Open WebUI resolves `input.options` by calling that method on UserValves.
-        field = mod.Pipe.UserValves.model_fields["thinking_default"].json_schema_extra
-        options = getattr(mod.Pipe.UserValves, field["input"]["options"])()
-        return [o["value"] for o in options]
+        return mod._thinking_default_levels(os.environ["OPENCLAW_BRIDGE_STATE_DIR"])
 
     def test_falls_back_when_there_is_no_cache(self):
         self.assertEqual(self._choices(self.mod), FALLBACK)
@@ -99,19 +96,6 @@ class DropdownTests(_StateDirCase):
         cache = Path(os.environ["OPENCLAW_BRIDGE_STATE_DIR"]) / "thinking-ladders.json"
         cache.write_text(json.dumps({"levels": ["low", "high", "xhigh"]}))
         self.assertEqual(self._choices(self.mod), ["default", "low", "high", "xhigh"])
-
-    def test_an_admins_new_state_dir_is_read_before_the_next_model_list(self):
-        """Open WebUI swaps `valves` on the Pipe when an admin saves them; the dropdown reads
-        that STATE_DIR at once, not the one the last `pipes()` saw (CodeRabbit, #388)."""
-        pipe = self.mod.Pipe()
-        other = tempfile.TemporaryDirectory()
-        self.addCleanup(other.cleanup)
-        (Path(other.name) / "thinking-ladders.json").write_text(json.dumps({"levels": ["low", "xhigh"]}))
-        pipe.valves = self.mod.Pipe.Valves(STATE_DIR=other.name)
-        self.assertEqual(self._choices(self.mod), ["default", "low", "xhigh"])
-
-    def test_the_default_is_unset_so_no_saved_valve_changes(self):
-        self.assertEqual(self.mod.Pipe.UserValves().thinking_default, "default")
 
 
 class NormalizeTests(_StateDirCase):

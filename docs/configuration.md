@@ -198,12 +198,6 @@ Type: `str`. Default: `title-gen`.
 
 Agent id used for background chat-title generation. It must exist on the Gateway (default 'title-gen'); if it does not, titles are silently skipped. Kept separate from AGENT_ID so title generation never queues behind your conversation.
 
-### thinking_default
-
-Type: `str`. Default: `default`. Per user: each user sets it in **Valves** (Open WebUI 0.13: Model controls, next to the model's name; 0.12: Chat Controls) ([Thinking level](./features/chat.md#thinking-level)).
-
-Your thinking level for chats that set none in Advanced Params (Reasoning Effort). 'default' sends nothing and keeps the model's own level. A level a model does not support is clamped down, and the chat says so.
-
 ## Status Action
 
 File: `openclaw_status_action.py`.

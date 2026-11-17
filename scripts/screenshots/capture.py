@@ -363,7 +363,7 @@ def add_chat_automation(session_key: str, *, name: str = "Morning forecast chart
 USAGE_DELAY_FILE = "/tmp/openclaw-screenshot-usage-delay-ms"
 STATUS_ROOT = "#openclaw-status-modal-root"
 # Each Status dialog section: still loading (its skeleton) or filled.
-SECTION_STATES = """() => Object.fromEntries(['context', 'limits', 'background', 'scheduled', 'subagents', 'agents'].map(n => {
+SECTION_STATES = """() => Object.fromEntries(['context', 'thinking', 'limits', 'background', 'scheduled', 'subagents', 'agents'].map(n => {
   const s = document.getElementById('openclaw-status-section-' + n);
   return [n, !s ? 'missing' : s.querySelector(':scope > [data-openclaw-loading]') ? 'loading' : 'filled'];
 }))"""
@@ -1496,39 +1496,19 @@ class Scenes:
             pipe_valves(self.token, **old)
 
     def thinking_level(self, page: Page) -> None:
-        """The thinking level, the Pipe's per-user `thinking_default` valve, with its choices.
-        A <select>'s native popup is not in a headless screenshot, so the same
-        element is drawn as a list (size = its option count)."""
+        """The thinking level: the Status dialog's Thinking level section, the user's own default with its
+        choices (ELI-442). A <select>'s native popup is not in a headless screenshot, so the same element
+        is drawn as a list (size = its option count)."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.wait_for_selector("#chat-input")
-        # Open WebUI 0.13 moved Valves from the Controls panel at the top of the chat into the
-        # Model controls popover next to the composer's model name.
-        top = page.locator('button[aria-label="Controls"]')
-        (top if top.count() else page.locator('button[aria-label="Model controls"]')).first.click()
-        page.locator('button[aria-expanded]', has_text="Valves").first.click()
-        page.locator('select:has(option[value="functions"])').first.select_option("functions")
-        page.locator('select:has(option[value="openclaw_gateway"])').first.select_option("openclaw_gateway")
-        box = page.locator(".chat-control-valves")
-        box.wait_for(timeout=30_000)
-        if not box.locator("select").count():
-            # Default -> Custom shows the field. Open WebUI 0.13's popover gives it role=menuitem.
-            box.locator("button", has_text="Default").first.click()
-        sel = box.locator("select").first
-        sel.wait_for(timeout=30_000)
+        page.locator('button[aria-label="OpenClaw status"]').last.click()
+        wait_js(page, f"() => !!document.querySelector('{STATUS_ROOT} #openclaw-thinking-default')",
+                "the Thinking level section", 60_000)
+        sel = page.locator(f"{STATUS_ROOT} #openclaw-thinking-default")
         print("  levels: " + json.dumps(sel.evaluate("s => [...s.options].map(o => o.value)")), flush=True)
         sel.evaluate("s => { s.size = s.options.length; }")
-        clip = """() => {
-          const b = document.querySelector('.chat-control-valves');
-          b.scrollIntoView({block: 'center'});
-          const r = b.getBoundingClientRect();
-          return {x: 0, y: Math.max(0, r.top - 60), width: innerWidth, height: Math.min(r.height + 120, innerHeight)};
-        }"""
-        self.s.shot(page, "thinking-level", clip_js=clip, text_selector=".chat-control-valves")
-        close = page.locator('button[aria-label="Close"]')
-        if close.count():
-            close.first.click()
-        else:
-            page.keyboard.press("Escape")
+        self.s.shot(page, "thinking-level", selector="#openclaw-status-section-thinking")
+        page.keyboard.press("Escape")
 
     def admin_valves(self, page: Page) -> None:
         """The Pipe's valves in the admin panel, from Owner Users down."""
