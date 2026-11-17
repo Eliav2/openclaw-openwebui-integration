@@ -395,14 +395,26 @@ async def open_new_chat(page: Page) -> None:
                                      '{ display: none !important; }')
 
 
+def _mode_of(post_data):
+    try:
+        return json.loads(post_data or "{}").get("mode")
+    except ValueError:
+        return "?"
+
+
 async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict:
     page = await new_page(browser, token)
     # What the page said and asked, for the artifact when a step fails (`-FAILED.txt`).
     trace = []
     page.on("console", lambda m: trace.append(f"console.{m.type}: {m.text[:300]}"))
     page.on("pageerror", lambda e: trace.append(f"pageerror: {str(e)[:300]}"))
-    page.on("request", lambda r: trace.append(f"{r.method} {r.url[-120:]} {(r.post_data or '')[:200]}")
+    page.on("request", lambda r: trace.append(f"{r.method} {r.url[-60:]} mode={_mode_of(r.post_data)}")
             if "/api/chat/actions" in r.url else None)
+    # Who removes the Status dialog or its drawer from the page, and when.
+    await page.add_init_script("""(() => { window.__ocRemoved = []; const rm = Element.prototype.remove;
+      Element.prototype.remove = function() { if (/^openclaw-(status-modal|drawer)-root$/.test(this.id))
+        window.__ocRemoved.push(this.id + ' ' + Math.round(performance.now()) + ' ' + new Error().stack.split('\\n').slice(1, 4).join(' | '));
+        return rm.call(this); }; })()""")
     work = tempfile.mkdtemp(prefix=f"demo-{spec['name']}-")
     valves = dict(spec.get("pipe_valves") or {})
     old = capture.pipe_valves(token, **valves) if valves else None
@@ -453,7 +465,9 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         # Also with the recordings, so the workflow's artifact has what the page showed when a step failed.
         await page.screenshot(path=os.path.join(out, f"{spec['name']}-FAILED.png"))
         with open(os.path.join(out, f"{spec['name']}-FAILED.txt"), "w") as fh:
-            fh.write("\n".join(trace) + "\n--- page text\n" + await page.evaluate("() => document.body.innerText"))
+            removed = await page.evaluate("() => window.__ocRemoved || []")
+            fh.write("\n".join(trace) + "\n--- removed\n" + "\n".join(removed)
+                     + "\n--- page text\n" + await page.evaluate("() => document.body.innerText"))
         raise
     finally:
         if old is not None:
