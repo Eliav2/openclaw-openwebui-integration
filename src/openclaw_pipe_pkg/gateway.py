@@ -1093,6 +1093,23 @@ class _TurnRenderer:
             self._assistant_stream_text = run_text.get("received", "")
             self._last_item_text = run_text.get("item", "")
 
+    def restore(self, output: list, text: str) -> None:
+        """Start from what a gone writer saved: its output, with its calls
+        indexed so a call's later result completes its card, not a new one."""
+        self.output = copy.deepcopy(output or [])
+        self.text = self.visible_text = text
+        answered = {i.get("call_id") for i in self.output if i.get("type") == _CALL_OUTPUT_ITEM}
+        for item in self.output:
+            tcid = item.get("call_id") or item.get("id") if item.get("type") == _CALL_ITEM else None
+            if not tcid:
+                continue
+            self._tool_items[tcid] = item
+            if tcid in answered:
+                self._tool_results.add(tcid)
+            else:
+                self._active_tool_args[tcid] = item.get("arguments") or "{}"
+                self._active_tool_names[tcid] = item.get("name") or ""
+
     def drop_shown(self, shown: str) -> bool:
         """Drop the leading `shown` part another message already holds
         (ELI-147). False, changing nothing, if the text doesn't start with it."""
@@ -3888,12 +3905,21 @@ def _committed_after_sent(message) -> float | None:
     return committed
 
 
+# Output item types of a tool card and its result (`_tool_call_started_event`).
+_CALL_ITEM = "function_call"
+_CALL_OUTPUT_ITEM = "function_call_output"
+# The CLI runtime's imported copy puts the prompt after its metadata block and a blank line.
+_IMPORT_WRAPPER_END = "\n\n"
+
+
 def _copy_of(message, sent: dict) -> bool:
     """`message` is the CLI runtime's imported copy of `sent`."""
     if not isinstance(message, dict) or message.get("role") != "user" or _history_user_run_id(message):
         return False
     text = (_history_item(sent) or {}).get("text", "").strip()
-    return bool(text) and (_history_item(message) or {}).get("text", "").strip().endswith(text)
+    copied = (_history_item(message) or {}).get("text", "").strip()
+    # The whole prompt, after the import's metadata block: "say blue" is no copy of "blue".
+    return bool(text) and (copied == text or copied.endswith(_IMPORT_WRAPPER_END + text))
 
 
 def _history_user_run_id(message) -> str | None:

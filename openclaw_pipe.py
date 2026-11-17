@@ -5551,6 +5551,23 @@ class _TurnRenderer:
             self._assistant_stream_text = run_text.get("received", "")
             self._last_item_text = run_text.get("item", "")
 
+    def restore(self, output: list, text: str) -> None:
+        """Start from what a gone writer saved: its output, with its calls
+        indexed so a call's later result completes its card, not a new one."""
+        self.output = copy.deepcopy(output or [])
+        self.text = self.visible_text = text
+        answered = {i.get("call_id") for i in self.output if i.get("type") == _CALL_OUTPUT_ITEM}
+        for item in self.output:
+            tcid = item.get("call_id") or item.get("id") if item.get("type") == _CALL_ITEM else None
+            if not tcid:
+                continue
+            self._tool_items[tcid] = item
+            if tcid in answered:
+                self._tool_results.add(tcid)
+            else:
+                self._active_tool_args[tcid] = item.get("arguments") or "{}"
+                self._active_tool_names[tcid] = item.get("name") or ""
+
     def drop_shown(self, shown: str) -> bool:
         """Drop the leading `shown` part another message already holds
         (ELI-147). False, changing nothing, if the text doesn't start with it."""
@@ -8346,12 +8363,21 @@ def _committed_after_sent(message) -> float | None:
     return committed
 
 
+# Output item types of a tool card and its result (`_tool_call_started_event`).
+_CALL_ITEM = "function_call"
+_CALL_OUTPUT_ITEM = "function_call_output"
+# The CLI runtime's imported copy puts the prompt after its metadata block and a blank line.
+_IMPORT_WRAPPER_END = "\n\n"
+
+
 def _copy_of(message, sent: dict) -> bool:
     """`message` is the CLI runtime's imported copy of `sent`."""
     if not isinstance(message, dict) or message.get("role") != "user" or _history_user_run_id(message):
         return False
     text = (_history_item(sent) or {}).get("text", "").strip()
-    return bool(text) and (_history_item(message) or {}).get("text", "").strip().endswith(text)
+    copied = (_history_item(message) or {}).get("text", "").strip()
+    # The whole prompt, after the import's metadata block: "say blue" is no copy of "blue".
+    return bool(text) and (copied == text or copied.endswith(_IMPORT_WRAPPER_END + text))
 
 
 def _history_user_run_id(message) -> str | None:
@@ -10327,11 +10353,11 @@ class _TurnWriter:
         the gone writer saved (its cards), which the transcript has none of."""
         if not (self.adopted and self.cron_run is not None) or self.cron_shown_restored:
             return
-        self.cron_shown_restored = True
+        # Marked only once restored: a locked DB fails the open, and the next event tries again.
         if await self.open(takeover=True):
             shown = self._claim["messages"].get(self.message_id) or {}
-            self.renderer.output = copy.deepcopy(shown.get("output") or [])
-            self.renderer.text = self.renderer.visible_text = _coerce_text(shown.get("content"))
+            self.renderer.restore(shown.get("output") or [], _coerce_text(shown.get("content")))
+            self.cron_shown_restored = True
 
     async def _render_cron_result(self, hist: dict) -> bool:
         """Feed the cron run's result from `hist` into M once; whether it did.
@@ -11693,8 +11719,10 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
     # An ended-while-down write claims M by the cron run's id (`_reconcile_cron_results`).
     cron = parse_cron_execution_id(meta.get(OPENCLAW_CRON_META) or run)
     if cron is not None:
-        pump.writer.cron_run = conn.adopt_cron_run(session_key, *cron, run)
-        spawn_background(_note_cron_run_finished(conn, pump.writer.cron_run))
+        # Its hidden run never shows in the row: the cron run's end ends M, not an idle row.
+        pump.cron_run = pump.writer.cron_run = conn.adopt_cron_run(session_key, *cron, run)
+        spawn_background(_note_cron_run_finished(conn, pump.cron_run))
+        spawn_background(_end_adopted_cron_run(pump))
     conn._turn_writers[(chat_id, message_id)] = pump.writer
     pump.task = spawn_background(_turn_pump_loop(conn, session_key, run, (user_id, chat_id), pump))
     spawn_background(conn.ensure_message_subscription(session_key))
@@ -11713,6 +11741,14 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
     if row is not None and not row.get("hasActiveRun"):
         pump.queue.put_nowait((_PUMP_SETTLED, row))
     return "adopted"
+
+
+async def _end_adopted_cron_run(pump: "_RunPump") -> None:
+    """Wake an adopted cron run's pump once the cron run ended (its `finished`
+    event, its result, or `cron.runs`): the pump then ends M with the result."""
+    await pump.cron_run["ended"].wait()
+    pump.terminal.set()
+    pump.queue.put_nowait((_PUMP_SETTLED, {"status": "done", "hasActiveRun": False}))
 
 
 async def _note_cron_run_finished(conn: "_GatewayConnection", cron_run: dict) -> None:
@@ -12552,13 +12588,18 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
     less than the transcript. `lastRunId` counts as closed at `settled_ms`
     (the embedded runtime writes no closer). Returns how many."""
     from open_webui.models.chats import Chats
-    if await _owui_chat_has_live_task(chat_id):
+    live = await _owui_chat_has_live_task(chat_id)
+    if live and not hides_cron_run_output(conn.gateway_version):
         return 0  # a reply is streaming: its own request finishes it
     hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
                                       timeout=ORPHAN_HISTORY_TIMEOUT_S)
     messages = (hist or {}).get("messages") or []
+    # A cron result has a message of its own, which no request writes (an
+    # adopted writer's task is no reason to skip it); one still open is skipped.
     cron_fixed = (await _reconcile_cron_results(conn, session_key, chat_id, written, messages)
                   if hides_cron_run_output(conn.gateway_version) else 0)
+    if live:
+        return cron_fixed  # a reply is streaming: its own request finishes it
     closed = _history_closed_runs(messages)
     if last_run and settled_ms and last_run not in {r for r, _ms in closed}:
         closed.append((last_run, settled_ms))

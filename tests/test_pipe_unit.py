@@ -16565,6 +16565,13 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
         self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
 
+    def test_an_older_prompt_ending_in_the_same_words_is_no_copy(self):
+        """Review on #405: the window starts after "say blue" was sent; a later "blue" stays put."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        msgs = [copy("say blue"), self._said("BLUE", run="R0", key="cli-assistant:R0"),
+                self._user("R1", "blue"), copy("blue"), self._said("ok", run="R1", key="cli-assistant:R1")]
+        self.assertEqual(_transcript_commit_order(msgs), msgs)
+
     def test_the_built_in_runtimes_steer_is_left_in_place(self):
         """2026.10.10's built-in runtime stores no imported copies: nothing moves."""
         msgs = [self._user("R1", "E2E_HOLD x"), self._said("E2E_HOLD_START", stop="toolUse"),
@@ -18543,7 +18550,7 @@ class CronResultTurnTests(_RoutingCase):
         self.assertIn("did not continue it", m["content"])
         self.assertEqual(m["output"][0]["type"], "function_call")
 
-    async def adopt_into(self, meta_overrides=None, saved_output=None, events=()):
+    async def adopt_into(self, meta_overrides=None, saved_output=None, events=(), hook=None, finish=True):
         """A fresh connection adopts M as a restarted Open WebUI does."""
         mid = self.message_of()
         msgs = self.owui.chat.chat["history"]["messages"]
@@ -18576,10 +18583,14 @@ class CronResultTurnTests(_RoutingCase):
             meta=msgs[mid]["meta"])
         self.assertEqual(got, "adopted")
         await self.spin()
+        if hook is not None:
+            await hook(b, b._turn_pumps[(self.key, run)])
         for ev in events:
             pump = b._turn_pumps[(self.key, run)]
             await pump.writer.feed(self.ev(run, ev))
         await self.spin()
+        if not finish:
+            return self.owui.msgs()[mid]
         finished["done"] = True
         pump = b._turn_pumps.get((self.key, run))
         if pump is not None:
@@ -18598,6 +18609,54 @@ class CronResultTurnTests(_RoutingCase):
         calls = [i.get("call_id") or i.get("id") for i in m["output"] if i["type"] == "function_call"]
         self.assertEqual(calls[:1], ["toolu_1"], m["output"])
         self.assertEqual(len(calls), 2, m["output"])
+        self.assertEqual((m["content"].strip(), m["done"]), ("E2E_HOLD_END", True))
+
+    async def test_a_failed_open_leaves_the_saved_cards_to_restore_on_the_next_event(self):
+        """Review on #405: a locked DB fails the first restore; the next event restores."""
+        card = {"type": "function_call", "id": "toolu_1", "name": "Bash", "arguments": "{}", "status": "completed"}
+
+        async def lock_once(b, pump):
+            real, calls = pump.writer.open, []
+
+            async def open_(*a, **k):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise RuntimeError("database is locked")
+                return await real(*a, **k)
+            pump.writer.open = open_
+        m = await self.adopt_into(saved_output=[card], hook=lock_once,
+                                  events=[_tool("start", tcid="toolu_2"), _tool("start", tcid="toolu_3")])
+        calls = [i.get("call_id") or i.get("id") for i in m["output"] if i["type"] == "function_call"]
+        self.assertEqual(calls[:1], ["toolu_1"], m["output"])
+        self.assertEqual((m["content"].strip(), m["done"]), ("E2E_HOLD_END", True))
+
+    async def test_a_saved_open_call_gets_its_result_in_its_own_card(self):
+        """Review on #405: the saved card's call is indexed, so its result completes it."""
+        card = {"type": "function_call", "id": "toolu_1", "name": "Bash", "arguments": '{"command": "ls"}',
+                "status": "in_progress"}
+        m = await self.adopt_into(saved_output=[card], events=[_tool("result", tcid="toolu_1")])
+        cards = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertEqual(len(cards), 1, m["output"])
+        self.assertEqual(cards[0]["arguments"], '{"command": "ls"}')
+
+    async def test_an_adopted_cron_message_stays_open_until_its_cron_run_ends(self):
+        """Review on #405: an idle row says nothing of the hidden run; its end does."""
+        conns = []
+
+        async def keep(b, pump):
+            conns.append(b)
+        with mock.patch.object(openclaw_pipe, "CRON_RESULT_WAIT_S", 0.05):
+            m = await self.adopt_into(finish=False, hook=keep)
+            await asyncio.sleep(0.2)
+            await self.spin()
+            m = self.owui.msgs()[self.message_of()]
+            self.assertIsNot(m["done"], True, "the cron run still runs")
+            for conn in conns:
+                conn.note_cron_event({"jobId": self.JOB, "action": "finished", "runAtMs": self.START,
+                                      "sessionKey": self.key, "durationMs": 5000})
+            for _ in range(5):
+                await self.spin()
+        m = self.owui.msgs()[self.message_of()]
         self.assertEqual((m["content"].strip(), m["done"]), ("E2E_HOLD_END", True))
 
     async def test_a_claim_left_by_a_failed_ended_while_down_write_finishes_by_its_cron_run(self):

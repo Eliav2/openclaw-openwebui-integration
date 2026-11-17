@@ -549,6 +549,16 @@ class CronResultEndedWhileDownTests(_EndedWhileDownCase):
         self.assertIsNotNone(m, list(self.chat["history"]["messages"]))
         self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
 
+    async def test_a_task_in_the_chat_does_not_keep_a_separate_cron_result_out(self):
+        """Review on #405: an adopted writer's task (or any request) writes its own message,
+        never the cron run's: the cron result is still written."""
+        self.live_task = True
+        await self.startup()
+        m = self.cron_message()
+        self.assertIsNotNone(m, list(self.chat["history"]["messages"]))
+        self.assertEqual((m["content"], m["done"]), ("E2E_CLI_WAKE_TWO", True))
+        self.assertEqual(self.msg()["content"], "Reading them.", "the live reply is left to its request")
+
     async def test_before_2026_11_5_there_is_no_cron_result_to_write(self):
         self.conn.gateway_version = "2026.11.3"
         await self.startup()
