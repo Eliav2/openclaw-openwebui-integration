@@ -634,11 +634,14 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
             # The Pipe's own notes are in no transcript (ELI-229).
             _keep_pipe_notes(list(message.get("output") or []), part)
             text, output = part.text.strip(), part.finished_output()
+            maps = await _embed_fields(conn, output, message.get("embeds"))
             async with conn._chat_write_lock(ref["chat_id"]):
                 await _owui_upsert_message(ref["chat_id"], ref["message_id"],
-                                           {"content": text, "output": output, "done": True})
+                                           {"content": text, "output": output, "done": True, **maps})
             emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": ref["message_id"],
                                             "user_id": user_id}, update_db=False)
+            if maps:
+                await emit({"type": "embeds", "data": {**maps, "replace": True}})
             await emit({"type": "chat:completion", "data": {"done": True, "content": text, "output": output}})
             pipe_log(f"  reply {ref['message_id'][:8]}... settled from the transcript around a steer")
     except Exception as ex:
@@ -857,6 +860,9 @@ class _TurnWriter:
         self.gateway_media: set[str] = set()
         self.event_media: list[str] = []
         self.images_made = 0
+        # The reply's maps: page by map id, and the ids open tabs were shown (`_show_maps`).
+        self._map_seen: dict = {}
+        self._maps_shown: set[str] = set()
         self._emit = None
         self._done = asyncio.Event()
         # A running push of M never lands after its final one (`_push_running`).
@@ -1031,9 +1037,49 @@ class _TurnWriter:
             self.sent_output = copy.deepcopy(output)
             self.sent_text = text
         await _save_response_stream(self.task_id, self.chat_id, self.message_id, text, self.sent_output)
+        await self._show_maps()
         if self.handover_owed and (self.request_task is None or self.request_task.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
+
+    async def _saved_embeds(self) -> list:
+        """The `embeds` M holds in the DB: a live view, or a map from before a takeover."""
+        from open_webui.models.chats import Chats
+        try:
+            saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+        except Exception as ex:
+            pipe_log(f"  turn writer: reading M's embeds failed: {ex!r}")
+            return []
+        return saved.get("embeds") or []
+
+    def _map_pages(self, output: list) -> list[str]:
+        """The pages of the maps in `output` that were fetched."""
+        return [self._map_seen[i] for i in _map_ids(output) if self._map_seen.get(i)]
+
+    async def _embed_list(self, output: list) -> list[str]:
+        """M's whole `embeds`: what it holds, then this reply's map pages."""
+        return _merge_embeds(await self._saved_embeds(), self._map_pages(output))
+
+    async def _show_maps(self) -> None:
+        """Fetch the reply's maps; when one is new, show open tabs the whole list and save it in M,
+        so a reload mid-reply shows it too. A tab replaces its `embeds` with an event's, and
+        update_db=False means Open WebUI saves nothing of the event. A failure leaves the map new,
+        for the next event to try again."""
+        await _map_embeds(self.conn, self.renderer.output, self._map_seen)
+        ids = [i for i in _map_ids(self.renderer.output) if self._map_seen.get(i)]
+        if all(i in self._maps_shown for i in ids):
+            return
+        try:
+            embeds = await self._embed_list(self.renderer.output)
+            emit = await self._emitter()
+            async with self._emit_lock:
+                await emit({"type": "embeds", "data": {"embeds": embeds, "replace": True}})
+            async with self.conn._chat_write_lock(self.chat_id):
+                await _owui_upsert_message(self.chat_id, self.message_id, {"embeds": embeds})
+        except Exception as ex:
+            pipe_log(f"  turn writer: map embed of {self.message_id[:8]}... failed: {ex!r}")
+            return
+        self._maps_shown.update(ids)
 
     def _introduced(self) -> bool:
         """M is a message this writer inserted and introduced to open tabs."""
@@ -1123,6 +1169,8 @@ class _TurnWriter:
                    "done": done}
         if status_history is not None:
             message["statusHistory"] = status_history
+        if self._map_pages(message["output"]):
+            message["embeds"] = await self._embed_list(message["output"])
         try:
             row = await _owui_upsert_message(self.chat_id, self.message_id, message)
         except Exception as ex:
@@ -1149,6 +1197,8 @@ class _TurnWriter:
                          f"its own status write may land after this one")
         lines = [] if stopped else await _build_usage_status_lines(
             self.conn, self.session_key, run_usage=run_usage)
+        # Before the lock: a map the stream never reached (a rebuilt reply) is fetched here.
+        await _map_embeds(self.conn, output, self._map_seen)
         async with self.conn._chat_write_lock(self.chat_id):
             try:
                 saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
@@ -1176,7 +1226,10 @@ class _TurnWriter:
         if not self._claim or self.message_id not in self._claim["messages"]:
             return False
         message = {**self._claim["messages"][self.message_id],
-                    "content": text, "output": output, "done": True, "statusHistory": status_history}
+                   "content": text, "output": output, "done": True, "statusHistory": status_history}
+        pages = self._map_pages(output)
+        if pages:
+            message["embeds"] = _merge_embeds(message.get("embeds"), pages)
         new = self._introduced()
         try:
             await _introduce_turn_message(
@@ -3101,7 +3154,8 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         if rendered.output:
             output = rendered.finished_output()
             text = rendered.text.strip()
-            fields.update(content=text, output=output)
+            fields.update(content=text, output=output,
+                          **await _embed_fields(conn, output, stub.get("embeds")))
     elif not has_content:
         rendered = _TurnRenderer()
         rendered._add_text(ORPHAN_STUB_NOTE)
@@ -3304,6 +3358,7 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             runs=runs, messages=messages, rendered=rendered)
         if not output:
             continue
+        maps = await _embed_fields(conn, output, None)
         async with conn._chat_write_lock(chat_id):
             chat = await Chats.get_chat_by_id(chat_id)
             msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
@@ -3317,14 +3372,19 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             held_text = _coerce_text(current.get("content")).strip()
             if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
                 continue  # holds as much as the transcript: never rewritten
+            if maps:
+                maps = {"embeds": _merge_embeds(current.get("embeds"), maps["embeds"])}
             if await _owui_upsert_message(
-                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
+                    chat_id, mid, {"content": text, "output": output, "done": True, **maps}) is None:
                 pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
                          "Open WebUI did not save the write (ELI-94)")
                 continue
             conn.mark_delivered_live(session_key, run)
         await _relay_emit_event(chat.user_id, chat_id, mid,
                                 {"type": "chat:completion", "data": {"output": output}})
+        if maps:
+            await _relay_emit_event(chat.user_id, chat_id, mid,
+                                    {"type": "embeds", "data": {**maps, "replace": True}})
         if getattr(conn._valves(), "PUBLISH_CHAT_FINISHED", False):
             await _publish_chat_finished(chat_id, mid, chat.user_id)
         pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "

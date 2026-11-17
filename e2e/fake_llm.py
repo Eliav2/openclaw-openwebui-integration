@@ -131,6 +131,8 @@ and only a core set is sent as real schemas.
 * `E2E_ASK_TOOL`                       -> calls OpenClaw's `ask_user` tool with
   `ASK_TOOL_ARGS` below, then, once the tool result is in, replies
   `E2E_ASK_TOOL_RESULT <status> Database: <answer>` (the answer when there is one).
+* `E2E_MAP`                            -> calls `map` (e2e/agent-tool: a fixed map of Kyoto),
+  then, once the tool result is in, replies `E2E_MAP_DONE`.
 * `E2E_APPROVAL`                       -> calls `e2e_guarded` (e2e/agent-tool), whose
   call needs a plugin approval (`E2E_APPROVAL_SHORT`: one that expires in 6 s), then replies `E2E_APPROVAL_RESULT ran` when the
   tool ran, else `E2E_APPROVAL_RESULT blocked: <the result's error>`.
@@ -185,6 +187,14 @@ ASK_TOOL_ARGS = {"questions": [{"id": "db", "header": "Database", "question": "W
                                 "options": [{"label": "Postgres", "description": "needs a server"},
                                             {"label": "SQLite"}]}],
                  "timeoutSeconds": 300}
+# E2E_MAP: the arguments a model gives the map tool (a walking day plan). The stack's stand-in
+# ignores them and shows its own fixed map; the real plugin (gateway-plugins/map in the
+# openclaw-workspace repo) uses them.
+MAP_ARGS = {"title": "Kyoto, day 1",
+            "stops": [{"label": "Fushimi Inari", "query": "Fushimi Inari Taisha, Kyoto, Japan", "group": "Day 1"},
+                      {"label": "Kiyomizu-dera", "query": "Kiyomizu-dera, Kyoto, Japan", "group": "Day 1"},
+                      {"label": "Gion", "query": "Gion, Kyoto, Japan", "group": "Day 1"}],
+            "route": {"mode": "walk"}}
 _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 # The result's JSON sits inside the tool's text, so its quotes may be escaped.
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
@@ -566,6 +576,12 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             if wrapper in offered:
                 return {"tool": wrapper, "args": {"id": "exec", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_MAP" in user_text:
+        if tool_results:
+            return {"text": "E2E_MAP_DONE"}
+        return _call_with("map", MAP_ARGS, offered) or {
+            "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_APPROVAL" in user_text:
         if tool_results:

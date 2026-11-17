@@ -2418,3 +2418,74 @@ def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
         assert _thread_bot_texts(token, cid, root) == [f"CHAN_{n}", f"FOLLOW_{n}", f"AFTER_{n}"]
     finally:
         capture.pipe_valves(token, **old)
+
+
+# The in-chat map (e2e/agent-tool's `map`, a fixed three-stop map of Kyoto). Phone width, as the
+# map is used on the road; a second browser without WebGL shows the drawing that stays instead.
+MAP_STOPS = 3
+MAP_PHONE_WIDTH_PX = 390
+MAP_PAGE = ".chat-assistant iframe"
+NO_WEBGL_ARGS = ["--disable-gpu", "--disable-3d-apis"]
+
+
+def _map_in_a_phone_chat(page, token, launch_args=()):
+    """A phone browser (`launch_args` to it) asks for the map; returns its page, the chat id and the
+    closer of the browser. It launches from the module's own Playwright (`page`'s browser): a second
+    `sync_playwright()` cannot start inside the one the `page` fixture holds."""
+    browser = page.context.browser.browser_type.launch(args=list(launch_args))
+    pg = capture.signed_in_page(browser, token, capture.PHONE)
+    capture.new_chat(pg)
+    chat_id = capture.send(pg, "E2E_MAP")
+    capture.wait_js(pg, _last_reply_done("E2E_MAP_DONE"), "the reply after the map call", TURN_MS)
+    return pg, chat_id, browser.close
+
+
+def _map_stops(page):
+    return page.frame_locator(MAP_PAGE).last.locator("li.stop")
+
+
+def _shot(page, name: str) -> None:
+    out = os.environ.get("E2E_LOG_DIR")
+    if out:
+        page.screenshot(path=os.path.join(out, f"{name}.png"))
+
+
+def test_a_map_shows_on_a_phone_with_its_stops_and_survives_a_reload(page, token):
+    pg, chat_id, close = _map_in_a_phone_chat(page, token)
+    try:
+        assert pg.viewport_size["width"] == MAP_PHONE_WIDTH_PX
+        _map_stops(pg).first.wait_for(timeout=60_000)
+        assert _map_stops(pg).count() == MAP_STOPS
+        frame = pg.frame_locator(MAP_PAGE).last
+        assert "5.9 km" in frame.locator(".summary").inner_text()
+        assert frame.locator("button.copy").first.get_attribute("data-coords") == "34.9671,135.7727"
+        # Nothing in the page opens a window.
+        assert frame.locator("a").count() == 0
+        _shot(pg, "map-phone")
+
+        # The map is in the saved message, not only on the screen the socket drew.
+        saved = capture.api("GET", f"/api/v1/chats/{chat_id}", token=token)["chat"]["history"]["messages"]
+        embeds = [m.get("embeds") for m in saved.values() if m.get("role") == "assistant"]
+        assert any(e and 'class="stop"' in e[0] for e in embeds), embeds
+
+        pg.reload()
+        pg.wait_for_selector("#chat-input", timeout=60_000)
+        _map_stops(pg).first.wait_for(timeout=60_000)
+        assert _map_stops(pg).count() == MAP_STOPS
+        _shot(pg, "map-phone-after-reload")
+    finally:
+        close()
+
+
+def test_a_map_without_webgl_keeps_the_drawing_of_its_stops_and_route(page, token):
+    pg, _chat_id, close = _map_in_a_phone_chat(page, token, NO_WEBGL_ARGS)
+    try:
+        _map_stops(pg).first.wait_for(timeout=60_000)
+        frame = pg.frame_locator(MAP_PAGE).last
+        assert frame.locator("#fallback").is_visible()
+        assert frame.locator("#fallback circle").count() == MAP_STOPS
+        assert frame.locator("#fallback polyline").count() == 1
+        assert frame.locator("#mapview").count() == 0
+        _shot(pg, "map-phone-no-webgl")
+    finally:
+        close()
