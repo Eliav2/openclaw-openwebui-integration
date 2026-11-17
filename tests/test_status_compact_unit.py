@@ -35,7 +35,8 @@ def _history(reply, key_holder):
 
 def _gateway(describe, replies):
     """`describe`: the session rows `sessions.describe` answers in turn (the last repeats);
-    `replies`: the compact reply `chat.history` shows at each read (None = not yet)."""
+    `replies`: the compact reply `chat.history` shows at each read (None = not yet, an Exception =
+    the read fails)."""
     sent, reads = {}, {"describe": 0, "history": 0}
 
     async def send_request(method, params, timeout=10):
@@ -46,6 +47,8 @@ def _gateway(describe, replies):
         if method == "chat.history":
             reply = replies[min(reads["history"], len(replies) - 1)]
             reads["history"] += 1
+            if isinstance(reply, Exception):
+                raise reply
             return _history(reply, sent)
         raise AssertionError(f"unexpected RPC: {method}")
 
@@ -93,6 +96,19 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_on_2026_11_5_a_refused_compaction_still_says_why(self):
         result, status_calls, _ = await self._compact([{"hasActiveRun": False}], [None, REFUSAL])
         self.assertEqual(result["status"], "error")
+        self.assertEqual(status_calls, [{"show_loading": False, "notice": "Compaction failed: the model refused"}])
+
+    async def test_the_reply_that_ended_the_wait_is_the_one_checked_for_a_refusal(self):
+        """A second history read could fail and drop the notice: the poll's own read is the answer."""
+        result, status_calls, _ = await self._compact(
+            [{"hasActiveRun": False}], [None, REFUSAL, RuntimeError("history down")])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(status_calls, [{"show_loading": False, "notice": "Compaction failed: the model refused"}])
+
+    async def test_a_failed_poll_read_is_polled_again(self):
+        result, status_calls, emitted = await self._compact(
+            [{"hasActiveRun": False}], [RuntimeError("history down"), REFUSAL])
+        self.assertEqual(result["status"], "error", emitted)
         self.assertEqual(status_calls, [{"show_loading": False, "notice": "Compaction failed: the model refused"}])
 
     async def test_a_compaction_that_never_ends_times_out(self):

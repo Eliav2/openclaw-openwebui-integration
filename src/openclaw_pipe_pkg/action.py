@@ -2938,15 +2938,16 @@ _COMPACT_DEADLINE_S = 180
 _COMPACT_HISTORY_ROWS = 10
 
 
-async def _compact_reply_in_history(conn, session_key: str, idempotency_key: str) -> bool:
-    """Whether the compact run's own reply is in the session's history yet."""
+async def _compact_reply_in_history(conn, session_key: str, idempotency_key: str) -> str | None:
+    """The compact run's own reply when it is in the session's history yet, else None
+    (also when the read fails, so the caller polls again)."""
     try:
         history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=_COMPACT_HISTORY_ROWS),
                                           timeout=8)
     except Exception as ex:
         pipe_log(f"[status-action] compact reply read failed: {ex}")
-        return False
-    return _compact_reply((history or {}).get("messages"), idempotency_key) is not None
+        return None
+    return _compact_reply((history or {}).get("messages"), idempotency_key)
 
 
 # A /compact run always ends "done"; only its reply says whether it compacted.
@@ -3805,6 +3806,7 @@ class Action:
 
         deadline = time.time() + _COMPACT_DEADLINE_S
         status = None
+        observed_reply = None
         while time.time() < deadline:
             await asyncio.sleep(_COMPACT_POLL_S)
             try:
@@ -3818,10 +3820,11 @@ class Action:
                 break
             # From 2026.11.5 a compaction clears the row's run fields, so its status never says "done":
             # the run is over when its own reply is in the history and no run is active.
-            if not status and row.get("hasActiveRun") is False and await _compact_reply_in_history(
-                    conn, session_key, idempotency_key):
-                status = "done"
-                break
+            if not status and row.get("hasActiveRun") is False:
+                observed_reply = await _compact_reply_in_history(conn, session_key, idempotency_key)
+                if observed_reply is not None:
+                    status = "done"
+                    break
 
         if status not in ("done", "failed", "cancelled"):
             await __event_emitter__({
@@ -3840,13 +3843,16 @@ class Action:
             return {"status": "error", "detail": status}
 
         # The run is done either way; its reply says whether it compacted (ELI-209).
-        try:
-            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=_COMPACT_HISTORY_ROWS),
-                                              timeout=8)
-            refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
-        except Exception as ex:
-            pipe_log(f"[status-action] compact reply read failed: {ex}")
-            refusal = None
+        # The reply that ended the poll is the one classified: a second read could fail and drop the notice.
+        reply = observed_reply
+        if reply is None:
+            try:
+                history = await conn.send_request("chat.history",
+                                                  dict(sessionKey=session_key, limit=_COMPACT_HISTORY_ROWS), timeout=8)
+                reply = _compact_reply((history or {}).get("messages"), idempotency_key)
+            except Exception as ex:
+                pipe_log(f"[status-action] compact reply read failed: {ex}")
+        refusal = _compact_refusal(reply)
         if refusal:
             pipe_log(f"[status-action] compact refused: {refusal}")
             await self._run_status(body, __user__, __event_emitter__, show_loading=False, notice=refusal)
