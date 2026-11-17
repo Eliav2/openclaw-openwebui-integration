@@ -878,12 +878,28 @@ LEVEL_SENT_AS = {"ultra": "max"}
 # there (the old valve is left as it was, for a rollback).
 PIPE_FUNCTION_ID = "openclaw_gateway"
 PREFS_SUFFIX = ":prefs"
+# An Open WebUI Pipe model id is `<function id>.<model>`.
+MODEL_ID_SEPARATOR = "."
 THINKING_PREF = "thinking_default"
 
 
 def function_id_of(model):
     """The function an Open WebUI model id belongs to: `openclaw_gateway.default` -> `openclaw_gateway`."""
-    return str(model or "").split(".")[0] or PIPE_FUNCTION_ID
+    return str(model or "").split(MODEL_ID_SEPARATOR)[0] or PIPE_FUNCTION_ID
+
+
+async def resolve_function_id(model):
+    """The Pipe's function id for an Open WebUI model id. A workspace model (Admin > Models) built on a Pipe
+    model reaches the Pipe as its base model, but the Status dialog is given the workspace model's id: look the
+    row up first, as Open WebUI does, so both name the same settings key. A failed lookup uses the id as given."""
+    base = model
+    try:
+        from open_webui.models.models import Models
+        row = await Models.get_model_by_id(model) if model else None
+        base = getattr(row, "base_model_id", None) or model
+    except Exception as ex:
+        pipe_log(f"[prefs] could not look up model {model!r}: {ex}")
+    return function_id_of(base) if MODEL_ID_SEPARATOR in str(base or "") else PIPE_FUNCTION_ID
 
 
 def prefs_key(function_id):
@@ -918,6 +934,18 @@ async def write_prefs(user_id, function_id, change):
     await Users.update_user_settings_by_id(user_id, {prefs_key(function_id): {**current, **change}})
 
 
+async def _move_legacy(user_id, function_id, level):
+    """Copy the old valve's level to the key, only while the key still has none: the turn's snapshot may be older
+    than a save from the Status dialog, which must stand. Open WebUI has no compare-and-set, so the check is a
+    read right before the write; the level in effect is returned."""
+    from open_webui.models.users import Users
+    own = merge_prefs(_settings_of(await Users.get_user_by_id(user_id)), None, function_id)
+    if THINKING_PREF in own:
+        return own[THINKING_PREF]
+    await Users.update_user_settings_by_id(user_id, {prefs_key(function_id): {**own, THINKING_PREF: level}})
+    return level
+
+
 async def thinking_default_of(user, function_id):
     """The user's thinking default (UNSET when none): their settings key, else the 0.x user valve, which is
     copied to the key once. Never raises: a turn must not fail on a preference."""
@@ -936,7 +964,7 @@ async def thinking_default_of(user, function_id):
     if not isinstance(level, str) or level == UNSET:
         return UNSET
     try:
-        await write_prefs(user_id, function_id, {THINKING_PREF: level})
+        return await _move_legacy(user_id, function_id, level)
     except Exception as ex:
         pipe_log(f"[prefs] could not move the old thinking_default valve: {ex}")
     return level
@@ -7798,21 +7826,25 @@ _THINKING_FILL_JS_TEMPLATE = r"""
     select.appendChild(option);
   });
   select.value = DATA.current;
+  // What is stored: the level this dialog loaded, then the last one a save went through for. A failed save puts
+  // the list back to it, not to the level the dialog opened with.
+  let saved = DATA.current;
   const note = S.noteEl('Your default for chats that set no level in Advanced Params (Reasoning Effort). '
     + DATA.unset + ' keeps the model\'s own level; a level a model does not support is clamped down.');
   select.onchange = function() {
     const level = select.value;
     select.disabled = true;
     note.textContent = 'Saving...';
-    S.askAction({ mode: 'thinking-default', level: level })
+    return S.askAction({ mode: 'thinking-default', level: level })
       .then(function(r) { return r.json(); })
       .then(function(r) {
         if (!r || r.status !== 'ok') throw new Error((r && r.detail) || 'not saved');
+        saved = level;
         note.textContent = 'Saved: ' + level + '.';
       })
       .catch(function(err) {
         note.textContent = 'Could not save: ' + err.message;
-        select.value = DATA.current;
+        select.value = saved;
       })
       .then(function() { select.disabled = false; });
   };
@@ -9468,7 +9500,7 @@ class Action:
         if not user_id:
             return {"status": "error", "detail": "no user"}
         try:
-            await write_prefs(user_id, function_id_of(body.get("model")), {THINKING_PREF: level})
+            await write_prefs(user_id, await resolve_function_id(body.get("model")), {THINKING_PREF: level})
         except Exception as ex:
             pipe_log(f"[status-action] could not save the thinking level: {ex}")
             return {"status": "error", "detail": "could not save it, try again"}
@@ -9478,7 +9510,7 @@ class Action:
         """The Thinking level section: the levels and the user's current one. Open WebUI only, so it
         fills even with no Gateway."""
         try:
-            fid = function_id_of(body.get("model"))
+            fid = await resolve_function_id(body.get("model"))
             current = await thinking_default_of(__user__ or {}, fid)
             levels = _thinking_default_levels(self.valves.STATE_DIR)
             if current not in levels:

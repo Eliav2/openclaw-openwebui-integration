@@ -1506,21 +1506,25 @@ _THINKING_FILL_JS_TEMPLATE = r"""
     select.appendChild(option);
   });
   select.value = DATA.current;
+  // What is stored: the level this dialog loaded, then the last one a save went through for. A failed save puts
+  // the list back to it, not to the level the dialog opened with.
+  let saved = DATA.current;
   const note = S.noteEl('Your default for chats that set no level in Advanced Params (Reasoning Effort). '
     + DATA.unset + ' keeps the model\'s own level; a level a model does not support is clamped down.');
   select.onchange = function() {
     const level = select.value;
     select.disabled = true;
     note.textContent = 'Saving...';
-    S.askAction({ mode: 'thinking-default', level: level })
+    return S.askAction({ mode: 'thinking-default', level: level })
       .then(function(r) { return r.json(); })
       .then(function(r) {
         if (!r || r.status !== 'ok') throw new Error((r && r.detail) || 'not saved');
+        saved = level;
         note.textContent = 'Saved: ' + level + '.';
       })
       .catch(function(err) {
         note.textContent = 'Could not save: ' + err.message;
-        select.value = DATA.current;
+        select.value = saved;
       })
       .then(function() { select.disabled = false; });
   };
@@ -3176,7 +3180,7 @@ class Action:
         if not user_id:
             return {"status": "error", "detail": "no user"}
         try:
-            await write_prefs(user_id, function_id_of(body.get("model")), {THINKING_PREF: level})
+            await write_prefs(user_id, await resolve_function_id(body.get("model")), {THINKING_PREF: level})
         except Exception as ex:
             pipe_log(f"[status-action] could not save the thinking level: {ex}")
             return {"status": "error", "detail": "could not save it, try again"}
@@ -3186,7 +3190,7 @@ class Action:
         """The Thinking level section: the levels and the user's current one. Open WebUI only, so it
         fills even with no Gateway."""
         try:
-            fid = function_id_of(body.get("model"))
+            fid = await resolve_function_id(body.get("model"))
             current = await thinking_default_of(__user__ or {}, fid)
             levels = _thinking_default_levels(self.valves.STATE_DIR)
             if current not in levels:

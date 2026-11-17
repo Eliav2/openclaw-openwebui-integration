@@ -15,7 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from _test_helpers import RecordingEmitter, action_gateway
+from _test_helpers import RecordingEmitter, action_gateway, run_page
+from test_status_action_unit import _FAKE_DOM_JS
 
 import openclaw_status_action as action
 
@@ -35,8 +36,9 @@ class Owui:
     """Open WebUI's Users and Functions for one user: `settings` (what the user's settings hold, as the
     API merges top-level keys), `legacy` (what the 0.x Pipe kept in the user valve, None: no record)."""
 
-    def __init__(self, settings=None, legacy=None, legacy_error=None):
+    def __init__(self, settings=None, legacy=None, legacy_error=None, models=None):
         self.settings = dict(settings or {})
+        self.models = dict(models or {})   # workspace model id -> base_model_id
         self.legacy = legacy
         self.legacy_error = legacy_error
         self.writes = []
@@ -61,10 +63,19 @@ class Owui:
                     raise owui.legacy_error
                 return dict(owui.legacy) if owui.legacy is not None else None
 
-        names = ("open_webui", "open_webui.models", "open_webui.models.users", "open_webui.models.functions")
+        class Models:
+            @staticmethod
+            async def get_model_by_id(model_id):
+                base = owui.models.get(model_id)
+                return types.SimpleNamespace(id=model_id, base_model_id=base) if model_id in owui.models else None
+
+        names = ("open_webui", "open_webui.models", "open_webui.models.users", "open_webui.models.functions",
+                 "open_webui.models.models")
         mods = {n: sys.modules.get(n) or types.ModuleType(n) for n in names}
         mods["open_webui.models.users"] = types.ModuleType("open_webui.models.users")
         mods["open_webui.models.functions"] = types.ModuleType("open_webui.models.functions")
+        mods["open_webui.models.models"] = types.ModuleType("open_webui.models.models")
+        mods["open_webui.models.models"].Models = Models
         mods["open_webui.models.users"].Users = Users
         mods["open_webui.models.functions"].Functions = Functions
         self.patch = mock.patch.dict(sys.modules, mods)
@@ -150,6 +161,39 @@ class ReadTests(_Case):
         self.assertEqual(await self.pipe.thinking_default_of(o.user(), FID), "high")
 
 
+class MigrationRaceTests(_Case):
+    async def test_an_explicit_save_that_lands_before_the_move_is_not_overwritten(self):
+        """The turn's snapshot has no key and the old valve says `high`; the Status dialog saved `low` meanwhile.
+        The move inserts the field only while it is still absent, so `low` stands."""
+        o = self.owui(legacy={"thinking_default": "high"})
+        user = o.user()                                  # the turn's snapshot: no prefs key yet
+        o.settings[KEY] = {"thinking_default": "low"}    # the dialog's save, after the snapshot
+        self.assertEqual(await self.pipe.thinking_default_of(user, FID), "low")
+        self.assertEqual(o.writes, [], "nothing written over it")
+        self.assertEqual(o.settings[KEY], {"thinking_default": "low"})
+
+
+class ResolvedFunctionIdTests(_Case):
+    """A workspace model (Admin > Models) built on a Pipe model reaches the Pipe as its base model; the Status
+    dialog gets the workspace model's id, so it resolves the same way before it names the settings key."""
+
+    async def test_a_workspace_model_resolves_to_its_base_models_function(self):
+        self.owui(models={"forecast-assistant": "openclaw_gateway.default"})
+        self.assertEqual(await self.pipe.resolve_function_id("forecast-assistant"), FID)
+
+    async def test_a_pipe_model_and_an_unknown_one_resolve_without_a_row(self):
+        self.owui()
+        self.assertEqual(await self.pipe.resolve_function_id("openclaw_gateway.default"), FID)
+        self.assertEqual(await self.pipe.resolve_function_id("my_gateway.default"), "my_gateway")
+        self.assertEqual(await self.pipe.resolve_function_id("forecast-assistant"), FID)
+        self.assertEqual(await self.pipe.resolve_function_id(None), FID)
+
+    async def test_a_failed_model_lookup_falls_back_to_the_models_own_prefix(self):
+        self.owui()
+        sys.modules["open_webui.models.models"].Models.get_model_by_id = mock.AsyncMock(side_effect=RuntimeError("db"))
+        self.assertEqual(await self.pipe.resolve_function_id("my_gateway.default"), "my_gateway")
+
+
 class WriteTests(_Case):
     async def test_a_write_carries_the_old_valve_and_touches_only_its_key(self):
         o = self.owui(settings={"ui": {"theme": "dark"}}, legacy={"thinking_default": "high", "x": 1})
@@ -195,6 +239,20 @@ class DialogTests(_Case):
             self.assertIn("level", res["detail"], bad)
         self.assertEqual(o.writes, [])
 
+    async def test_the_save_from_a_workspace_models_chat_uses_the_pipes_key(self):
+        o = self.owui(models={"forecast-assistant": "openclaw_gateway.default"})
+        res = await action.Action().action(
+            {"mode": "thinking-default", "level": "high", "model": "forecast-assistant", "chat_id": "c1"},
+            __user__={"id": USER}, __event_emitter__=RecordingEmitter())
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(o.writes, [{KEY: {"thinking_default": "high"}}])
+
+    async def test_the_section_reads_the_pipes_key_for_a_workspace_model(self):
+        o = self.owui(settings={KEY: {"thinking_default": "low"}}, models={"forecast-assistant": "openclaw_gateway.default"})
+        emitted = RecordingEmitter()
+        await action.Action()._fill_thinking({"model": "forecast-assistant"}, o.user(), lambda code: emitted({"code": code}))
+        self.assertIn('"current": "low"', emitted.events[0]["code"])
+
     async def test_the_default_level_is_saved_as_default(self):
         o = self.owui(settings={KEY: {"thinking_default": "high"}})
         res = await action.Action().action(
@@ -210,6 +268,37 @@ class DialogTests(_Case):
             __user__={"id": USER}, __event_emitter__=RecordingEmitter())
         self.assertEqual(res["status"], "error")
         self.assertIn("save", res["detail"])
+
+
+_ROLLBACK_PAGE_JS = _FAKE_DOM_JS + r"""
+const answers = [...input.answers];
+global.localStorage = { getItem: () => 'tok' };
+global.fetch = () => Promise.resolve({ json: () => Promise.resolve(answers.shift()) });
+run(input.open);
+run(input.fill);
+const select = document.getElementById('openclaw-thinking-default');
+(async () => {
+  const seen = [];
+  for (const level of input.picks) {
+    select.value = level;
+    await select.onchange();
+    seen.push(select.value);
+  }
+  console.log(JSON.stringify(seen));
+})();
+"""
+
+
+class DialogRollbackTests(unittest.TestCase):
+    def test_a_failed_save_restores_the_last_saved_level_not_the_one_the_dialog_opened_with(self):
+        """Opened at low, saved medium, then a failed save of high: the list goes back to medium (what is stored)."""
+        fill = action._render_thinking_fill_js({"levels": ["default", "low", "medium", "high"], "current": "low"})
+        open_js = action._render_modal_open_js(
+            {"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "openclaw_gateway.default"})
+        seen = run_page(_ROLLBACK_PAGE_JS, {
+            "open": open_js, "fill": fill, "picks": ["medium", "high"],
+            "answers": [{"status": "ok", "level": "medium"}, {"status": "error", "detail": "could not save it"}]})
+        self.assertEqual(seen, ["medium", "medium"])
 
 
 if __name__ == "__main__":

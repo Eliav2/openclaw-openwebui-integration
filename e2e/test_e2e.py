@@ -3166,7 +3166,9 @@ def test_the_pipes_models_have_no_user_valves_so_no_valves_button(token):
     assert ours, "no model of the Pipe"
     assert not [m["id"] for m in ours if m.get("has_user_valves")], ours[0]
     status, spec = _request("GET", f"/api/v1/functions/id/{PIPE_FUNCTION_ID}/valves/user/spec", token=token)
-    assert status in (200, 404) and not (spec or {}).get("properties"), spec
+    assert status in (200, 404), (status, spec)
+    if status == 200:   # a 404's body is text: only a spec has fields to read
+        assert not (spec or {}).get("properties"), spec
 
 
 def test_the_thinking_level_reaches_the_model_and_a_clamp_says_so(token, think_model):

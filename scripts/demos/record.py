@@ -398,6 +398,10 @@ async def open_new_chat(page: Page) -> None:
                                      '{ display: none !important; }')
 
 
+# The Status Action's endpoint: its requests are what a failed demo's trace lists.
+ACTIONS_PATH = "/api/chat/actions"
+
+
 def _mode_of(post_data):
     try:
         return json.loads(post_data or "{}").get("mode")
@@ -412,7 +416,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
     page.on("console", lambda m: trace.append(f"console.{m.type}: {m.text[:300]}"))
     page.on("pageerror", lambda e: trace.append(f"pageerror: {str(e)[:300]}"))
     page.on("request", lambda r: trace.append(f"{r.method} {r.url[-60:]} mode={_mode_of(r.post_data)}")
-            if "/api/chat/actions" in r.url else None)
+            if ACTIONS_PATH in r.url else None)
     # Who removes the Status dialog or its drawer from the page, and when.
     await page.add_init_script("""(() => { window.__ocRemoved = []; const rm = Element.prototype.remove;
       Element.prototype.remove = function() { if (/^openclaw-(status-modal|drawer)-root$/.test(this.id))
@@ -464,13 +468,17 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
                 "frames": len(rec.frames), "frame_px": jpeg_size(rec.frames[-1][1]), "steps": steps, "chat": demo.chat_id}
     except Exception:
         print(f"  frames kept in {work}", flush=True)
-        await page.screenshot(path=os.path.join(work, "failed.png"))
-        # Also with the recordings, so the workflow's artifact has what the page showed when a step failed.
-        await page.screenshot(path=os.path.join(out, f"{spec['name']}-FAILED.png"))
-        with open(os.path.join(out, f"{spec['name']}-FAILED.txt"), "w") as fh:
+        # Best effort: a failure to collect what the page showed must not replace the step's own failure.
+        try:
+            await page.screenshot(path=os.path.join(work, "failed.png"))
+            # Also with the recordings, so the workflow's artifact has what the page showed when a step failed.
+            await page.screenshot(path=os.path.join(out, f"{spec['name']}-FAILED.png"))
             removed = await page.evaluate("() => window.__ocRemoved || []")
-            fh.write("\n".join(trace) + "\n--- removed\n" + "\n".join(removed)
-                     + "\n--- page text\n" + await page.evaluate("() => document.body.innerText"))
+            with open(os.path.join(out, f"{spec['name']}-FAILED.txt"), "w") as fh:
+                fh.write("\n".join(trace) + "\n--- removed\n" + "\n".join(removed)
+                         + "\n--- page text\n" + await page.evaluate("() => document.body.innerText"))
+        except Exception as ex:
+            print(f"  could not collect the failed page: {ex}", flush=True)
         raise
     finally:
         if old is not None:
