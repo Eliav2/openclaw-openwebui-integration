@@ -7,6 +7,6 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 (cd "$here" && bun install --frozen-lockfile >/dev/null)
 cd "$here/../.."
-files=$(git ls-files 'gateway-plugins/*.js' 'push/*.js' 'push/*.ts' 'scripts/*.ts' 'scripts/*.js' | grep -v -E '\.test\.')
+files=$(git ls-files 'gateway-plugins/*.js' 'scripts/*.ts' 'scripts/*.js' | grep -v -E '\.test\.')
 # shellcheck disable=SC2086
 exec "$here/node_modules/.bin/eslint" --suppressions-location scripts/lint-js/eslint-suppressions.json "$@" $files

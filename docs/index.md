@@ -6,7 +6,7 @@
 
 Every page of the OpenClaw for Open WebUI docs, with one line on what it covers. Each page opens with a one-line summary, then an `Applies to:` line (Pipe, Action) and the valves it uses, so a person or an agent can tell from the top whether it is the right page.
 
-The two functions: the **Pipe** is the chat integration, and the **Status Action** adds the Status button. A third, optional one, the **Web Push** event function, sends [push notifications](./install/web-push.md).
+The two functions: the **Pipe** is the chat integration, and the **Status Action** adds the Status button. Push notifications are a separate project, [open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push); see [Push notifications](./install/web-push.md) for the Pipe's part.
 
 ## Install
 

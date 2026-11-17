@@ -92,6 +92,10 @@ With the Status Action installed, one click shows context used, rate limits and 
 - **[Every Gateway model](https://eliav2.github.io/openclaw-openwebui-integration/features/sessions-and-models#model-picker):** the model picker lists the models your Gateway allows, one session per chat.
 - **[Channels](https://eliav2.github.io/openclaw-openwebui-integration/features/channels):** mention the agent in a channel and it answers in a thread, then follows it, answering what is meant for it without a new mention.
 
+## Push notifications
+
+Notifications on your phone or computer when a reply finishes live in a separate project, [Eliav2/open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push). This repository only publishes the `chat.finished` event it listens for ([`PUBLISH_CHAT_FINISHED`](./docs/configuration.md#publish_chat_finished)); there is no push function to install from here.
+
 ## Docs
 
 Everything else is on the docs site: **[eliav2.github.io/openclaw-openwebui-integration](https://eliav2.github.io/openclaw-openwebui-integration/)**, from [why this exists](https://eliav2.github.io/openclaw-openwebui-integration/why) to [configuration](https://eliav2.github.io/openclaw-openwebui-integration/configuration), [troubleshooting](https://eliav2.github.io/openclaw-openwebui-integration/troubleshooting) and [versions](https://eliav2.github.io/openclaw-openwebui-integration/versions). For agents: [llms.txt](https://eliav2.github.io/openclaw-openwebui-integration/llms.txt) and [llms-full.txt](https://eliav2.github.io/openclaw-openwebui-integration/llms-full.txt). The same pages are in [docs/](./docs/index.md) here.

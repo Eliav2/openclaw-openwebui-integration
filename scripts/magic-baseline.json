@@ -17,17 +17,10 @@
   "if \"pairing required\" in content and repair_pairing and valves:": 1,
   "if command == \"healthcheck\":": 1,
   "if command == \"status\":": 2,
-  "refusal = command != \"status\" and sandbox_refusal(live=live)": 2,
-  "return all(v for k, v in state.items() if k != \"is_global\" or spec.global_)": 1
+  "refusal = command != \"status\" and sandbox_refusal(live=live)": 2
  },
  "install_action.py": {
   "if status != HTTPStatus.OK or not isinstance(payload, dict) or \"status\" not in payload:": 1
- },
- "push/openclaw_web_push.py": {
-  "if event.get(\"event\") != \"chat.finished\":": 1,
-  "payload = {**payload, \"body\": snippet(payload[\"body\"].rstrip(\"…\"), keep) if keep > 20 else \"\"}": 1,
-  "return (cut.rsplit(\" \", 1)[0] if \" \" in cut else cut).rstrip(\" ,;:\") + \"…\"": 1,
-  "return str(sub.get(\"endpoint\", \"\")).split(\"/\")[2:3][0] if \"//\" in str(sub.get(\"endpoint\", \"\")) else \"?\"": 1
  },
  "scripts/check_owui_fixture.py": {
   "if which == \"next\":": 1,
@@ -468,7 +461,6 @@
   "return (bool(stream) and stream != \"tool\") or _is_terminal_event(payload)": 1,
   "return (isinstance(m, dict) and m.get(\"role\") == \"user\" and not _history_user_run_id(m)": 1,
   "return (isinstance(payload, dict) and payload.get(\"state\") == \"final\"": 1,
-  "return (m.get(\"provenance\") or {}).get(\"kind\") == \"inter_session\"": 1,
   "return ({i.get(\"id\") for i in seg if i.get(\"type\") == \"function_call\"} <= calls": 1,
   "return any(isinstance(m, dict) and m.get(\"role\") == \"assistant\"": 1,
   "return bool(self._claim and self._claim.get(\"how\") == \"new\" and self._claim.get(\"parent\"))": 1,
