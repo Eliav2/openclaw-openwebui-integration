@@ -775,14 +775,46 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # 2026.10.2+ marks the wake turn by cron provenance instead and runs it under
 # its own run id: an ordinary agent turn.
 
+# 2026.11.5 hides the whole run: sourceTool "cron_execution"
+# (session-event-handoff-Ct6SCwLg.mjs:376), no assistant stream
+# (embedded-agent-subscribe-EcG91LL0.mjs:816), prompt and reply left out of
+# chat.history (chat-display-projection.history-m8O6y-mh.mjs:242, 251). Its
+# reply comes as an `automation-result` message after the run
+# (conversation-result-CfQov6Jy.mjs:6-24).
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
+_CRON_SOURCE_TOOLS = ("cron", "cron_execution")
+_CRON_PROVENANCE_KIND = "internal_system"
+_AUTOMATION_KIND_CRON = "cron"
+
+
+def hides_cron_run_output(version) -> bool:
+    """True for a 2026.11.5+ Gateway, which shows a cron run into a session
+    only by its `automation-result` message. Unknown versions count as older."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 11, 5)
+
+
+def cron_execution_id(job: str, start_ms) -> str:
+    """The Gateway's id of one cron job run (run-id-Be9gQ-r9.mjs createCronExecutionId)."""
+    return f"cron:{job}:{int(start_ms)}"
+
+
+def cron_result_message(messages: list, execution_id: str) -> dict | None:
+    """The `automation-result` message that cron run committed, else None."""
+    for m in reversed(messages or []):
+        auto = m.get("openclawAutomation") if isinstance(m, dict) else None
+        if (isinstance(auto, dict) and auto.get("kind") == _AUTOMATION_KIND_CRON
+                and auto.get("runId") == execution_id and m.get("role") == _ASSISTANT_ROLE):
+            return m
+    return None
 
 
 def _cron_turn_job(m: dict) -> str | None:
     """The cron job a wake turn names (provenance, else prompt header), else None."""
     prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
     if prov:
-        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+        if prov.get("kind") != _CRON_PROVENANCE_KIND or prov.get("sourceTool") not in _CRON_SOURCE_TOOLS:
             return None
         hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
         if prov.get("jobId") or hit:
@@ -3172,11 +3204,32 @@ class _GatewayConnection:
                     isinstance(target, str) and target.startswith("session:")):
                 return
             runs = self._cron_runs.setdefault(target[len("session:"):], [])
-            run = {"job": job_id, "start": start, "end": None}
+            # `agent_run`: the hidden agent run that executes it (2026.11.5,
+            # `claim_cron_run`); `ended`: set on its `finished`, which comes
+            # after its result is committed (server-cron-BkJWNNVt.mjs:2983).
+            run = {"job": job_id, "start": start, "end": None, "agent_run": None,
+                   "ended": asyncio.Event()}
             runs.append(run)
             del runs[:-20]
-        if payload.get("action") == "finished" and isinstance(payload.get("durationMs"), (int, float)):
-            run["end"] = start + payload["durationMs"]
+        if payload.get("action") == _CRON_FINISHED:
+            if isinstance(payload.get("durationMs"), (int, float)):
+                run["end"] = start + payload["durationMs"]
+            run["ended"].set()
+
+    def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
+        """The heard cron run into `session_key` that agent run `run_id`, first
+        seen at `at_ms`, executes: its own claim, else the oldest unclaimed one
+        started by then and not finished. Runs queued in one session's lane
+        start in order, so the oldest is this one's."""
+        runs = self._cron_runs.get(session_key) or []
+        mine = next((r for r in runs if r.get("agent_run") == run_id), None)
+        if mine is not None:
+            return mine
+        run = next((r for r in runs if r.get("agent_run") is None and r["start"] <= at_ms
+                    and not r["ended"].is_set()), None)
+        if run is not None:
+            run["agent_run"] = run_id
+        return run
 
     def cron_run_at(self, session_key: str, at_ms: float) -> dict | None:
         """The newest recorded cron run into `session_key` covering `at_ms`."""
@@ -4559,6 +4612,8 @@ def _idempotency_keys(message) -> tuple[str, str]:
 
 
 _ASSISTANT_ROLE = "assistant"
+# A `cron` event's action once a job run is over.
+_CRON_FINISHED = "finished"
 # What a reply reads from its run's messages: the usage, image and
 # attachment_error blocks (ELI-322, ELI-328), and the keys that name the run.
 _DIGEST_BLOCK_TYPES = ("image", "attachment_error")

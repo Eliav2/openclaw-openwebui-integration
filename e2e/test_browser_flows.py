@@ -58,6 +58,15 @@ def _steers() -> bool:
     return _openclaw_version() >= (2026, 10, 10)
 
 
+@functools.lru_cache(maxsize=1)
+def _hides_cron_run_output() -> bool:
+    """2026.11.5+ runs a cron job into a chat's session as a hidden automation
+    run: its text never streams (embedded-agent-subscribe-EcG91LL0.mjs:816),
+    only its tool events; the reply arrives whole as its `automation-result`
+    message (conversation-result-CfQov6Jy.mjs)."""
+    return _openclaw_version() >= (2026, 11, 5)
+
+
 STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS
 
 
@@ -1711,7 +1720,8 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
     """A reply the agent starts (a cron wake into the chat's session) shows
     in the tab open on the chat with no reload: a new message that streams
     word by word, then the question it ends with as a card in that tab.
-    Answering the card reaches the agent."""
+    Answering the card reaches the agent. 2026.11.5 streams no text of it: the
+    message comes whole, with the card."""
     capture.new_chat(page)
     capture.send(page, "E2E_ECHO: BROWSER_WAKE_CHAT")
     _wait(page, _turn_over("BROWSER_WAKE_CHAT"), "the first reply")
@@ -1720,9 +1730,10 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
     capture.schedule_wake(key, "E2E_WAKE_ASK", 2)
     _wait(page, _reply_js(1, "r.text.includes('E2E_WAKE_ASK_START') && r.text.includes('Which color?')"),
           "the agent's own reply in the open tab, with no reload")
-    texts = _seen(page, _replies(page)[1]["id"])
-    assert any("slow-1" in t and "slow-6" not in t for t in texts), \
-        f"the reply did not stream in the tab: {_tails(texts)}"
+    if not _hides_cron_run_output():
+        texts = _seen(page, _replies(page)[1]["id"])
+        assert any("slow-1" in t and "slow-6" not in t for t in texts), \
+            f"the reply did not stream in the tab: {_tails(texts)}"
     capture.wait_js(page, "() => !!document.querySelector('input[placeholder=\"Type your answer\"]')",
                     "the question card in the open tab", TURN_MS)
     page.locator("section button", has=page.locator("span", has_text="Green")).first.click()
@@ -1761,8 +1772,9 @@ def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
     key = f"agent:main:openwebui-{me['id']}-{_chat_id(page)}"
     job = capture.schedule_wake(key, f"E2E_HOLD {hold_token}", 2)
     try:
-        _wait(page, _reply_js(1, "r.text.includes('E2E_HOLD_START') && !r.done"),
-              "the agent's reply running in the open tab")
+        # 2026.11.5 holds the run's text back: it runs showing its command's card.
+        running = "!r.done" if _hides_cron_run_output() else "r.text.includes('E2E_HOLD_START') && !r.done"
+        _wait(page, _reply_js(1, running), "the agent's reply running in the open tab")
         page.locator('button[aria-label="Stop"]').click()
         _wait(page, _reply_js(1, "r.done"), "the reply ended by Stop", 30_000)
         deadline, runs = time.monotonic() + 60, []

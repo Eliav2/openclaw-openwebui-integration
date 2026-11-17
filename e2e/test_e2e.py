@@ -463,6 +463,14 @@ def _openclaw_release() -> tuple:
     return _openclaw_version()[:2]
 
 
+def _hides_cron_run_output() -> bool:
+    """2026.11.5+ runs a cron job into a chat's session as a hidden automation
+    run: its prompt, text and closing stay out of `chat.history`
+    (chat-display-projection.history-m8O6y-mh.mjs:242, 251), and its reply is
+    an `automation-result` message (conversation-result-CfQov6Jy.mjs)."""
+    return _openclaw_version() >= (2026, 11, 5)
+
+
 def _skip_known_105_gap(issue: str, what: str) -> None:
     """A known gap of the Pipe on OpenClaw 2026.10 before 2026.10.10 (the
     pinned lane, the version live runs): skipped there under its issue, so the
@@ -527,7 +535,8 @@ def _wake_messages(key: str) -> dict:
     wake has its own run id, an agent turn like any other: its message comes
     from that run id, and `chat.history` shows the wake's prompt turn as a
     forwarded "assistant" message with the cron prefix moved into its
-    provenance (GH #24)."""
+    provenance (GH #24). From 2026.11.5 the wake's turn is hidden and its
+    reply is an `automation-result` message: the message is its cron run's."""
     hist = _gw("chat.history", {"sessionKey": key, "limit": 100})
     session_id, turn, out = hist.get("sessionId"), None, {}
     for m in hist.get("messages") or []:
@@ -539,6 +548,13 @@ def _wake_messages(key: str) -> dict:
             cron = (str(text).lstrip().startswith("[cron:")
                     or (m.get("provenance") or {}).get("sourceTool") == "cron")
             turn = ikey[:-len(":user")] if cron else None
+            continue
+        auto = m.get("openclawAutomation") or {}
+        if auto.get("kind") == "cron" and auto.get("runId"):
+            # 2026.11.5: the wake's message is its cron run's result.
+            for tok in ("WAKE_ONE", "WAKE_TWO", "WAKE_SLOW"):
+                if tok in str(text):
+                    out[tok] = str(uuid.uuid5(TURN_NS, f"{key}:{auto['runId']}"))
             continue
         run = meta.get("runId")
         for tok in ("WAKE_ONE", "WAKE_TWO", "WAKE_SLOW"):
@@ -2361,6 +2377,9 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 @pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a wake after the run")
 def test_a_cron_wake_a_second_wake_fired_into_is_completed_whole_on_start(token):
+    if _hides_cron_run_output():
+        pytest.skip("OpenClaw 2026.11.5+ keeps a cron run's transcript out of chat.history: "
+                    "no wake reply is rebuilt from it")
     """Two cron wakes, the second fired while the first's claude-cli run works:
     2026.10.10 runs the second after the first's run, and its prompt carries
     the time it fired; the first's messages, imported with Claude Code's own

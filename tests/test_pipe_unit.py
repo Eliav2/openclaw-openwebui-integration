@@ -18089,3 +18089,127 @@ class ClaudeThinkingProfileFixtureTest(unittest.TestCase):
                          f"OpenClaw {got['openclaw_version']} changed the Claude thinking profiles "
                          f"(fixture: {self.fx['openclaw_version']}); re-check CLAUDE_CLI_THINKING_OFF_IGNORED, "
                          "then re-extract with scripts/extract_openclaw_claude_thinking_profiles.py --write")
+
+
+class CronResultTurnTests(_RoutingCase):
+    """2026.11.5 runs a cron job into a chat's session as a hidden automation run:
+    no assistant stream, a chat final with no message, its prompt and reply
+    hidden from chat.history (chat-display-projection.history-m8O6y-mh.mjs:242,
+    251). Its reply reaches the chat only as an `automation-result` message
+    committed after the run (conversation-result-CfQov6Jy.mjs). That message is
+    the wake's message, one per cron run. Events as a local 2026.11.5 sent them."""
+
+    JOB = "fbb472f8-ef97-4ee2-8959-a6ef1fd1c009"
+    START = 1794924711196
+    RUN = "d265f256-146a-4994-b060-32658c6b3393"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.conn.gateway_version = "2026.11.5"
+        self.history = {"messages": []}
+
+    def cron(self, action, job=None, start=None, **extra):
+        job, start = job or self.JOB, start or self.START
+        self.conn.note_cron_event({"jobId": job, "action": action, "runAtMs": start,
+                                   "job": {"id": job, "sessionTarget": f"session:{self.key}"}, **extra})
+
+    def result(self, text, job=None, start=None):
+        job, start = job or self.JOB, start or self.START
+        cron_run = f"cron:{job}:{start}"
+        return {"role": "assistant", "content": [{"type": "text", "text": text}],
+                "api": "openclaw-transcript", "provider": "openclaw", "model": "automation-result",
+                "stopReason": "stop", "timestamp": start + 900,
+                "idempotencyKey": f"cron-current-completion:{cron_run}",
+                "openclawAutomation": {"kind": "cron", "jobId": job, "runId": cron_run}}
+
+    def hidden_run(self, run, start):
+        """The run's events: nothing that shows, then a final with no message."""
+        for payload in ({"stream": "run_status", "data": {"phase": "preparing_workspace"}},
+                        {"stream": "lifecycle", "data": {"phase": "start", "startedAt": start + 700}},
+                        {"stream": "usage", "data": {"outputTokens": 5}},
+                        {"stream": "lifecycle", "data": {"phase": "end", "stopReason": "stop"}},
+                        {"state": "final", "stopReason": "stop"}):
+            _turn_route_now(self.conn, self.ev(run, {"ts": start + 800, **payload}))
+
+    def message_of(self, job=None, start=None):
+        return turn_message_id(self.key, f"cron:{job or self.JOB}:{start or self.START}", self.CHAT)
+
+    async def test_the_automation_result_is_the_wakes_one_finished_message(self):
+        self.cron("started")
+        self.hidden_run(self.RUN, self.START)
+        await self.spin()
+        self.history = {"messages": [self.result("E2E_WAKE_CHAT")]}
+        self.conn._on_session_message({"sessionKey": self.key, "message": self.result("E2E_WAKE_CHAT")})
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        msgs = self.new_messages()
+        self.assertEqual(list(msgs), [self.message_of()], msgs)
+        m = msgs[self.message_of()]
+        self.assertEqual((m["content"].strip(), m["done"]), ("E2E_WAKE_CHAT", True))
+
+    async def test_a_quiet_cron_run_writes_no_message(self):
+        """No result (NO_REPLY or no_change): nothing in the chat, no "sent together" note."""
+        self.cron("started")
+        self.hidden_run(self.RUN, self.START)
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        self.assertEqual(self.new_messages(), {})
+
+    async def test_two_wakes_queued_in_a_row_get_one_message_each(self):
+        """The second job fires while the first's run works: its run waits in
+        the session's lane, so runs take the heard cron runs oldest first."""
+        second, run2 = self.START + 1000, "6f0a1d6e-0000-4000-8000-000000000002"
+        self.cron("started")
+        self.cron("started", job="job-two", start=second)
+        self.hidden_run(self.RUN, self.START)
+        await self.spin()
+        self.history = {"messages": [self.result("WAKE_ONE")]}
+        self.cron("finished", durationMs=1500)
+        await self.spin()
+        self.hidden_run(run2, second + 600)
+        await self.spin()
+        self.history = {"messages": [self.result("WAKE_ONE"),
+                                     self.result("WAKE_TWO", job="job-two", start=second)]}
+        self.cron("finished", job="job-two", start=second, durationMs=1200)
+        await self.spin()
+        msgs = self.new_messages()
+        self.assertEqual({k: m["content"].strip() for k, m in msgs.items()},
+                         {self.message_of(): "WAKE_ONE",
+                          self.message_of("job-two", second): "WAKE_TWO"})
+
+    async def test_a_cron_run_that_streamed_a_tool_card_ends_with_card_and_result(self):
+        """2026.11.5 still streams a hidden run's tool events (only its text is
+        held back), so M runs with the card, then gets the result's text."""
+        self.cron("started")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 700, "stream": "run_status",
+                                                      "data": {"phase": "starting_model"}}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 800, **_tool("start", tcid="toolu_1")}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"ts": self.START + 850, **_tool("result", tcid="toolu_1")}))
+        await self.spin()
+        running = self.new_messages()[self.message_of()]
+        self.assertIs(running["done"], False)
+        self.hidden_run(self.RUN, self.START)
+        self.history = {"messages": [self.result("E2E_HOLD_END")]}
+        self.cron("finished", durationMs=1011)
+        await self.spin()
+        m = self.new_messages()[self.message_of()]
+        self.assertEqual([i.get("type") for i in m["output"]], ["function_call", "function_call_output", "message"])
+        self.assertTrue(m["content"].rstrip().endswith("E2E_HOLD_END"), m["content"])
+        self.assertIs(m["done"], True)
+
+    async def test_before_2026_11_5_a_cron_run_is_an_ordinary_agent_run(self):
+        """2026.11.3 streams a cron run like any agent run: its message is its run's."""
+        self.conn.gateway_version = "2026.11.3"
+        self.history = _turn_history(run=self.RUN)
+        self.cron("started")
+        await self.run_turn(self.RUN)
+        msgs = self.new_messages()
+        self.assertEqual(list(msgs), [turn_message_id(self.key, self.RUN, self.CHAT)], msgs)
+
+
+class CronExecutionTurnJobTests(unittest.TestCase):
+    def test_a_2026_11_5_cron_execution_turn_names_its_job(self):
+        m = {"role": "user", "content": "[cron:job-9 x] hi", "idempotencyKey": "k1",
+             "provenance": {"kind": "internal_system", "sourceTool": "cron_execution",
+                            "jobId": "job-9", "runId": "cron:job-9:1"}}
+        self.assertEqual(openclaw_pipe._cron_turn_job(m), "job-9")

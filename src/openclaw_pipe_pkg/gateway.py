@@ -2107,11 +2107,32 @@ class _GatewayConnection:
                     isinstance(target, str) and target.startswith("session:")):
                 return
             runs = self._cron_runs.setdefault(target[len("session:"):], [])
-            run = {"job": job_id, "start": start, "end": None}
+            # `agent_run`: the hidden agent run that executes it (2026.11.5,
+            # `claim_cron_run`); `ended`: set on its `finished`, which comes
+            # after its result is committed (server-cron-BkJWNNVt.mjs:2983).
+            run = {"job": job_id, "start": start, "end": None, "agent_run": None,
+                   "ended": asyncio.Event()}
             runs.append(run)
             del runs[:-20]
-        if payload.get("action") == "finished" and isinstance(payload.get("durationMs"), (int, float)):
-            run["end"] = start + payload["durationMs"]
+        if payload.get("action") == _CRON_FINISHED:
+            if isinstance(payload.get("durationMs"), (int, float)):
+                run["end"] = start + payload["durationMs"]
+            run["ended"].set()
+
+    def claim_cron_run(self, session_key: str, run_id: str, at_ms: float) -> dict | None:
+        """The heard cron run into `session_key` that agent run `run_id`, first
+        seen at `at_ms`, executes: its own claim, else the oldest unclaimed one
+        started by then and not finished. Runs queued in one session's lane
+        start in order, so the oldest is this one's."""
+        runs = self._cron_runs.get(session_key) or []
+        mine = next((r for r in runs if r.get("agent_run") == run_id), None)
+        if mine is not None:
+            return mine
+        run = next((r for r in runs if r.get("agent_run") is None and r["start"] <= at_ms
+                    and not r["ended"].is_set()), None)
+        if run is not None:
+            run["agent_run"] = run_id
+        return run
 
     def cron_run_at(self, session_key: str, at_ms: float) -> dict | None:
         """The newest recorded cron run into `session_key` covering `at_ms`."""
@@ -3494,6 +3515,8 @@ def _idempotency_keys(message) -> tuple[str, str]:
 
 
 _ASSISTANT_ROLE = "assistant"
+# A `cron` event's action once a job run is over.
+_CRON_FINISHED = "finished"
 # What a reply reads from its run's messages: the usage, image and
 # attachment_error blocks (ELI-322, ELI-328), and the keys that name the run.
 _DIGEST_BLOCK_TYPES = ("image", "attachment_error")
