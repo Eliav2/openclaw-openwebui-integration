@@ -49,6 +49,12 @@ class StoppedTabTests(_WriterCase):
         self.assertEqual({k: pushed.get(k) for k in ("id", "role", "parentId")},
                          {"id": "m4", "role": "assistant", "parentId": "q4"})
 
+    async def test_the_push_says_the_reply_is_done(self):
+        """The close runs once the row is done: a tab with no cancel event of its own (another
+        viewer) still sees the reply finished, as the whole-row push showed it."""
+        pushed = await self._stop("חצי תשובה")
+        self.assertIs(pushed.get("done"), True)
+
     async def test_a_reply_stopped_before_text_still_pushes_its_status_lines(self):
         """There the push sets the status lines on purpose: its text says "Stopped" now."""
         pushed = await self._stop("")

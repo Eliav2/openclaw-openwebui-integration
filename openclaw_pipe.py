@@ -10039,7 +10039,9 @@ def _stopped_push(current: dict, fields: dict, message_id: str) -> dict:
     rest of the saved row: Open WebUI merges the node over the tab's copy, and the request's own
     status line can be in the tab before it is in the row (its emitter sends, then writes), so a
     pushed `statusHistory` would drop it (ELI-512, chat cb7b779f)."""
-    return {**{k: current[k] for k in MESSAGE_IDENTITY_KEYS if k in current}, **fields, "id": message_id}
+    # The close runs once the row is done: a tab with no cancel event of its own sees it end.
+    return {**{k: current[k] for k in MESSAGE_IDENTITY_KEYS if k in current}, **fields,
+            "id": message_id, "done": True}
 
 
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
