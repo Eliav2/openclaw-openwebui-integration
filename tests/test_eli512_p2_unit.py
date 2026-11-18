@@ -375,7 +375,8 @@ class ParkedStopTests(unittest.TestCase):
         close.assert_called_once()
         args, kwargs = close.call_args
         self.assertEqual({k: v for k, v in args[1].items() if k != "output"},
-                         {"chat_id": CHAT, "message_id": "m9", "user_id": GUEST, "request_task_id": "task-9"})
+                         {"chat_id": CHAT, "message_id": "m9", "user_id": GUEST, "request_task_id": "task-9",
+                          "lang": "he", "shown": ""})
         self.assertEqual(args[2], "**נעצר.**")
         self.assertEqual(kwargs, {"only_if_empty": True})
 
@@ -385,8 +386,9 @@ class ParkedStopTests(unittest.TestCase):
         turn.renderer.visible_text = "MEDIA:/tmp/openclaw/x.png"
         self._stop(turn).assert_called_once()
 
-    def test_a_stop_after_text_writes_nothing(self):
-        self._stop(self._turn("half an answer")).assert_not_called()
+    def test_a_stop_after_text_hands_its_cards_to_the_close(self):
+        """Its text stays, but its cards are closed (test_eli512_details_unit.StoppedCardsTests)."""
+        self._stop(self._turn("half an answer")).assert_called_once()
 
 
 if __name__ == "__main__":

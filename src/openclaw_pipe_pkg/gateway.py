@@ -1187,6 +1187,85 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
     )
 
 
+# Open WebUI (v0.13.3) renders a `<details>` block only in the shape of its own: `<details ...>`
+# ending its line and `<summary>...</summary>` ending the next (src/lib/utils/marked/extension.ts:
+# 34-35). Any other shape is an HTML token, which a chat shows as plain text (HTMLToken.svelte:139).
+_DETAILS_OPEN = "<details"
+_DETAILS_OPEN_TAG = re.compile(r"<details(?:\s[^>]*)?>")
+_SUMMARY_OPEN = "<summary>"
+_SUMMARY_TAG = re.compile(r"<summary>.*?</summary>")
+_CODE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_LINE_END = "\n"
+DETAILS_LINE_HOLD_MAX = 2000  # a line held as a possible `<details` line is let go past this
+
+
+class _DetailsShaper:
+    """Puts a model's `<details><summary>S</summary>...` block, written on one line, in the lines
+    Open WebUI renders as a collapsible (ELI-512), as text streams in. Only a line that starts
+    with the tag is touched, never one in a code fence. Such a line is held until it ends; any
+    other is passed on as it comes."""
+
+    def __init__(self):
+        self.line = ""           # the current line so far
+        self.held = True         # whether it is still held (it may be a `<details` line)
+        self.fence = ""          # the open code fence's marker, if any
+        self.after_open = False  # the last line opened a `<details` with no summary
+
+    def _may_shape(self, line: str) -> bool:
+        if self.fence or len(line) > DETAILS_LINE_HOLD_MAX:
+            return False
+        tags = (_DETAILS_OPEN, _SUMMARY_OPEN) if self.after_open else (_DETAILS_OPEN,)
+        return any(tag.startswith(line) or line.startswith(tag) for tag in tags)
+
+    def _shape(self, line: str) -> str:
+        body, end = (line[:-1], _LINE_END) if line.endswith(_LINE_END) else (line, "")
+        parts, opened = [], False
+        tag = _DETAILS_OPEN_TAG.match(body)
+        if tag:
+            parts, body, opened = [tag.group(0)], body[tag.end():].lstrip(), True
+        if tag or self.after_open:
+            summary = _SUMMARY_TAG.match(body)
+            if summary:
+                parts, body, opened = parts + [summary.group(0)], body[summary.end():].lstrip(), False
+        self.after_open = opened
+        if not parts:
+            return line
+        return _LINE_END.join(parts + ([body] if body else [])) + end
+
+    def _end_line(self) -> None:
+        fence = _CODE_FENCE.match(self.line)
+        if fence and not self.fence:
+            self.fence = fence.group(1)
+        elif fence and fence.group(1).startswith(self.fence) and not self.line[fence.end():].strip():
+            # Only a line of the fence's marks, at least as many, closes it (CommonMark).
+            self.fence = ""
+        self.line, self.held = "", True
+
+    def feed(self, chunk: str) -> str:
+        out = []
+        for ch in chunk:
+            self.line += ch
+            if not self.held:
+                out.append(ch)
+            elif ch == _LINE_END:
+                out.append(self._shape(self.line))
+            elif not self._may_shape(self.line):
+                out.append(self.line)
+                self.held, self.after_open = False, False
+            if ch == _LINE_END:
+                self._end_line()
+        return "".join(out)
+
+    def flush(self) -> str:
+        """The held line, shaped. The message ends here (a tool card or the run's end): a fence
+        or an open `<details` never runs on into the next one."""
+        line, held = self.line, self.held
+        self._end_line()
+        shaped = self._shape(line) if held else ""
+        self.fence, self.after_open = "", False
+        return shaped
+
+
 class _TurnRenderer:
     """Rebuild a run's visible content (text, tool cards, Pipe notes) from its
     Gateway events, as the inline reply renders it. The turn writer uses it to
@@ -1215,6 +1294,8 @@ class _TurnRenderer:
         self.run_boundary = False
         # A possible silent sentinel at a message start (`_add_text`).
         self._held = ""
+        # A model's `<details>` line, put in Open WebUI's shape (`_add_text`).
+        self._details = _DetailsShaper()
         # The run's reply was a silent sentinel alone, not lost text.
         self.silenced = False
         # The run yielded with no text after: its yield's acknowledgment, else None.
@@ -1298,6 +1379,10 @@ class _TurnRenderer:
         """Append `chunk`; returns it as added. A leading silent sentinel is
         held: followed by more text it is dropped (ELI-219), alone it stays out
         (`flush`)."""
+        return self._add_shaped(self._details.feed(chunk or ""))
+
+    def _add_shaped(self, chunk: str) -> str:
+        """`_add_text` for text the `<details` shaper already passed."""
         if not chunk:
             return ""
         last = self.output[-1] if self.output else None
@@ -1318,12 +1403,13 @@ class _TurnRenderer:
 
     def flush(self) -> str:
         """Release held text unless it is a sentinel; returns it as added."""
+        shaped = self._add_shaped(self._details.flush())
         held, self._held = self._held, ""
         if held.strip() in _SILENT_SENTINELS:
             self.silenced = True
         if not held.strip() or held.strip() in _SILENT_SENTINELS:
-            return ""
-        return self._append_text(held)
+            return shaped
+        return shaped + self._append_text(held)
 
     def _append_text(self, chunk: str) -> str:
         if not chunk:

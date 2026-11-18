@@ -514,12 +514,42 @@ STOPPED_SAVE_WAIT_S = 10.0
 STOPPED_SAVE_POLL_S = 0.25
 
 
+# The statuses Open WebUI's cancel save leaves on a card it found unfinished.
+STOPPED_CARD_STATUSES = frozenset({"incomplete", "in_progress"})
+
+
+def _close_stopped_cards(output: list, lang: str) -> bool:
+    """Close the cards a Stop left unfinished, in place, as a finished reply's are
+    (`_TurnRenderer.finished_output`): completed, a call with no result answered "Stopped".
+    Open WebUI's cancel save marks every card still `in_progress` `incomplete`, and a group
+    shows no labels for those, only the tools' names (ELI-512). A call answered only with the
+    generic no-result note (`finished_output`) says "Stopped" too. Whether it changed any."""
+    stopped = ui_text("stopped", lang)
+    answered = {i.get("call_id") for i in output if isinstance(i, dict) and i.get("type") == _CALL_OUTPUT_ITEM}
+    changed = False
+    for item in output:
+        parts = item.get("output") if isinstance(item, dict) and item.get("type") == _CALL_OUTPUT_ITEM else None
+        if isinstance(parts, list) and [p.get("text") for p in parts if isinstance(p, dict)] == [TOOL_NO_RESULT_NOTE]:
+            item["output"], changed = [{"type": OUTPUT_TEXT_PART, "text": stopped}], True
+    for at in range(len(output) - 1, -1, -1):
+        item = output[at]
+        if not isinstance(item, dict) or item.get("type") != _CALL_ITEM \
+                or item.get("status") not in STOPPED_CARD_STATUSES:
+            continue
+        item["status"], changed = "completed", True
+        call_id = item.get("call_id") or item.get("id")
+        if call_id and call_id not in answered:
+            output.insert(at + 1, _tool_call_result_event(call_id, stopped)["item"])
+    return changed
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
                               only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
     for the request to end first, or Open WebUI's own save lands over this.
-    `only_if_empty`: a reply stopped before any text gets `note` as its content,
-    one with content stays as it is, its "Stopped" status line too."""
+    `only_if_empty`: a stopped reply (ELI-512). One stopped before any text gets
+    `note` as its content; one with content keeps it and its "Stopped" status
+    line. Either way its cards are closed (`_close_stopped_cards`)."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
@@ -543,13 +573,30 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
         async with conn._chat_write_lock(chat_id):
             current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
             text = (current.get("content") or "").strip()
-            if only_if_empty and text:
-                return
-            text = f"{text}\n\n{note}" if text else note
-            output = list(current.get("output") or [])
+            # What the reply showed: Open WebUI's cancel save writes no content, and the stop's
+            # own snapshot can fail, so a reply that showed text can read back with none.
+            shown = (ref.get("shown") or "").strip()
+            output = copy.deepcopy(list(current.get("output") or []))
             # The cards the reply showed when it was stopped, should the save have missed one.
             have = {i.get("id") for i in output if isinstance(i, dict)}
-            output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
+            restored = [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
+            output += restored
+            closed = only_if_empty and _close_stopped_cards(output, ref.get("lang") or UI_LANG_DEFAULT)
+            if only_if_empty and (text or shown):
+                # It keeps its text and its "Stopped" line; only its cards change.
+                fields = {"output": output, **({} if text else {"content": shown})}
+                if not (restored or closed or not text):
+                    return
+                if not await _owui_upsert_message(chat_id, message_id, fields):
+                    pipe_log(f"  reply {message_id[:8]}...: closing its stopped cards failed")
+                    return
+                try:
+                    await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
+                        message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+                except Exception as ex:
+                    pipe_log(f"  reply {message_id[:8]}...: pushing its stopped cards failed: {ex!r}")
+                return
+            text = f"{text}\n\n{note}" if text else note
             output.append(_turn_note_item(note))
             fields = {"content": text, "output": output, "done": True}
             if only_if_empty:
