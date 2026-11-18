@@ -981,7 +981,7 @@ class Scenes:
         set_title(self.token, chat, "ספקי תחנות")
         print("  reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:300],
                                        ensure_ascii=False), flush=True)
-        self.s.shot(page, "status-hebrew", clip_js=LAST_REPLY_CLIP, text_selector=".chat-assistant >> nth=-1")
+        self.s.shot(page, "hebrew-status", clip_js=LAST_REPLY_CLIP, text_selector=".chat-assistant >> nth=-1")
         wait_js(page, last_text_has("כשהדוח יגיע"), "the reply's end", 90_000)
 
     def model_picker(self, page: Page) -> None:
@@ -1613,7 +1613,7 @@ def main(argv=None) -> int:
                 small.context.close()
             shooter.run("background-agent-waiting", scenes.background_agent, page)
             hpage = signed_in_page(browser, token, PHONE, ui_locale="he-IL")
-            shooter.run("status-hebrew", scenes.hebrew_status, hpage)
+            shooter.run("hebrew-status", scenes.hebrew_status, hpage)
             hpage.context.close()
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("claude-login-prompts", scenes.claude_login_prompts, page)
