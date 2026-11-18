@@ -904,6 +904,28 @@ def test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it(token):
     os.remove(gate)
 
 
+def test_a_stop_from_another_surface_says_stopped(token):
+    """ELI-512 (W5 T5b): a run stopped from another surface (Control UI, Telegram /stop:
+    `sessions.abort`) while its command runs, before any text. 2026.11.5's row reads
+    `status: null` for a moment before `killed`; the reply says Stopped, not that it
+    produced no text."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_ABORT_CHAT")
+    key = _session_key(token, chat_id)
+    hold_token = f"quiet{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    try:
+        reply = _post_turn(token, chat_id, f"E2E_HOLD_QUIET {hold_token}")
+        _until("the command running", lambda: any(
+            i.get("type") == "function_call" for i in
+            (_chat_messages(token, chat_id).get(reply) or {}).get("output") or []), timeout_s=60, every_s=0.3)
+        _gw("sessions.abort", {"key": key})
+        _until("the reply done", lambda: _chat_messages(token, chat_id)[reply].get("done"), timeout_s=60)
+    finally:
+        open(gate, "w").close()
+    content = _chat_messages(token, chat_id)[reply].get("content") or ""
+    assert "**Stopped.**" in content and "produced no reply text" not in content, content
+
+
 def test_a_turn_the_model_ends_silent_shows_no_error(token):
     """ELI-336: a claude-cli turn the model ends with a bare NO_REPLY. The Gateway fails a
     person's turn with no text as `CLI backend returned an empty response.`; that silence is the

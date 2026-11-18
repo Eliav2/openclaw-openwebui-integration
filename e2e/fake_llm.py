@@ -76,6 +76,8 @@ and only a core set is sent as real schemas.
   `exec` printing TAKEOVER_LINK (a takeover page's link), then runs `exec` in
   the foreground until the file `hold-TOKEN` exists (90 s at most), then
   replies `E2E_TAKEOVER_END` (ELI-318).
+* `E2E_HOLD_QUIET TOKEN`                -> `E2E_HOLD TOKEN` with no text before the
+  command: a reply stopped while it runs has no text (ELI-512).
 * `E2E_HOLD_SPAWN TOKEN`                -> `E2E_HOLD TOKEN`, then, once the file
   exists, spawns the sub-agent `E2E_SPAWN` does and replies `E2E_SPAWNED`: a
   child that starts when the test says, while the chat's run goes on (ELI-260).
@@ -194,6 +196,7 @@ BG_AGENT_TITLE = "E2E background agent"   # E2E_BG_AGENT: the Agent call's descr
 BG_EXEC_COMMAND = "sleep 25; echo e2e-bg-done"
 BG_EXEC_TITLE = "E2E background sleep"
 _HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
+_HOLD_QUIET = re.compile(r"E2E_HOLD_QUIET ([A-Za-z0-9_]{3,})")
 _TAKEOVER = re.compile(r"E2E_TAKEOVER ([A-Za-z0-9_]{3,})")
 # E2E_TAKEOVER's link: what the stack's CONTROL_LINK_PATTERN matches (ELI-318).
 TAKEOVER_LINK = "https://takeover.e2e.invalid/control/E2eTakeoverSession0001"
@@ -537,6 +540,16 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
                 return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
             return {"text": say, **call} if say else call
         return {"text": "E2E_TAKEOVER_END"}
+    m = _HOLD_QUIET.search(user_text)
+    if m:
+        # E2E_HOLD with no text before the command: a stop leaves a reply with
+        # no text (ELI-512).
+        if tool_results:
+            return {"text": "E2E_HOLD_END"}
+        call = _call_with("exec", {"command": f"for i in $(seq 450); do [ -e '{hold_file(m.group(1))}' ] && break; "
+                                              "sleep 0.2; done; echo e2e-hold-released",
+                                   "yieldMs": 100_000}, offered)
+        return call or {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
     m = _HOLD.search(user_text)
     if m:
         if tool_results:
