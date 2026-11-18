@@ -2107,7 +2107,10 @@ class _PipeTurn:
             return None
         return {"chat_id": chat_id, "message_id": message_id,
                 "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
-                "request_task_id": (self.__metadata__ or {}).get("task_id")}
+                "request_task_id": (self.__metadata__ or {}).get("task_id"),
+                # Its cards as the run had them, closed: what it showed when it was stopped.
+                "output": [i for i in (renderer.finished_output() if renderer is not None else [])
+                           if i.get("type") in ("function_call", "function_call_output")]}
 
     async def show_stopped(self, emit=None):
         """"Stopped" as the reply's last line, or, if it cannot be sent, the

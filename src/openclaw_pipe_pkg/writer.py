@@ -477,6 +477,11 @@ async def _close_reply_status(ref: dict) -> None:
         pipe_log(f"  reply {message_id[:8]}...: closing its status failed: {ex!r}")
 
 
+# A reply stopped before any text waits this long for Open WebUI's cancel save before its note.
+STOPPED_SAVE_WAIT_S = 10.0
+STOPPED_SAVE_POLL_S = 0.25
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
                               only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
@@ -495,13 +500,25 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
                                             "user_id": ref.get("user_id")}, update_db=True)
             await emit({"type": "status", "data": {"description": "", "done": True}})
+        if only_if_empty:
+            # Open WebUI's cancel save (`{done, output}`, no content) can come after the request
+            # task is gone from its list: wait for it, or it lands over the note (ELI-512).
+            for _ in range(int(STOPPED_SAVE_WAIT_S / STOPPED_SAVE_POLL_S)):
+                saved = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
+                if saved.get("done") is True:
+                    break
+                await asyncio.sleep(STOPPED_SAVE_POLL_S)
         async with conn._chat_write_lock(chat_id):
             current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
             text = (current.get("content") or "").strip()
             if only_if_empty and text:
                 return
             text = f"{text}\n\n{note}" if text else note
-            output = list(current.get("output") or []) + [_turn_note_item(note)]
+            output = list(current.get("output") or [])
+            # The cards the reply showed when it was stopped, should the save have missed one.
+            have = {i.get("id") for i in output if isinstance(i, dict)}
+            output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
+            output.append(_turn_note_item(note))
             await _owui_upsert_message(
                 chat_id, message_id, {"content": text, "output": output, "done": True})
         # A reply that is only the Pipe's note is no news: no toast or notification for it

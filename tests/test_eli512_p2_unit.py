@@ -231,6 +231,35 @@ class StoppedContentTests(_WriterCase):
         # Its "Stopped" status line stays the last one: no empty closing line after it.
         self.assertEqual(self.owui.events("status"), [])
 
+    async def test_the_note_waits_for_open_webuis_cancel_save(self):
+        """Open WebUI saves a cancelled reply (`done`, its output) after the Pipe's stop: the note
+        is written after that save, so the save cannot drop it or the cards."""
+        self.owui.msgs()["m2"] = {"role": "assistant", "content": "", "done": False, "output": []}
+        card = {"type": "function_call", "id": "toolu_1", "name": "exec", "status": "incomplete"}
+        ref = {"chat_id": self.CHAT, "message_id": "m2", "user_id": self.USER}
+
+        async def cancel_save():
+            await asyncio.sleep(0.6)
+            await self.owui._chats.upsert_message_to_chat_by_id_and_message_id(
+                self.CHAT, "m2", {"done": True, "output": [card]})
+        with mock.patch.object(ocp, "STOPPED_SAVE_POLL_S", 0.05):
+            await asyncio.gather(cancel_save(), ocp._close_unsent_reply(
+                self.conn, ref, ocp.ui_text("stopped_reason"), only_if_empty=True))
+        saved = self.owui.msgs()["m2"]
+        self.assertEqual(saved["content"], ocp.ui_text("stopped_reason"))
+        ids = [i.get("id") for i in saved["output"]]
+        self.assertEqual(ids[0], "toolu_1")
+        self.assertTrue(ids[-1].startswith("msg_note_"), ids)
+
+    async def test_cards_the_save_missed_are_kept(self):
+        self.owui.msgs()["m2"] = {"role": "assistant", "content": "", "done": True, "output": []}
+        card = {"type": "function_call", "id": "toolu_1", "name": "exec", "status": "completed"}
+        ref = {"chat_id": self.CHAT, "message_id": "m2", "user_id": self.USER, "output": [card]}
+        await ocp._close_unsent_reply(self.conn, ref, ocp.ui_text("stopped_reason"), only_if_empty=True)
+        out = self.owui.msgs()["m2"]["output"]
+        self.assertEqual(out[0]["id"], "toolu_1")
+        self.assertTrue(out[-1]["id"].startswith("msg_note_"))
+
     async def test_a_live_reply_with_content_is_left_as_it_is(self):
         self.owui.msgs()["m2"] = {"role": "assistant", "content": "partial", "done": True}
         ref = {"chat_id": self.CHAT, "message_id": "m2", "user_id": self.USER}
@@ -261,8 +290,8 @@ class ParkedStopTests(unittest.TestCase):
         close = self._stop(self._turn())
         close.assert_called_once()
         args, kwargs = close.call_args
-        self.assertEqual(args[1], {"chat_id": CHAT, "message_id": "m9", "user_id": GUEST,
-                                   "request_task_id": "task-9"})
+        self.assertEqual({k: v for k, v in args[1].items() if k != "output"},
+                         {"chat_id": CHAT, "message_id": "m9", "user_id": GUEST, "request_task_id": "task-9"})
         self.assertEqual(args[2], "**נעצר.**")
         self.assertEqual(kwargs, {"only_if_empty": True})
 
