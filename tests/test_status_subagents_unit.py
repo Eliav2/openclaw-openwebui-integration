@@ -544,6 +544,50 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(following)
         self.assertEqual([t["status"] for t in seen[-1]["tasks"]], ["completed"])
 
+    async def test_the_limits_in_progress_note_goes_when_the_run_ends(self):
+        """ELI-512: a dialog opened during a run said "a response is in progress" under
+        the limits until it was opened again; the follow's describe refills the note."""
+        import asyncio
+
+        parent, changes, emitted, limits = {"status": "running"}, {}, [], []
+        listed = _list_rpc([], {}, [])
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": PARENT_KEY, "modelProvider": "anthropic",
+                                    "status": parent["status"],
+                                    "hasActiveRun": parent["status"] == "running"}}
+            return await listed(method, params, timeout)
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=send_request)
+        conn.session_change_event = lambda key: changes.setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: asyncio.Event()
+        conn.session_child_event = lambda key: asyncio.Event()
+        conn.ensure_message_subscription = mock.AsyncMock()
+        conn.has_reply = lambda _key: False
+        real = openclaw_status_action._render_limits_fill_js
+
+        async def settle():
+            for _ in range(2000):
+                await asyncio.sleep(0)
+
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_limits_fill_js",
+                side_effect=lambda d: (limits.append(dict(d)), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await settle()
+            shown_during_the_run = [d["sessionActive"] for d in limits]
+            parent["status"] = "done"
+            changes.pop(PARENT_KEY).set()   # the run's settle
+            await asyncio.wait_for(opened, 5)
+
+        self.assertEqual(shown_during_the_run, [True])
+        self.assertFalse(limits[-1]["sessionActive"], limits)
+        self.assertEqual(limits[-1]["windows"], [])
+
     def _follow_conn(self, rows, describe, previews=None):
         """A connection with events per session key: (conn, {kind: {key: Event}})."""
         import asyncio

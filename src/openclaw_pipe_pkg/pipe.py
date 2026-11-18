@@ -36,8 +36,10 @@ CAPACITY_WAIT_REASON = "run-capacity"
 # done, failed, interrupted, killed, timeout (sessions-row-*.mjs
 # SessionRunStatusSchema); `cancelled` is an older Gateway's stop (ELI-512).
 STOPPED_STATUSES = ("cancelled", "killed")
+# A run past its deadline: the row's status, and the `stopReason` of its aborted end.
+TIMEOUT_STATUS = "timeout"
 # The UI_TEXT line a reply with no text says for its run's end.
-_TEXTLESS_END_KEYS = {"failed": "response_failed", "timeout": "response_timed_out"}
+_TEXTLESS_END_KEYS = {"failed": "response_failed", TIMEOUT_STATUS: "response_timed_out"}
 
 
 def _stopped_note(lang) -> str:
@@ -1565,8 +1567,12 @@ class _PipeTurn:
         self.error_shown = ""  # the run's "**Error:**" line, once shown
         self.model_silent = False  # the run failed only because the model said nothing (ELI-336)
         self.aborted = False
-        # The run's own end said it was aborted: a stop from any surface (ELI-512).
-        self.run_aborted = False
+        # The run whose own end said it was aborted (a stop from any surface), and
+        # the Gateway's `stopReason` for it (ELI-512).
+        self.aborted_run_id = None
+        self.abort_stop_reason = None
+        # park's "Stopped" status line reached the page.
+        self.stopped_shown = False
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
         self.run_usage = None
@@ -1683,7 +1689,9 @@ class _PipeTurn:
                         err = (str(data.get("error", "unknown"))
                                if stream == "lifecycle" and phase == "error" else "")
                         aborted_run = state == "aborted" or data.get("aborted") is True
-                        self.run_aborted = self.run_aborted or aborted_run
+                        if aborted_run:
+                            self.aborted_run_id = self.our_run_id
+                            self.abort_stop_reason = payload.get("stopReason") or data.get("stopReason")
                         if self.hand_over_after_kill(err, aborted_run):
                             continue
                         async for chunk in self.on_completion(payload, stream, phase, state, err, aborted_run):
@@ -1808,7 +1816,7 @@ class _PipeTurn:
                 emit = self.__event_emitter__
                 # A parked reply ends on park's "Stopped": Open WebUI shows the last
                 # line, and an empty one after it left the bubble blank (ELI-512).
-                closing = status_lines or ([] if self.aborted else [""])
+                closing = status_lines or ([] if self.stopped_shown else [""])
                 if self.end_snapshot_follows():
                     # The end snapshot's own write saves them: a row save less.
                     emit = await self.unsaved_emitter()
@@ -2056,9 +2064,13 @@ class _PipeTurn:
         )
         try:
             await self.maybe_emit_snapshot(force=True)
-            await _emit_status(self.__event_emitter__, ui_text("stopped", self.lang), done=True)
         except (Exception, asyncio.CancelledError) as ex:
-            pipe_log(f"  stop snapshot/status skipped: {ex!r}")
+            pipe_log(f"  stop snapshot skipped: {ex!r}")
+        try:
+            await _emit_status(self.__event_emitter__, ui_text("stopped", self.lang), done=True)
+            self.stopped_shown = True
+        except (Exception, asyncio.CancelledError) as ex:
+            pipe_log(f"  stop status skipped: {ex!r}")
 
     async def finish_held_prompt(self):
         """The run ended with a needs-input prompt held back: ask it, or show it."""
@@ -2383,13 +2395,15 @@ class _PipeTurn:
                 # No text and nothing recovered: show the run's real terminal state.
                 # Its own aborted end first: 2026.11.5's row reads `status: null`
                 # for a moment before `killed` (ELI-512).
-                reason = _stopped_note(self.lang) if self.run_aborted else None
+                reason = self.run_end_note()
                 try:
                     if reason is None:
                         desc = await self.conn.send_request(
                             "sessions.describe", dict(key=self.session_key), timeout=8)
                         row = desc.get("session") or {}
-                        reason = _textless_end_note(row.get("status"), self.lang)
+                        # Another run's end is not this reply's (ELI-512).
+                        if row.get("lastRunId") == self.our_run_id:
+                            reason = _textless_end_note(row.get("status"), self.lang)
                 except Exception as ex:
                     pipe_log(f"  terminal-reason describe failed: {ex}")
                 no_response_text = "\n\n" + (
@@ -2519,6 +2533,18 @@ class _PipeTurn:
             pipe_log("  usage line: the run's messages report no usage; using the session row")
         return usage
 
+    @property
+    def run_aborted(self) -> bool:
+        """This reply's current run ended aborted: not a run it handed over from."""
+        return self.aborted_run_id is not None and self.aborted_run_id == self.our_run_id
+
+    def run_end_note(self) -> str | None:
+        """What the run's own aborted end says: a Gateway deadline is a timeout, not a Stop."""
+        if not self.run_aborted:
+            return None
+        stopped_by_deadline = self.abort_stop_reason == TIMEOUT_STATUS
+        return _textless_end_note(TIMEOUT_STATUS if stopped_by_deadline else STOPPED_STATUSES[-1], self.lang)
+
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back by run id, else by user text (only for a run
         seen here: otherwise the last reply may be another run's). A steered
@@ -2542,6 +2568,10 @@ class _PipeTurn:
             pipe_log(f"  recovery by run id: chat.history failed: {ex!r}")
         if not self.first_event_arrived:
             pipe_log("  recovery: nothing of this run seen, no text by its id")
+            return None
+        if self.run_aborted:
+            # By user text the answer may be a later run's, to the same words (ELI-512).
+            pipe_log("  recovery: the run was stopped, no text by its id")
             return None
         return await _recover_turn_text(self.conn, self.session_key, self.text)
 
@@ -2569,6 +2599,9 @@ class _PipeTurn:
         status = row.get("status")
         if status in STOPPED_STATUSES:
             return _stopped_note(self.lang)
+        if (status == TIMEOUT_STATUS and not row.get("lastRunError")
+                and row.get("lastRunId") == self.our_run_id):
+            return _textless_end_note(status, self.lang)
         if status in ("failed", "timeout"):
             err = row.get("lastRunError")
             return _plain_error(ERROR_RUN if err else ERROR_UNFINISHED, err, self.text)

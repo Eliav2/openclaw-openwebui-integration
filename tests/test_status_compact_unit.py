@@ -63,6 +63,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
     async def _compact(self, describe, replies):
         conn, sent, reads = _gateway(describe, replies)
+        self.reads = reads
         emitted, status_calls = [], []
 
         async def run_request(_conn, _method, params, **_kw):
@@ -130,10 +131,15 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         `cancelled`): the dialog says so, instead of waiting out the deadline for "timed out"."""
         for status in ("killed", "timeout", "interrupted"):
             with self.subTest(status=status):
-                result, status_calls, _ = await self._compact(
+                result, status_calls, emitted = await self._compact(
                     [{"status": status, "hasActiveRun": False}], [None])
                 self.assertEqual(result, {"status": "error", "detail": status})
                 self.assertEqual(status_calls, [])
+                codes = " ".join(e["data"]["code"] for e in emitted if e.get("type") == "execute")
+                self.assertIn(f"Compact {status}.", codes)
+                self.assertNotIn("Compact timed out", codes)
+                # The first terminal row ends the poll.
+                self.assertEqual(self.reads["describe"], 1)
 
     async def test_a_compaction_that_never_ends_times_out(self):
         result, status_calls, _ = await self._compact([{"hasActiveRun": False}], [None])

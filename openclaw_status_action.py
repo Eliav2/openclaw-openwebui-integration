@@ -10110,6 +10110,9 @@ class Action:
             }))
             return provider, session_row
 
+        # The limits fill last shown: its "in progress" note follows the run (ELI-512).
+        limits_shown: dict = {}
+
         async def fill_limits():
             provider, session_row = await context_ready
             if provider is None:
@@ -10127,7 +10130,7 @@ class Action:
             if not windows_data and provider == "anthropic":
                 windows_data = await _claude_cli_usage_windows(conn)
 
-            await emit(_render_limits_fill_js({
+            limits_shown.update({
                 "provider": provider,
                 "windows": windows_data,
                 "entry": None if windows_data else _limits_entry_for(usage, provider),
@@ -10136,7 +10139,15 @@ class Action:
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
-            }))
+            })
+            await emit(_render_limits_fill_js(limits_shown))
+
+        async def refill_limits_activity(session_row):
+            """The limits note again once the run started or ended."""
+            live = _session_row_live(session_row)
+            if limits_shown and limits_shown["sessionActive"] != live:
+                limits_shown["sessionActive"] = live
+                await emit(_render_limits_fill_js(limits_shown))
 
         async def fill_background():
             await emit(_render_background_fill_js(
@@ -10332,7 +10343,8 @@ class Action:
                 conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
             await asyncio.wait([described])
             if described.exception() is None:
-                await fill_context(described)
+                _provider, session_row = await fill_context(described)
+                await refill_limits_activity(session_row)
             else:
                 pipe_log(f"[status-action] sessions.describe (follow) failed: {described.exception()}")
             running = _running_row(described) or conn.has_reply(session_key)
