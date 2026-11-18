@@ -67,7 +67,7 @@ def _hides_cron_run_output() -> bool:
     return _openclaw_version() >= (2026, 11, 5)
 
 
-STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS
+STEER_PENDING = "it reads it at its next step"  # texts.py UI_TEXT "steer_pending", English
 
 
 def _steer_pending_js(index: int) -> str:
@@ -531,6 +531,45 @@ def test_stop_ends_the_reply_where_it_was(page):
     _reload(page)
     _wait(page, _reply_js(-1, "all.length === 2 && r.done"), "both replies after a reload", 60_000)
     assert [r["text"] for r in _replies(page)] == [stopped["text"], second["text"]]
+
+
+# The Pipe's status lines (texts.py UI_TEXT): Hebrew for a Hebrew UI, and none of the English ones.
+HEBREW_THINKING = "חושב…"
+ENGLISH_PIPE_STATUSES = ("Thinking...", "Waiting --", "Queued:", "Sent while the agent works", "Stopped")
+# Every distinct text each message (its status line included) shows, from every DOM change.
+RECORD_MESSAGE_TEXTS = """(() => {
+  window.__messageTexts = [];
+  const push = () => {
+    for (const m of document.querySelectorAll('[id^="message-"]')) {
+      const t = m.innerText.trim();
+      if (t && !window.__messageTexts.includes(t)) window.__messageTexts.push(t);
+    }
+  };
+  new MutationObserver(push).observe(document, {subtree: true, childList: true, characterData: true});
+})();"""
+
+
+def test_a_hebrew_ui_shows_the_pipes_status_lines_in_hebrew(page, token):
+    """A user whose Open WebUI speaks Hebrew (ELI-512): the Pipe's status line while the reply works is
+    Hebrew, on a phone, and no English status of the Pipe shows at any point of the turn."""
+    ctx = page.context.browser.new_context(
+        **capture.PHONE, locale="he-IL", timezone_id="UTC", color_scheme="light",
+        storage_state={"cookies": [], "origins": [{"origin": capture.BASE, "localStorage": [
+            {"name": "token", "value": token}, {"name": "theme", "value": "light"},
+            {"name": "locale", "value": "he-IL"}]}]})
+    try:
+        he = ctx.new_page()
+        he.add_init_script(RECORD_MESSAGE_TEXTS)
+        capture.new_chat(he)
+        capture.send(he, "E2E_SLOW:4 BROWSER_HEBREW")
+        _wait(he, f"() => window.__messageTexts.some(t => t.includes({json.dumps(HEBREW_THINKING)}))",
+              "the Hebrew Thinking line")
+        _wait(he, _reply_js(0, f"r.text.includes({json.dumps(_slow('BROWSER_HEBREW', 4))})"), "the whole reply")
+        seen = he.evaluate("() => window.__messageTexts")
+        english = [line for line in ENGLISH_PIPE_STATUSES for t in seen if line in t]
+        assert not english, f"English status lines in a Hebrew UI: {english}"
+    finally:
+        ctx.close()
 
 
 def _saved_replies(page, token: str) -> list:

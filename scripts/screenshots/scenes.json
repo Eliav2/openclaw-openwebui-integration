@@ -542,6 +542,25 @@
       ]
     },
     {
+      "_comment": "ELI-512: a Hebrew Open WebUI: the Pipe's status row speaks Hebrew. A background agent holds the reply open so the shot sees the row.",
+      "match": "תבדוק לי את ספקי תחנות מזג האוויר",
+      "steps": [
+        {
+          "say": "אעביר את הבדיקה לעוזר שיעבוד ברקע.",
+          "tool": "Agent",
+          "args": {
+            "description": "בדיקת ספקים",
+            "run_in_background": true,
+            "prompt": "השווה בין שלושת ספקי תחנות מזג האוויר: מחיר, גישה לנתונים ותמיכה."
+          }
+        },
+        {
+          "say": "הוא עובד על זה. בינתיים: שלושת הספקים מוכרים את אותו חיישן, אז ההבדל הוא בחבילת הנתונים ובכמה זמן הם שומרים היסטוריה. אכתוב כאן כשהדוח יגיע.",
+          "delay": 0.6
+        }
+      ]
+    },
+    {
       "match": "Save my weather API key",
       "steps": [
         {

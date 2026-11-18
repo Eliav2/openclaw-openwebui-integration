@@ -58,14 +58,6 @@ class RunIdTests(unittest.TestCase):
 
 
 class LanguageTests(unittest.TestCase):
-    def test_the_bubble_speaks_the_ui_language(self):
-        he = openclaw_pipe.pending_lang({"variables": {"{{USER_LANGUAGE}}": "he-IL"}})
-        self.assertEqual(he, "he")
-        self.assertIn("ממתין לגייטווי", openclaw_pipe.pending_status_text(he))
-        for meta in ({"variables": {"{{USER_LANGUAGE}}": "en-US"}}, {"variables": {}}, {}, None):
-            self.assertEqual(openclaw_pipe.pending_lang(meta), "en")
-        self.assertIn("gateway", openclaw_pipe.pending_status_text("en").lower())
-
     def test_the_note_names_the_original_send_time(self):
         at = time.mktime((2026, 11, 17, 7, 44, 0, 0, 0, -1))
         self.assertIn("07:44", openclaw_pipe.pending_sent_note(at, "he", now=at + 600))
@@ -669,7 +661,7 @@ class DeferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_at, self.STAMP)  # the message's own time, not the time it was kept
         status = [e for e in self.events if e["type"] == "status"][-1]["data"]
         self.assertEqual(status["done"], False)
-        self.assertIn("ממתין לגייטווי", status["description"])
+        self.assertEqual(status["description"], openclaw_pipe.ui_text("gateway_wait", "he"))
         self.arm.assert_called_once()
         self.assertEqual(self.request_ids, ["t1"])  # the request that kept it, for the recovery
 

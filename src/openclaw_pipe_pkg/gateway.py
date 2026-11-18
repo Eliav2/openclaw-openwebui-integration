@@ -802,20 +802,15 @@ CONTROL_LINK_NOTE = ("**[Take control ↗]({link})**: the agent is waiting for y
 # only when the Gateway sends `tokensBefore`; the session's `totalTokens` is
 # stale by then and no stand-in.
 COMPACTION_STREAM = "compaction"
-COMPACTING_NOTE = "🧹 _Compacting context…_"
-COMPACTION_FAILED_NOTE = "🧹 _Context compaction did not complete: the conversation goes on uncompacted._"
-COMPACTION_SKIPPED_NOTE = "🧹 _Context compaction skipped: nothing to compact yet._"
-COMPACTION_STOPPED_NOTE = "🧹 _Context compaction stopped._"
-COMPACTED_BODY = ("Older messages in this conversation were summarized to free up the model's "
-                  "context. The agent continues from that summary plus the most recent messages; "
-                  "everything stays visible here.")
+# Its texts are UI_TEXT's "compact*" lines (texts.py).
+COMPACTION_END_NOTES = {"skipped": "compaction_skipped", "aborted": "compaction_stopped"}
 
 
-def _compacted_note(tokens_before) -> str:
-    was = f" · was ~{_fmt_tokens(tokens_before)} tokens" if isinstance(tokens_before, int) \
-        and tokens_before > 0 else ""
-    return (f"<details>\n<summary>🧹 Context compacted{was}</summary>\n\n"
-            f"{COMPACTED_BODY}\n</details>")
+def _compacted_note(tokens_before, lang: str = UI_LANG_DEFAULT) -> str:
+    was = ui_text("compacted_was", lang, tokens=_fmt_tokens(tokens_before)) \
+        if isinstance(tokens_before, int) and tokens_before > 0 else ""
+    return (f"<details>\n<summary>{ui_text('compacted_summary', lang)}{was}</summary>\n\n"
+            f"{ui_text('compacted_body', lang)}\n</details>")
 
 
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
@@ -1051,7 +1046,8 @@ class _TurnRenderer:
     run text; MEDIA and ask-user rewrites come from `note_turn_rewrite`.
     """
 
-    def __init__(self):
+    def __init__(self, lang: str = UI_LANG_DEFAULT):
+        self.lang = lang  # of the Pipe's notes (texts.py)
         self.visible_text = ""
         # As OWUI 0.12 stores a reply: `text` is `content`, `output` the
         # Responses items. A card baked into `content` is no card (ELI-92).
@@ -1216,13 +1212,12 @@ class _TurnRenderer:
         if phase == "start":
             self._compaction_note_id = nid
             self._compaction_before = data.get("tokensBefore")
-            return {"id": nid, "text": COMPACTING_NOTE}
+            return {"id": nid, "text": ui_text("compacting", self.lang)}
         self._compaction_note_id = None
         if data.get("completed") is True:
-            return {"id": nid, "text": _compacted_note(self._compaction_before)}
-        return {"id": nid, "text": {"skipped": COMPACTION_SKIPPED_NOTE,
-                                    "aborted": COMPACTION_STOPPED_NOTE}.get(data.get("outcome"),
-                                                                           COMPACTION_FAILED_NOTE)}
+            return {"id": nid, "text": _compacted_note(self._compaction_before, self.lang)}
+        return {"id": nid, "text": ui_text(COMPACTION_END_NOTES.get(data.get("outcome"), "compaction_failed"),
+                                           self.lang)}
 
     def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
         """The call's card, opened on first sight (start or result)."""
@@ -2251,7 +2246,8 @@ class _GatewayConnection:
                                   "thinking": thinking, "request_task_id": request_task_id,
                                   "span_run": span_run, "steer_pending": steer_pending,
                                   "before": list(before or [])}
-        self._run_renderers[key] = _TurnRenderer()
+        self._run_renderers[key] = _TurnRenderer(
+            ui_lang_of((self.parse_owui_session_key(session_key) or (None, None))[0]))
         # Bound memory for runs that never end.
         if len(self._run_targets) > 100:
             for stale in list(self._run_targets)[:50]:

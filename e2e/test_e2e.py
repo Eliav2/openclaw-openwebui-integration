@@ -773,7 +773,7 @@ def test_a_running_reply_does_not_say_it_is_queued(token):
 
 
 
-STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS
+STEER_PENDING = "it reads it at its next step"  # texts.py UI_TEXT "steer_pending", English
 
 
 def _steers_mid_run_messages() -> bool:
