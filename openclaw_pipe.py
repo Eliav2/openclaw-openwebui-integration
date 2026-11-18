@@ -5439,6 +5439,23 @@ def _tool_card_labels(name: str, args_str: str, lang: str) -> dict | None:
     return None if labels["completed"] == name else labels
 
 
+# The items of a group of cards (`_TurnRenderer._card_run`): a call; its result and the model's
+# reasoning sit between calls without ending the group.
+_TOOL_CALL_ITEM = "function_call"
+_CARD_RUN_JOINERS = frozenset({"function_call_output", "reasoning"})
+_CARD_GROUP_MIN = 2  # Open WebUI groups two or more cards
+
+
+def _card_label_in_words(card: dict) -> bool:
+    """Whether a card's header says what it did in words, not by the tool's name: a label in
+    words, or a spawn card, whose name is the sub-agent's title."""
+    name = str(card.get("name") or "")
+    if name.startswith(SPAWN_CARD_PREFIX):
+        return True
+    done = ((card.get("display_labels") or {}).get("completed") or "")
+    return bool(done) and not done.startswith(name.replace(f" {TOOL_ERROR_MARK}", ""))
+
+
 def _tool_call_started_event(name: str, tool_call_id: str, args_str: str,
                              labels: dict | None = None) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
@@ -5924,7 +5941,33 @@ class _TurnRenderer:
             self._tool_items[tcid] = item
             self.output.append(item)
             events.append(event)
+            self._even_group_labels(events)
         return item
+
+    def _card_run(self) -> list[dict]:
+        """The cards at the end of `output` with no text between them: the group Open WebUI
+        draws as one ("Explored ...")."""
+        run = []
+        for item in reversed(self.output):
+            kind = item.get("type")
+            if kind == _TOOL_CALL_ITEM:
+                run.append(item)
+            elif kind not in _CARD_RUN_JOINERS:
+                break
+        return run[::-1]
+
+    def _even_group_labels(self, events: list) -> None:
+        """One way of naming a group's cards (ELI-512). Open WebUI heads a group with its cards'
+        labels when any has one, else with "Explored" and their names: a group with some cards
+        labelled read "ToolSearch, exec: QA sleep test". Its labels stay only when every card has
+        one in plain words (Hebrew); else none does (English: "Explored ToolSearch, exec")."""
+        run = self._card_run()
+        if len(run) < _CARD_GROUP_MIN or all(_card_label_in_words(c) for c in run):
+            return
+        for card in run:
+            if card.pop("display_labels", None) is not None:
+                events.append({"type": "response.output_item.added", "output_index": _OUTPUT_APPEND_INDEX,
+                               "item": copy.deepcopy(card)})
 
     def _unanswered(self, note: str) -> list[dict]:
         """A result event for every call with no result yet, saying `note`."""
@@ -9330,13 +9373,21 @@ FINAL_STATUS_REQUEST_WAIT_S = 30
 _CANCEL_STATUS_TAIL = (*ui_texts("stopped"), "")
 
 
+def _says_stopped(text: str | None) -> bool:
+    """Whether a reply's text ends with the Pipe's "Stopped." note, in any UI language."""
+    return (text or "").rstrip().endswith(ui_texts("stopped_reason"))
+
+
 def _final_status_history(history: list | None, lines: list, stopped: bool,
-                          lang: str = UI_LANG_DEFAULT) -> tuple[list, list]:
-    """M's final status lines (cancel tail dropped) and the ones it adds."""
+                          lang: str = UI_LANG_DEFAULT, said: bool = False) -> tuple[list, list]:
+    """M's final status lines (cancel tail dropped) and the ones it adds. `said`: M's text
+    already says "Stopped.", so no "Stopped" status line repeats it (ELI-512)."""
     kept = [h for h in (history or []) if isinstance(h, dict)]
     while kept and kept[-1].get("done") is not False and kept[-1].get("description") in _CANCEL_STATUS_TAIL:
         kept.pop()
-    if stopped:
+    if stopped and said:
+        new = [{"description": "", "done": True}]
+    elif stopped:
         new = [{"description": ui_text("stopped", lang), "done": True}]
     else:
         new = [{"description": line, "done": True} for line in lines] or [{"description": "", "done": True}]
@@ -9850,12 +9901,21 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             have = {i.get("id") for i in output if isinstance(i, dict)}
             output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
             output.append(_turn_note_item(note))
-            if not await _owui_upsert_message(
-                    chat_id, message_id, {"content": text, "output": output, "done": True}):
+            fields = {"content": text, "output": output, "done": True}
+            if only_if_empty:
+                # The text says "Stopped." now: its "Stopped" status line would say it twice.
+                fields["statusHistory"], _new = _final_status_history(
+                    current.get("statusHistory"), [], True, said=True)
+            if not await _owui_upsert_message(chat_id, message_id, fields):
                 # Not saved: no tab is shown a note a reload would not have.
                 pipe_log(f"  reply {message_id[:8]}...: saving its note failed; not shown")
                 return
         data = {"done": True, "content": text, "output": output}
+        if only_if_empty:
+            # Open tabs drop the "Stopped" line too (its replacement is already saved).
+            status = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                              "user_id": ref.get("user_id")}, update_db=False)
+            await status({"type": "status", "data": {"description": "", "done": True}})
         if _is_note_only(output):
             # No news: no toast or notification for it in another chat.
             await _note_only_completion(chat_id, message_id, ref.get("user_id"), data)
@@ -10547,7 +10607,8 @@ class _TurnWriter:
             except Exception as ex:
                 saved = {}
                 pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
-            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang)
+            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang,
+                                                 said=_says_stopped(text))
             whole = await self._persist(done=True, output=output, text=text, status_history=history)
             if whole:
                 try:

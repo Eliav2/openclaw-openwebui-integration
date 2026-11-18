@@ -2089,6 +2089,23 @@ def _tool_card_labels(name: str, args_str: str, lang: str) -> dict | None:
     return None if labels["completed"] == name else labels
 
 
+# The items of a group of cards (`_TurnRenderer._card_run`): a call; its result and the model's
+# reasoning sit between calls without ending the group.
+_TOOL_CALL_ITEM = "function_call"
+_CARD_RUN_JOINERS = frozenset({"function_call_output", "reasoning"})
+_CARD_GROUP_MIN = 2  # Open WebUI groups two or more cards
+
+
+def _card_label_in_words(card: dict) -> bool:
+    """Whether a card's header says what it did in words, not by the tool's name: a label in
+    words, or a spawn card, whose name is the sub-agent's title."""
+    name = str(card.get("name") or "")
+    if name.startswith(SPAWN_CARD_PREFIX):
+        return True
+    done = ((card.get("display_labels") or {}).get("completed") or "")
+    return bool(done) and not done.startswith(name.replace(f" {TOOL_ERROR_MARK}", ""))
+
+
 def _tool_call_started_event(name: str, tool_call_id: str, args_str: str,
                              labels: dict | None = None) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
@@ -2574,7 +2591,33 @@ class _TurnRenderer:
             self._tool_items[tcid] = item
             self.output.append(item)
             events.append(event)
+            self._even_group_labels(events)
         return item
+
+    def _card_run(self) -> list[dict]:
+        """The cards at the end of `output` with no text between them: the group Open WebUI
+        draws as one ("Explored ...")."""
+        run = []
+        for item in reversed(self.output):
+            kind = item.get("type")
+            if kind == _TOOL_CALL_ITEM:
+                run.append(item)
+            elif kind not in _CARD_RUN_JOINERS:
+                break
+        return run[::-1]
+
+    def _even_group_labels(self, events: list) -> None:
+        """One way of naming a group's cards (ELI-512). Open WebUI heads a group with its cards'
+        labels when any has one, else with "Explored" and their names: a group with some cards
+        labelled read "ToolSearch, exec: QA sleep test". Its labels stay only when every card has
+        one in plain words (Hebrew); else none does (English: "Explored ToolSearch, exec")."""
+        run = self._card_run()
+        if len(run) < _CARD_GROUP_MIN or all(_card_label_in_words(c) for c in run):
+            return
+        for card in run:
+            if card.pop("display_labels", None) is not None:
+                events.append({"type": "response.output_item.added", "output_index": _OUTPUT_APPEND_INDEX,
+                               "item": copy.deepcopy(card)})
 
     def _unanswered(self, note: str) -> list[dict]:
         """A result event for every call with no result yet, saying `note`."""

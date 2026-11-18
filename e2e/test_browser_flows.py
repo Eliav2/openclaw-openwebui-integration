@@ -598,7 +598,8 @@ def _saved_assistant(page, token: str) -> dict:
 
 def test_a_reply_stopped_before_any_text_says_stopped(page, token):
     """ELI-512: Stop while the reply's command runs and before it said anything. The reply ends
-    "Stopped." in its text, not as an empty bubble, live and after a reload (the saved content)."""
+    "Stopped." in its text, not as an empty bubble, live and after a reload (the saved content).
+    It says it once: no "Stopped" status line under that text (ELI-512 polish)."""
     hold_token = f"quietstop{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py: E2E_HOLD_QUIET runs `exec` with no text before it, until this file exists.
     gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
@@ -614,8 +615,11 @@ def test_a_reply_stopped_before_any_text_says_stopped(page, token):
         open(gate, "w").close()
     saved = _saved_assistant(page, token)
     assert "**Stopped.**" in (saved.get("content") or ""), saved.get("content")
+    assert "Stopped" not in _saved_status_lines(page, token, saved["id"]), saved.get("statusHistory")
     _reload(page)
     _wait(page, _body_text_js(0, "Stopped."), "Stopped. after a reload", 60_000)
+    shown = page.evaluate(_message_text_js(0))
+    assert shown.count("Stopped") == 1, shown[-200:]
 
 
 # The usage line's context part (emit.py `_build_usage_status_lines`).

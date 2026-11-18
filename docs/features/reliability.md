@@ -135,7 +135,7 @@ Pressing Stop in Open WebUI cancels the Pipe's reply. The Pipe first saves the p
 
 That is what `/stop` is for. With `SEND_STOP_ON_CANCEL` on (the default), the Pipe sends it right after the abort, so a long shell command or browser action is killed instead of running on against a chat nobody is watching.
 
-The run's remaining output is never added to the stopped message later, and never posted as a message of its own. A reply stopped before it said anything is saved as "**Stopped.**" (in your [interface language](./chat.md#status-lines-in-your-language)) after its tool cards, so a reload and the chat show what happened instead of an empty bubble.
+The run's remaining output is never added to the stopped message later, and never posted as a message of its own. A reply stopped before it said anything is saved as "**Stopped.**" (in your [interface language](./chat.md#status-lines-in-your-language)) after its tool cards, so a reload and the chat show what happened instead of an empty bubble. That text says it, so its "Stopped" status line goes, and the reply says it once.
 
 Valve: [`SEND_STOP_ON_CANCEL`](../configuration.md#send_stop_on_cancel) (on).
 

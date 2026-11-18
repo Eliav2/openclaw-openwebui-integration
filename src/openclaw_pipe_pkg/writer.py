@@ -27,13 +27,21 @@ FINAL_STATUS_REQUEST_WAIT_S = 30
 _CANCEL_STATUS_TAIL = (*ui_texts("stopped"), "")
 
 
+def _says_stopped(text: str | None) -> bool:
+    """Whether a reply's text ends with the Pipe's "Stopped." note, in any UI language."""
+    return (text or "").rstrip().endswith(ui_texts("stopped_reason"))
+
+
 def _final_status_history(history: list | None, lines: list, stopped: bool,
-                          lang: str = UI_LANG_DEFAULT) -> tuple[list, list]:
-    """M's final status lines (cancel tail dropped) and the ones it adds."""
+                          lang: str = UI_LANG_DEFAULT, said: bool = False) -> tuple[list, list]:
+    """M's final status lines (cancel tail dropped) and the ones it adds. `said`: M's text
+    already says "Stopped.", so no "Stopped" status line repeats it (ELI-512)."""
     kept = [h for h in (history or []) if isinstance(h, dict)]
     while kept and kept[-1].get("done") is not False and kept[-1].get("description") in _CANCEL_STATUS_TAIL:
         kept.pop()
-    if stopped:
+    if stopped and said:
+        new = [{"description": "", "done": True}]
+    elif stopped:
         new = [{"description": ui_text("stopped", lang), "done": True}]
     else:
         new = [{"description": line, "done": True} for line in lines] or [{"description": "", "done": True}]
@@ -547,12 +555,21 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             have = {i.get("id") for i in output if isinstance(i, dict)}
             output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
             output.append(_turn_note_item(note))
-            if not await _owui_upsert_message(
-                    chat_id, message_id, {"content": text, "output": output, "done": True}):
+            fields = {"content": text, "output": output, "done": True}
+            if only_if_empty:
+                # The text says "Stopped." now: its "Stopped" status line would say it twice.
+                fields["statusHistory"], _new = _final_status_history(
+                    current.get("statusHistory"), [], True, said=True)
+            if not await _owui_upsert_message(chat_id, message_id, fields):
                 # Not saved: no tab is shown a note a reload would not have.
                 pipe_log(f"  reply {message_id[:8]}...: saving its note failed; not shown")
                 return
         data = {"done": True, "content": text, "output": output}
+        if only_if_empty:
+            # Open tabs drop the "Stopped" line too (its replacement is already saved).
+            status = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                              "user_id": ref.get("user_id")}, update_db=False)
+            await status({"type": "status", "data": {"description": "", "done": True}})
         if _is_note_only(output):
             # No news: no toast or notification for it in another chat.
             await _note_only_completion(chat_id, message_id, ref.get("user_id"), data)
@@ -1244,7 +1261,8 @@ class _TurnWriter:
             except Exception as ex:
                 saved = {}
                 pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
-            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang)
+            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang,
+                                                 said=_says_stopped(text))
             whole = await self._persist(done=True, output=output, text=text, status_history=history)
             if whole:
                 try:

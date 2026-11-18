@@ -282,8 +282,7 @@ class StoppedContentTests(_WriterCase):
         ref = {"chat_id": self.CHAT, "message_id": "m2", "user_id": self.USER}
         await ocp._close_unsent_reply(self.conn, ref, ocp.ui_text("stopped_reason"), only_if_empty=True)
         self.assertEqual(self.owui.msgs()["m2"]["content"], ocp.ui_text("stopped_reason"))
-        # Its "Stopped" status line stays the last one: no empty closing line after it.
-        self.assertEqual(self.owui.events("status"), [])
+        # Its "Stopped" status line goes: test_eli512_polish_unit.StoppedOnceTests.
 
     async def test_the_note_waits_for_open_webuis_cancel_save(self):
         """Open WebUI saves a cancelled reply (`done`, its output) after the Pipe's stop: the note
