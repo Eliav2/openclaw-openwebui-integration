@@ -7580,6 +7580,9 @@ class _GatewayConnection:
                 self.unregister_consumer(
                     session_key, previous["run_id"], queue=previous["queue"])
             if previous["run_id"] and previous["run_id"] != run_id:
+                # Its reply learns its run was stopped (ELI-512 P1-6).
+                if previous.get("on_stop") is not None:
+                    previous["on_stop"]()
                 spawn_background(self._abort_cancelled_run(
                     session_key, previous["run_id"], previous["send_stop"]))
         if run_id:
@@ -7595,7 +7598,7 @@ class _GatewayConnection:
                  "attachments": list(attachments or []),
                  "send_stop": send_stop, "task": None,
                  "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
-                 "waiting": list(waiting or [])}
+                 "waiting": list(waiting or []), "on_stop": on_stop}
 
         def _release() -> None:
             if on_stop is not None:
@@ -17201,8 +17204,10 @@ class _PipeTurn:
         self.aborted_run_id = None
         self.abort_stop_reason = None
         # The parked run was stopped, not claimed by a follow-up: the reply ends on
-        # "Stopped" (ELI-512 P1-6).
+        # "Stopped" (ELI-512 P1-6). `status_closed`: the closing lines went out, so a
+        # later stop shows it itself, after them.
         self.stopped_shown = False
+        self.status_closed = False
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
         self.run_usage = None
@@ -17446,13 +17451,23 @@ class _PipeTurn:
                 emit = self.__event_emitter__
                 # A stopped reply ends on its "Stopped": Open WebUI shows the last
                 # line, and an empty one after it left the bubble blank (ELI-512).
-                closing = status_lines or ([] if self.stopped_shown else [""])
+                stopped = ui_text("stopped", self.lang)
+                closing = (status_lines + [stopped] if self.stopped_shown
+                           else status_lines or [""])
                 if self.end_snapshot_follows():
                     # The end snapshot's own write saves them: a row save less.
                     emit = await self.unsaved_emitter()
                     self.final_statuses = [{"description": line, "done": True} for line in closing]
-                for line in closing:
+                for line in closing[:-1]:
                     await _emit_status(emit, line, done=True)
+                if closing[-1] == stopped:
+                    await self.show_stopped(emit)
+                else:
+                    await _emit_status(emit, closing[-1], done=True)
+                # A stop released while they went out comes after them (P1-6).
+                self.status_closed = True
+                if self.stopped_shown and closing[-1] != stopped:
+                    await self.show_stopped()
                 # The request's emitter tracks this; the unsaved one goes around it.
                 self.turn.status_open = False
 
@@ -17701,15 +17716,23 @@ class _PipeTurn:
     def on_parked_stop(self):
         """The parked run is stopped: a Stop, or no follow-up claimed it. A Send
         now or a message sent while it worked claims it instead, and this reply
-        stays as it was (ELI-512 P1-6). Synchronous, as the release is."""
+        stays as it was (ELI-512 P1-6). Synchronous, as the release is: before
+        the closing lines they end on "Stopped"; after them it follows them."""
+        if self.stopped_shown:
+            return
         self.stopped_shown = True
-        spawn_background(self.show_stopped())
+        if self.status_closed:
+            spawn_background(self.show_stopped())
 
-    async def show_stopped(self):
-        try:
-            await _emit_status(self.__event_emitter__, ui_text("stopped", self.lang), done=True)
-        except Exception as ex:
-            pipe_log(f"  stop status skipped: {ex!r}")
+    async def show_stopped(self, emit=None):
+        """"Stopped" as the reply's last line, or, if it cannot be sent, the
+        closing empty one, so the status does not stay open."""
+        for line in (ui_text("stopped", self.lang), ""):
+            try:
+                await _emit_status(emit or self.__event_emitter__, line, done=True)
+                return
+            except Exception as ex:
+                pipe_log(f"  closing status {line!r} skipped: {ex!r}")
 
     async def finish_held_prompt(self):
         """The run ended with a needs-input prompt held back: ask it, or show it."""

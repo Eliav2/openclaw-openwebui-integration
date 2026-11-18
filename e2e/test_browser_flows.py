@@ -515,11 +515,14 @@ def test_stop_ends_the_reply_where_it_was(page, token):
     _wait(page, _reply_js(0, "r.text.includes('BROWSER_STOP slow-1 slow-2')"), "the reply part way through")
     page.locator('button[aria-label="Stop"]').click()
     _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(0, 'r.done')})()", "the stopped reply, done")
+    # A real Stop ends on "Stopped", shown and saved, as the reply's last status line (ELI-512
+    # P2-1, P1-6). It comes once the page answered which button it was: the baseline after it.
+    rid = _replies(page)[0]["id"]
+    _wait(page, f"() => {_message_text_js(0)}.includes('Stopped')", "the stopped reply's Stopped line")
+    _wait_saved_status(page, token, rid, lambda lines: lines[-1:] == ["Stopped"],
+                       "the stopped reply's saved Stopped line")
     stopped = _replies(page)[0]
     shown_at_stop = len(_seen(page, stopped["id"]))
-    # A real Stop saves "Stopped" as the reply's last status line (ELI-512 P2-1, P1-6).
-    _wait_saved_status(page, token, stopped["id"], lambda lines: lines[-1:] == ["Stopped"],
-                       "the stopped reply's saved Stopped line")
     assert "BROWSER_STOP slow-1" in stopped["text"] and full not in stopped["text"], stopped["text"]
 
     _type_and_send(page, "E2E_ECHO: BROWSER_AFTER_STOP")
@@ -1071,7 +1074,8 @@ def test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped(page,
         capture.pipe_valves(token, **old)
     _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
     first, second = _replies(page)
-    assert "BROWSER_CORRECTION" in second["text"] or "E2E_HOLD_END" in second["text"], second["text"]
+    # The correction's own answer, on any Gateway: it went to the agent, not just under the run.
+    assert "BROWSER_CORRECTION" in second["text"], second["text"]
     _wait_saved_status(page, token, second["id"], lambda ls: bool(ls), "the second reply's status")
     # In the open tab, where W5 saw it: the cancel's status event, never saved (live and here).
     shown = page.evaluate(f"() => {_message_text_js(0)}")

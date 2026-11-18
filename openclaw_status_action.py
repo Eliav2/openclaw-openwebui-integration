@@ -4242,6 +4242,9 @@ class _GatewayConnection:
                 self.unregister_consumer(
                     session_key, previous["run_id"], queue=previous["queue"])
             if previous["run_id"] and previous["run_id"] != run_id:
+                # Its reply learns its run was stopped (ELI-512 P1-6).
+                if previous.get("on_stop") is not None:
+                    previous["on_stop"]()
                 spawn_background(self._abort_cancelled_run(
                     session_key, previous["run_id"], previous["send_stop"]))
         if run_id:
@@ -4257,7 +4260,7 @@ class _GatewayConnection:
                  "attachments": list(attachments or []),
                  "send_stop": send_stop, "task": None,
                  "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
-                 "waiting": list(waiting or [])}
+                 "waiting": list(waiting or []), "on_stop": on_stop}
 
         def _release() -> None:
             if on_stop is not None:

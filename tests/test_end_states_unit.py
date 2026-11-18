@@ -224,3 +224,54 @@ class FollowUpIsNoStopTests(_TurnCase):
                                                   "done": True}])
         statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
         self.assertEqual(statuses[-1]["description"], openclaw_pipe.ui_text("stopped"), statuses)
+
+    def _statuses(self):
+        return [e["data"] for e in self.emitted if e.get("type") == "status"]
+
+    async def _stop_with_no_window(self):
+        """A cancel with no parking window: the run is stopped in park itself."""
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0
+        r1 = self._reply("count", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        await self._spin()
+
+    async def test_a_stop_before_the_closing_lines_ends_them(self):
+        await self._stop_with_no_window()
+        statuses = self._statuses()
+        self.assertEqual(statuses[-1], {"description": openclaw_pipe.ui_text("stopped"), "done": True}, statuses)
+        self.assertEqual(len(self._stopped_lines()), 1, statuses)
+
+    async def test_a_stopped_line_that_cannot_be_sent_still_closes_the_status(self):
+        """The status must not stay open on "Thinking..." when "Stopped" fails to go out."""
+        real = openclaw_pipe._emit_status
+
+        async def flaky(emitter, description, *, done=False):
+            if description == openclaw_pipe.ui_text("stopped"):
+                raise RuntimeError("socket gone")
+            await real(emitter, description, done=done)
+        with mock.patch.object(openclaw_pipe, "_emit_status", flaky):
+            await self._stop_with_no_window()
+        self.assertEqual(self._statuses()[-1], {"description": "", "done": True}, self._statuses())
+
+
+class ReplacedParkedRunTests(unittest.IsolatedAsyncioTestCase):
+    """A second cancel that parks only an unsent message aborts the first reply's parked run:
+    that reply was stopped, and learns it (ELI-512 P1-6, CodeRabbit on #414)."""
+
+    async def test_the_first_reply_hears_its_run_stopped(self):
+        conn = openclaw_pipe._GatewayConnection(lambda: None)
+        stopped = []
+        with mock.patch.object(conn, "_arm_parked_timer"), \
+                mock.patch.object(conn, "_abort_cancelled_run", mock.AsyncMock()):
+            conn.park_cancelled_turn("sk", "run-1", None, [], 10, send_stop=True,
+                                     on_stop=lambda: stopped.append("A"))
+            conn.park_cancelled_turn("sk", None, None, ["unsent"], 10, send_stop=True,
+                                     on_stop=lambda: stopped.append("B"))
+            await asyncio.sleep(0)
+        self.assertEqual(stopped, ["A"])
+        self.assertEqual(conn._pending_cancel_aborts["sk"]["carried"], ["unsent"])
