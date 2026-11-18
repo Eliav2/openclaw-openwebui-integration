@@ -7544,7 +7544,8 @@ class _GatewayConnection:
                             run_text: dict | None = None, settle=None,
                             reply: dict | None = None,
                             waiting: list | None = None,
-                            attachments: list | None = None) -> None:
+                            attachments: list | None = None,
+                            on_stop=None) -> None:
         """Park a cancelled reply's unfinished business for the next message.
 
         OWUI cancels the same way for Stop and Send now, so the turn is parked
@@ -7553,7 +7554,8 @@ class _GatewayConnection:
         holds dedup baselines, since closing events repeat the whole text;
         `waiting` replies are ended by the claimer or a release (ELI-188).
         `settle` asks the browser which button it was, in a background task
-        (ELI-95); without it `grace_s` decides. Unclaimed, the run is aborted.
+        (ELI-95); without it `grace_s` decides. Unclaimed, the run is aborted
+        and `on_stop` called: a claimed run was no Stop (ELI-512 P1-6).
 
         Synchronous on purpose: it runs on the cancel path, where an await can
         be interrupted. An OWUI shutdown is no Stop: the run keeps going for
@@ -7596,6 +7598,8 @@ class _GatewayConnection:
                  "waiting": list(waiting or [])}
 
         def _release() -> None:
+            if on_stop is not None:
+                on_stop()
             # Read from the entry: `_keep_in_own_message` may have cleared it.
             if entry["queue"] is not None:
                 self.unregister_consumer(session_key, entry["run_id"], queue=entry["queue"])
@@ -17196,7 +17200,8 @@ class _PipeTurn:
         # the Gateway's `stopReason` for it (ELI-512).
         self.aborted_run_id = None
         self.abort_stop_reason = None
-        # park's "Stopped" status line reached the page.
+        # The parked run was stopped, not claimed by a follow-up: the reply ends on
+        # "Stopped" (ELI-512 P1-6).
         self.stopped_shown = False
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
@@ -17439,7 +17444,7 @@ class _PipeTurn:
                 # One `status` per fact, since OWUI clamps each to one line. All
                 # done=True: done=False made them shimmer before the last one.
                 emit = self.__event_emitter__
-                # A parked reply ends on park's "Stopped": Open WebUI shows the last
+                # A stopped reply ends on its "Stopped": Open WebUI shows the last
                 # line, and an empty one after it left the bubble blank (ELI-512).
                 closing = status_lines or ([] if self.stopped_shown else [""])
                 if self.end_snapshot_follows():
@@ -17679,6 +17684,7 @@ class _PipeTurn:
             reply=({"message_id": self.owui_message_id,
                     "renderer": copy.deepcopy(self.renderer)}
                    if self.owui_message_id and not self.keeps_its_run else None),
+            on_stop=self.on_parked_stop,
         )
         pipe_log(
             f"Generator {type(stop).__name__}: run parked "
@@ -17691,10 +17697,18 @@ class _PipeTurn:
             await self.maybe_emit_snapshot(force=True)
         except (Exception, asyncio.CancelledError) as ex:
             pipe_log(f"  stop snapshot skipped: {ex!r}")
+
+    def on_parked_stop(self):
+        """The parked run is stopped: a Stop, or no follow-up claimed it. A Send
+        now or a message sent while it worked claims it instead, and this reply
+        stays as it was (ELI-512 P1-6). Synchronous, as the release is."""
+        self.stopped_shown = True
+        spawn_background(self.show_stopped())
+
+    async def show_stopped(self):
         try:
             await _emit_status(self.__event_emitter__, ui_text("stopped", self.lang), done=True)
-            self.stopped_shown = True
-        except (Exception, asyncio.CancelledError) as ex:
+        except Exception as ex:
             pipe_log(f"  stop status skipped: {ex!r}")
 
     async def finish_held_prompt(self):

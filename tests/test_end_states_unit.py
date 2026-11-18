@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import openclaw_pipe
+import test_pipe_unit
 from test_pipe_unit import _TurnCase
 
 NO_TEXT = "_(This turn produced no reply text.)_"
@@ -164,3 +165,62 @@ class RunEndStateTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(openclaw_pipe, "_recover_turn_text",
                                mock.AsyncMock(return_value="run B's answer")):
             self.assertIsNone(await turn.recover_from_transcript())
+
+
+class FollowUpIsNoStopTests(_TurnCase):
+    """P1-6 (ELI-512): Open WebUI cancels reply 1 the same way for Stop and for a message sent
+    while it works. Only a stopped run says "Stopped"; a follow-up that claims the run leaves
+    reply 1 as it was, and its run goes on in reply 2."""
+    SK = None
+    _hold_parked_timers = test_pipe_unit.NoDroppedMessagesTests._hold_parked_timers
+    _read = test_pipe_unit.NoDroppedMessagesTests._read
+    _spin = staticmethod(test_pipe_unit.NoDroppedMessagesTests._spin)
+
+    def _stopped_lines(self):
+        return [e["data"] for e in self.emitted if e.get("type") == "status"
+                and e["data"].get("description") == openclaw_pipe.ui_text("stopped")]
+
+    async def test_a_message_sent_while_the_run_works_does_not_stop_reply_one(self):
+        armed = self._hold_parked_timers()
+        r1 = self._reply("count to 3", "m1", intent="send_now")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()           # Open WebUI cancels reply 1 for the follow-up
+        await self._spin()
+
+        r2 = self._reply("and count in Hebrew", "m2")
+        q.put_nowait(self._delta("run-1", "2\n"))
+        out2 = await self._read(r2, "2\n")
+        q.put_nowait(self._final("run-1"))
+        self.active = False
+        await r2.aclose()
+        await self._spin()
+
+        self.assertIn("2", out2, "reply 2 continues the run")
+        self.assertNotIn("abort", self.rpc)
+        self.assertEqual(armed[:1], [0.3])
+        self.assertEqual(self._stopped_lines(), [])
+
+    async def test_a_cancel_no_follow_up_claims_ends_stopped(self):
+        """No page answer and no next message within the window: the run is stopped, and the
+        reply says so."""
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.05
+        r1 = self._reply("count", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        for _ in range(200):        # bounded: the window is 0.05 s
+            if self._stopped_lines():
+                break
+            await asyncio.sleep(0.01)  # allow-sleep: the fallback window's own timer
+        self.assertEqual(self._stopped_lines(), [{"description": openclaw_pipe.ui_text("stopped"),
+                                                  "done": True}])
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertEqual(statuses[-1]["description"], openclaw_pipe.ui_text("stopped"), statuses)

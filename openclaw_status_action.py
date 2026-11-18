@@ -4206,7 +4206,8 @@ class _GatewayConnection:
                             run_text: dict | None = None, settle=None,
                             reply: dict | None = None,
                             waiting: list | None = None,
-                            attachments: list | None = None) -> None:
+                            attachments: list | None = None,
+                            on_stop=None) -> None:
         """Park a cancelled reply's unfinished business for the next message.
 
         OWUI cancels the same way for Stop and Send now, so the turn is parked
@@ -4215,7 +4216,8 @@ class _GatewayConnection:
         holds dedup baselines, since closing events repeat the whole text;
         `waiting` replies are ended by the claimer or a release (ELI-188).
         `settle` asks the browser which button it was, in a background task
-        (ELI-95); without it `grace_s` decides. Unclaimed, the run is aborted.
+        (ELI-95); without it `grace_s` decides. Unclaimed, the run is aborted
+        and `on_stop` called: a claimed run was no Stop (ELI-512 P1-6).
 
         Synchronous on purpose: it runs on the cancel path, where an await can
         be interrupted. An OWUI shutdown is no Stop: the run keeps going for
@@ -4258,6 +4260,8 @@ class _GatewayConnection:
                  "waiting": list(waiting or [])}
 
         def _release() -> None:
+            if on_stop is not None:
+                on_stop()
             # Read from the entry: `_keep_in_own_message` may have cleared it.
             if entry["queue"] is not None:
                 self.unregister_consumer(session_key, entry["run_id"], queue=entry["queue"])

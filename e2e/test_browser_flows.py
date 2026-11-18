@@ -504,7 +504,7 @@ def test_continue_on_a_reply_adds_nothing_and_says_why(page):
     assert _replies(page)[-1]["text"] == before
 
 
-def test_stop_ends_the_reply_where_it_was(page):
+def test_stop_ends_the_reply_where_it_was(page, token):
     """Stop: the reply keeps the words shown so far and never grows after it
     (the run is stopped, its rest is not written into the message later), the
     composer works, the next message gets its own answer with nothing of the
@@ -517,6 +517,9 @@ def test_stop_ends_the_reply_where_it_was(page):
     _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(0, 'r.done')})()", "the stopped reply, done")
     stopped = _replies(page)[0]
     shown_at_stop = len(_seen(page, stopped["id"]))
+    # A real Stop saves "Stopped" as the reply's last status line (ELI-512 P2-1, P1-6).
+    _wait_saved_status(page, token, stopped["id"], lambda lines: lines[-1:] == ["Stopped"],
+                       "the stopped reply's saved Stopped line")
     assert "BROWSER_STOP slow-1" in stopped["text"] and full not in stopped["text"], stopped["text"]
 
     _type_and_send(page, "E2E_ECHO: BROWSER_AFTER_STOP")
@@ -1027,6 +1030,48 @@ def test_stop_after_send_now_stops_the_run(page, token):
     assert not active, "the run went on after Stop: the session still had a running run"
     history = capture.gateway_call("chat.history", {"sessionKey": key, "limit": 50})
     assert "E2E_HOLD_END" not in json.dumps(history.get("messages")), "the stopped run still answered"
+    os.remove(hold)
+
+
+def _saved_status_lines(page, token: str, message_id: str) -> list:
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    return [h.get("description") for h in saved[message_id].get("statusHistory") or [] if isinstance(h, dict)]
+
+
+def _wait_saved_status(page, token: str, message_id: str, ok, what: str) -> list:
+    deadline = time.time() + TURN_MS / 1000
+    while not ok(lines := _saved_status_lines(page, token, message_id)):
+        assert time.time() < deadline, f"{what}: {lines}"
+        time.sleep(0.5)
+    return lines
+
+
+def test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped(page, token):
+    """ELI-512 P1-6 (W5, live 2/2): a correction sent while the agent runs a tool. Open WebUI
+    cancels the first reply's request for it, as for Stop; the run goes on with the message
+    (steered into it on 2026.10.10+). The first reply must not say "Stopped", saved or shown, and
+    the second reply carries the run to its end. The scripted run's tool waits for a file."""
+    hold_token = f"p16{os.getpid()}_{len(_fake_llm_requests())}"
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    capture.new_chat(page)
+    try:
+        capture.send(page, f"E2E_HOLD {hold_token}")
+        _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
+        _type_and_send(page, "E2E_ECHO: BROWSER_CORRECTION")
+        _wait(page, f"() => {_user_message_js('BROWSER_CORRECTION')}", "the correction in the chat")
+    finally:
+        open(hold, "w").close()
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    first, second = _replies(page)
+    assert "BROWSER_CORRECTION" in second["text"] or "E2E_HOLD_END" in second["text"], second["text"]
+    # Saved last: the cancel's status lines and any writer's come before both replies settle.
+    lines = _wait_saved_status(page, token, second["id"], lambda ls: bool(ls), "the second reply's status")
+    lines = _saved_status_lines(page, token, first["id"])
+    assert "Stopped" not in lines, f"the first reply says Stopped: {lines}"
+    _reload(page)
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies after a reload", 60_000)
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in shown, shown[-200:]
     os.remove(hold)
 
 
