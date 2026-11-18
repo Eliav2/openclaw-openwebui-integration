@@ -1881,11 +1881,13 @@ def test_show_less_puts_a_long_task_back_at_its_first_lines(page, token):
     more.click()
     _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show less'""",
           "the task shown whole", 10_000)
-    scrolled = page.evaluate("""() => {
+    # "Show less" can show before the box has grown to the whole task: scroll it once it
+    # overflows, or the scroll is a no-op and the test proves nothing.
+    _wait(page, """() => {
       const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+      if (!body || body.scrollHeight <= body.clientHeight) return false;
       body.scrollTop = body.scrollHeight;
-      return body.scrollTop; }""")
-    assert scrolled > 0, "the task box did not scroll, so this proves nothing"
+      return body.scrollTop > 0; }""", "the whole task's box, scrolled down", 10_000)
     more.click()
     _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show all'""",
           "the task clamped again", 10_000)
