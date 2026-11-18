@@ -16259,6 +16259,8 @@ class _PipeTurn:
         self.pending_sent_at = None
         # The final status lines, shown unsaved until the end snapshot saves them.
         self.final_statuses = []
+        # A "Queued"/"Waiting" status line is up: the run's first event replaces it (ELI-511).
+        self.wait_line_shown = False
 
     @property
     def our_run_id(self):
@@ -16832,6 +16834,7 @@ class _PipeTurn:
                     "Queued: waiting for the current run to finish…",
                     done=False,
                 )
+                self.wait_line_shown = True
             ever_active = await _wait_for_session_idle(
                 self.conn, self.session_key, active, on_busy=queued)
             if ever_active and not self.to_be_steered:
@@ -16945,6 +16948,7 @@ class _PipeTurn:
             await _file_context_commit(self.conn, _state_dir(getattr(self.pipe.valves, "STATE_DIR", "")),
                                        self.session_key, self.sent_texts)
             if getattr(self, "to_be_steered", False):
+                self.wait_line_shown = False
                 await _emit_status(self.__event_emitter__, STEER_PENDING_STATUS, done=False)
             if self.channel_commit is not None:
                 # The Gateway has the turn: commit the thread's cursors.
@@ -17101,6 +17105,8 @@ class _PipeTurn:
                         if evt_run_id and evt_run_id != self.our_run_id:
                             pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
                             continue
+                        if self.wait_line_shown and not self.enqueued_not_started:
+                            await self.show_run_started()
 
                         err = (str(data.get("error", "unknown"))
                                if stream == "lifecycle" and phase == "error" else "")
@@ -17291,12 +17297,21 @@ class _PipeTurn:
         self.awaiting_owner = False
         self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
 
+    async def show_run_started(self):
+        """The run is going: the "Queued"/"Waiting" line gives way to the line a
+        running reply shows. 2026.11.5 reports every send `queued` until it runs
+        (ELI-511)."""
+        self.wait_line_shown = False
+        pipe_log("  run started; queued status replaced")
+        await _emit_status(self.__event_emitter__, "Thinking...", done=False)
+
     async def on_settle_row(self, msg):
         """A session row: the queued status, or the run's end when its final was lost."""
         row = msg.get("row") or {}
         if row.get("status") == "queued" and not self.first_event_arrived \
                 and not self.queued_shown:
-            self.queued_shown = True
+            self.queued_shown = self.wait_line_shown = True
+            pipe_log("  session row says queued; showing Waiting until the run starts")
             await _emit_status(
                 self.__event_emitter__,
                 "Waiting -- your message is queued behind an "

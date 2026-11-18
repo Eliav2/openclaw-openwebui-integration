@@ -684,6 +684,30 @@ def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
         f"the wake was cut by the queued turn: {json.dumps(wake)[:1500]}")
     assert "E2E_QUEUED_REPLY" not in wake[0]["content"]
     _assert_clean(token, chat_id, msgs)
+    # It showed it was queued, and that line gave way once its run started (ELI-511).
+    running = _running_status_lines(msgs[aid])
+    assert any(line.startswith(QUEUED_LINES) for line in running), running
+    assert not running[-1].startswith(QUEUED_LINES), running
+
+
+# The lines a reply shows while it waits for its run to start (pipe.py).
+QUEUED_LINES = ("Queued: waiting", "Waiting -- your message is queued")
+
+
+def _running_status_lines(msg: dict) -> list:
+    """The not-done status lines a reply showed, in order."""
+    return [str(h.get("description")) for h in msg.get("statusHistory") or []
+            if isinstance(h, dict) and not h.get("done")]
+
+
+def test_a_running_reply_does_not_say_it_is_queued(token):
+    """Eliav 2026-11-18 (c9dc45f0, ELI-511): 2026.11.5 reports every send `queued` until it
+    runs. A reply in an idle chat may show that while its run is admitted, never once its
+    run streams."""
+    for n in range(3):
+        chat_id, msg = _chat_turn(token, f"E2E_ECHO: not queued {n}")
+        running = _running_status_lines(msg)
+        assert running and not running[-1].startswith(QUEUED_LINES), f"chat {chat_id}: {running}"
 
 
 STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS
