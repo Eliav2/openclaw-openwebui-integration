@@ -4075,7 +4075,7 @@ class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
                 _GatewayConnection(lambda: None),
                 {"chat_id": "c", "user_id": "u", "message_id": "m"}, ocp.ui_text("not_sent"))
         (msg,) = upserts
-        self.assertEqual(msg["content"], f"earlier run text\n\n{ocp.ui_text("not_sent")}")
+        self.assertEqual(msg["content"], f"earlier run text\n\n{ocp.ui_text('not_sent')}")
         self.assertEqual(len(msg["output"]), 2)
 
 
