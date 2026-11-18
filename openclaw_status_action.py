@@ -263,6 +263,26 @@ UI_TEXT = {
                              "ההודעות האחרונות, והכול עדיין מופיע כאן."},
     # The Pipe's own card label.
     "subagent_card": {"en": "Sub-agent", "he": "עוזר"},
+    # A tool card's header (Open WebUI's `display_labels`): running, then done. English keeps the
+    # tool's own name, plus the title the agent gave the call; Hebrew says what it does.
+    "tool_command_running": {"en": "{name}{title}", "he": "מריץ פקודה"},
+    "tool_command": {"en": "{name}{title}", "he": "הריץ פקודה"},
+    "tool_read_running": {"en": "{name}{title}", "he": "קורא"},
+    "tool_read": {"en": "{name}{title}", "he": "קרא"},
+    "tool_edit_running": {"en": "{name}{title}", "he": "כותב לקובץ"},
+    "tool_edit": {"en": "{name}{title}", "he": "כתב לקובץ"},
+    "tool_search_running": {"en": "{name}{title}", "he": "מחפש ברשת"},
+    "tool_search": {"en": "{name}{title}", "he": "חיפש ברשת"},
+    "tool_fetch_running": {"en": "{name}{title}", "he": "פותח דף"},
+    "tool_fetch": {"en": "{name}{title}", "he": "פתח דף"},
+    "tool_helper_running": {"en": "{name}{title}", "he": "מפעיל עוזר"},
+    "tool_helper": {"en": "{name}{title}", "he": "הפעיל עוזר"},
+    "tool_lookup_running": {"en": "{name}{title}", "he": "מחפש"},
+    "tool_lookup": {"en": "{name}{title}", "he": "חיפש"},
+    "tool_tools_running": {"en": "{name}{title}", "he": "מחפש כלי"},
+    "tool_tools": {"en": "{name}{title}", "he": "מצא כלי"},
+    "tool_tool_running": {"en": "{name}{title}", "he": "משתמש בכלי"},
+    "tool_tool": {"en": "{name}{title}", "he": "השתמש בכלי"},
 }
 
 # The last UI language each Open WebUI user sent: for replies written without a request.
@@ -2037,7 +2057,40 @@ def _attr(value: str) -> str:
 _OUTPUT_APPEND_INDEX = 1 << 30
 
 
-def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
+# A tool card's header label kind (UI_TEXT "tool_<kind>"), by lowercase tool name; others are "tool".
+TOOL_LABEL_KINDS = {
+    "exec": "command", "bash": "command", "process": "command",
+    "read": "read", "memory_get": "read", "ls": "read",
+    "write": "edit", "edit": "edit", "multiedit": "edit", "apply_patch": "edit",
+    "web_search": "search", "websearch": "search", "web_fetch": "fetch", "webfetch": "fetch",
+    "agent": "helper", "toolsearch": "tools",
+    "grep": "lookup", "glob": "lookup", "memory_search": "lookup", "sessions_search": "lookup",
+}
+TOOL_LABEL_DEFAULT_KIND = "tool"
+# Call arguments that title a call (exec's `title`, Claude Code's Agent `description`), in order.
+TOOL_LABEL_TITLE_ARGS = ("title", "description")
+TOOL_LABEL_TITLE_MAX = 48
+SPAWN_CARD_PREFIX = "🤖"  # a spawn card's name already says what it is (`_tool_card_view`)
+
+
+def _tool_card_labels(name: str, args_str: str, lang: str) -> dict | None:
+    """Open WebUI's `display_labels` for a card of tool `name`: what the header says while it
+    runs and once done, in `lang` (ELI-512). The item's `name` stays the tool's own. None
+    when the label would be just the name (English, untitled): the card stays as it was."""
+    if not name or name.startswith(SPAWN_CARD_PREFIX):
+        return None
+    args = _json_object(args_str)
+    title = next((" ".join(args[k].split()) for k in TOOL_LABEL_TITLE_ARGS
+                  if isinstance(args.get(k), str) and args[k].strip()), "")[:TOOL_LABEL_TITLE_MAX]
+    kind = TOOL_LABEL_KINDS.get(name.lower(), TOOL_LABEL_DEFAULT_KIND)
+    values = {"name": name, "title": f": {title}" if title else ""}
+    labels = {"running": ui_text(f"tool_{kind}_running", lang, **values),
+              "completed": ui_text(f"tool_{kind}", lang, **values)}
+    return None if labels["completed"] == name else labels
+
+
+def _tool_call_started_event(name: str, tool_call_id: str, args_str: str,
+                             labels: dict | None = None) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
 
     A yielded `response.*` dict lands in OWUI's backend output list, so the
@@ -2055,6 +2108,7 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
             "name": name,
             "arguments": args_str[:3000],
             "status": "in_progress",
+            **({"display_labels": labels} if labels else {}),
         },
     }
 
@@ -2293,14 +2347,15 @@ def _spawn_call_args(payload: dict) -> dict | None:
     return _json_object(args_str) if _is_spawn_tool(name) else None
 
 
-def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
+def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str,
+                                   labels: dict | None = None) -> dict:
     """Re-announce a failed call's item with status "failed" and ❌ in its name.
 
     OWUI draws the red X only for status "failed" (ELI-278). Re-sending the
     start event with the same id replaces the item in both OWUI reducers, so
     it works live on any card; `response.name.done` does not (ELI-124).
     """
-    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
+    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str, labels)
     event["item"]["status"] = "failed"
     return event
 
@@ -2513,7 +2568,8 @@ class _TurnRenderer:
         """The call's card, opened on first sight (start or result)."""
         item = self._tool_items.get(tcid)
         if item is None:
-            event = _tool_call_started_event(name, tcid, args_str)
+            event = _tool_call_started_event(name, tcid, args_str,
+                                             _tool_card_labels(name, args_str, self.lang))
             item = copy.deepcopy(event["item"])
             self._tool_items[tcid] = item
             self.output.append(item)
@@ -2649,7 +2705,8 @@ class _TurnRenderer:
                     item["status"] = "failed" if failed else "completed"
                     if failed:
                         item["name"] = f"{card_name} {TOOL_ERROR_MARK}"
-                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args))
+                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args,
+                                                                     item.get("display_labels")))
                         result_str = _tool_error_banner(result_str)
                     event = _tool_call_result_event(tcid, result_str)
                     self.output.append(copy.deepcopy(event["item"]))
@@ -6030,7 +6087,19 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
     `run_usage`: the run's own usage gives the context fill, since OpenClaw
     2026.10 writes a first reply's totals to the row only after the run (ELI-177).
+
+    The context and rate-limit lines are for owner users only (`_sender_is_owner`,
+    the check that picks the restricted connection): to anyone else they are
+    jargon about the owner's account (ELI-512). Their goal line stays.
     """
+    if not await _sender_is_owner(conn, session_key):
+        try:
+            desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
+            goal = ((desc or {}).get("session") or {}).get("goal")
+            goal_line = _format_goal_line(goal) if goal else None
+        except Exception:
+            goal_line = None
+        return [goal_line] if goal_line else []
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
     )

@@ -431,6 +431,12 @@ def _turn_note_item(note: str) -> dict:
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
 
 
+def _is_note_only(output: list | None) -> bool:
+    """Whether a reply's `output` is the Pipe's own notes and nothing else: no run text, no card."""
+    items = [i for i in output or [] if isinstance(i, dict)]
+    return bool(items) and all(str(i.get("id") or "").startswith(_NOTE_ITEM_PREFIX) for i in items)
+
+
 def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
     """Put the Pipe's own notes back after a transcript rebuild (ELI-229)."""
     output = renderer.output
@@ -471,9 +477,12 @@ async def _close_reply_status(ref: dict) -> None:
         pipe_log(f"  reply {message_id[:8]}...: closing its status failed: {ex!r}")
 
 
-async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
+async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
+                              only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
-    for the request to end first, or Open WebUI's own save lands over this."""
+    for the request to end first, or Open WebUI's own save lands over this.
+    `only_if_empty`: a reply stopped before any text gets `note` as its content,
+    one with content stays as it is, its "Stopped" status line too."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
@@ -482,16 +491,24 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
 
     chat_id, message_id = ref["chat_id"], ref["message_id"]
     try:
-        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
-                                        "user_id": ref.get("user_id")}, update_db=True)
-        await emit({"type": "status", "data": {"description": "", "done": True}})
+        if not only_if_empty:
+            emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                            "user_id": ref.get("user_id")}, update_db=True)
+            await emit({"type": "status", "data": {"description": "", "done": True}})
         async with conn._chat_write_lock(chat_id):
             current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
             text = (current.get("content") or "").strip()
+            if only_if_empty and text:
+                return
             text = f"{text}\n\n{note}" if text else note
             output = list(current.get("output") or []) + [_turn_note_item(note)]
             await _owui_upsert_message(
                 chat_id, message_id, {"content": text, "output": output, "done": True})
+        # A reply that is only the Pipe's note is no news: no toast or notification for it
+        # in another chat (Open WebUI skips both for an `internal` event).
+        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                        "user_id": ref.get("user_id"),
+                                        "internal": _is_note_only(output)}, update_db=False)
         await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                          "output": output}})
         pipe_log(f"  reply {message_id[:8]}... ended: {note}")
@@ -1033,14 +1050,16 @@ class _TurnWriter:
                 return
         await self._stream()
 
-    async def _emitter(self):
-        if self._emit is None:
-            from open_webui.socket.main import get_event_emitter
+    async def _emitter(self, internal: bool = False):
+        """M's event emitter. `internal`: one Open WebUI shows no toast or notification for."""
+        from open_webui.socket.main import get_event_emitter
 
+        info = {"chat_id": self.chat_id, "message_id": self.message_id, "user_id": self.user_id}
+        if internal:
+            return await get_event_emitter({**info, "internal": True}, update_db=False)
+        if self._emit is None:
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = await get_event_emitter(
-                {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False)
+            self._emit = await get_event_emitter(info, update_db=False)
         return self._emit
 
     async def _stream(self) -> None:
@@ -1513,6 +1532,10 @@ class _TurnWriter:
             if images:
                 text = f"{text}\n\n{images}" if text else images
                 output.append(_turn_note_item(images))
+            if stopped and not text and not note:
+                # Stopped before any text: say so in the saved reply, not only in its status
+                # line, so a reload and the chat's preview show it (ELI-512).
+                note = ui_text("stopped_reason", self.lang)
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
@@ -1529,7 +1552,7 @@ class _TurnWriter:
                     pushed = await self._push_final(text, output, history)
                 # A finished reply this writer took over was published when it
                 # first finished: the run continues into it, with no second publish.
-                if (not stopped and not self._claim.get("was_done")
+                if (not stopped and not self._claim.get("was_done") and not _is_note_only(output)
                         and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False)):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
@@ -1541,8 +1564,11 @@ class _TurnWriter:
             # already has them: a status event would add each one again.
             for line in status if not pushed else ():
                 await emit({"type": "status", "data": line})
-            await emit({"type": "chat:completion", "data": {"done": True, "content": text,
-                                                             "output": output}})
+            # A reply that is only the Pipe's note ("sent together with your next one") is
+            # no news: it ends without a toast or notification in another chat (ELI-512).
+            done_emit = await self._emitter(internal=True) if _is_note_only(output) else emit
+            await done_emit({"type": "chat:completion", "data": {"done": True, "content": text,
+                                                                  "output": output}})
             if not self.newer_run:
                 await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")

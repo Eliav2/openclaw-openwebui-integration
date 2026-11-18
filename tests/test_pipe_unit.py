@@ -8635,7 +8635,9 @@ class _FakeOwuiChat:
         async def get_event_emitter(meta, update_db=True):
             fake.emitter_update_db = update_db
             async def emit(event):
+                # `internal` as Open WebUI's emitter sends it: no toast or notification for it.
                 fake.emits.append(("events", {"chat_id": meta["chat_id"], "message_id": meta["message_id"],
+                                              **({"internal": True} if meta.get("internal") is True else {}),
                                               "data": copy.deepcopy(event)}, f"user:{meta['user_id']}"))
             return emit
 

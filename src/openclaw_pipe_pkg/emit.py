@@ -245,7 +245,19 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
     `run_usage`: the run's own usage gives the context fill, since OpenClaw
     2026.10 writes a first reply's totals to the row only after the run (ELI-177).
+
+    The context and rate-limit lines are for owner users only (`_sender_is_owner`,
+    the check that picks the restricted connection): to anyone else they are
+    jargon about the owner's account (ELI-512). Their goal line stays.
     """
+    if not await _sender_is_owner(conn, session_key):
+        try:
+            desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
+            goal = ((desc or {}).get("session") or {}).get("goal")
+            goal_line = _format_goal_line(goal) if goal else None
+        except Exception:
+            goal_line = None
+        return [goal_line] if goal_line else []
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
     )

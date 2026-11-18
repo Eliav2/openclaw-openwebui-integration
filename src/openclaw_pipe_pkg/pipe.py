@@ -2091,6 +2091,23 @@ class _PipeTurn:
         self.stopped_shown = True
         if self.status_closed:
             spawn_background(self.show_stopped())
+        reply = self.stopped_reply_ref()
+        if reply is not None:
+            # Stopped before any text: the saved reply says so, after Open WebUI's own
+            # end-of-reply save, so a reload and the chat's preview show it (ELI-512).
+            spawn_background(_close_unsent_reply(self.conn, reply, ui_text("stopped_reason", self.lang),
+                                                 only_if_empty=True))
+
+    def stopped_reply_ref(self) -> dict | None:
+        """This reply's message, when it was stopped before showing any run text; else None."""
+        chat_id, message_id = getattr(self, "owui_origin_chat_id", None), getattr(self, "owui_message_id", None)
+        renderer = getattr(self, "renderer", None)
+        if (renderer is not None and (renderer.visible_text or "").strip()) or not chat_id or not message_id \
+                or getattr(self, "channel_id", None):
+            return None
+        return {"chat_id": chat_id, "message_id": message_id,
+                "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
+                "request_task_id": (self.__metadata__ or {}).get("task_id")}
 
     async def show_stopped(self, emit=None):
         """"Stopped" as the reply's last line, or, if it cannot be sent, the

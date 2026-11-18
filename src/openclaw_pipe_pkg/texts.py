@@ -92,6 +92,26 @@ UI_TEXT = {
                              "ההודעות האחרונות, והכול עדיין מופיע כאן."},
     # The Pipe's own card label.
     "subagent_card": {"en": "Sub-agent", "he": "עוזר"},
+    # A tool card's header (Open WebUI's `display_labels`): running, then done. English keeps the
+    # tool's own name, plus the title the agent gave the call; Hebrew says what it does.
+    "tool_command_running": {"en": "{name}{title}", "he": "מריץ פקודה"},
+    "tool_command": {"en": "{name}{title}", "he": "הריץ פקודה"},
+    "tool_read_running": {"en": "{name}{title}", "he": "קורא"},
+    "tool_read": {"en": "{name}{title}", "he": "קרא"},
+    "tool_edit_running": {"en": "{name}{title}", "he": "כותב לקובץ"},
+    "tool_edit": {"en": "{name}{title}", "he": "כתב לקובץ"},
+    "tool_search_running": {"en": "{name}{title}", "he": "מחפש ברשת"},
+    "tool_search": {"en": "{name}{title}", "he": "חיפש ברשת"},
+    "tool_fetch_running": {"en": "{name}{title}", "he": "פותח דף"},
+    "tool_fetch": {"en": "{name}{title}", "he": "פתח דף"},
+    "tool_helper_running": {"en": "{name}{title}", "he": "מפעיל עוזר"},
+    "tool_helper": {"en": "{name}{title}", "he": "הפעיל עוזר"},
+    "tool_lookup_running": {"en": "{name}{title}", "he": "מחפש"},
+    "tool_lookup": {"en": "{name}{title}", "he": "חיפש"},
+    "tool_tools_running": {"en": "{name}{title}", "he": "מחפש כלי"},
+    "tool_tools": {"en": "{name}{title}", "he": "מצא כלי"},
+    "tool_tool_running": {"en": "{name}{title}", "he": "משתמש בכלי"},
+    "tool_tool": {"en": "{name}{title}", "he": "השתמש בכלי"},
 }
 
 # The last UI language each Open WebUI user sent: for replies written without a request.

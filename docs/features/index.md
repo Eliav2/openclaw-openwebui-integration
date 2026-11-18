@@ -28,7 +28,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Voice calls**](./chat.md#voice-calls): a message you speak in Open WebUI's voice mode reaches the agent with a note that the reply will be read aloud, so it answers in short spoken sentences without markup
 - [**Composer toggles**](./chat.md#what-the-composer-toggles-do): Open WebUI's web search, code interpreter, tools and integrations toggles do not reach the agent, which uses only the tools your Gateway gives it
 - [**Slash commands in the / menu**](./chat.md#slash-commands-as-prompts): the Gateway's slash commands as prompts in Open WebUI's `/` menu, kept in sync, without touching your own prompts
-- [**Usage and goal line**](./chat.md#usage-and-goal-line): context, rate-limit and goal state under every reply
+- [**Usage and goal line**](./chat.md#usage-and-goal-line): context, rate-limit and goal state under every reply (context and limits for owner users only)
 - [**Context compaction marked**](./chat.md#context-compaction): when the Gateway compacts the session mid-reply, the reply shows a collapsed "Context compacted" block where it happened
 - [**Chat titles**](./chat.md#chat-titles): chats name themselves, on a separate agent so it never queues behind your conversation
 - [**Push notifications**](../install/web-push.md) _(separate project, [open-webui-pwa-push](https://github.com/Eliav2/open-webui-pwa-push))_: a notification on your phone or computer when a reply finishes, agent turns included, with the chat's title only, not while you are looking at that chat

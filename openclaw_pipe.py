@@ -269,6 +269,26 @@ UI_TEXT = {
                              "ההודעות האחרונות, והכול עדיין מופיע כאן."},
     # The Pipe's own card label.
     "subagent_card": {"en": "Sub-agent", "he": "עוזר"},
+    # A tool card's header (Open WebUI's `display_labels`): running, then done. English keeps the
+    # tool's own name, plus the title the agent gave the call; Hebrew says what it does.
+    "tool_command_running": {"en": "{name}{title}", "he": "מריץ פקודה"},
+    "tool_command": {"en": "{name}{title}", "he": "הריץ פקודה"},
+    "tool_read_running": {"en": "{name}{title}", "he": "קורא"},
+    "tool_read": {"en": "{name}{title}", "he": "קרא"},
+    "tool_edit_running": {"en": "{name}{title}", "he": "כותב לקובץ"},
+    "tool_edit": {"en": "{name}{title}", "he": "כתב לקובץ"},
+    "tool_search_running": {"en": "{name}{title}", "he": "מחפש ברשת"},
+    "tool_search": {"en": "{name}{title}", "he": "חיפש ברשת"},
+    "tool_fetch_running": {"en": "{name}{title}", "he": "פותח דף"},
+    "tool_fetch": {"en": "{name}{title}", "he": "פתח דף"},
+    "tool_helper_running": {"en": "{name}{title}", "he": "מפעיל עוזר"},
+    "tool_helper": {"en": "{name}{title}", "he": "הפעיל עוזר"},
+    "tool_lookup_running": {"en": "{name}{title}", "he": "מחפש"},
+    "tool_lookup": {"en": "{name}{title}", "he": "חיפש"},
+    "tool_tools_running": {"en": "{name}{title}", "he": "מחפש כלי"},
+    "tool_tools": {"en": "{name}{title}", "he": "מצא כלי"},
+    "tool_tool_running": {"en": "{name}{title}", "he": "משתמש בכלי"},
+    "tool_tool": {"en": "{name}{title}", "he": "השתמש בכלי"},
 }
 
 # The last UI language each Open WebUI user sent: for replies written without a request.
@@ -2198,7 +2218,19 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
     `run_usage`: the run's own usage gives the context fill, since OpenClaw
     2026.10 writes a first reply's totals to the row only after the run (ELI-177).
+
+    The context and rate-limit lines are for owner users only (`_sender_is_owner`,
+    the check that picks the restricted connection): to anyone else they are
+    jargon about the owner's account (ELI-512). Their goal line stays.
     """
+    if not await _sender_is_owner(conn, session_key):
+        try:
+            desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
+            goal = ((desc or {}).get("session") or {}).get("goal")
+            goal_line = _format_goal_line(goal) if goal else None
+        except Exception:
+            goal_line = None
+        return [goal_line] if goal_line else []
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
     )
@@ -5375,7 +5407,40 @@ def _attr(value: str) -> str:
 _OUTPUT_APPEND_INDEX = 1 << 30
 
 
-def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
+# A tool card's header label kind (UI_TEXT "tool_<kind>"), by lowercase tool name; others are "tool".
+TOOL_LABEL_KINDS = {
+    "exec": "command", "bash": "command", "process": "command",
+    "read": "read", "memory_get": "read", "ls": "read",
+    "write": "edit", "edit": "edit", "multiedit": "edit", "apply_patch": "edit",
+    "web_search": "search", "websearch": "search", "web_fetch": "fetch", "webfetch": "fetch",
+    "agent": "helper", "toolsearch": "tools",
+    "grep": "lookup", "glob": "lookup", "memory_search": "lookup", "sessions_search": "lookup",
+}
+TOOL_LABEL_DEFAULT_KIND = "tool"
+# Call arguments that title a call (exec's `title`, Claude Code's Agent `description`), in order.
+TOOL_LABEL_TITLE_ARGS = ("title", "description")
+TOOL_LABEL_TITLE_MAX = 48
+SPAWN_CARD_PREFIX = "🤖"  # a spawn card's name already says what it is (`_tool_card_view`)
+
+
+def _tool_card_labels(name: str, args_str: str, lang: str) -> dict | None:
+    """Open WebUI's `display_labels` for a card of tool `name`: what the header says while it
+    runs and once done, in `lang` (ELI-512). The item's `name` stays the tool's own. None
+    when the label would be just the name (English, untitled): the card stays as it was."""
+    if not name or name.startswith(SPAWN_CARD_PREFIX):
+        return None
+    args = _json_object(args_str)
+    title = next((" ".join(args[k].split()) for k in TOOL_LABEL_TITLE_ARGS
+                  if isinstance(args.get(k), str) and args[k].strip()), "")[:TOOL_LABEL_TITLE_MAX]
+    kind = TOOL_LABEL_KINDS.get(name.lower(), TOOL_LABEL_DEFAULT_KIND)
+    values = {"name": name, "title": f": {title}" if title else ""}
+    labels = {"running": ui_text(f"tool_{kind}_running", lang, **values),
+              "completed": ui_text(f"tool_{kind}", lang, **values)}
+    return None if labels["completed"] == name else labels
+
+
+def _tool_call_started_event(name: str, tool_call_id: str, args_str: str,
+                             labels: dict | None = None) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
 
     A yielded `response.*` dict lands in OWUI's backend output list, so the
@@ -5393,6 +5458,7 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
             "name": name,
             "arguments": args_str[:3000],
             "status": "in_progress",
+            **({"display_labels": labels} if labels else {}),
         },
     }
 
@@ -5631,14 +5697,15 @@ def _spawn_call_args(payload: dict) -> dict | None:
     return _json_object(args_str) if _is_spawn_tool(name) else None
 
 
-def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
+def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str,
+                                   labels: dict | None = None) -> dict:
     """Re-announce a failed call's item with status "failed" and ❌ in its name.
 
     OWUI draws the red X only for status "failed" (ELI-278). Re-sending the
     start event with the same id replaces the item in both OWUI reducers, so
     it works live on any card; `response.name.done` does not (ELI-124).
     """
-    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
+    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str, labels)
     event["item"]["status"] = "failed"
     return event
 
@@ -5851,7 +5918,8 @@ class _TurnRenderer:
         """The call's card, opened on first sight (start or result)."""
         item = self._tool_items.get(tcid)
         if item is None:
-            event = _tool_call_started_event(name, tcid, args_str)
+            event = _tool_call_started_event(name, tcid, args_str,
+                                             _tool_card_labels(name, args_str, self.lang))
             item = copy.deepcopy(event["item"])
             self._tool_items[tcid] = item
             self.output.append(item)
@@ -5987,7 +6055,8 @@ class _TurnRenderer:
                     item["status"] = "failed" if failed else "completed"
                     if failed:
                         item["name"] = f"{card_name} {TOOL_ERROR_MARK}"
-                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args))
+                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args,
+                                                                     item.get("display_labels")))
                         result_str = _tool_error_banner(result_str)
                     event = _tool_call_result_event(tcid, result_str)
                     self.output.append(copy.deepcopy(event["item"]))
@@ -9664,6 +9733,12 @@ def _turn_note_item(note: str) -> dict:
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
 
 
+def _is_note_only(output: list | None) -> bool:
+    """Whether a reply's `output` is the Pipe's own notes and nothing else: no run text, no card."""
+    items = [i for i in output or [] if isinstance(i, dict)]
+    return bool(items) and all(str(i.get("id") or "").startswith(_NOTE_ITEM_PREFIX) for i in items)
+
+
 def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
     """Put the Pipe's own notes back after a transcript rebuild (ELI-229)."""
     output = renderer.output
@@ -9704,9 +9779,12 @@ async def _close_reply_status(ref: dict) -> None:
         pipe_log(f"  reply {message_id[:8]}...: closing its status failed: {ex!r}")
 
 
-async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
+async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
+                              only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
-    for the request to end first, or Open WebUI's own save lands over this."""
+    for the request to end first, or Open WebUI's own save lands over this.
+    `only_if_empty`: a reply stopped before any text gets `note` as its content,
+    one with content stays as it is, its "Stopped" status line too."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
@@ -9715,16 +9793,24 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
 
     chat_id, message_id = ref["chat_id"], ref["message_id"]
     try:
-        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
-                                        "user_id": ref.get("user_id")}, update_db=True)
-        await emit({"type": "status", "data": {"description": "", "done": True}})
+        if not only_if_empty:
+            emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                            "user_id": ref.get("user_id")}, update_db=True)
+            await emit({"type": "status", "data": {"description": "", "done": True}})
         async with conn._chat_write_lock(chat_id):
             current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
             text = (current.get("content") or "").strip()
+            if only_if_empty and text:
+                return
             text = f"{text}\n\n{note}" if text else note
             output = list(current.get("output") or []) + [_turn_note_item(note)]
             await _owui_upsert_message(
                 chat_id, message_id, {"content": text, "output": output, "done": True})
+        # A reply that is only the Pipe's note is no news: no toast or notification for it
+        # in another chat (Open WebUI skips both for an `internal` event).
+        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                        "user_id": ref.get("user_id"),
+                                        "internal": _is_note_only(output)}, update_db=False)
         await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                          "output": output}})
         pipe_log(f"  reply {message_id[:8]}... ended: {note}")
@@ -10266,14 +10352,16 @@ class _TurnWriter:
                 return
         await self._stream()
 
-    async def _emitter(self):
-        if self._emit is None:
-            from open_webui.socket.main import get_event_emitter
+    async def _emitter(self, internal: bool = False):
+        """M's event emitter. `internal`: one Open WebUI shows no toast or notification for."""
+        from open_webui.socket.main import get_event_emitter
 
+        info = {"chat_id": self.chat_id, "message_id": self.message_id, "user_id": self.user_id}
+        if internal:
+            return await get_event_emitter({**info, "internal": True}, update_db=False)
+        if self._emit is None:
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = await get_event_emitter(
-                {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False)
+            self._emit = await get_event_emitter(info, update_db=False)
         return self._emit
 
     async def _stream(self) -> None:
@@ -10746,6 +10834,10 @@ class _TurnWriter:
             if images:
                 text = f"{text}\n\n{images}" if text else images
                 output.append(_turn_note_item(images))
+            if stopped and not text and not note:
+                # Stopped before any text: say so in the saved reply, not only in its status
+                # line, so a reload and the chat's preview show it (ELI-512).
+                note = ui_text("stopped_reason", self.lang)
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
@@ -10762,7 +10854,7 @@ class _TurnWriter:
                     pushed = await self._push_final(text, output, history)
                 # A finished reply this writer took over was published when it
                 # first finished: the run continues into it, with no second publish.
-                if (not stopped and not self._claim.get("was_done")
+                if (not stopped and not self._claim.get("was_done") and not _is_note_only(output)
                         and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False)):
                     await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
@@ -10774,8 +10866,11 @@ class _TurnWriter:
             # already has them: a status event would add each one again.
             for line in status if not pushed else ():
                 await emit({"type": "status", "data": line})
-            await emit({"type": "chat:completion", "data": {"done": True, "content": text,
-                                                             "output": output}})
+            # A reply that is only the Pipe's note ("sent together with your next one") is
+            # no news: it ends without a toast or notification in another chat (ELI-512).
+            done_emit = await self._emitter(internal=True) if _is_note_only(output) else emit
+            await done_emit({"type": "chat:completion", "data": {"done": True, "content": text,
+                                                                  "output": output}})
             if not self.newer_run:
                 await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")
@@ -17723,6 +17818,23 @@ class _PipeTurn:
         self.stopped_shown = True
         if self.status_closed:
             spawn_background(self.show_stopped())
+        reply = self.stopped_reply_ref()
+        if reply is not None:
+            # Stopped before any text: the saved reply says so, after Open WebUI's own
+            # end-of-reply save, so a reload and the chat's preview show it (ELI-512).
+            spawn_background(_close_unsent_reply(self.conn, reply, ui_text("stopped_reason", self.lang),
+                                                 only_if_empty=True))
+
+    def stopped_reply_ref(self) -> dict | None:
+        """This reply's message, when it was stopped before showing any run text; else None."""
+        chat_id, message_id = getattr(self, "owui_origin_chat_id", None), getattr(self, "owui_message_id", None)
+        renderer = getattr(self, "renderer", None)
+        if (renderer is not None and (renderer.visible_text or "").strip()) or not chat_id or not message_id \
+                or getattr(self, "channel_id", None):
+            return None
+        return {"chat_id": chat_id, "message_id": message_id,
+                "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
+                "request_task_id": (self.__metadata__ or {}).get("task_id")}
 
     async def show_stopped(self, emit=None):
         """"Stopped" as the reply's last line, or, if it cannot be sent, the
