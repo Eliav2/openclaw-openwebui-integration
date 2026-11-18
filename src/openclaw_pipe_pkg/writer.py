@@ -543,6 +543,20 @@ def _close_stopped_cards(output: list, lang: str) -> bool:
     return changed
 
 
+# The fields that name a message, so a tab without it can still show what is pushed.
+MESSAGE_IDENTITY_KEYS = ("role", "parentId", "model", "modelName", "modelIdx", "timestamp", "user_id")
+
+
+def _stopped_push(current: dict, fields: dict, message_id: str) -> dict:
+    """A stopped reply's node for open tabs: what the close changed, and what names it. Not the
+    rest of the saved row: Open WebUI merges the node over the tab's copy, and the request's own
+    status line can be in the tab before it is in the row (its emitter sends, then writes), so a
+    pushed `statusHistory` would drop it (ELI-512, chat cb7b779f)."""
+    # The close runs once the row is done: a tab with no cancel event of its own sees it end.
+    return {**{k: current[k] for k in MESSAGE_IDENTITY_KEYS if k in current}, **fields,
+            "id": message_id, "done": True}
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
                               only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
@@ -592,7 +606,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
                     return
                 try:
                     await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
-                        message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+                        message_id, None, _stopped_push(current, fields, message_id)), None, message_id)
                 except Exception as ex:
                     pipe_log(f"  reply {message_id[:8]}...: pushing its stopped cards failed: {ex!r}")
                 return
@@ -613,7 +627,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             # where a status event would only add a line after it.
             try:
                 await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
-                    message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+                    message_id, None, _stopped_push(current, fields, message_id)), None, message_id)
             except Exception as ex:
                 pipe_log(f"  reply {message_id[:8]}...: pushing its status lines failed: {ex!r}")
         if _is_note_only(output):

@@ -5809,9 +5809,16 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
 # ending its line and `<summary>...</summary>` ending the next (src/lib/utils/marked/extension.ts:
 # 34-35). Any other shape is an HTML token, which a chat shows as plain text (HTMLToken.svelte:139).
 _DETAILS_OPEN = "<details"
-_DETAILS_OPEN_TAG = re.compile(r"<details(?:\s[^>]*)?>")
-_SUMMARY_OPEN = "<summary>"
-_SUMMARY_TAG = re.compile(r"<summary>.*?</summary>")
+# A tag's attributes, a quoted value as one unit: a `>` or `<summary` in it ends nothing.
+_TAG_ATTRS = r"""(?:\s+[^\s"'<>=/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>=`]+))?)*\s*"""
+_QUOTED_VALUE = re.compile(r""""[^"]*"|'[^']*'""")
+_DETAILS_OPEN_TAG = re.compile(rf"<details({_TAG_ATTRS})>")
+_SUMMARY_OPEN = "<summary"
+# Open WebUI reads only a bare `<summary>`; a summary's attributes do nothing there.
+_SUMMARY_TAG = re.compile(rf"<summary(?:{_TAG_ATTRS})>(.*?)</summary>")
+# Up to three spaces before a tag are no code block, but Open WebUI matches `<details` only at
+# the line's start: such a line loses them.
+_TAG_INDENT_MAX = 3
 _CODE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
 _LINE_END = "\n"
 DETAILS_LINE_HOLD_MAX = 2000  # a line held as a possible `<details` line is let go past this
@@ -5832,19 +5839,28 @@ class _DetailsShaper:
     def _may_shape(self, line: str) -> bool:
         if self.fence or len(line) > DETAILS_LINE_HOLD_MAX:
             return False
+        bare = line.lstrip(" ")
+        if len(line) - len(bare) > _TAG_INDENT_MAX:
+            return False
         tags = (_DETAILS_OPEN, _SUMMARY_OPEN) if self.after_open else (_DETAILS_OPEN,)
-        return any(tag.startswith(line) or line.startswith(tag) for tag in tags)
+        return any(tag.startswith(bare) or bare.startswith(tag) for tag in tags)
 
     def _shape(self, line: str) -> str:
         body, end = (line[:-1], _LINE_END) if line.endswith(_LINE_END) else (line, "")
+        if len(body) - len(body.lstrip(" ")) <= _TAG_INDENT_MAX:
+            body = body.lstrip(" ")
         parts, opened = [], False
         tag = _DETAILS_OPEN_TAG.match(body)
         if tag:
-            parts, body, opened = [tag.group(0)], body[tag.end():].lstrip(), True
+            # Open WebUI's own match stops at the first `>` (extension.ts:34): none in a value.
+            attrs = _QUOTED_VALUE.sub(
+                lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), tag.group(1))
+            parts, body, opened = [f"<details{attrs}>"], body[tag.end():].lstrip(), True
         if tag or self.after_open:
             summary = _SUMMARY_TAG.match(body)
             if summary:
-                parts, body, opened = parts + [summary.group(0)], body[summary.end():].lstrip(), False
+                parts, body, opened = (parts + [f"<summary>{summary.group(1)}</summary>"],
+                                       body[summary.end():].lstrip(), False)
         self.after_open = opened
         if not parts:
             return line
@@ -10014,6 +10030,20 @@ def _close_stopped_cards(output: list, lang: str) -> bool:
     return changed
 
 
+# The fields that name a message, so a tab without it can still show what is pushed.
+MESSAGE_IDENTITY_KEYS = ("role", "parentId", "model", "modelName", "modelIdx", "timestamp", "user_id")
+
+
+def _stopped_push(current: dict, fields: dict, message_id: str) -> dict:
+    """A stopped reply's node for open tabs: what the close changed, and what names it. Not the
+    rest of the saved row: Open WebUI merges the node over the tab's copy, and the request's own
+    status line can be in the tab before it is in the row (its emitter sends, then writes), so a
+    pushed `statusHistory` would drop it (ELI-512, chat cb7b779f)."""
+    # The close runs once the row is done: a tab with no cancel event of its own sees it end.
+    return {**{k: current[k] for k in MESSAGE_IDENTITY_KEYS if k in current}, **fields,
+            "id": message_id, "done": True}
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
                               only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
@@ -10063,7 +10093,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
                     return
                 try:
                     await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
-                        message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+                        message_id, None, _stopped_push(current, fields, message_id)), None, message_id)
                 except Exception as ex:
                     pipe_log(f"  reply {message_id[:8]}...: pushing its stopped cards failed: {ex!r}")
                 return
@@ -10084,7 +10114,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             # where a status event would only add a line after it.
             try:
                 await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
-                    message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+                    message_id, None, _stopped_push(current, fields, message_id)), None, message_id)
             except Exception as ex:
                 pipe_log(f"  reply {message_id[:8]}...: pushing its status lines failed: {ex!r}")
         if _is_note_only(output):
