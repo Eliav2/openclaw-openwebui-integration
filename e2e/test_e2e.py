@@ -3285,6 +3285,81 @@ def test_an_approval_that_expires_takes_the_card_away_and_a_late_answer_is_harml
         page.close()
 
 
+# ── What a non-owner's run can call (ELI-512 guest sweep) ────────────────────
+# The model is out of the loop: e2e/fake_claude.py's E2E_CLI_TRY flow asks the
+# Gateway's MCP server for the run's tools and forces each call itself, with
+# the run's own grant. A refusal is the Gateway's (or a fence plugin's) answer.
+
+# Each forced call: harmless arguments, enough for the tool to run if allowed.
+# {owner} is the owner's chat session: a guest reading or stopping it is the leak.
+TRY_CALLS = {
+    "conversations_send": {"target": "e2e-nowhere", "text": "E2E_TRY"},
+    "automations": {"action": "list"},
+    "gateway": {"action": "config.get"},
+    "sessions": {"action": "stop", "sessionKey": "{owner}"},
+    "terminal": {"action": "list"},
+    "exec": {"command": "echo e2e-try-exec"},
+    "read": {"path": "AGENTS.md"},
+    "memory_search": {"query": "e2e"},
+    "sessions_history": {"sessionKey": "{owner}"},
+    "secrets": {"action": "list"},
+}
+# Words of a refusal: the Gateway's owner gate (a gated result, not an isError one), its
+# authorization and scope errors, a tool not on the run's list, or a before_tool_call block.
+TRY_REFUSED = re.compile(r"needs the owner's authority|missing scope|only permits|is available to non-owner|"
+                         r"requires? (?:owner|current (?:session|operator))|not (?:found|allowed|available|permitted)|"
+                         r"unknown tool|forbidden|unauthori[sz]ed|blocked|denied|identity-fence:", re.I)
+
+
+def _try_answer(raw) -> tuple[str, str]:
+    """("refused" | "ran" | "error", text) of one forced MCP call's answer."""
+    status, reply = raw
+    if not isinstance(reply, dict):
+        return ("refused" if status in (403, 404) else "error"), str(reply)[:300]
+    if reply.get("error"):
+        text = json.dumps(reply["error"])
+        return ("refused" if TRY_REFUSED.search(text) else "error"), text[:300]
+    result = reply.get("result") or {}
+    text = " ".join(str(c.get("text") or "") for c in result.get("content") or [] if isinstance(c, dict))
+    if result.get("isError"):
+        return ("refused" if TRY_REFUSED.search(text) else "error"), text[:300]
+    if "needs the owner's authority" in text:
+        return "refused", text[:300]
+    return "ran", text[:300]
+
+
+def _forced_calls(tok: str, label: str, owner_key: str) -> dict:
+    word = f"t{uuid.uuid4().hex[:8]}"
+    calls = json.loads(json.dumps(TRY_CALLS).replace("{owner}", owner_key))
+    _chat_id, msg = _chat_turn(tok, f"E2E_CLI_TRY {word} {json.dumps(calls)}", model=CLI_MODEL)
+    assert f"E2E_TRY_DONE {word}" in (msg.get("content") or ""), msg
+    path = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"try-{word}.json")
+    got = json.load(open(path))
+    got["verdicts"] = {name: _try_answer(raw) for name, raw in got["calls"].items()}
+    out = os.environ.get("E2E_TRY_REPORT_DIR") or os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"])
+    if out:
+        with open(os.path.join(out, f"try-{label}.json"), "w") as f:
+            json.dump(got, f, indent=1)
+    return got
+
+
+def test_a_non_owners_run_cannot_call_owner_or_private_tools(token, guest_token, owner_users_set):
+    """A user not in OWNER_USERS: every owner-only tool and every private one (shell, files,
+    memory, other sessions, secrets) is refused when the run forces the call, while the
+    owner's run reaches them. ELI-512's sweep found them offered to a guest. (11.5 offers
+    every tool on every turn for the prompt cache and gates the call, so the offered list
+    is not the test.)"""
+    owner_chat, _ = _chat_turn(token, "Respond with exactly: E2E_OWNER_CHAT")
+    owner_key = _session_key(token, owner_chat)
+    owner = _forced_calls(token, "owner", owner_key)
+    guest = _forced_calls(guest_token, "guest", owner_key)
+    # Precondition: the owner's run reaches the shell, the files and its own history through the same path.
+    for name in ("exec", "read", "sessions_history"):
+        assert owner["verdicts"][name][0] == "ran", owner["verdicts"]
+    reached = {name: v for name, v in guest["verdicts"].items() if v[0] != "refused"}
+    assert not reached, f"a guest's forced calls not refused: {json.dumps(reached, indent=1)}"
+
+
 def test_a_guest_cannot_approve_a_plugin_approval(token, guest_token, owner_users_set):
     """Only the owner approves. A guest's run goes over the connection
     without operator.admin, so the Gateway refuses the run's approval request

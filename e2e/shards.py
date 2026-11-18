@@ -114,6 +114,7 @@ SHARDS = {
         f"{E2E}::test_a_denied_plugin_approval_keeps_the_tool_from_running",
         f"{E2E}::test_stop_while_a_plugin_approval_waits_takes_the_card_away",
         f"{E2E}::test_an_approval_that_expires_takes_the_card_away_and_a_late_answer_is_harmless",
+        f"{E2E}::test_a_non_owners_run_cannot_call_owner_or_private_tools",
         f"{E2E}::test_a_guest_cannot_approve_a_plugin_approval",
         f"{E2E}::test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply",
         f"{E2E}::test_a_socket_drop_mid_run_the_pipe_did_not_start_ends_the_run_whole",

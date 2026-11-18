@@ -35,6 +35,10 @@ Replies:
   Gateway's settle announce, in a `--resume` process) is recorded as live Claude Code records it:
   first its `<synthetic>` "No response requested." for the yielded turn, then the prompt as a
   meta message. It is answered `E2E_YIELD_ANSWER TOKEN`.
+* `E2E_CLI_TRY TOKEN {"tool": {args}, ...}` -> asks the Gateway's MCP server for `tools/list`, then
+  calls each tool with its args itself, with the run's own grant: no model decides anything. The
+  answers go to `$E2E_FAKE_CLAUDE_DIR/try-TOKEN.json` (`offered`, `calls`); the reply is
+  `E2E_TRY_DONE TOKEN`.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * a message saying `No reply needed` -> a bare `NO_REPLY`, the agent's silence (ELI-336). The
@@ -68,6 +72,7 @@ TOOL_HOLD = re.compile(r"E2E_CLI_TOOL_HOLD\s+([A-Za-z0-9_]{3,})")
 ABORT_TOOL = re.compile(r"E2E_CLI_ABORT_TOOL\s+([A-Za-z0-9_]{3,})")
 LATE_STEER = re.compile(r"E2E_CLI_LATE_STEER\s+([A-Za-z0-9_]{3,})")
 SPAWN_YIELD = re.compile(r"E2E_CLI_SPAWN_YIELD\s+([A-Za-z0-9_]{3,})")
+TRY = re.compile(r"E2E_CLI_TRY\s+([A-Za-z0-9_]{3,})\s+(\{.*\})", re.S)
 # What Claude Code records for a turn it never answered (one a yield ended), at the next input.
 SYNTHETIC_MODEL = "<synthetic>"
 SYNTHETIC_NO_RESPONSE = "No response requested."
@@ -204,10 +209,10 @@ def mcp_server():
     return servers.get("openclaw") or next(iter(servers.values()), None)
 
 
-def mcp_call(server, name, arguments):
-    """One `tools/call` over the server's HTTP transport: (HTTP status, JSON-RPC reply or body)."""
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": name, "arguments": arguments}}).encode()
+def mcp_call(server, name, arguments, method="tools/call"):
+    """One `tools/call` (or `method`) over the server's HTTP transport: (HTTP status, JSON-RPC reply or body)."""
+    params = {"name": name, "arguments": arguments} if method == "tools/call" else (arguments or {})
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     req = urllib.request.Request(server["url"], data=body, method="POST", headers={
         **(server.get("headers") or {}), "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream"})
@@ -321,6 +326,23 @@ while True:
         say(reply)
         lifecycle("completed", msg.get("uuid"))
         result(reply)
+        continue
+    tried = TRY.search(text_of(msg))
+    if tried:
+        token, calls = tried.group(1), json.loads(tried.group(2))
+        # The Gateway's own answer for this run's grant: what it offers, then each call forced.
+        status, listed = mcp_call(MCP, "", {}, method="tools/list")
+        offered = [t.get("name") for t in ((listed or {}).get("result") or {}).get("tools") or []] \
+            if isinstance(listed, dict) else []
+        answers = {}
+        for name, arguments in calls.items():
+            answers[name] = mcp_call(MCP, name, arguments)
+        with open(os.path.join(DIR, f"try-{token}.json"), "w") as f:
+            json.dump({"listStatus": status, "offered": offered, "calls": answers}, f)
+        note(f"tried {token}: {len(answers)} call(s)")
+        say(f"E2E_TRY_DONE {token}")
+        lifecycle("completed", msg.get("uuid"))
+        result(f"E2E_TRY_DONE {token}")
         continue
     spawn_yield = SPAWN_YIELD.search(text_of(msg))
     if spawn_yield:
