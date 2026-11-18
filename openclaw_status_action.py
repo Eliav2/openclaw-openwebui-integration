@@ -2459,10 +2459,13 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
 # ending its line and `<summary>...</summary>` ending the next (src/lib/utils/marked/extension.ts:
 # 34-35). Any other shape is an HTML token, which a chat shows as plain text (HTMLToken.svelte:139).
 _DETAILS_OPEN = "<details"
-_DETAILS_OPEN_TAG = re.compile(r"<details(?:\s[^>]*)?>")
+# A tag's attributes, a quoted value as one unit: a `>` or `<summary` in it ends nothing.
+_TAG_ATTRS = r"""(?:\s+[^\s"'<>=/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>=`]+))?)*\s*"""
+_QUOTED_VALUE = re.compile(r""""[^"]*"|'[^']*'""")
+_DETAILS_OPEN_TAG = re.compile(rf"<details({_TAG_ATTRS})>")
 _SUMMARY_OPEN = "<summary"
 # Open WebUI reads only a bare `<summary>`; a summary's attributes do nothing there.
-_SUMMARY_TAG = re.compile(r"<summary(?:\s[^>]*)?>(.*?)</summary>")
+_SUMMARY_TAG = re.compile(rf"<summary(?:{_TAG_ATTRS})>(.*?)</summary>")
 # Up to three spaces before a tag are no code block, but Open WebUI matches `<details` only at
 # the line's start: such a line loses them.
 _TAG_INDENT_MAX = 3
@@ -2499,7 +2502,10 @@ class _DetailsShaper:
         parts, opened = [], False
         tag = _DETAILS_OPEN_TAG.match(body)
         if tag:
-            parts, body, opened = [tag.group(0)], body[tag.end():].lstrip(), True
+            # Open WebUI's own match stops at the first `>` (extension.ts:34): none in a value.
+            attrs = _QUOTED_VALUE.sub(
+                lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), tag.group(1))
+            parts, body, opened = [f"<details{attrs}>"], body[tag.end():].lstrip(), True
         if tag or self.after_open:
             summary = _SUMMARY_TAG.match(body)
             if summary:

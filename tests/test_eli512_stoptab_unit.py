@@ -94,6 +94,18 @@ class DetailsCoverageTests(unittest.TestCase):
         self.assertEqual(_shaped("  <details><summary>S</summary>\nbody\n</details>"),
                          "<details>\n<summary>S</summary>\nbody\n</details>")
 
+    def test_a_quoted_attribute_is_one_unit(self):
+        """CodeRabbit on #418: a `>` or `<summary` inside a quoted value neither ends the tag nor
+        becomes the summary. Its `<` and `>` are escaped: Open WebUI's own tag match stops at the
+        first `>` (extension.ts:34)."""
+        self.assertEqual(_shaped('<details data-x="a>b"><summary>S</summary>\nbody\n</details>'),
+                         '<details data-x="a&gt;b">\n<summary>S</summary>\nbody\n</details>')
+        self.assertEqual(
+            _shaped("<details title='<summary>X</summary>'><summary>S</summary>\nbody\n</details>"),
+            "<details title='&lt;summary&gt;X&lt;/summary&gt;'>\n<summary>S</summary>\nbody\n</details>")
+        self.assertEqual(_shaped('<details>\n<summary title="a>b">S</summary> x\n</details>'),
+                         '<details>\n<summary>S</summary>\nx\n</details>')
+
     def test_four_spaces_are_code_and_stay(self):
         text = "    <details><summary>S</summary>\n"
         self.assertEqual(_shaped(text), text)
