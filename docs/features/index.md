@@ -14,6 +14,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 ## In the chat
 
 - [**Real-time streaming**](./chat.md#streaming): replies appear token by token, not all at once at the end
+- [**Status lines in your language**](./chat.md#status-lines-in-your-language): the Pipe's status row and notes in Open WebUI's interface language, Hebrew or English, short enough for a phone
 - [**Native tool cards**](./chat.md#tool-cards): tool calls render as Open WebUI's own two-phase cards, expandable to their input and output
 - [**Sub-agent cards**](./chat.md#sub-agent-cards): a sub-agent the agent starts shows as a card named after it, with the head of its task and whether it started
 - [**Failed tools marked**](./chat.md#failed-tools): failed calls are labelled live, and a call that never returns is closed rather than left spinning

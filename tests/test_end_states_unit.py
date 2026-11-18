@@ -49,12 +49,12 @@ class TextlessEndTests(_TurnCase):
         """T5b: the run's own end says aborted while the row reads `status: null` (the moment
         before `killed`): the reply says Stopped, not that it produced no text."""
         out = await self._textless([self._aborted_final("run-1")], None)
-        self.assertIn(openclaw_pipe.STOPPED_NOTE, out)
+        self.assertIn(openclaw_pipe.ui_text("stopped_reason"), out)
         self.assertNotIn(NO_TEXT, out)
 
     async def test_a_killed_row_says_stopped(self):
         out = await self._textless([self._final("run-1")], "killed")
-        self.assertIn(openclaw_pipe.STOPPED_NOTE, out)
+        self.assertIn(openclaw_pipe.ui_text("stopped_reason"), out)
         self.assertNotIn(NO_TEXT, out)
 
     async def test_a_timed_out_run_says_it_timed_out(self):
