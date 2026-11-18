@@ -28,12 +28,15 @@ _CANCEL_STATUS_TAIL = (*ui_texts("stopped"), "")
 
 
 def _final_status_history(history: list | None, lines: list, stopped: bool,
-                          lang: str = UI_LANG_DEFAULT) -> tuple[list, list]:
-    """M's final status lines (cancel tail dropped) and the ones it adds."""
+                          lang: str = UI_LANG_DEFAULT, said: bool = False) -> tuple[list, list]:
+    """M's final status lines (cancel tail dropped) and the ones it adds. `said`: M's text
+    already says "Stopped.", so no "Stopped" status line repeats it (ELI-512)."""
     kept = [h for h in (history or []) if isinstance(h, dict)]
     while kept and kept[-1].get("done") is not False and kept[-1].get("description") in _CANCEL_STATUS_TAIL:
         kept.pop()
-    if stopped:
+    if stopped and said:
+        new = [{"description": "", "done": True}]
+    elif stopped:
         new = [{"description": ui_text("stopped", lang), "done": True}]
     else:
         new = [{"description": line, "done": True} for line in lines] or [{"description": "", "done": True}]
@@ -241,8 +244,7 @@ async def _drop_chat_finished_claims_of_deleted_replies() -> None:
         pipe_log(f"  dropping chat.finished claims of deleted replies failed: {ex!r}")
 
 
-# Open WebUI's output item and content part that carry a reply's text.
-OUTPUT_MESSAGE_ITEM = "message"
+# Open WebUI's content part that carries a reply's text (its item: OUTPUT_MESSAGE_ITEM, gateway.py).
 OUTPUT_TEXT_PART = "output_text"
 
 
@@ -477,6 +479,8 @@ def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
             if before else 0
         output.insert(pos, copy.deepcopy(item))
         have.add(item.get("id"))
+    # A note back between two cards parts their group: they get their own labels back.
+    _even_card_labels(output, renderer.lang)
 
 
 
@@ -547,12 +551,24 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             have = {i.get("id") for i in output if isinstance(i, dict)}
             output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
             output.append(_turn_note_item(note))
-            if not await _owui_upsert_message(
-                    chat_id, message_id, {"content": text, "output": output, "done": True}):
+            fields = {"content": text, "output": output, "done": True}
+            if only_if_empty:
+                # The text says "Stopped." now: its "Stopped" status line would say it twice.
+                fields["statusHistory"], _new = _final_status_history(
+                    current.get("statusHistory"), [], True, said=True)
+            if not await _owui_upsert_message(chat_id, message_id, fields):
                 # Not saved: no tab is shown a note a reload would not have.
                 pipe_log(f"  reply {message_id[:8]}...: saving its note failed; not shown")
                 return
         data = {"done": True, "content": text, "output": output}
+        if only_if_empty:
+            # Open tabs drop the "Stopped" line too: the saved status history replaces theirs,
+            # where a status event would only add a line after it.
+            try:
+                await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
+                    message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+            except Exception as ex:
+                pipe_log(f"  reply {message_id[:8]}...: pushing its status lines failed: {ex!r}")
         if _is_note_only(output):
             # No news: no toast or notification for it in another chat.
             await _note_only_completion(chat_id, message_id, ref.get("user_id"), data)
@@ -1176,6 +1192,8 @@ class _TurnWriter:
             if item in items:
                 part = item["content"][0]
                 part["text"] = show(part.get("text") or "", n == len(output) - 1)
+        # A message left with no text (its `MEDIA:` line moves to the reply's end) parts no cards.
+        _even_card_labels(output, self.renderer.lang)
         if not items:
             return output, show(self.renderer.text, True)
         return output, "".join(i["content"][0]["text"] for i in items)
@@ -1223,11 +1241,11 @@ class _TurnWriter:
         return True
 
     async def _persist_final(self, output: list, text: str, stopped: bool,
-                             run_usage: dict | None = None) -> tuple[list, list, bool]:
+                             run_usage: dict | None = None, said: bool = False) -> tuple[list, list, bool]:
         """M's `done: true` write with its final status lines (ELI-210), after
         the handed-over request ends. Returns M's whole status history, the new
         lines and whether the row reads back finished. `run_usage`: for a row
-        with no totals (ELI-177)."""
+        with no totals (ELI-177). `said`: M's text ends with the Pipe's "Stopped." note."""
         from open_webui.models.chats import Chats
 
         if self.request_task is not None and not self.request_task.done():
@@ -1244,7 +1262,8 @@ class _TurnWriter:
             except Exception as ex:
                 saved = {}
                 pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
-            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang)
+            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang,
+                                                 said=said)
             whole = await self._persist(done=True, output=output, text=text, status_history=history)
             if whole:
                 try:
@@ -1580,7 +1599,8 @@ class _TurnWriter:
             if images:
                 text = f"{text}\n\n{images}" if text else images
                 output.append(_turn_note_item(images, media=True))
-            if stopped and not text and not note:
+            said_stopped = stopped and not text and not note
+            if said_stopped:
                 # Stopped before any text: say so in the saved reply, not only in its status
                 # line, so a reload and the chat's preview show it (ELI-512).
                 note = ui_text("stopped_reason", self.lang)
@@ -1589,7 +1609,8 @@ class _TurnWriter:
                 output.append(_turn_note_item(note))
             run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
                              None) if hist else None
-            history, status, saved = await self._persist_final(output, text, stopped, run_usage)
+            history, status, saved = await self._persist_final(output, text, stopped, run_usage,
+                                                                   said=said_stopped)
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
