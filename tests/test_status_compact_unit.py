@@ -125,10 +125,32 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "error", emitted)
         self.assertEqual(status_calls, [{"show_loading": False, "notice": "Compaction failed: the model refused"}])
 
+    async def test_on_2026_11_5_a_stopped_timed_out_or_cut_compaction_ends_the_wait_at_once(self):
+        """ELI-512: 2026.11.5 ends such a run `killed`, `timeout` or `interrupted` (its enum has no
+        `cancelled`): the dialog says so, instead of waiting out the deadline for "timed out"."""
+        for status in ("killed", "timeout", "interrupted"):
+            with self.subTest(status=status):
+                result, status_calls, _ = await self._compact(
+                    [{"status": status, "hasActiveRun": False}], [None])
+                self.assertEqual(result, {"status": "error", "detail": status})
+                self.assertEqual(status_calls, [])
+
     async def test_a_compaction_that_never_ends_times_out(self):
         result, status_calls, _ = await self._compact([{"hasActiveRun": False}], [None])
         self.assertEqual(result, {"status": "error", "detail": "timeout"})
         self.assertEqual(status_calls, [])
+
+
+class SessionLiveTests(unittest.TestCase):
+    """The Rate limits note "a response is in progress" (ELI-512): 2026.11.5 reads `queued` while
+    it starts a run, and `hasActiveRun` is the row's own answer."""
+
+    def test_a_starting_or_running_run_is_live_and_an_ended_one_is_not(self):
+        for row, live in (({"status": "running"}, True), ({"status": "queued", "hasActiveRun": True}, True),
+                          ({"status": None, "hasActiveRun": True}, True), ({"status": "queued"}, True),
+                          ({"status": "killed", "hasActiveRun": False}, False), ({}, False)):
+            with self.subTest(row=row):
+                self.assertIs(action._session_row_live(row), live)
 
 
 if __name__ == "__main__":
