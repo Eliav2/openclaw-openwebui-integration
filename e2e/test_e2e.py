@@ -685,8 +685,11 @@ def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
     assert "E2E_QUEUED_REPLY" not in wake[0]["content"]
     _assert_clean(token, chat_id, msgs)
     # It showed it was queued, and that line gave way once its run started (ELI-511).
+    # 2026.11.5 shows a wake only once it ended, so the message finds the chat idle
+    # there; test_a_message_the_gateway_holds_says_waiting_until_its_run_streams waits.
     running = _running_status_lines(msgs[aid])
-    assert any(line.startswith(QUEUED_LINES) for line in running), running
+    if not _gateway_at_least(2026, 11, 5):
+        assert any(line.startswith(QUEUED_LINES) for line in running), running
     assert not running[-1].startswith(QUEUED_LINES), running
 
 
@@ -700,14 +703,74 @@ def _running_status_lines(msg: dict) -> list:
             if isinstance(h, dict) and not h.get("done")]
 
 
+def _gateway_at_least(*version) -> bool:
+    m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,3})", os.environ.get("OPENCLAW_VERSION", ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= version
+
+
+def _streaming_status(token: str, chat_id: str, reply: str) -> list:
+    """The reply's running status lines once its first words show and before it is done:
+    what the user sees while it streams (`E2E_SLOW`, a word a second)."""
+    seen = {}
+
+    def streaming():
+        msg = _chat_messages(token, chat_id).get(reply) or {}
+        assert not msg.get("done"), f"done before it was seen streaming: {msg.get('content')!r}"
+        seen["msg"] = msg
+        return "slow-2" in (msg.get("content") or "")
+    _until("the reply streaming", streaming, timeout_s=120, every_s=0.3)
+    return _running_status_lines(seen["msg"])
+
+
+@pytest.mark.skipif(not _gateway_at_least(2026, 11, 5), reason="rows say `queued` while admitting from 2026.11.5")
+def test_a_message_the_gateway_holds_says_waiting_until_its_run_streams(token):
+    """Eliav 2026-11-18 (c9dc45f0, ELI-511): 2026.11.5 reports a send `queued` until it
+    runs; the Pipe kept saying so while the run streamed. Here the Gateway really holds
+    it: the global lane is full (agents.defaults.maxConcurrent 1, another chat's run held
+    until the test lets it go), so the row says `queued` before any event of the run.
+    The reply says Waiting while held, and no longer once its words stream."""
+    other, _ = _chat_turn(token, "Respond with exactly: E2E_LANE_OTHER")
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_LANE_CHAT")
+    key = _session_key(token, chat_id)
+    word = f"E2E_LANE_{uuid.uuid4().hex[:6]}"
+    hold_token = f"lane{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    subprocess.run(["openclaw", "config", "set", "agents.defaults.maxConcurrent", "1"],
+                   check=True, capture_output=True, timeout=180)
+    try:
+        _post_turn(token, other, f"E2E_HOLD {hold_token}")
+        _until("the other chat's run holding the lane", lambda: _gw(
+            "sessions.describe", {"key": _session_key(token, other)}).get("session", {}).get("hasActiveRun"),
+            timeout_s=60, every_s=0.5)
+        reply = _post_turn(token, chat_id, f"E2E_SLOW:8 {word}")
+        _until("the message held by the Gateway", lambda: _gw(
+            "sessions.describe", {"key": key}).get("session", {}).get("status") == "queued",
+            timeout_s=60, every_s=0.2)
+        _until("the reply saying it waits", lambda: any(
+            line.startswith(QUEUED_LINES) for line in
+            _running_status_lines(_chat_messages(token, chat_id).get(reply) or {})), timeout_s=60, every_s=0.3)
+    finally:
+        open(gate, "w").close()
+        subprocess.run(["openclaw", "config", "unset", "agents.defaults.maxConcurrent"],
+                       check=True, capture_output=True, timeout=180)
+    running = _streaming_status(token, chat_id, reply)
+    assert not running[-1].startswith(QUEUED_LINES), f"still waiting while it streams: {running}"
+    _wait_for(token, chat_id, [word, "slow-8"])
+
+
 def test_a_running_reply_does_not_say_it_is_queued(token):
-    """Eliav 2026-11-18 (c9dc45f0, ELI-511): 2026.11.5 reports every send `queued` until it
-    runs. A reply in an idle chat may show that while its run is admitted, never once its
-    run streams."""
+    """Eliav 2026-11-18 (c9dc45f0, ELI-511): 2026.11.5 reports every send `queued` while it
+    admits it. Nothing in the chat is ahead of the message: no Waiting line, and no queued
+    line once its reply streams."""
     for n in range(3):
-        chat_id, msg = _chat_turn(token, f"E2E_ECHO: not queued {n}")
-        running = _running_status_lines(msg)
-        assert running and not running[-1].startswith(QUEUED_LINES), f"chat {chat_id}: {running}"
+        chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_IDLE_CHAT")
+        reply = _post_turn(token, chat_id, f"E2E_SLOW:6 E2E_IDLE_{n}")
+        running = _streaming_status(token, chat_id, reply)
+        # The Pipe's own Queued line is real (the last turn may still be settling); Waiting is not.
+        assert not any(line.startswith(QUEUED_LINES[1]) for line in running), f"chat {chat_id}: {running}"
+        assert not running[-1].startswith(QUEUED_LINES), f"chat {chat_id}: {running}"
+        _wait_for(token, chat_id, [f"E2E_IDLE_{n}", "slow-6"])
+
 
 
 STEER_PENDING = "it reads it at its next step"  # writer.py STEER_PENDING_STATUS

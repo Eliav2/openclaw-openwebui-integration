@@ -54,6 +54,7 @@ SHARDS = {
         f"{E2E}::test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing",
         f"{E2E}::test_a_message_queued_behind_a_wake_does_not_cut_it",
         f"{E2E}::test_a_running_reply_does_not_say_it_is_queued",
+        f"{E2E}::test_a_message_the_gateway_holds_says_waiting_until_its_run_streams",
         f"{E2E}::test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn",
         f"{E2E}::test_a_message_sent_while_a_run_works_is_steered_into_it",
         f"{E2E}::test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it",

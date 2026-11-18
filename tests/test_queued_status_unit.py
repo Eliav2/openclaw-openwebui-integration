@@ -45,12 +45,34 @@ class QueuedStatusReplacedTests(_TurnCase):
         for _ in range(50):
             await asyncio.sleep(0)
 
-    async def test_the_admission_queued_row_gives_way_when_the_run_starts(self):
-        """The row says `queued` before the run's first event: Waiting shows, and the run's
-        first event replaces it with the running line, before any text."""
+    async def test_an_admission_queued_row_in_an_idle_session_shows_no_waiting(self):
+        """Eliav 2026-11-18 (c9dc45f0): the row says `queued` while 2026.11.5 admits the
+        send, with nothing else running. Nothing is ahead of it: no Waiting line, before
+        the run starts or after."""
         gen = self._reply("hello", "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
+        self._admission_push()
+        await self._spin()
+        self.assertNotIn(WAITING, self._statuses())
+        q = self._queue("run-1")
+        q.put_nowait(self._lifecycle_start("run-1"))
+        q.put_nowait(self._delta("run-1", "hi there"))
+        self.assertIn("hi there", await self._finish(gen, first, "run-1"))
+        self.assertNotIn(WAITING, self._statuses())
+
+    def _live_run(self, run_id):
+        """Another run of the session whose events have started (a wake, say)."""
+        self.conn.register_consumer(self.SK, run_id)
+        self.conn._consumers[f"{self.SK}:{run_id}"].started = True
+
+    async def test_a_queued_row_behind_a_live_run_shows_waiting_until_the_run_starts(self):
+        """The row says `queued` while another run of the session is live: Waiting shows, and
+        this run's first event replaces it with the running line, before any text."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self._live_run("wake-1")
         self._admission_push()
         await self._spin()
         self.assertEqual(self._statuses()[-1], WAITING)
@@ -95,9 +117,8 @@ class QueuedStatusReplacedTests(_TurnCase):
         self.conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False,
                                         "reason": "chat.run.settled"})
         await self._until_registered("run-1")
-        self._admission_push()
         await self._spin()
-        self.assertIn(self._statuses()[-1], (QUEUED, WAITING), "not started yet: still waiting")
+        self.assertEqual(self._statuses()[-1], QUEUED, "sent, not started yet: still Queued")
 
         q = self._queue("run-1")
         q.put_nowait(self._lifecycle_start("run-1"))
@@ -119,3 +140,59 @@ class QueuedStatusReplacedTests(_TurnCase):
         self.assertNotIn(WAITING, statuses)
         self.assertNotIn(QUEUED, statuses)
         self.assertEqual(statuses.count(THINKING), 1, statuses)
+
+    async def test_a_capacity_wait_row_shows_waiting_until_the_run_starts(self):
+        """2026.11.5 pushes `reason: run-capacity` when its global lane holds the run: a real
+        wait, shown, then replaced by the run's first event."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self.conn._on_sessions_changed({"sessionKey": self.SK, "reason": "run-capacity",
+                                        "hasActiveRun": True, "status": "queued"})
+        await self._spin()
+        self.assertEqual(self._statuses()[-1], WAITING)
+        q = self._queue("run-1")
+        q.put_nowait(self._lifecycle_start("run-1"))
+        await self._spin()
+        self.assertEqual(self._statuses()[-1], THINKING, self._statuses())
+        q.put_nowait(self._delta("run-1", "hi there"))
+        self.assertIn("hi there", await self._finish(gen, first, "run-1"))
+
+    async def test_an_event_without_a_run_id_keeps_the_waiting_line(self):
+        """Only this reply's own run starting replaces the line: a run-less event on the
+        session (a question or approval note) does not."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self._live_run("wake-1")
+        self._admission_push()
+        await self._spin()
+        q = self._queue("run-1")
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "stream": "item", "data": {"kind": "note", "title": "x"}}})
+        await self._spin()
+        self.assertEqual(self._statuses()[-1], WAITING, self._statuses())
+        q.put_nowait(self._lifecycle_start("run-1"))
+        await self._spin()
+        self.assertEqual(self._statuses()[-1], THINKING, self._statuses())
+        await self._finish(gen, first, "run-1")
+
+    async def test_a_status_emit_that_fails_does_not_drop_the_runs_first_text(self):
+        """The line's replacement is best effort: an emitter error leaves the text that
+        started the run in the reply."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self._live_run("wake-1")
+        self._admission_push()
+        await self._spin()
+        turn_emit = self.emitted.append
+
+        def failing(event):
+            if event.get("data", {}).get("description") == THINKING:
+                raise RuntimeError("socket gone")
+            turn_emit(event)
+        self.emitted = type("E", (list,), {"append": staticmethod(failing)})(self.emitted)
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "first words"))
+        self.assertIn("first words", await self._finish(gen, first, "run-1"))

@@ -29,6 +29,9 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
 # Marks a retry body after a thinking-level rejection: it sends no level, not
 # even the user's thinking default.
 THINKING_DROPPED_KEY = "openclaw_thinking_dropped"
+# The `sessions.changed` reason of a run the Gateway holds for capacity, its
+# global lane full (2026.11.5 `registerAgentRunCapacityWait`).
+CAPACITY_WAIT_REASON = "run-capacity"
 
 
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
@@ -1653,7 +1656,8 @@ class _PipeTurn:
                         if evt_run_id and evt_run_id != self.our_run_id:
                             pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
                             continue
-                        if self.wait_line_shown and not self.enqueued_not_started:
+                        if (self.wait_line_shown and not self.enqueued_not_started
+                                and evt_run_id == self.our_run_id):
                             await self.show_run_started()
 
                         err = (str(data.get("error", "unknown"))
@@ -1847,19 +1851,27 @@ class _PipeTurn:
 
     async def show_run_started(self):
         """The run is going: the "Queued"/"Waiting" line gives way to the line a
-        running reply shows. 2026.11.5 reports every send `queued` until it runs
-        (ELI-511)."""
+        running reply shows (ELI-511)."""
         self.wait_line_shown = False
         pipe_log("  run started; queued status replaced")
-        await _emit_status(self.__event_emitter__, "Thinking...", done=False)
+        try:
+            await _emit_status(self.__event_emitter__, "Thinking...", done=False)
+        except Exception as exc:
+            # Best effort: the run's event that started it still shows.
+            pipe_log(f"  could not replace queued status: {exc!r}")
 
     async def on_settle_row(self, msg):
         """A session row: the queued status, or the run's end when its final was lost."""
         row = msg.get("row") or {}
+        # Waiting only for a real wait: the Gateway's capacity wait, or another
+        # live run of the session. 2026.11.5 reports every send `queued` while it
+        # admits it (ELI-511).
         if row.get("status") == "queued" and not self.first_event_arrived \
-                and not self.queued_shown:
+                and not self.queued_shown \
+                and (row.get("reason") == CAPACITY_WAIT_REASON
+                     or self.conn.live_runs(self.session_key) - {self.our_run_id}):
             self.queued_shown = self.wait_line_shown = True
-            pipe_log("  session row says queued; showing Waiting until the run starts")
+            pipe_log(f"  session row says queued ({row.get('reason')}); showing Waiting until the run starts")
             await _emit_status(
                 self.__event_emitter__,
                 "Waiting -- your message is queued behind an "
