@@ -1192,8 +1192,12 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
 # 34-35). Any other shape is an HTML token, which a chat shows as plain text (HTMLToken.svelte:139).
 _DETAILS_OPEN = "<details"
 _DETAILS_OPEN_TAG = re.compile(r"<details(?:\s[^>]*)?>")
-_SUMMARY_OPEN = "<summary>"
-_SUMMARY_TAG = re.compile(r"<summary>.*?</summary>")
+_SUMMARY_OPEN = "<summary"
+# Open WebUI reads only a bare `<summary>`; a summary's attributes do nothing there.
+_SUMMARY_TAG = re.compile(r"<summary(?:\s[^>]*)?>(.*?)</summary>")
+# Up to three spaces before a tag are no code block, but Open WebUI matches `<details` only at
+# the line's start: such a line loses them.
+_TAG_INDENT_MAX = 3
 _CODE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
 _LINE_END = "\n"
 DETAILS_LINE_HOLD_MAX = 2000  # a line held as a possible `<details` line is let go past this
@@ -1214,11 +1218,16 @@ class _DetailsShaper:
     def _may_shape(self, line: str) -> bool:
         if self.fence or len(line) > DETAILS_LINE_HOLD_MAX:
             return False
+        bare = line.lstrip(" ")
+        if len(line) - len(bare) > _TAG_INDENT_MAX:
+            return False
         tags = (_DETAILS_OPEN, _SUMMARY_OPEN) if self.after_open else (_DETAILS_OPEN,)
-        return any(tag.startswith(line) or line.startswith(tag) for tag in tags)
+        return any(tag.startswith(bare) or bare.startswith(tag) for tag in tags)
 
     def _shape(self, line: str) -> str:
         body, end = (line[:-1], _LINE_END) if line.endswith(_LINE_END) else (line, "")
+        if len(body) - len(body.lstrip(" ")) <= _TAG_INDENT_MAX:
+            body = body.lstrip(" ")
         parts, opened = [], False
         tag = _DETAILS_OPEN_TAG.match(body)
         if tag:
@@ -1226,7 +1235,8 @@ class _DetailsShaper:
         if tag or self.after_open:
             summary = _SUMMARY_TAG.match(body)
             if summary:
-                parts, body, opened = parts + [summary.group(0)], body[summary.end():].lstrip(), False
+                parts, body, opened = (parts + [f"<summary>{summary.group(1)}</summary>"],
+                                       body[summary.end():].lstrip(), False)
         self.after_open = opened
         if not parts:
             return line
