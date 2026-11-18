@@ -611,6 +611,9 @@ def test_a_reply_stopped_before_any_text_says_stopped(page, token):
         _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(0, 'r.done')})()", "the stopped reply, done")
         # In the reply's body, not only its "Stopped" status row.
         _wait(page, _body_text_js(0, "Stopped."), "Stopped. in the reply's body")
+        # The open tab says it once too, not only a reload (its status lines are replaced).
+        _wait(page, f"() => {_message_text_js(0)}.split('Stopped').length === 2",
+              "the open tab's one Stopped")
     finally:
         open(gate, "w").close()
     saved = _saved_assistant(page, token)

@@ -8,6 +8,7 @@
    it did in words (Hebrew), else none has one ("Explored ToolSearch, exec")."""
 import json
 import unittest
+from unittest import mock
 
 import test_pipe_unit  # noqa: F401  (installs the module stubs openclaw_pipe needs)
 from test_eli512_p2_unit import _WriterCase
@@ -95,6 +96,48 @@ class GroupLabelTests(unittest.TestCase):
             {"type": "tool_result", "tool_use_id": "t2", "name": "exec", "content": [{"type": "text", "text": "ok"}]}]}]
         self.assertEqual(_cards(ocp._history_renderer(msgs, "en")), {"t1": None, "t2": None})
 
+    def test_a_note_back_between_cards_gives_them_their_labels_back(self):
+        """A rebuild has no Pipe note: its cards group and lose their titles. The note put back
+        (`_keep_pipe_notes`) parts them again, and each gets its own label back."""
+        msgs = [{"role": "assistant", "content": [
+            {"type": "toolcall", "id": "t1", "name": "exec", "arguments": TITLED},
+            {"type": "tool_result", "tool_use_id": "t1", "name": "exec", "content": [{"type": "text", "text": "ok"}]},
+            {"type": "toolcall", "id": "t2", "name": "ToolSearch", "arguments": {}},
+            {"type": "tool_result", "tool_use_id": "t2", "name": "ToolSearch", "content": [{"type": "text", "text": "ok"}]}]}]
+        part = ocp._history_renderer(msgs, "en")
+        self.assertEqual(_cards(part), {"t1": None, "t2": None})
+        note = ocp._turn_note_item("Take control: https://example.invalid/x")
+        streamed = [{"type": "function_call", "id": "t1"}, note, {"type": "function_call", "id": "t2"}]
+        ocp._keep_pipe_notes(streamed, part)
+        self.assertEqual(_cards(part)["t1"]["completed"], "exec: QA sleep test")
+
+    def test_a_message_with_no_text_left_parts_no_cards(self):
+        """A `MEDIA:` line's message is empty once its image moves to the reply's end: Open WebUI
+        skips it and groups the cards around it."""
+        out = [{"type": "function_call", "id": "t1", "name": "exec", "arguments": json.dumps(TITLED),
+                "display_labels": {"running": "exec: QA sleep test", "completed": "exec: QA sleep test"}},
+               {"type": "message", "id": "m", "content": [{"type": "output_text", "text": " "}]},
+               {"type": "function_call", "id": "t2", "name": "ToolSearch", "arguments": "{}"}]
+        self.assertEqual([c["id"] for c in ocp._even_card_labels(out, "en")], ["t1"])
+        self.assertNotIn("display_labels", out[0])
+        out[1]["content"][0]["text"] = "Now the tools."
+        ocp._even_card_labels(out, "en")
+        self.assertEqual(out[0]["display_labels"]["completed"], "exec: QA sleep test")
+
+
+class WriterViewLabelTests(_WriterCase):
+    async def test_the_writers_view_groups_cards_around_a_moved_image(self):
+        w = self.writer()
+        for payload in (_start("exec", "t1", TITLED), _result("exec", "t1", TITLED),
+                        _text("MEDIA:/tmp/openclaw/chart.png\n"), _start("ToolSearch", "t2"),
+                        _result("ToolSearch", "t2")):
+            await w.feed(payload)
+        w._rewrite = lambda text: text.replace("MEDIA:/tmp/openclaw/chart.png", "")
+        with mock.patch.object(w, "_resolve_media", mock.AsyncMock()):
+            output, _ = await w._view(final=True)
+        self.assertEqual({i["id"]: i.get("display_labels") for i in output if i.get("type") == "function_call"},
+                         {"t1": None, "t2": None})
+
 
 class StoppedOnceTests(_WriterCase):
     async def test_the_writers_stopped_reply_has_no_stopped_status_line(self):
@@ -126,8 +169,35 @@ class StoppedOnceTests(_WriterCase):
         saved = self.owui.msgs()["m2"]
         self.assertEqual(saved["content"], "**Stopped.**")
         self.assertEqual([h["description"] for h in saved["statusHistory"]], ["Thinking...", ""])
-        # An open tab drops the line too.
-        self.assertEqual(self.owui.events("status")[-1]["data"], {"description": "", "done": True})
+        # An open tab drops the line too: its history is replaced, not added to (a status event
+        # would leave "Stopped" in its expanded history).
+        self.assertEqual(self.owui.events("status"), [])
+        pushed = self.owui.events("chat:messages")[-1]["data"]["messages"]["m2"]
+        self.assertEqual([h["description"] for h in pushed["statusHistory"]], ["Thinking...", ""])
+        self.assertEqual(pushed["content"], "**Stopped.**")
+
+    async def test_a_failed_status_push_still_completes_the_tab(self):
+        self.owui.msgs()["m2"] = {"role": "assistant", "content": "", "done": True,
+                                  "statusHistory": [{"description": "Stopped", "done": True}]}
+        emits = self.owui.emits
+
+        class Refusing(list):
+            def append(self, entry):
+                if entry[1].get("data", {}).get("type") in ("status", "chat:messages"):
+                    raise ConnectionError("socket gone")
+                super().append(entry)
+        self.owui.emits = Refusing(emits)
+        ref = {"chat_id": self.CHAT, "message_id": "m2", "user_id": self.USER}
+        await ocp._close_unsent_reply(self.conn, ref, ocp.ui_text("stopped_reason"), only_if_empty=True)
+        self.assertEqual(self.owui.msgs()["m2"]["content"], "**Stopped.**")
+        self.assertTrue([d for e, d, _ in self.owui.emits if d["data"].get("type") == "chat:completion"])
+
+    async def test_a_reply_quoting_stopped_keeps_its_stopped_line(self):
+        """Only the Pipe's own note drops the line: a reply that ends quoting it does not."""
+        w = self.writer()
+        await w.feed(_text("The log ends with **Stopped.**"))
+        await w.finalize(stopped=True)
+        self.assertEqual(self.m()["statusHistory"][-1]["description"], "Stopped")
 
     async def test_a_live_reply_with_content_keeps_its_status(self):
         self.owui.msgs()["m2"] = {"role": "assistant", "content": "partial", "done": True,
@@ -160,6 +230,23 @@ class RequestStoppedLineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_reply_stopped_before_text_closes_empty(self):
         self.assertEqual(await self._shown(self._turn()), [""])
+
+    async def test_a_stop_after_the_closing_lines_adds_no_stopped(self):
+        """The request's lines already went out: the stop's own line is the empty one, so its late
+        save cannot land after the note's and bring "Stopped" back."""
+        turn = self._turn()
+        turn.stopped_shown, turn.status_closed, turn.conn = False, True, object()
+        lines, spawned = [], []
+
+        async def emit(event):
+            lines.append(event["data"]["description"])
+        turn.__event_emitter__ = emit
+        with mock.patch.object(ocp, "spawn_background", spawned.append), \
+                mock.patch.object(ocp, "_close_unsent_reply", mock.AsyncMock()):
+            turn.on_parked_stop()
+            for coro in spawned:
+                await coro
+        self.assertEqual(lines, [""])
 
     async def test_a_reply_stopped_after_text_ends_on_stopped(self):
         self.assertEqual(await self._shown(self._turn("half an answer")), ["Stopped"])

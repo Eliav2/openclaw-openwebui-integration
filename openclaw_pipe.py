@@ -5439,21 +5439,78 @@ def _tool_card_labels(name: str, args_str: str, lang: str) -> dict | None:
     return None if labels["completed"] == name else labels
 
 
-# The items of a group of cards (`_TurnRenderer._card_run`): a call; its result and the model's
-# reasoning sit between calls without ending the group.
+# The items of a group of cards (`_card_groups`): a call; its result and the model's reasoning
+# sit between calls without ending the group, as does a message with no text Open WebUI shows.
 _TOOL_CALL_ITEM = "function_call"
+# Open WebUI's output item that carries a reply's text.
+OUTPUT_MESSAGE_ITEM = "message"
 _CARD_RUN_JOINERS = frozenset({"function_call_output", "reasoning"})
 _CARD_GROUP_MIN = 2  # Open WebUI groups two or more cards
 
 
-def _card_label_in_words(card: dict) -> bool:
+def _card_tool_name(card: dict) -> str:
+    return str(card.get("name") or "").replace(f" {TOOL_ERROR_MARK}", "")
+
+
+def _card_own_labels(card: dict, lang: str) -> dict | None:
+    """The labels a card has on its own: those it carries, else its tool's and arguments'."""
+    return card.get("display_labels") or _tool_card_labels(
+        _card_tool_name(card), str(card.get("arguments") or ""), lang)
+
+
+def _card_label_in_words(card: dict, lang: str) -> bool:
     """Whether a card's header says what it did in words, not by the tool's name: a label in
     words, or a spawn card, whose name is the sub-agent's title."""
-    name = str(card.get("name") or "")
+    name = _card_tool_name(card)
     if name.startswith(SPAWN_CARD_PREFIX):
         return True
-    done = ((card.get("display_labels") or {}).get("completed") or "")
-    return bool(done) and not done.startswith(name.replace(f" {TOOL_ERROR_MARK}", ""))
+    done = (_card_own_labels(card, lang) or {}).get("completed") or ""
+    return bool(done) and not done.startswith(name)
+
+
+def _shows_no_text(item: dict) -> bool:
+    """A message Open WebUI skips: no text left (a `MEDIA:` line moved to the reply's end)."""
+    return item.get("type") == OUTPUT_MESSAGE_ITEM and not "".join(
+        str(part.get("text") or "") for part in item.get("content") or [] if isinstance(part, dict)).strip()
+
+
+def _card_groups(output: list) -> list[list[dict]]:
+    """The cards of `output` Open WebUI draws as one group each ("Explored ..."), in order."""
+    groups, run = [], []
+    for item in output:
+        kind = item.get("type")
+        if kind == _TOOL_CALL_ITEM:
+            run.append(item)
+        elif kind not in _CARD_RUN_JOINERS and not _shows_no_text(item):
+            if run:
+                groups.append(run)
+            run = []
+    if run:
+        groups.append(run)
+    return groups
+
+
+def _even_card_labels(output: list, lang: str, *, last_only: bool = False) -> list[dict]:
+    """One way of naming each group's cards (ELI-512), in place; the cards it changed. Open
+    WebUI heads a group with its cards' labels when any has one, else with "Explored" and their
+    names: a group with some cards labelled read "ToolSearch, exec: QA sleep test". A group keeps
+    labels only when every card has one in plain words (Hebrew); else none does (English:
+    "Explored ToolSearch, exec"). A card on its own, or one whose group text now parts, gets its
+    own labels back. `last_only`: the group at the end, as a live reply grows."""
+    groups = _card_groups(output)
+    changed = []
+    for group in groups[-1:] if last_only else groups:
+        plain = len(group) >= _CARD_GROUP_MIN and not all(_card_label_in_words(c, lang) for c in group)
+        for card in group:
+            want = None if plain else _card_own_labels(card, lang)
+            if card.get("display_labels") == want:
+                continue
+            if want is None:
+                card.pop("display_labels", None)
+            else:
+                card["display_labels"] = want
+            changed.append(card)
+    return changed
 
 
 def _tool_call_started_event(name: str, tool_call_id: str, args_str: str,
@@ -5944,30 +6001,12 @@ class _TurnRenderer:
             self._even_group_labels(events)
         return item
 
-    def _card_run(self) -> list[dict]:
-        """The cards at the end of `output` with no text between them: the group Open WebUI
-        draws as one ("Explored ...")."""
-        run = []
-        for item in reversed(self.output):
-            kind = item.get("type")
-            if kind == _TOOL_CALL_ITEM:
-                run.append(item)
-            elif kind not in _CARD_RUN_JOINERS:
-                break
-        return run[::-1]
-
     def _even_group_labels(self, events: list) -> None:
-        """One way of naming a group's cards (ELI-512). Open WebUI heads a group with its cards'
-        labels when any has one, else with "Explored" and their names: a group with some cards
-        labelled read "ToolSearch, exec: QA sleep test". Its labels stay only when every card has
-        one in plain words (Hebrew); else none does (English: "Explored ToolSearch, exec")."""
-        run = self._card_run()
-        if len(run) < _CARD_GROUP_MIN or all(_card_label_in_words(c) for c in run):
-            return
-        for card in run:
-            if card.pop("display_labels", None) is not None:
-                events.append({"type": "response.output_item.added", "output_index": _OUTPUT_APPEND_INDEX,
-                               "item": copy.deepcopy(card)})
+        """Even the labels of the group a new card joined (`_even_card_labels`); an open tab
+        is shown each card it changed again."""
+        for card in _even_card_labels(self.output, self.lang, last_only=True):
+            events.append({"type": "response.output_item.added", "output_index": _OUTPUT_APPEND_INDEX,
+                           "item": copy.deepcopy(card)})
 
     def _unanswered(self, note: str) -> list[dict]:
         """A result event for every call with no result yet, saying `note`."""
@@ -9373,11 +9412,6 @@ FINAL_STATUS_REQUEST_WAIT_S = 30
 _CANCEL_STATUS_TAIL = (*ui_texts("stopped"), "")
 
 
-def _says_stopped(text: str | None) -> bool:
-    """Whether a reply's text ends with the Pipe's "Stopped." note, in any UI language."""
-    return (text or "").rstrip().endswith(ui_texts("stopped_reason"))
-
-
 def _final_status_history(history: list | None, lines: list, stopped: bool,
                           lang: str = UI_LANG_DEFAULT, said: bool = False) -> tuple[list, list]:
     """M's final status lines (cancel tail dropped) and the ones it adds. `said`: M's text
@@ -9595,8 +9629,7 @@ async def _drop_chat_finished_claims_of_deleted_replies() -> None:
         pipe_log(f"  dropping chat.finished claims of deleted replies failed: {ex!r}")
 
 
-# Open WebUI's output item and content part that carry a reply's text.
-OUTPUT_MESSAGE_ITEM = "message"
+# Open WebUI's content part that carries a reply's text (its item: OUTPUT_MESSAGE_ITEM, gateway.py).
 OUTPUT_TEXT_PART = "output_text"
 
 
@@ -9831,6 +9864,8 @@ def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
             if before else 0
         output.insert(pos, copy.deepcopy(item))
         have.add(item.get("id"))
+    # A note back between two cards parts their group: they get their own labels back.
+    _even_card_labels(output, renderer.lang)
 
 
 
@@ -9912,10 +9947,13 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
                 return
         data = {"done": True, "content": text, "output": output}
         if only_if_empty:
-            # Open tabs drop the "Stopped" line too (its replacement is already saved).
-            status = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
-                                              "user_id": ref.get("user_id")}, update_db=False)
-            await status({"type": "status", "data": {"description": "", "done": True}})
+            # Open tabs drop the "Stopped" line too: the saved status history replaces theirs,
+            # where a status event would only add a line after it.
+            try:
+                await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
+                    message_id, None, {**current, **fields, "id": message_id}), None, message_id)
+            except Exception as ex:
+                pipe_log(f"  reply {message_id[:8]}...: pushing its status lines failed: {ex!r}")
         if _is_note_only(output):
             # No news: no toast or notification for it in another chat.
             await _note_only_completion(chat_id, message_id, ref.get("user_id"), data)
@@ -10539,6 +10577,8 @@ class _TurnWriter:
             if item in items:
                 part = item["content"][0]
                 part["text"] = show(part.get("text") or "", n == len(output) - 1)
+        # A message left with no text (its `MEDIA:` line moves to the reply's end) parts no cards.
+        _even_card_labels(output, self.renderer.lang)
         if not items:
             return output, show(self.renderer.text, True)
         return output, "".join(i["content"][0]["text"] for i in items)
@@ -10586,11 +10626,11 @@ class _TurnWriter:
         return True
 
     async def _persist_final(self, output: list, text: str, stopped: bool,
-                             run_usage: dict | None = None) -> tuple[list, list, bool]:
+                             run_usage: dict | None = None, said: bool = False) -> tuple[list, list, bool]:
         """M's `done: true` write with its final status lines (ELI-210), after
         the handed-over request ends. Returns M's whole status history, the new
         lines and whether the row reads back finished. `run_usage`: for a row
-        with no totals (ELI-177)."""
+        with no totals (ELI-177). `said`: M's text ends with the Pipe's "Stopped." note."""
         from open_webui.models.chats import Chats
 
         if self.request_task is not None and not self.request_task.done():
@@ -10608,7 +10648,7 @@ class _TurnWriter:
                 saved = {}
                 pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
             history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang,
-                                                 said=_says_stopped(text))
+                                                 said=said)
             whole = await self._persist(done=True, output=output, text=text, status_history=history)
             if whole:
                 try:
@@ -10944,7 +10984,8 @@ class _TurnWriter:
             if images:
                 text = f"{text}\n\n{images}" if text else images
                 output.append(_turn_note_item(images, media=True))
-            if stopped and not text and not note:
+            said_stopped = stopped and not text and not note
+            if said_stopped:
                 # Stopped before any text: say so in the saved reply, not only in its status
                 # line, so a reload and the chat's preview show it (ELI-512).
                 note = ui_text("stopped_reason", self.lang)
@@ -10953,7 +10994,8 @@ class _TurnWriter:
                 output.append(_turn_note_item(note))
             run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
                              None) if hist else None
-            history, status, saved = await self._persist_final(output, text, stopped, run_usage)
+            history, status, saved = await self._persist_final(output, text, stopped, run_usage,
+                                                                   said=said_stopped)
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
