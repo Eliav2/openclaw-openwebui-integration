@@ -504,7 +504,7 @@ def test_continue_on_a_reply_adds_nothing_and_says_why(page):
     assert _replies(page)[-1]["text"] == before
 
 
-def test_stop_ends_the_reply_where_it_was(page):
+def test_stop_ends_the_reply_where_it_was(page, token):
     """Stop: the reply keeps the words shown so far and never grows after it
     (the run is stopped, its rest is not written into the message later), the
     composer works, the next message gets its own answer with nothing of the
@@ -515,6 +515,12 @@ def test_stop_ends_the_reply_where_it_was(page):
     _wait(page, _reply_js(0, "r.text.includes('BROWSER_STOP slow-1 slow-2')"), "the reply part way through")
     page.locator('button[aria-label="Stop"]').click()
     _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(0, 'r.done')})()", "the stopped reply, done")
+    # A real Stop ends on "Stopped", shown and saved, as the reply's last status line (ELI-512
+    # P2-1, P1-6). It comes once the page answered which button it was: the baseline after it.
+    rid = _replies(page)[0]["id"]
+    _wait(page, f"() => {_message_text_js(0)}.includes('Stopped')", "the stopped reply's Stopped line")
+    _wait_saved_status(page, token, rid, lambda lines: lines[-1:] == ["Stopped"],
+                       "the stopped reply's saved Stopped line")
     stopped = _replies(page)[0]
     shown_at_stop = len(_seen(page, stopped["id"]))
     assert "BROWSER_STOP slow-1" in stopped["text"] and full not in stopped["text"], stopped["text"]
@@ -1027,6 +1033,59 @@ def test_stop_after_send_now_stops_the_run(page, token):
     assert not active, "the run went on after Stop: the session still had a running run"
     history = capture.gateway_call("chat.history", {"sessionKey": key, "limit": 50})
     assert "E2E_HOLD_END" not in json.dumps(history.get("messages")), "the stopped run still answered"
+    os.remove(hold)
+
+
+def _saved_status_lines(page, token: str, message_id: str) -> list:
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    message = saved[message_id.removeprefix("message-")]   # `_replies` ids are the DOM's
+    return [h.get("description") for h in message.get("statusHistory") or [] if isinstance(h, dict)]
+
+
+def _wait_saved_status(page, token: str, message_id: str, ok, what: str) -> list:
+    deadline = time.time() + TURN_MS / 1000
+    while not ok(lines := _saved_status_lines(page, token, message_id)):
+        assert time.time() < deadline, f"{what}: {lines}"
+        time.sleep(0.5)
+    return lines
+
+
+def test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped(page, token):
+    """ELI-512 P1-6 (W5, live 2/2): a correction sent with Send now while the agent runs a tool.
+    Open WebUI cancels the first reply's request for it, as for Stop (the page says "send_now"),
+    and the message is steered into the run (2026.10.10+), which goes on under it. The first
+    reply must not say "Stopped", saved or shown. The scripted run's tool waits for a file."""
+    hold_token = f"p16{os.getpid()}_{len(_fake_llm_requests())}"
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    old = capture.pipe_valves(token, AUTO_SEND_WHILE_RUNNING=False)
+    try:
+        capture.new_chat(page)
+        capture.send(page, f"E2E_HOLD {hold_token}")
+        _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
+        _type_and_send(page, "E2E_ECHO: BROWSER_CORRECTION")
+        send_now = page.locator('button[aria-label="Send now"]').first
+        send_now.wait_for(timeout=30_000)
+        send_now.click()
+        _wait(page, f"() => {_user_message_js('BROWSER_CORRECTION')}", "the correction in the chat")
+        _wait(page, _steer_pending_js(1) if _steers() else _reply_js(1, "!r.done"),
+              "the correction waiting for the run to take it in")
+    finally:
+        open(hold, "w").close()
+        capture.pipe_valves(token, **old)
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    first, second = _replies(page)
+    # The correction's own answer, on any Gateway: it went to the agent, not just under the run.
+    assert "BROWSER_CORRECTION" in second["text"], second["text"]
+    _wait_saved_status(page, token, second["id"], lambda ls: bool(ls), "the second reply's status")
+    # In the open tab, where W5 saw it: the cancel's status event, never saved (live and here).
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in shown, f"the first reply shows Stopped: {shown[-200:]!r}"
+    lines = _saved_status_lines(page, token, first["id"])
+    assert "Stopped" not in lines, f"the first reply says Stopped: {lines}"
+    _reload(page)
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies after a reload", 60_000)
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in shown, shown[-200:]
     os.remove(hold)
 
 

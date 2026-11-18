@@ -145,6 +145,7 @@ SHARDS = {
         f"{BROWSER}::test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together",
         f"{BROWSER}::test_a_queued_reply_stopped_says_its_message_was_not_sent",
         f"{BROWSER}::test_stop_after_send_now_stops_the_run",
+        f"{BROWSER}::test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped",
         f"{BROWSER}::test_a_reload_mid_reply_shows_the_answer_so_far_and_keeps_going",
         f"{BROWSER}::test_tool_cards_show_running_failed_and_done",
         f"{BROWSER}::test_the_status_dialog_compacts_the_chat",
