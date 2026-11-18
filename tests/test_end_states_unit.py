@@ -143,7 +143,7 @@ class RunEndStateTests(unittest.IsolatedAsyncioTestCase):
             setattr(turn, name, value)
         return turn
 
-    def test_a_stop_of_the_run_it_handed_over_from_is_not_this_runs(self):
+    async def test_a_stop_of_the_run_it_handed_over_from_is_not_this_runs(self):
         """The owner rule switches the reply to a replacement run (`our_run_id`): the first
         run's abort no longer ends the reply as Stopped."""
         turn = self._turn(aborted_run_id="run-1")
