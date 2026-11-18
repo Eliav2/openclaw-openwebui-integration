@@ -2129,6 +2129,43 @@ def test_a_silent_announce_of_a_deleted_sub_agent_still_shows_the_childs_result_
     assert "E2E_SILENT_DEL_RESULT done" in json.dumps(cards[0].get("output")), cards[0].get("output")
 
 
+# 2026.11.5 ends a run at an accepted `sessions_yield` (lifecycle end `yielded: true`); the
+# children's answer comes as a new run, `announce:requester-settle:...:yield-1`.
+YIELD_ENDS_THE_RUN_IN = (2026, 11, 5)
+
+
+def test_a_claude_cli_sub_agent_answer_after_a_yield_is_its_own_reply(token):
+    """ELI-512: a claude-cli chat spawns a sub-agent and yields. The reply the yield ended said
+    "(This turn produced no reply text.)", and the answer the parent gave when the sub-agent
+    finished streamed, then was saved as "No response requested.": Claude Code's `<synthetic>`
+    placeholder, which 2026.11.5 drops from the live stream but imports into `chat.history`
+    inside the answering run. e2e/fake_claude.py records it as live Claude Code does."""
+    if _openclaw_version() < YIELD_ENDS_THE_RUN_IN:
+        pytest.skip("before 2026.11.5 a yield keeps the run open and the answer is in the same reply (ELI-56)")
+    word = f"y{uuid.uuid4().hex[:8]}"
+    chat_id, _first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    asked = _post_turn(token, chat_id, f"E2E_CLI_SPAWN_YIELD {word}", model=CLI_MODEL)
+
+    def answered():
+        # The announce run's reply follows the asked one, as its child.
+        msgs = _chat_messages(token, chat_id)
+        after = [msgs[k] for k in msgs[asked].get("childrenIds") or [] if k in msgs]
+        done = [m for m in after if m.get("role") == "assistant" and m.get("done") is True]
+        return (msgs, done[0]) if done and msgs[asked].get("done") is True else None
+
+    msgs, answer = _until("a finished reply after the yielded one", answered, timeout_s=TURN_TIMEOUT_S)
+    first = msgs[asked]
+    assert "no reply text" not in first["content"], first["content"]
+    assert first["content"].strip().endswith(f"E2E_YIELD_ACK {word}"), first["content"]
+    calls = [o.get("name") for o in first.get("output") or [] if o.get("type") == "function_call"]
+    assert len(calls) == 2 and calls[0].endswith(f"yield helper {word}"), calls   # the spawn's card, then the yield's
+    assert answer["content"].strip() == f"E2E_YIELD_ANSWER {word}", answer["content"]
+    assert "No response requested" not in json.dumps(answer.get("output")), answer.get("output")
+    assert not [o for o in answer.get("output") or [] if o.get("type") == "function_call"], (
+        "the yielded run's cards repeated in the answer", answer.get("output"))
+    _assert_clean(token, chat_id, msgs)
+
+
 def test_a_reply_that_opens_with_no_reply_and_answers_after_shows_the_answer_once(token):
     """The agent says NO_REPLY, runs a tool, and answers after all (a
     claude-cli run whose background Agent reported, live on 2026.10.5): the

@@ -4665,10 +4665,32 @@ def _event_frame(payload: dict) -> dict:
     return {"type": "event", "event": event, "payload": payload}
 
 
+# Claude Code's placeholder for a turn it never answered (one a yield or an
+# abort ended), with the model `<synthetic>`. 2026.11.5 drops it from the live
+# stream (`isClaudeSyntheticNoResponse`) but imports it into `chat.history`,
+# where it sorts inside the next run (ELI-512).
+_CLI_SYNTHETIC_MODEL = "<synthetic>"
+_CLI_SYNTHETIC_NO_RESPONSE = "No response requested."
+_TEXT_BLOCK = "text"   # a content block's type
+
+
+def _is_cli_synthetic_no_response(message) -> bool:
+    """An imported `<synthetic>` "No response requested.": no reply of any run."""
+    if not isinstance(message, dict) or message.get("model") != _CLI_SYNTHETIC_MODEL:
+        return False
+    content = message.get("content")
+    blocks = content if isinstance(content, list) else [{"type": _TEXT_BLOCK, "text": content}]
+    return (len(blocks) == 1 and isinstance(blocks[0], dict) and blocks[0].get("type") == _TEXT_BLOCK
+            and str(blocks[0].get("text") or "").strip() == _CLI_SYNTHETIC_NO_RESPONSE)
+
+
 def _history_item(message) -> dict | None:
-    """Flatten one `chat.history` message to {role, text}, text blocks only."""
+    """Flatten one `chat.history` message to {role, text}, text blocks only.
+    Claude Code's synthetic placeholder has no text."""
     if not isinstance(message, dict):
         return None
+    if _is_cli_synthetic_no_response(message):
+        return {"role": message.get("role"), "text": ""}
     content = message.get("content")
     if isinstance(content, str):
         text = content
@@ -5336,6 +5358,25 @@ def _short_title(text: str) -> str:
     return cut.rstrip(" ,;:(") + "…"
 
 
+# `sessions_yield`, and the status of its accepted result. From 2026.11.5 an
+# accepted yield ends the run; the children's answer comes as a new run (ELI-512).
+YIELD_TOOL = "sessions_yield"
+YIELD_ACCEPTED = "yielded"
+# What a run that yielded without a word or an acknowledgment ends with.
+YIELD_WAIT_NOTE = "_(Waiting for the sub-agents: their answer comes in the next reply.)_"
+
+
+def _yield_acknowledgment(name: str, result_str: str, failed: bool) -> str | None:
+    """An accepted `sessions_yield` result's acknowledgment ("" when it has
+    none), else None."""
+    if failed or _bare_tool_name(name) != YIELD_TOOL:
+        return None
+    result = _json_object(result_str)
+    if result.get("status") != YIELD_ACCEPTED:
+        return None
+    return str(result.get("acknowledgment") or "").strip()
+
+
 def _is_spawn_tool(name: str) -> bool:
     """`sessions_spawn`, bare or as a claude-cli MCP tool name."""
     return name == "sessions_spawn" or (name.startswith("mcp__")
@@ -5531,6 +5572,8 @@ class _TurnRenderer:
         self._held = ""
         # The run's reply was a silent sentinel alone, not lost text.
         self.silenced = False
+        # The run yielded with no text after: its yield's acknowledgment, else None.
+        self.yielded: str | None = None
         self._compactions = 0
         self._compaction_note_id: str | None = None
         self._compaction_before = None
@@ -5640,6 +5683,7 @@ class _TurnRenderer:
     def _append_text(self, chunk: str) -> str:
         if not chunk:
             return ""
+        self.yielded = None
         if self.run_boundary:
             self.run_boundary = False
             chunk = _message_boundary_separator(self.text, chunk) + chunk
@@ -5807,6 +5851,9 @@ class _TurnRenderer:
                     name, args_str = deferred
                     result_str = _deferred_call_result_text(result_str)
                 failed = data.get("isError") is True
+                acknowledgment = _yield_acknowledgment(name, result_str, failed)
+                if acknowledgment is not None:
+                    self.yielded = acknowledgment
                 if _is_spawn_tool(name) and not failed:
                     result_str, failed = _spawn_result_view(args_str, result_str)
                 card_name, card_args = _tool_card_view(name, args_str)
@@ -8172,14 +8219,15 @@ def _history_events(messages: list):
     A claude-cli closer repeats its run's text, so it counts only when the
     run carried none, and in place. Text after a tool call gets the live
     stream's separator (`sawToolUseSinceText`). A `message` tool send's
-    duplicate record is shown once (ELI-324)."""
+    duplicate record is shown once (ELI-324). Claude Code's `<synthetic>`
+    placeholder is skipped: as text it hid the closer after it (ELI-512)."""
     text = ""                 # what the events so far said
     sent_by_tool: set[str] = set()   # texts the agent's `message` tool already delivered
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
     reply_ended = False       # a reply of this run ended since the last text
     for message in messages:
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or _is_cli_synthetic_no_response(message):
             continue
         role = message.get("role")
         if role == "toolResult" and message.get("toolCallId"):
@@ -11805,7 +11853,9 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
 def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One closed run's messages, back to the previous run's closing message;
     None until it closes. `started_ms` cuts a silent previous run's leftovers
-    (ELI-227). The walk goes past steered-in messages (ELI-271) and drops a
+    (ELI-227); so does Claude Code's `<synthetic>` placeholder, which ends the
+    turn a yield ended (2026.11.5 sends its successor no lifecycle start,
+    ELI-512). The walk goes past steered-in messages (ELI-271) and drops a
     wake prompt that sorts inside the run."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
@@ -11818,7 +11868,8 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
             continue
         start, queued = end, set()
         while start > 0 and _run_closed_by(messages[start - 1]) in (None, run_id) \
-                and not _stamped_before(messages[start - 1], started_ms):
+                and not _stamped_before(messages[start - 1], started_ms) \
+                and not _is_cli_synthetic_no_response(messages[start - 1]):
             if (messages[start - 1] or {}).get("role") == "user":
                 if _history_queued_prompt(messages, start - 1, run_id):
                     queued.add(start - 1)
@@ -17389,6 +17440,9 @@ class _PipeTurn:
         """The run's end signals and the error lines they show."""
         if stream == "lifecycle" and phase == "end":
             self.done = True
+            if (payload.get("data") or {}).get("yielded") is True and self.renderer.yielded is None:
+                # The Gateway says the run yielded (2026.11.5), whatever its tool said.
+                self.renderer.yielded = ""
             pipe_log("  lifecycle end -> done")
         elif _is_model_silence(err):
             self.model_silent = self.done = True
@@ -17716,6 +17770,14 @@ class _PipeTurn:
         elif not self.aborted and not self.text_yielded and self.model_silent:
             # The model's silence is its answer: no error and no fallback line (ELI-336).
             pipe_log("  the run ended silent: nothing shown")
+        elif not self.aborted and not self.text_yielded and self.renderer.yielded is not None:
+            # From 2026.11.5 an accepted yield ends the run; the children's
+            # answer is a new run, in its own reply (ELI-512).
+            pipe_log("  the run yielded to its sub-agents: their answer comes as a new run")
+            waiting = "\n\n" + (self.renderer.yielded or YIELD_WAIT_NOTE)
+            self.record_visible_chunk(waiting)
+            yield waiting
+            await self.save_end_snapshot()
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(

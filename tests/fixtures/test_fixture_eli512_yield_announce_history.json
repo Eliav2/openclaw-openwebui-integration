@@ -1,0 +1,270 @@
+{
+ "_source": "OpenClaw 2026.11.5 chat.history of a claude-cli session: spawn, sessions_yield, then the announce run (ELI-512, live 2026-11-18). Ids and the prompt replaced.",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Start a sub-agent labelled \"helper\" to answer with the capital of Japan only, wait for it, then tell me what it said.",
+   "timestamp": 1794994824934,
+   "idempotencyKey": "msg-00000000-0000-4000-8000-0000000000cc-74dd1e31-50af-4418-b2dc-33a4c1c39afc-1794994824.9231668:user",
+   "provenance": {
+    "kind": "external_user"
+   },
+   "__openclaw": {
+    "senderIsOwner": true,
+    "senderId": "gateway-owner",
+    "senderIdentity": {
+     "type": "profile",
+     "id": "gateway-owner"
+    },
+    "transport": {
+     "clients": [
+      {
+       "id": "webchat",
+       "mode": "cli",
+       "displayName": "owui-pipe-e769bc48"
+      }
+     ]
+    },
+    "chatRequestIdentity": "2b9a4a57d66debf76862deb855ead277ae976f78884fd342dc553edcc4941185",
+    "modelSelection": {
+     "provider": "anthropic",
+     "model": "claude-opus-5-5"
+    },
+    "id": "6919d151-dea6-43ef-aea0-6cd669c557d7",
+    "idempotencyKey": "msg-00000000-0000-4000-8000-0000000000cc-74dd1e31-50af-4418-b2dc-33a4c1c39afc-1794994824.9231668:user",
+    "recordTimestampMs": 1794994824983,
+    "transcriptPosition": {
+     "source": "YpJLXf3_BFkhiRWS_t6SMo6kBN2yfFTAecGeN5dhY9s",
+     "rawSeq": 1
+    },
+    "seq": 1,
+    "senderProfileAvatarUrl": "/api/users/gateway-owner/avatar?v=1791746268044"
+   }
+  },
+  {
+   "role": "user",
+   "content": "Start a sub-agent labelled \"helper\" to answer with the capital of Japan only, wait for it, then tell me what it said.",
+   "timestamp": 1794994827458,
+   "__openclaw": {
+    "id": "8dd2b147-9a9d-4017-9b43-cafd396871c1",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2ffe4a6a-bac4-44c8-98f3-e5adde198891",
+    "externalId": "8dd2b147-9a9d-4017-9b43-cafd396871c1"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_016bTz8jwB64jAK57964dR3a",
+     "name": "ToolSearch",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "query": "select:mcp__openclaw__sessions_spawn,mcp__openclaw__sessions_yield",
+      "max_results": 2
+     }
+    },
+    {
+     "type": "tool_result",
+     "tool_use_id": "toolu_016bTz8jwB64jAK57964dR3a",
+     "content": [
+      {
+       "type": "tool_reference",
+       "tool_name": "mcp__openclaw__sessions_spawn"
+      },
+      {
+       "type": "tool_reference",
+       "tool_name": "mcp__openclaw__sessions_yield"
+      }
+     ],
+     "name": "ToolSearch"
+    }
+   ],
+   "api": "anthropic-messages",
+   "provider": "claude-cli",
+   "model": "claude-opus-5-5",
+   "stopReason": "tool_use",
+   "usage": {
+    "input": 2,
+    "output": 106,
+    "cacheRead": 26019,
+    "cacheWrite": 1897
+   },
+   "timestamp": 1794994829003,
+   "__openclaw": {
+    "id": "90febad1-1fff-4d6d-9980-f149d55d4770",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2ffe4a6a-bac4-44c8-98f3-e5adde198891",
+    "externalId": "90febad1-1fff-4d6d-9980-f149d55d4770"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_016MCWw1kvACj8GbJHXhstP9",
+     "name": "mcp__openclaw__sessions_spawn",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "task": "Answer with the capital of Japan only.",
+      "label": "qa-w5 capital",
+      "context": "isolated",
+      "mode": "run"
+     }
+    },
+    {
+     "tool_use_id": "toolu_016MCWw1kvACj8GbJHXhstP9",
+     "type": "tool_result",
+     "content": [
+      {
+       "type": "text",
+       "text": "{\n  \"status\": \"accepted\",\n  \"childSessionKey\": \"agent:main:subagent:4e295773-b166-4ac8-9d03-9e85d35066e4\",\n  \"label\": \"qa-w5 capital\",\n  \"runId\": \"8bfdeba4-af5b-4dc6-8ca0-5208bf4295fa\",\n  \"mode\": \"run\",\n  \"expectsCompletionMessage\": true,\n  \"context\": \"isolated\",\n  \"note\": \"The final reply returns to the requester as a completion event. Continue any independent work. Wait for completion events for ALL required children before your final answer; never busy-poll. A late completion still requires review and any unfinished work; avoid repeating already delivered updates.\",\n  \"resolvedModel\": \"anthropic/claude-opus-5-5\",\n  \"resolvedProvider\": \"anthropic\",\n  \"modelApplied\": true\n}"
+      }
+     ],
+     "name": "mcp__openclaw__sessions_spawn"
+    }
+   ],
+   "api": "anthropic-messages",
+   "provider": "claude-cli",
+   "model": "claude-opus-5-5",
+   "stopReason": "tool_use",
+   "usage": {
+    "input": 4,
+    "output": 145,
+    "cacheRead": 27916,
+    "cacheWrite": 4712
+   },
+   "timestamp": 1794994830953,
+   "__openclaw": {
+    "id": "16fb36be-18dc-4c2d-97db-1977661fb216",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2ffe4a6a-bac4-44c8-98f3-e5adde198891",
+    "externalId": "16fb36be-18dc-4c2d-97db-1977661fb216"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01MCk48ku5JJf4siFmr6638E",
+     "name": "mcp__openclaw__sessions_yield",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "acknowledgment": "Spawned \"qa-w5 capital\"; waiting for its result."
+     }
+    },
+    {
+     "tool_use_id": "toolu_01MCk48ku5JJf4siFmr6638E",
+     "type": "tool_result",
+     "content": [
+      {
+       "type": "text",
+       "text": "{\n  \"status\": \"yielded\",\n  \"acknowledgment\": \"Spawned \\\"qa-w5 capital\\\"; waiting for its result.\"\n}"
+      }
+     ],
+     "name": "mcp__openclaw__sessions_yield"
+    }
+   ],
+   "api": "anthropic-messages",
+   "provider": "claude-cli",
+   "model": "claude-opus-5-5",
+   "stopReason": "tool_use",
+   "usage": {
+    "input": 2,
+    "output": 85,
+    "cacheRead": 32628,
+    "cacheWrite": 438
+   },
+   "timestamp": 1794994832354,
+   "__openclaw": {
+    "id": "8282fb9a-f469-4d8a-83ef-ad9a80e27539",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2ffe4a6a-bac4-44c8-98f3-e5adde198891",
+    "externalId": "8282fb9a-f469-4d8a-83ef-ad9a80e27539"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "No response requested."
+    }
+   ],
+   "api": "anthropic-messages",
+   "provider": "claude-cli",
+   "model": "<synthetic>",
+   "stopReason": "stop_sequence",
+   "usage": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0
+   },
+   "timestamp": 1794994839745,
+   "__openclaw": {
+    "id": "a324f8d5-27f7-4df9-a5f1-6ca70a238919",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2ffe4a6a-bac4-44c8-98f3-e5adde198891",
+    "externalId": "a324f8d5-27f7-4df9-a5f1-6ca70a238919"
+   }
+  },
+  {
+   "__openclaw": {
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2ffe4a6a-bac4-44c8-98f3-e5adde198891",
+    "externalId": "6be0be0e-9056-4f8f-a1e5-007fea11e7e1",
+    "runId": "announce:requester-settle:main:agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-00000000-0000-4000-8000-0000000000cc:8bfdeba4-af5b-4dc6-8ca0-5208bf4295fa:yield-1",
+    "id": "342f34da-ec6d-41b3-a8f4-733ff9be0cc7",
+    "idempotencyKey": "cli-assistant:announce:requester-settle:main:agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-00000000-0000-4000-8000-0000000000cc:8bfdeba4-af5b-4dc6-8ca0-5208bf4295fa:yield-1",
+    "recordTimestampMs": 1794994842503,
+    "transcriptPosition": {
+     "source": "YpJLXf3_BFkhiRWS_t6SMo6kBN2yfFTAecGeN5dhY9s",
+     "rawSeq": 3
+    },
+    "seq": 3
+   },
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "The sub-agent \"qa-w5 capital\" finished with status `ok` and said: **Tokyo**\n\nIt ran as a one-shot isolated sub-agent (run `8bfdeba4-af5b-4dc6-8ca0-5208bf4295fa`) on `anthropic/claude-opus-5-5`. Its result came back as a completion event after one `sessions_yield`."
+    }
+   ],
+   "stopReason": "stop",
+   "api": "cli",
+   "provider": "claude-cli",
+   "model": "claude-opus-5-5",
+   "usage": {
+    "input": 2,
+    "output": 150,
+    "totalTokens": 34411,
+    "cacheRead": 33204,
+    "cacheWrite": 1055,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    },
+    "contextUsage": {
+     "state": "available",
+     "promptTokens": 34261,
+     "totalTokens": 34264
+    }
+   },
+   "timestamp": 1794994842481,
+   "idempotencyKey": "cli-assistant:announce:requester-settle:main:agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-00000000-0000-4000-8000-0000000000cc:8bfdeba4-af5b-4dc6-8ca0-5208bf4295fa:yield-1"
+  }
+ ]
+}

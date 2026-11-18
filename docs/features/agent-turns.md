@@ -30,6 +30,7 @@ The design behind this is in [Agent turns](../design/agent-turns.md).
 | A cron job that runs in this chat's session | a reply, live |
 | Another session's `sessions_send` into this chat's session | a reply, live |
 | A sub-agent that finishes while its parent is idle | the parent's reply to the result, live |
+| A sub-agent the parent waited for with `sessions_yield` (OpenClaw 2026.11.5+) | the parent's answer, as the next reply, live |
 | A sub-agent that finishes while its parent is still running | part of the running reply |
 | A command the agent left running in the background that ends | the agent's reply to its result, live, finished when that run ends |
 | A Gateway restart recovery of an interrupted reply | continues that same reply |
@@ -45,6 +46,7 @@ A sub-agent's own session is not a chat, so nothing is written for it directly. 
 <img src="../img/subagent-result-light.png" alt="The parent's first reply, then its reply to the sub-agent's result, with no message from you in between" width="320">
 
 - **Parent idle:** the Gateway hands the result to the parent as a new run. That run is an ordinary reply in the chat, and it usually quotes or summarises the result.
+- **Parent waits for it** (`sessions_yield`): from OpenClaw 2026.11.5 the wait ends the parent's run. Its reply ends with the line the agent gave for the wait (such as "Waiting for its result."), or "_(Waiting for the sub-agents: their answer comes in the next reply.)_" when it gave none. The parent's answer, once the sub-agents finish, is the next reply, with its tool cards left in the first one. On claude-cli that answer is kept whole, not replaced by Claude Code's "No response requested." placeholder for the turn the wait ended. On earlier OpenClaw versions the wait keeps the run going, and the answer is part of the same reply.
 - **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching. That includes the parent's answer to an earlier sub-agent's result: when two sub-agents finish together, both answers stay in that one reply, a blank line apart.
 - **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it, or the first sentence of its task. Expand the card to read the result. On OpenClaw 2026.10 the Gateway counts that silence as a failed reply: the card carries its error ("Agent couldn't generate a response") below it, and the Gateway retries the delivery later. A retry adds no second card; one the parent answers aloud is a reply of its own.
 
