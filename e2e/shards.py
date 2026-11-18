@@ -99,6 +99,7 @@ SHARDS = {
         f"{E2E}::test_a_wake_reply_ends_like_an_inline_reply",
         f"{E2E}::test_a_subagent_result_ends_like_an_inline_reply",
         f"{E2E}::test_two_subagent_results_that_land_together_both_stay_in_the_chat",
+        f"{E2E}::test_a_claude_cli_sub_agent_answer_after_a_yield_is_its_own_reply",
         f"{E2E}::test_a_reply_that_opens_with_no_reply_and_answers_after_shows_the_answer_once",
         f"{E2E}::test_a_reply_the_agent_starts_that_errors_still_finishes",
         f"{E2E}::test_the_status_action_lists_a_background_command",

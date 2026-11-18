@@ -2754,7 +2754,9 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
 def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One closed run's messages, back to the previous run's closing message;
     None until it closes. `started_ms` cuts a silent previous run's leftovers
-    (ELI-227). The walk goes past steered-in messages (ELI-271) and drops a
+    (ELI-227); so does Claude Code's `<synthetic>` placeholder, which ends the
+    turn a yield ended (2026.11.5 sends its successor no lifecycle start,
+    ELI-512). The walk goes past steered-in messages (ELI-271) and drops a
     wake prompt that sorts inside the run."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
@@ -2767,7 +2769,8 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
             continue
         start, queued = end, set()
         while start > 0 and _run_closed_by(messages[start - 1]) in (None, run_id) \
-                and not _stamped_before(messages[start - 1], started_ms):
+                and not _stamped_before(messages[start - 1], started_ms) \
+                and not _is_cli_synthetic_no_response(messages[start - 1]):
             if (messages[start - 1] or {}).get("role") == "user":
                 if _history_queued_prompt(messages, start - 1, run_id):
                     queued.add(start - 1)

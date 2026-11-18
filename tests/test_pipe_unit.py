@@ -2406,6 +2406,69 @@ class NoDroppedMessagesTests(_TurnCase):
                  and (c.get("item") or {}).get("type") == "function_call"]
         self.assertEqual(len(cards), 1, "the card stays")
 
+    def _yield_events(self, run_id, result, is_error=False):
+        """A spawn, then a `sessions_yield` with `result` (claude-cli's MCP names, 2026.11.5)."""
+        def tool(tcid, name, phase, **data):
+            return {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": run_id, "stream": "tool",
+                "data": {"phase": phase, "name": name, "toolCallId": tcid, **data}}}
+        return [*self._spawn_card_events(run_id),
+                tool("t2", "mcp__openclaw__sessions_yield", "start",
+                     args={"acknowledgment": "Waiting for helper."}),
+                tool("t2", "mcp__openclaw__sessions_yield", "result",
+                     result=json.dumps(result), isError=is_error)]
+
+    async def _yield_reply_text(self, events):
+        gen = self._reply("start one and wait", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in events:
+            self._queue("run-1").put_nowait(ev)
+        chunks = [await asyncio.wait_for(first, 2)]
+        chunks += [c async for c in gen]
+        return "".join(c for c in chunks if isinstance(c, str))
+
+    async def test_a_run_that_yields_to_its_sub_agent_ends_with_its_acknowledgment(self):
+        """ELI-512: from 2026.11.5 an accepted yield ends the run; the reply said "(This turn
+        produced no reply text.)" while the sub-agent's answer was on its way as a new run."""
+        out = await self._yield_reply_text([
+            *self._yield_events("run-1", {"status": "yielded", "acknowledgment": "Waiting for helper."}),
+            self._final("run-1")])
+        self.assertNotIn("no reply text", out)
+        self.assertTrue(out.rstrip().endswith("Waiting for helper."), out)
+
+    async def test_a_yield_with_no_acknowledgment_says_the_answer_comes_next(self):
+        out = await self._yield_reply_text([*self._yield_events("run-1", {"status": "yielded"}),
+                                      self._final("run-1")])
+        self.assertNotIn("no reply text", out)
+        self.assertIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+
+    async def test_a_run_the_gateway_ends_as_yielded_says_the_answer_comes_next(self):
+        """2026.11.5's lifecycle end says `yielded: true` (live capture), on any runtime."""
+        out = await self._yield_reply_text([
+            {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+                "data": {"phase": "end", "stopReason": "end_turn", "yielded": True}}},
+            self._final("run-1")])
+        self.assertNotIn("no reply text", out)
+        self.assertIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+
+    async def test_a_refused_yield_still_says_the_turn_had_no_text(self):
+        out = await self._yield_reply_text([
+            *self._yield_events("run-1", {"status": "error", "error": "nothing pending"}, is_error=True),
+            self._final("run-1")])
+        self.assertIn("no reply text", out)
+        self.assertNotIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+
+    async def test_text_after_a_yield_is_the_reply_with_no_waiting_line(self):
+        """Before 2026.11.5 the run stays open through the yield and answers in it (ELI-56)."""
+        out = await self._yield_reply_text([
+            *self._yield_events("run-1", {"status": "yielded", "acknowledgment": "Waiting for helper."}),
+            self._delta("run-1", "It said 51."), self._final("run-1")])
+        self.assertIn("It said 51.", out)
+        self.assertNotIn("Waiting for helper.", out)
+        self.assertNotIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+
     async def test_a_run_with_no_text_and_no_card_still_says_so(self):
         out = await self._reply_text([self._final("run-1")])
         self.assertIn("no reply text", out)

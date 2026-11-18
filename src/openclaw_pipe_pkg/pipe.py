@@ -1984,6 +1984,9 @@ class _PipeTurn:
         """The run's end signals and the error lines they show."""
         if stream == "lifecycle" and phase == "end":
             self.done = True
+            if (payload.get("data") or {}).get("yielded") is True and self.renderer.yielded is None:
+                # The Gateway says the run yielded (2026.11.5), whatever its tool said.
+                self.renderer.yielded = ""
             pipe_log("  lifecycle end -> done")
         elif _is_model_silence(err):
             self.model_silent = self.done = True
@@ -2311,6 +2314,14 @@ class _PipeTurn:
         elif not self.aborted and not self.text_yielded and self.model_silent:
             # The model's silence is its answer: no error and no fallback line (ELI-336).
             pipe_log("  the run ended silent: nothing shown")
+        elif not self.aborted and not self.text_yielded and self.renderer.yielded is not None:
+            # From 2026.11.5 an accepted yield ends the run; the children's
+            # answer is a new run, in its own reply (ELI-512).
+            pipe_log("  the run yielded to its sub-agents: their answer comes as a new run")
+            waiting = "\n\n" + (self.renderer.yielded or YIELD_WAIT_NOTE)
+            self.record_visible_chunk(waiting)
+            yield waiting
+            await self.save_end_snapshot()
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
