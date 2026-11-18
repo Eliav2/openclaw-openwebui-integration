@@ -24,7 +24,7 @@ Always on.
 
 The lines the Pipe itself shows in a reply follow Open WebUI's interface language: the status row while a reply works ("Thinking...", queued, sent while the agent works, waiting on a background agent, Stopped), and its notes in the reply text (no reply text, a message that went with your next one, a reply cut off by a restart, context compaction), plus the Sub-agent card's name. Hebrew and English are supported; any other language shows English. In Hebrew the lines use everyday words and each status line fits one line on a phone.
 
-<img src="../img/status-hebrew-light.png" alt="A reply in a Hebrew Open WebUI on a phone: the status row under it reads, in Hebrew, that it is waiting on a helper working in the background" width="320">
+<img src="../img/hebrew-status-light.png" alt="A reply in a Hebrew Open WebUI on a phone: the status row under it reads, in Hebrew, that it is waiting on a helper working in the background" width="320">
 
 The language is the one set in Open WebUI under Settings > General > Language, which Open WebUI sends with each message. A reply the Pipe finishes with no message behind it (after an Open WebUI restart, or one the agent starts) uses the language of your last message since the Pipe started, and English before that. Error messages follow the language of your own message instead, see [Troubleshooting](../troubleshooting.md).
 
