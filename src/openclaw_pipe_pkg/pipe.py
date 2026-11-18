@@ -186,6 +186,7 @@ class _TurnState:
     `unsent`, each ended with a note once those are sent or dropped (ELI-188).
     `handed_over`: the turn writer took the message over. `deferred`: the Gateway
     was unreachable, so the message waits in the chat for the pending worker (ELI-504).
+    `note_only`: the reply's whole text is a Pipe note saying where its answer is.
     """
     conn: object = None
     session_key: str | None = None
@@ -201,6 +202,7 @@ class _TurnState:
     queue: object = None
     run_text: dict | None = None
     parked: bool = False
+    note_only: bool = False
 
 
 class Pipe:
@@ -742,8 +744,9 @@ class Pipe:
                         and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
                 # A handed-over reply is published by its turn writer instead.
+                # A reply that is only the Pipe's note is no news: nothing to publish (ELI-512).
                 elif (not _task.cancelled() and _task.exception() is None and not turn.parked
-                        and not turn.handed_over and turn.reply
+                        and not turn.handed_over and turn.reply and not turn.note_only
                         and getattr(self.valves, "PUBLISH_CHAT_FINISHED", False)):
                     r = turn.reply
                     spawn_background(_publish_chat_finished(r["chat_id"], r["message_id"], r["user_id"]))
@@ -2091,6 +2094,27 @@ class _PipeTurn:
         self.stopped_shown = True
         if self.status_closed:
             spawn_background(self.show_stopped())
+        reply = self.stopped_reply_ref()
+        if reply is not None:
+            # Stopped before any text: the saved reply says so, after Open WebUI's own
+            # end-of-reply save, so a reload and the chat's preview show it (ELI-512).
+            spawn_background(_close_unsent_reply(self.conn, reply, ui_text("stopped_reason", self.lang),
+                                                 only_if_empty=True))
+
+    def stopped_reply_ref(self) -> dict | None:
+        """This reply's message, when it was stopped before showing any run text; else None."""
+        chat_id, message_id = getattr(self, "owui_origin_chat_id", None), getattr(self, "owui_message_id", None)
+        renderer = getattr(self, "renderer", None)
+        # What the reply shows, not the run's raw text: a held MEDIA line is in that but not shown.
+        if getattr(self, "visible_message_text", "").strip() or not chat_id or not message_id \
+                or getattr(self, "channel_id", None):
+            return None
+        return {"chat_id": chat_id, "message_id": message_id,
+                "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
+                "request_task_id": (self.__metadata__ or {}).get("task_id"),
+                # Its cards as the run had them, closed: what it showed when it was stopped.
+                "output": [i for i in (renderer.finished_output() if renderer is not None else [])
+                           if i.get("type") in ("function_call", "function_call_output")]}
 
     async def show_stopped(self, emit=None):
         """"Stopped" as the reply's last line, or, if it cannot be sent, the
@@ -2244,6 +2268,7 @@ class _PipeTurn:
         if self.steered_into and not self.text_yielded and not self.aborted:
             # A later message was steered in first: the answer is in its reply.
             note = ui_text("sent_with_next", self.lang)
+            self.turn.note_only = not self.visible_message_text.strip()
             self.record_visible_chunk(note)
             yield note
             self.text_yielded = True
@@ -2283,6 +2308,7 @@ class _PipeTurn:
                 and steers_mid_run_messages(self.conn.gateway_version)):
             # Steered into a run no reply here shows (a wake, another tab's).
             note = ui_text("steered_into_running", self.lang)
+            self.turn.note_only = not self.visible_message_text.strip()
             self.record_visible_chunk(note)
             yield note
             self.text_yielded = True

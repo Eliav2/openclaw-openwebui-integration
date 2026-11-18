@@ -789,7 +789,40 @@ def _attr(value: str) -> str:
 _OUTPUT_APPEND_INDEX = 1 << 30
 
 
-def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
+# A tool card's header label kind (UI_TEXT "tool_<kind>"), by lowercase tool name; others are "tool".
+TOOL_LABEL_KINDS = {
+    "exec": "command", "bash": "command", "process": "command",
+    "read": "read", "memory_get": "read", "ls": "read",
+    "write": "edit", "edit": "edit", "multiedit": "edit", "apply_patch": "edit",
+    "web_search": "search", "websearch": "search", "web_fetch": "fetch", "webfetch": "fetch",
+    "agent": "helper", "toolsearch": "tools",
+    "grep": "lookup", "glob": "lookup", "memory_search": "lookup", "sessions_search": "lookup",
+}
+TOOL_LABEL_DEFAULT_KIND = "tool"
+# Call arguments that title a call (exec's `title`, Claude Code's Agent `description`), in order.
+TOOL_LABEL_TITLE_ARGS = ("title", "description")
+TOOL_LABEL_TITLE_MAX = 48
+SPAWN_CARD_PREFIX = "🤖"  # a spawn card's name already says what it is (`_tool_card_view`)
+
+
+def _tool_card_labels(name: str, args_str: str, lang: str) -> dict | None:
+    """Open WebUI's `display_labels` for a card of tool `name`: what the header says while it
+    runs and once done, in `lang` (ELI-512). The item's `name` stays the tool's own. None
+    when the label would be just the name (English, untitled): the card stays as it was."""
+    if not name or name.startswith(SPAWN_CARD_PREFIX):
+        return None
+    args = _json_object(args_str)
+    title = next((" ".join(args[k].split()) for k in TOOL_LABEL_TITLE_ARGS
+                  if isinstance(args.get(k), str) and args[k].strip()), "")[:TOOL_LABEL_TITLE_MAX]
+    kind = TOOL_LABEL_KINDS.get(name.lower(), TOOL_LABEL_DEFAULT_KIND)
+    values = {"name": name, "title": f": {title}" if title else ""}
+    labels = {"running": ui_text(f"tool_{kind}_running", lang, **values),
+              "completed": ui_text(f"tool_{kind}", lang, **values)}
+    return None if labels["completed"] == name else labels
+
+
+def _tool_call_started_event(name: str, tool_call_id: str, args_str: str,
+                             labels: dict | None = None) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
 
     A yielded `response.*` dict lands in OWUI's backend output list, so the
@@ -807,6 +840,7 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
             "name": name,
             "arguments": args_str[:3000],
             "status": "in_progress",
+            **({"display_labels": labels} if labels else {}),
         },
     }
 
@@ -1045,14 +1079,15 @@ def _spawn_call_args(payload: dict) -> dict | None:
     return _json_object(args_str) if _is_spawn_tool(name) else None
 
 
-def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
+def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str,
+                                   labels: dict | None = None) -> dict:
     """Re-announce a failed call's item with status "failed" and ❌ in its name.
 
     OWUI draws the red X only for status "failed" (ELI-278). Re-sending the
     start event with the same id replaces the item in both OWUI reducers, so
     it works live on any card; `response.name.done` does not (ELI-124).
     """
-    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
+    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str, labels)
     event["item"]["status"] = "failed"
     return event
 
@@ -1265,7 +1300,8 @@ class _TurnRenderer:
         """The call's card, opened on first sight (start or result)."""
         item = self._tool_items.get(tcid)
         if item is None:
-            event = _tool_call_started_event(name, tcid, args_str)
+            event = _tool_call_started_event(name, tcid, args_str,
+                                             _tool_card_labels(name, args_str, self.lang))
             item = copy.deepcopy(event["item"])
             self._tool_items[tcid] = item
             self.output.append(item)
@@ -1401,7 +1437,8 @@ class _TurnRenderer:
                     item["status"] = "failed" if failed else "completed"
                     if failed:
                         item["name"] = f"{card_name} {TOOL_ERROR_MARK}"
-                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args))
+                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args,
+                                                                     item.get("display_labels")))
                         result_str = _tool_error_banner(result_str)
                     event = _tool_call_result_event(tcid, result_str)
                     self.output.append(copy.deepcopy(event["item"]))
@@ -3749,9 +3786,10 @@ def _history_latest_prompt_tokens(history: dict) -> int | None:
     return None
 
 
-def _history_renderer(messages: list) -> "_TurnRenderer":
-    """A `_TurnRenderer` fed from `chat.history` instead of live events (ELI-88/90/92)."""
-    r = _TurnRenderer()
+def _history_renderer(messages: list, lang: str = UI_LANG_DEFAULT) -> "_TurnRenderer":
+    """A `_TurnRenderer` fed from `chat.history` instead of live events (ELI-88/90/92), its
+    notes and card labels in `lang`."""
+    r = _TurnRenderer(lang)
     for payload in _history_events(messages):
         r.feed(payload)
     r.flush()

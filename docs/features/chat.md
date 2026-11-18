@@ -34,6 +34,8 @@ Always on.
 
 Tool calls are sent as Responses-API output items, so Open WebUI draws them with its own two-phase tool card: a spinner while the tool runs, the result when it finishes. Nothing is hand-rolled HTML, so the cards match the rest of the UI and survive a reload.
 
+A card's header says what the call does, in your [interface language](#status-lines-in-your-language): in English, the tool's name plus the title the agent gave the call ("exec: Check disk space"; a call with no title shows the bare name, as before); in Hebrew, plain words ("הריץ פקודה" for a command, "חיפש ברשת" for a web search). The label replaces Open WebUI's "View Result from" header; the tool's own name stays in the English label and in the saved card, which the [Status dialog](./status.md) and the Pipe read. A sub-agent's card keeps its own name (see [Sub-agent cards](#sub-agent-cards)). These headers need Open WebUI 0.13.1 or later, the first release that reads a card's labels; on older releases every card shows the tool's name, as before (see [Versions](../versions.md)).
+
 Expand a card to see the arguments the agent passed and the result it got back. Arguments are capped at 3000 characters and results at 8000, so one huge tool result cannot bury the conversation.
 
 <img src="../img/demos/tool-cards.gif" alt="Two tool cards in a reply: each spins while its command runs and turns into a finished card, then the first is opened to its command and output" width="800">
@@ -234,6 +236,8 @@ After every reply, a status row shows where you stand:
 <img src="../img/usage-goal-light.png" alt="The status rows under a reply, opened: the goal and the context used" width="320">
 
 > 🧠 34k/1.0m (3.5%) · ⏱ 5h 62% left
+
+The context and rate-limit rows are for [owner users](./owner-users.md) only. When [`OWNER_USERS`](../configuration.md#owner_users) is set, anyone else gets the reply without them: the numbers are about the owner's account, and only the goal line (when the session has one) shows. With `OWNER_USERS` empty everyone is an owner and sees them.
 
 The context number is what the reply's own run filled, read from that run's usage, so a new chat's first reply has it too.
 

@@ -25,6 +25,8 @@ A secret the agent asks for (its `secrets` tool) goes into the owner's secret st
 
 A plugin approval (a tool call a plugin holds until someone allows it) is the owner's to give. A run they send cannot request one: that connection lacks `operator.approvals`, so the tool call is blocked. Should one still come from their chat, the Pipe denies it at once. See [Questions](./questions.md#plugin-approvals).
 
+Their replies end without the context and rate-limit rows of the [usage line](./chat.md#usage-and-goal-line): those numbers are about the owner's account. If the session has a goal, its goal line still shows.
+
 On a loopback Gateway the second device pairs silently. On a remote one, approve it like the first, see [Device pairing](../install/pairing.md). The `DEVICE_IDENTITY` valve names only the main identity; the second one always has its own file.
 
 In [channels](./channels.md#who-has-which-rights), every turn runs over that connection when the valve is set, yours too: a channel thread is one session shared by everyone in it.

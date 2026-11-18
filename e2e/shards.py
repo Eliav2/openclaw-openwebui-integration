@@ -86,6 +86,8 @@ SHARDS = {
         f"{BROWSER}::test_continue_on_a_reply_adds_nothing_and_says_why",
         f"{BROWSER}::test_stop_ends_the_reply_where_it_was",
         f"{BROWSER}::test_a_hebrew_ui_shows_the_pipes_status_lines_in_hebrew",
+        f"{BROWSER}::test_a_reply_stopped_before_any_text_says_stopped",
+        f"{BROWSER}::test_only_an_owner_user_sees_the_context_line",
         f"{BROWSER}::test_a_message_sent_from_a_second_tab_keeps_the_running_reply",
         f"{BROWSER}::test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole",
     ],

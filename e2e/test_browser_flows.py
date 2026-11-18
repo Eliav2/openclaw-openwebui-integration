@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
@@ -576,6 +577,97 @@ def test_a_hebrew_ui_shows_the_pipes_status_lines_in_hebrew(page, token):
         assert not english, f"English status lines in a Hebrew UI: {english}"
     finally:
         ctx.close()
+
+
+# A reply's body (Open WebUI's ResponseMessage), apart from its status rows.
+REPLY_BODY = "#response-content-container"
+
+
+def _body_text_js(index: int, needle: str) -> str:
+    """Reply `index`'s body (not its status rows) shows `needle`."""
+    return (f"() => {{ const a = [...document.querySelectorAll('.chat-assistant')].at({index}); "
+            f"const b = a && a.querySelector({json.dumps(REPLY_BODY)}); "
+            f"return !!b && b.innerText.includes({json.dumps(needle)}); }}")
+
+
+def _saved_assistant(page, token: str) -> dict:
+    """The chat's last assistant message as saved."""
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    return max((m for m in saved.values() if m.get("role") == "assistant"), key=lambda m: m.get("timestamp") or 0)
+
+
+def test_a_reply_stopped_before_any_text_says_stopped(page, token):
+    """ELI-512: Stop while the reply's command runs and before it said anything. The reply ends
+    "Stopped." in its text, not as an empty bubble, live and after a reload (the saved content)."""
+    hold_token = f"quietstop{os.getpid()}_{len(_fake_llm_requests())}"
+    # e2e/fake_llm.py: E2E_HOLD_QUIET runs `exec` with no text before it, until this file exists.
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    capture.new_chat(page)
+    try:
+        capture.send(page, f"E2E_HOLD_QUIET {hold_token}")
+        _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
+        page.locator('button[aria-label="Stop"]').click()
+        _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(0, 'r.done')})()", "the stopped reply, done")
+        # In the reply's body, not only its "Stopped" status row.
+        _wait(page, _body_text_js(0, "Stopped."), "Stopped. in the reply's body")
+    finally:
+        open(gate, "w").close()
+    saved = _saved_assistant(page, token)
+    assert "**Stopped.**" in (saved.get("content") or ""), saved.get("content")
+    _reload(page)
+    _wait(page, _body_text_js(0, "Stopped."), "Stopped. after a reload", 60_000)
+
+
+# The usage line's context part (emit.py `_build_usage_status_lines`).
+CONTEXT_METER = "🧠"
+RATE_LIMIT_METER = "⏱"
+
+
+@pytest.fixture
+def owner_is_the_admin(token):
+    """OWNER_USERS set to the stack's admin, then put back: anyone else is not an owner."""
+    fid = capture.MODEL.split(".", 1)[0]
+    before = capture.api("GET", f"/api/v1/functions/id/{fid}/valves", token=token) or {}
+    me = capture.api("GET", "/api/v1/auths/", token=token)
+    capture.api("POST", f"/api/v1/functions/id/{fid}/valves/update", {**before, "OWNER_USERS": me["email"]}, token)
+    yield
+    capture.api("POST", f"/api/v1/functions/id/{fid}/valves/update", before, token)
+
+
+def _new_user_token(token: str) -> str:
+    """A second Open WebUI account (an admin there, so model access is not in the way)."""
+    email, password = f"guest-{uuid.uuid4().hex[:8]}@e2e.invalid", uuid.uuid4().hex
+    capture.api("POST", "/api/v1/auths/add", {"name": "E2E Guest", "email": email, "password": password,
+                                              "role": "admin"}, token)
+    return capture.api("POST", "/api/v1/auths/signin", {"email": email, "password": password})["token"]
+
+
+def test_only_an_owner_user_sees_the_context_line(page, token, owner_is_the_admin):
+    """ELI-512: the context and rate-limit line under a reply is the owner's. A user not in
+    OWNER_USERS (Ortal, a guest) gets the reply without it, on a phone, live and after a reload."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: BROWSER_OWNER_METER")
+    _wait(page, _reply_js(0, f"r.done && r.text.includes('BROWSER_OWNER_METER') "
+                             f"&& r.text.includes({json.dumps(CONTEXT_METER)})"), "the owner's context line")
+
+    guest_token = _new_user_token(token)
+    guest = capture.signed_in_page(page.context.browser, guest_token, capture.PHONE)
+    try:
+        capture.new_chat(guest)
+        capture.send(guest, "E2E_ECHO: BROWSER_GUEST_METER")
+        _wait(guest, _reply_js(0, "r.done && r.text.includes('BROWSER_GUEST_METER')"), "the guest's reply")
+        live = _replies(guest)[0]["text"]
+        assert CONTEXT_METER not in live and RATE_LIMIT_METER not in live, live
+        # Every status row, the ones Open WebUI folds away too.
+        history = json.dumps(_saved_assistant(guest, guest_token).get("statusHistory") or [], ensure_ascii=False)
+        assert CONTEXT_METER not in history and RATE_LIMIT_METER not in history, history
+        _reload(guest)
+        _wait(guest, _reply_js(0, "r.done && r.text.includes('BROWSER_GUEST_METER')"), "the guest's reply, reloaded",
+              60_000)
+        text = _replies(guest)[0]["text"]
+        assert CONTEXT_METER not in text and RATE_LIMIT_METER not in text, text
+    finally:
+        guest.context.close()
 
 
 def _saved_replies(page, token: str) -> list:
