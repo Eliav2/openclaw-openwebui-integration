@@ -15489,6 +15489,20 @@ THINKING_DROPPED_KEY = "openclaw_thinking_dropped"
 # The `sessions.changed` reason of a run the Gateway holds for capacity, its
 # global lane full (2026.11.5 `registerAgentRunCapacityWait`).
 CAPACITY_WAIT_REASON = "run-capacity"
+# A run's end as its session row reports it. 2026.11.5's enum is queued, running,
+# done, failed, interrupted, killed, timeout (sessions-row-*.mjs
+# SessionRunStatusSchema); `cancelled` is an older Gateway's stop (ELI-512).
+STOPPED_STATUSES = ("cancelled", "killed")
+STOPPED_NOTE = "**Stopped.**"
+_TEXTLESS_END_NOTES = {
+    "failed": "**The response failed.** Please try again.",
+    "timeout": "**The response timed out.** Please try again.",
+}
+
+
+def _textless_end_note(status) -> str | None:
+    """What a reply with no text says for its run's row `status`, else None."""
+    return STOPPED_NOTE if status in STOPPED_STATUSES else _TEXTLESS_END_NOTES.get(status)
 
 
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
@@ -17004,6 +17018,8 @@ class _PipeTurn:
         self.error_shown = ""  # the run's "**Error:**" line, once shown
         self.model_silent = False  # the run failed only because the model said nothing (ELI-336)
         self.aborted = False
+        # The run's own end said it was aborted: a stop from any surface (ELI-512).
+        self.run_aborted = False
         self.first_event_arrived = False
         # The run's last-call usage, from its `chat` final (ELI-177).
         self.run_usage = None
@@ -17120,6 +17136,7 @@ class _PipeTurn:
                         err = (str(data.get("error", "unknown"))
                                if stream == "lifecycle" and phase == "error" else "")
                         aborted_run = state == "aborted" or data.get("aborted") is True
+                        self.run_aborted = self.run_aborted or aborted_run
                         if self.hand_over_after_kill(err, aborted_run):
                             continue
                         async for chunk in self.on_completion(payload, stream, phase, state, err, aborted_run):
@@ -17242,11 +17259,14 @@ class _PipeTurn:
                 # One `status` per fact, since OWUI clamps each to one line. All
                 # done=True: done=False made them shimmer before the last one.
                 emit = self.__event_emitter__
+                # A parked reply ends on park's "Stopped": Open WebUI shows the last
+                # line, and an empty one after it left the bubble blank (ELI-512).
+                closing = status_lines or ([] if self.aborted else [""])
                 if self.end_snapshot_follows():
                     # The end snapshot's own write saves them: a row save less.
                     emit = await self.unsaved_emitter()
-                    self.final_statuses = [{"description": line, "done": True} for line in status_lines or [""]]
-                for line in status_lines or [""]:
+                    self.final_statuses = [{"description": line, "done": True} for line in closing]
+                for line in closing:
                     await _emit_status(emit, line, done=True)
                 # The request's emitter tracks this; the unsaved one goes around it.
                 self.turn.status_open = False
@@ -17803,16 +17823,15 @@ class _PipeTurn:
                 await self.save_end_snapshot()
             else:
                 # No text and nothing recovered: show the run's real terminal state.
-                reason = None
+                # Its own aborted end first: 2026.11.5's row reads `status: null`
+                # for a moment before `killed` (ELI-512).
+                reason = STOPPED_NOTE if self.run_aborted else None
                 try:
-                    desc = await self.conn.send_request(
-                        "sessions.describe", dict(key=self.session_key), timeout=8)
-                    row = desc.get("session") or {}
-                    status = row.get("status")
-                    if status == "failed":
-                        reason = "**The response failed.** Please try again."
-                    elif status == "cancelled":
-                        reason = "**Stopped.**"
+                    if reason is None:
+                        desc = await self.conn.send_request(
+                            "sessions.describe", dict(key=self.session_key), timeout=8)
+                        row = desc.get("session") or {}
+                        reason = _textless_end_note(row.get("status"))
                 except Exception as ex:
                     pipe_log(f"  terminal-reason describe failed: {ex}")
                 no_response_text = "\n\n" + (
@@ -17990,8 +18009,8 @@ class _PipeTurn:
         if self.text_yielded:
             return ""
         status = row.get("status")
-        if status in ("cancelled", "killed"):
-            return "**Stopped.**"
+        if status in STOPPED_STATUSES:
+            return STOPPED_NOTE
         if status in ("failed", "timeout"):
             err = row.get("lastRunError")
             return _plain_error(ERROR_RUN if err else ERROR_UNFINISHED, err, self.text)

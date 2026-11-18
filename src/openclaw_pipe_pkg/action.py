@@ -2934,6 +2934,17 @@ def _spawn_task_of(messages: list) -> str | None:
 # Wait for a /compact run: poll every _COMPACT_POLL_S seconds, give up after _COMPACT_DEADLINE_S
 # (`openclaw sessions compact`'s own default RPC timeout).
 _COMPACT_POLL_S = 1.5
+# A compaction run is over at any of these row statuses: 2026.11.5 ends a stopped,
+# timed-out or restart-cut run `killed`, `timeout` or `interrupted`; `cancelled`
+# is an older Gateway's stop (ELI-512).
+_COMPACT_ENDED_STATUSES = ("done", "failed", "cancelled", "killed", "timeout", "interrupted")
+# A session row whose run is live, starting (`queued`) included.
+_SESSION_LIVE_STATUSES = ("running", "queued")
+
+
+def _session_row_live(row: dict) -> bool:
+    """Whether a session row has a live run: 2026.11.5 reads `queued` while it starts one."""
+    return row.get("hasActiveRun") is True or row.get("status") in _SESSION_LIVE_STATUSES
 _COMPACT_DEADLINE_S = 180
 _COMPACT_HISTORY_ROWS = 10
 # The row can say "done" before the run's reply is in the history (2026.11.5 commits it after the run ends):
@@ -3422,7 +3433,7 @@ class Action:
                 "windows": windows_data,
                 "entry": None if windows_data else _limits_entry_for(usage, provider),
                 # A live run is when usage.status can report zero windows.
-                "sessionActive": session_row.get("status") == "running",
+                "sessionActive": _session_row_live(session_row),
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
@@ -3819,7 +3830,7 @@ class Action:
                 continue
             row = (desc or {}).get("session") or {}
             status = row.get("status")
-            if status in ("done", "failed", "cancelled"):
+            if status in _COMPACT_ENDED_STATUSES:
                 break
             # From 2026.11.5 a compaction clears the row's run fields, so its status never says "done":
             # the run is over when its own reply is in the history and no run is active.
@@ -3829,7 +3840,7 @@ class Action:
                     status = "done"
                     break
 
-        if status not in ("done", "failed", "cancelled"):
+        if status not in _COMPACT_ENDED_STATUSES:
             await __event_emitter__({
                 "type": "execute",
                 "data": {"code": _render_sections_error_js(

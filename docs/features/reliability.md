@@ -123,7 +123,7 @@ What the Pipe logs when the Gateway socket drops mid-reply (an excerpt):
 
 Silence is never treated as the end of a reply. A long tool call or a long stretch of silent reasoning is waited on; the reply ends only on the run's own end, its settled session row, or a restart.
 
-There is no timer and no event count: thousands of tool calls before the first word keep the reply open too. When a run ends without text, the reason comes from its real final state, so you see **Stopped.**, the run's error, or **Failed:** the run did not complete, rather than a generic timeout. With no reason at all, the reply says "_(This turn produced no reply text.)_".
+There is no timer and no event count: thousands of tool calls before the first word keep the reply open too. When a run ends without text, the reason comes from its real final state, so you see **Stopped.** (also for a stop from another surface, such as the Control UI or Telegram), **The response timed out.**, the run's error, or **Failed:** the run did not complete, rather than a generic timeout. A reply you stop in Open WebUI keeps its "Stopped" status line. With no reason at all, the reply says "_(This turn produced no reply text.)_".
 
 Always on.
 
