@@ -3740,13 +3740,18 @@ class _GatewayConnection:
         """The session's one active run is a Pipe reply run in `chat_id`, the
         only kind the Gateway steers into. Into any other it falls back to its
         follow-up queue, where on 2026.10.10-beta.1 the send never runs."""
+        runs = self.live_runs(session_key)
+        parsed = parse_pipe_run_id(next(iter(runs))) if len(runs) == 1 else None
+        return bool(parsed and parsed["kind"] == "reply" and parsed["chat"] == chat_id)
+
+    def live_runs(self, session_key: str) -> set:
+        """The session's runs whose events have started and not ended."""
         # Started only: a message waiting to be steered has a consumer too.
         runs = {c.run_id for c in self._consumers.values()
                 if c.session_key == session_key and c.started and not (c.ended or c.steered)}
         runs |= {run for (s, run), pump in getattr(self, "_turn_pumps", {}).items()
                  if s == session_key and pump.started and not pump.terminal.is_set()}
-        parsed = parse_pipe_run_id(next(iter(runs))) if len(runs) == 1 else None
-        return bool(parsed and parsed["kind"] == "reply" and parsed["chat"] == chat_id)
+        return runs
 
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """(user_id, chat_id) of a key `_owui_session_key` built, else None.
