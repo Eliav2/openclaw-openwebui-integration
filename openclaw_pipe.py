@@ -17663,7 +17663,7 @@ class _PipeTurn:
                 # A stopped reply ends on its "Stopped": Open WebUI shows the last
                 # line, and an empty one after it left the bubble blank (ELI-512).
                 stopped = ui_text("stopped", self.lang)
-                closing = (status_lines + [stopped] if self.stopped_shown
+                closing = (status_lines + [self.stopped_line()] if self.stopped_shown
                            else status_lines or [""])
                 if self.end_snapshot_follows():
                     # The end snapshot's own write saves them: a row save less.
@@ -17677,7 +17677,7 @@ class _PipeTurn:
                     await _emit_status(emit, closing[-1], done=True)
                 # A stop released while they went out comes after them (P1-6).
                 self.status_closed = True
-                if self.stopped_shown and closing[-1] != stopped:
+                if self.stopped_shown and closing[-1] not in (stopped, self.stopped_line()):
                     await self.show_stopped()
                 # The request's emitter tracks this; the unsaved one goes around it.
                 self.turn.status_open = False
@@ -17956,10 +17956,16 @@ class _PipeTurn:
                 "output": [i for i in (renderer.finished_output() if renderer is not None else [])
                            if i.get("type") in ("function_call", "function_call_output")]}
 
+    def stopped_line(self) -> str:
+        """The stopped reply's last status line: "Stopped", or the closing empty one when its
+        saved text says it (`on_parked_stop`). The request's own save can land after that
+        text's, so it never brings the line back (ELI-512 polish)."""
+        return "" if self.stopped_reply_ref() is not None else ui_text("stopped", self.lang)
+
     async def show_stopped(self, emit=None):
-        """"Stopped" as the reply's last line, or, if it cannot be sent, the
+        """The stopped reply's last line, or, if it cannot be sent, the
         closing empty one, so the status does not stay open."""
-        for line in (ui_text("stopped", self.lang), ""):
+        for line in dict.fromkeys((self.stopped_line(), "")):
             try:
                 await _emit_status(emit or self.__event_emitter__, line, done=True)
                 return

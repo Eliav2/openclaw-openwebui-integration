@@ -138,5 +138,32 @@ class StoppedOnceTests(_WriterCase):
         self.assertEqual(self.owui.events("status"), [])
 
 
+class RequestStoppedLineTests(unittest.IsolatedAsyncioTestCase):
+    """The live request saves its own closing lines. One that ends "Stopped" can land after the
+    note's write and bring the line back (the English After shot): it ends empty instead."""
+
+    def _turn(self, visible=""):
+        turn = ocp._PipeTurn.__new__(ocp._PipeTurn)
+        turn.renderer = ocp._TurnRenderer("en")
+        turn.visible_message_text = visible
+        turn.owui_origin_chat_id, turn.owui_message_id, turn.channel_id = "c1", "m9", None
+        turn.__user__, turn.__metadata__, turn.lang = {"id": "u1"}, {}, "en"
+        return turn
+
+    async def _shown(self, turn):
+        lines = []
+
+        async def emit(event):
+            lines.append(event["data"]["description"])
+        await turn.show_stopped(emit)
+        return lines
+
+    async def test_a_reply_stopped_before_text_closes_empty(self):
+        self.assertEqual(await self._shown(self._turn()), [""])
+
+    async def test_a_reply_stopped_after_text_ends_on_stopped(self):
+        self.assertEqual(await self._shown(self._turn("half an answer")), ["Stopped"])
+
+
 if __name__ == "__main__":
     unittest.main()
