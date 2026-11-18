@@ -228,6 +228,9 @@ UI_TEXT = {
     "send_failed": {"en": "_(This message was to go together with your next one, "
                           "which could not be sent: see the next reply.)_",
                     "he": "_(ההודעה הייתה אמורה להישלח יחד עם הבאה, שלא נשלחה: ראו בתשובה הבאה.)_"},
+    # What a run that yielded without a word or an acknowledgment ends with.
+    "yield_wait": {"en": "_(Waiting for the sub-agents: their answer comes in the next reply.)_",
+                   "he": "_(מחכה לעוזרים שעובדים ברקע: התשובה שלהם תגיע בהודעה הבאה.)_"},
     "steered_into_running": {"en": "_(Sent to the reply that was already running: the agent answers it there.)_",
                              "he": "_(נוספה לתשובה שכבר הייתה בדרך: התשובה שם.)_"},
     "image_not_relayed": {"en": "_(Note: that image couldn't be relayed to the agent -- "
@@ -5482,8 +5485,6 @@ def _short_title(text: str) -> str:
 # accepted yield ends the run; the children's answer comes as a new run (ELI-512).
 YIELD_TOOL = "sessions_yield"
 YIELD_ACCEPTED = "yielded"
-# What a run that yielded without a word or an acknowledgment ends with.
-YIELD_WAIT_NOTE = "_(Waiting for the sub-agents: their answer comes in the next reply.)_"
 
 
 def _yield_acknowledgment(name: str, result_str: str, failed: bool) -> str | None:
@@ -17946,7 +17947,7 @@ class _PipeTurn:
             # From 2026.11.5 an accepted yield ends the run; the children's
             # answer is a new run, in its own reply (ELI-512).
             pipe_log("  the run yielded to its sub-agents: their answer comes as a new run")
-            waiting = "\n\n" + (self.renderer.yielded or YIELD_WAIT_NOTE)
+            waiting = "\n\n" + (self.renderer.yielded or ui_text("yield_wait", self.lang))
             self.record_visible_chunk(waiting)
             yield waiting
             await self.save_end_snapshot()

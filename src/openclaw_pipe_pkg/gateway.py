@@ -899,8 +899,6 @@ def _short_title(text: str) -> str:
 # accepted yield ends the run; the children's answer comes as a new run (ELI-512).
 YIELD_TOOL = "sessions_yield"
 YIELD_ACCEPTED = "yielded"
-# What a run that yielded without a word or an acknowledgment ends with.
-YIELD_WAIT_NOTE = "_(Waiting for the sub-agents: their answer comes in the next reply.)_"
 
 
 def _yield_acknowledgment(name: str, result_str: str, failed: bool) -> str | None:

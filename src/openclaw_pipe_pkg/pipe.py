@@ -2322,7 +2322,7 @@ class _PipeTurn:
             # From 2026.11.5 an accepted yield ends the run; the children's
             # answer is a new run, in its own reply (ELI-512).
             pipe_log("  the run yielded to its sub-agents: their answer comes as a new run")
-            waiting = "\n\n" + (self.renderer.yielded or YIELD_WAIT_NOTE)
+            waiting = "\n\n" + (self.renderer.yielded or ui_text("yield_wait", self.lang))
             self.record_visible_chunk(waiting)
             yield waiting
             await self.save_end_snapshot()

@@ -1837,7 +1837,7 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
             p.stop()
 
     def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None, user_valves=None,
-               user_settings=None):
+               user_settings=None, variables=None):
         """`image`: base64 data of a PNG attached to the message. `user_valves`: the user's valves as
         Open WebUI passes them in `__user__`. `user_settings`: the user's Open WebUI settings (the
         Pipe's own key is in them, ELI-442), also in `__user__`."""
@@ -1857,7 +1857,8 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
                 "messages": [{"role": "user", "content": content}]}
         if thinking:
             body["reasoning_effort"] = thinking
-        meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id}
+        meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id,
+                **({"variables": variables} if variables else {})}
         user = ({"id": "u1", **({"valves": user_valves} if user_valves is not None else {}),
                  **({"settings": user_settings} if user_settings is not None else {})}
                 if user_valves is not None or user_settings is not None else None)
@@ -2418,8 +2419,8 @@ class NoDroppedMessagesTests(_TurnCase):
                 tool("t2", "mcp__openclaw__sessions_yield", "result",
                      result=json.dumps(result), isError=is_error)]
 
-    async def _yield_reply_text(self, events):
-        gen = self._reply("start one and wait", "m1")
+    async def _yield_reply_text(self, events, variables=None):
+        gen = self._reply("start one and wait", "m1", variables=variables)
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
         for ev in events:
@@ -2441,7 +2442,13 @@ class NoDroppedMessagesTests(_TurnCase):
         out = await self._yield_reply_text([*self._yield_events("run-1", {"status": "yielded"}),
                                       self._final("run-1")])
         self.assertNotIn("no reply text", out)
-        self.assertIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+        self.assertIn(openclaw_pipe.ui_text("yield_wait"), out)
+
+    async def test_the_answer_comes_next_line_is_in_the_users_language(self):
+        out = await self._yield_reply_text([*self._yield_events("run-1", {"status": "yielded"}),
+                                            self._final("run-1")],
+                                           variables={"{{USER_LANGUAGE}}": "he-IL"})
+        self.assertIn(openclaw_pipe.ui_text("yield_wait", "he"), out)
 
     async def test_a_run_the_gateway_ends_as_yielded_says_the_answer_comes_next(self):
         """2026.11.5's lifecycle end says `yielded: true` (live capture), on any runtime."""
@@ -2451,14 +2458,14 @@ class NoDroppedMessagesTests(_TurnCase):
                 "data": {"phase": "end", "stopReason": "end_turn", "yielded": True}}},
             self._final("run-1")])
         self.assertNotIn("no reply text", out)
-        self.assertIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+        self.assertIn(openclaw_pipe.ui_text("yield_wait"), out)
 
     async def test_a_refused_yield_still_says_the_turn_had_no_text(self):
         out = await self._yield_reply_text([
             *self._yield_events("run-1", {"status": "error", "error": "nothing pending"}, is_error=True),
             self._final("run-1")])
         self.assertIn("no reply text", out)
-        self.assertNotIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+        self.assertNotIn(openclaw_pipe.ui_text("yield_wait"), out)
 
     async def test_text_after_a_yield_is_the_reply_with_no_waiting_line(self):
         """Before 2026.11.5 the run stays open through the yield and answers in it (ELI-56)."""
@@ -2467,7 +2474,7 @@ class NoDroppedMessagesTests(_TurnCase):
             self._delta("run-1", "It said 51."), self._final("run-1")])
         self.assertIn("It said 51.", out)
         self.assertNotIn("Waiting for helper.", out)
-        self.assertNotIn(openclaw_pipe.YIELD_WAIT_NOTE, out)
+        self.assertNotIn(openclaw_pipe.ui_text("yield_wait"), out)
 
     async def test_a_run_with_no_text_and_no_card_still_says_so(self):
         out = await self._reply_text([self._final("run-1")])
