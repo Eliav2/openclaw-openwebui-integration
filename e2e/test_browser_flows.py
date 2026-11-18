@@ -579,7 +579,24 @@ def test_a_hebrew_ui_shows_the_pipes_status_lines_in_hebrew(page, token):
         ctx.close()
 
 
-def test_a_reply_stopped_before_any_text_says_stopped(page):
+# A reply's body (Open WebUI's ResponseMessage), apart from its status rows.
+REPLY_BODY = "#response-content-container"
+
+
+def _body_text_js(index: int, needle: str) -> str:
+    """Reply `index`'s body (not its status rows) shows `needle`."""
+    return (f"() => {{ const a = [...document.querySelectorAll('.chat-assistant')].at({index}); "
+            f"const b = a && a.querySelector({json.dumps(REPLY_BODY)}); "
+            f"return !!b && b.innerText.includes({json.dumps(needle)}); }}")
+
+
+def _saved_assistant(page, token: str) -> dict:
+    """The chat's last assistant message as saved."""
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    return max((m for m in saved.values() if m.get("role") == "assistant"), key=lambda m: m.get("timestamp") or 0)
+
+
+def test_a_reply_stopped_before_any_text_says_stopped(page, token):
     """ELI-512: Stop while the reply's command runs and before it said anything. The reply ends
     "Stopped." in its text, not as an empty bubble, live and after a reload (the saved content)."""
     hold_token = f"quietstop{os.getpid()}_{len(_fake_llm_requests())}"
@@ -591,11 +608,14 @@ def test_a_reply_stopped_before_any_text_says_stopped(page):
         _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
         page.locator('button[aria-label="Stop"]').click()
         _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(0, 'r.done')})()", "the stopped reply, done")
-        _wait(page, _reply_js(0, "r.text.includes('Stopped.')"), "Stopped. in the reply")
+        # In the reply's body, not only its "Stopped" status row.
+        _wait(page, _body_text_js(0, "Stopped."), "Stopped. in the reply's body")
     finally:
         open(gate, "w").close()
+    saved = _saved_assistant(page, token)
+    assert "**Stopped.**" in (saved.get("content") or ""), saved.get("content")
     _reload(page)
-    _wait(page, _reply_js(0, "r.done && r.text.includes('Stopped.')"), "Stopped. after a reload", 60_000)
+    _wait(page, _body_text_js(0, "Stopped."), "Stopped. after a reload", 60_000)
 
 
 # The usage line's context part (emit.py `_build_usage_status_lines`).
@@ -630,11 +650,17 @@ def test_only_an_owner_user_sees_the_context_line(page, token, owner_is_the_admi
     _wait(page, _reply_js(0, f"r.done && r.text.includes('BROWSER_OWNER_METER') "
                              f"&& r.text.includes({json.dumps(CONTEXT_METER)})"), "the owner's context line")
 
-    guest = capture.signed_in_page(page.context.browser, _new_user_token(token), capture.PHONE)
+    guest_token = _new_user_token(token)
+    guest = capture.signed_in_page(page.context.browser, guest_token, capture.PHONE)
     try:
         capture.new_chat(guest)
         capture.send(guest, "E2E_ECHO: BROWSER_GUEST_METER")
         _wait(guest, _reply_js(0, "r.done && r.text.includes('BROWSER_GUEST_METER')"), "the guest's reply")
+        live = _replies(guest)[0]["text"]
+        assert CONTEXT_METER not in live and RATE_LIMIT_METER not in live, live
+        # Every status row, the ones Open WebUI folds away too.
+        history = json.dumps(_saved_assistant(guest, guest_token).get("statusHistory") or [], ensure_ascii=False)
+        assert CONTEXT_METER not in history and RATE_LIMIT_METER not in history, history
         _reload(guest)
         _wait(guest, _reply_js(0, "r.done && r.text.includes('BROWSER_GUEST_METER')"), "the guest's reply, reloaded",
               60_000)

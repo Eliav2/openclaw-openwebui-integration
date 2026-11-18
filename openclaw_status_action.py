@@ -5054,9 +5054,10 @@ def _history_latest_prompt_tokens(history: dict) -> int | None:
     return None
 
 
-def _history_renderer(messages: list) -> "_TurnRenderer":
-    """A `_TurnRenderer` fed from `chat.history` instead of live events (ELI-88/90/92)."""
-    r = _TurnRenderer()
+def _history_renderer(messages: list, lang: str = UI_LANG_DEFAULT) -> "_TurnRenderer":
+    """A `_TurnRenderer` fed from `chat.history` instead of live events (ELI-88/90/92), its
+    notes and card labels in `lang`."""
+    r = _TurnRenderer(lang)
     for payload in _history_events(messages):
         r.feed(payload)
     r.flush()

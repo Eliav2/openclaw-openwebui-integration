@@ -23,6 +23,7 @@ Below the minimums the chat itself still works, but some features break (the tab
 | --- | --- | --- |
 | Tool cards (live, native) | Open WebUI 0.11.1 | 0.10.2 and 0.11.0: a card keeps spinning after its tool has finished, because 0.11.1 changed how Open WebUI pairs a call with its result and the Pipe follows 0.11.1 |
 | Replies the agent starts (cron jobs, sub-agent results, restart recovery) | Open WebUI 0.12.0 | 0.11.1 and older: the reply is never written to the chat. The writer needs the chat row lock 0.12 added |
+| Tool card headers in your language, with the call's title ([Tool cards](./features/chat.md#tool-cards)) | Open WebUI 0.13.1 | 0.13.0 and older read no card labels: every card shows the tool's name |
 | Status dialog styling | Open WebUI 0.12.0 | Older releases lack a few of its CSS classes: slightly different spacing and text size, nothing missing |
 | Status button in the composer on chat open | Open WebUI 0.12.0 | Appears after the next reply instead |
 | A reply that finishes while a tab is loading the chat | Open WebUI 0.12.4 | 0.12.0 to 0.12.3: that tab can show the reply cut until it is reloaded. Those releases replace what reached the page during a load with what the load fetched; 0.12.4 keeps it ([open-webui#32761](https://github.com/open-webui/open-webui/issues/32761)) |

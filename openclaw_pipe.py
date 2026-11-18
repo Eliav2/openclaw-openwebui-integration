@@ -8404,9 +8404,10 @@ def _history_latest_prompt_tokens(history: dict) -> int | None:
     return None
 
 
-def _history_renderer(messages: list) -> "_TurnRenderer":
-    """A `_TurnRenderer` fed from `chat.history` instead of live events (ELI-88/90/92)."""
-    r = _TurnRenderer()
+def _history_renderer(messages: list, lang: str = UI_LANG_DEFAULT) -> "_TurnRenderer":
+    """A `_TurnRenderer` fed from `chat.history` instead of live events (ELI-88/90/92), its
+    notes and card labels in `lang`."""
+    r = _TurnRenderer(lang)
     for payload in _history_events(messages):
         r.feed(payload)
     r.flush()
@@ -9728,15 +9729,43 @@ def _is_sentinel_message_item(item: dict) -> bool:
     return text.strip() in _SILENT_SENTINELS
 
 
-def _turn_note_item(note: str) -> dict:
-    return {"type": "message", "id": f"msg_note_{uuid.uuid4().hex[:12]}", "status": "completed",
+# A Pipe-added item carrying the run's images: kept over a rebuild like a note
+# (`_keep_pipe_notes`), but a reply of only images is a real reply (`_is_note_only`).
+_MEDIA_ITEM_PREFIX = f"{_NOTE_ITEM_PREFIX}media_"
+
+
+def _turn_note_item(note: str, media: bool = False) -> dict:
+    prefix = _MEDIA_ITEM_PREFIX if media else _NOTE_ITEM_PREFIX
+    return {"type": "message", "id": f"{prefix}{uuid.uuid4().hex[:12]}", "status": "completed",
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
+
+
+async def _note_only_completion(chat_id: str, message_id: str, user_id: str | None, data: dict) -> None:
+    """A note-only reply's end (`_is_note_only`): `internal` for the user's own tabs, so Open WebUI
+    shows no toast or notification for it in another chat; that also skips Open WebUI's shared copy
+    for the chat's other viewers (`socket/main.py`, the `chat:{id}` room), sent here as it sends it."""
+    from open_webui.socket.main import get_event_emitter, sio
+
+    emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id, "user_id": user_id,
+                                    "internal": True}, update_db=False)
+    await emit({"type": "chat:completion", "data": data})
+    if _is_temporary_chat(chat_id):
+        return
+    shared = {k: v for k, v in data.items() if k in SHARED_COMPLETION_KEYS}
+    await sio.emit("events", {"chat_id": chat_id, "message_id": message_id, "user_id": user_id,
+                              "shared": True, "data": {"type": "chat:completion", "data": shared}},
+                   room=f"chat:{chat_id}")
+
+
+# What Open WebUI's shared copy of a completion carries (socket/main.py `get_event_emitter`).
+SHARED_COMPLETION_KEYS = ("done", "content", "output")
 
 
 def _is_note_only(output: list | None) -> bool:
     """Whether a reply's `output` is the Pipe's own notes and nothing else: no run text, no card."""
-    items = [i for i in output or [] if isinstance(i, dict)]
-    return bool(items) and all(str(i.get("id") or "").startswith(_NOTE_ITEM_PREFIX) for i in items)
+    ids = [str(i.get("id") or "") for i in output or [] if isinstance(i, dict)]
+    return bool(ids) and all(i.startswith(_NOTE_ITEM_PREFIX) and not i.startswith(_MEDIA_ITEM_PREFIX)
+                             for i in ids)
 
 
 def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
@@ -9821,15 +9850,19 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             have = {i.get("id") for i in output if isinstance(i, dict)}
             output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
             output.append(_turn_note_item(note))
-            await _owui_upsert_message(
-                chat_id, message_id, {"content": text, "output": output, "done": True})
-        # A reply that is only the Pipe's note is no news: no toast or notification for it
-        # in another chat (Open WebUI skips both for an `internal` event).
-        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
-                                        "user_id": ref.get("user_id"),
-                                        "internal": _is_note_only(output)}, update_db=False)
-        await emit({"type": "chat:completion", "data": {"done": True, "content": text,
-                                                         "output": output}})
+            if not await _owui_upsert_message(
+                    chat_id, message_id, {"content": text, "output": output, "done": True}):
+                # Not saved: no tab is shown a note a reload would not have.
+                pipe_log(f"  reply {message_id[:8]}...: saving its note failed; not shown")
+                return
+        data = {"done": True, "content": text, "output": output}
+        if _is_note_only(output):
+            # No news: no toast or notification for it in another chat.
+            await _note_only_completion(chat_id, message_id, ref.get("user_id"), data)
+        else:
+            emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                            "user_id": ref.get("user_id")}, update_db=False)
+            await emit({"type": "chat:completion", "data": data})
         pipe_log(f"  reply {message_id[:8]}... ended: {note}")
     except Exception as ex:
         pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
@@ -10369,16 +10402,14 @@ class _TurnWriter:
                 return
         await self._stream()
 
-    async def _emitter(self, internal: bool = False):
-        """M's event emitter. `internal`: one Open WebUI shows no toast or notification for."""
-        from open_webui.socket.main import get_event_emitter
-
-        info = {"chat_id": self.chat_id, "message_id": self.message_id, "user_id": self.user_id}
-        if internal:
-            return await get_event_emitter({**info, "internal": True}, update_db=False)
+    async def _emitter(self):
         if self._emit is None:
+            from open_webui.socket.main import get_event_emitter
+
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = await get_event_emitter(info, update_db=False)
+            self._emit = await get_event_emitter(
+                {"chat_id": self.chat_id, "message_id": self.message_id,
+                 "user_id": self.user_id}, update_db=False)
         return self._emit
 
     async def _stream(self) -> None:
@@ -10834,7 +10865,8 @@ class _TurnWriter:
             if not self.opened:
                 # Adopted, with nothing new: it ends as it stands only when the
                 # transcript was read; unread, a later load may still rebuild it.
-                if not (self._showable() or note or blocks or missing or self.event_media
+                # A Stop always ends M: with "Stopped." when nothing else shows.
+                if not (self._showable() or note or stopped or blocks or missing or self.event_media
                         or (self.adopted and hist)) or not await self._open_at_end():
                     return
             output, text = await self._view(final=True)
@@ -10850,7 +10882,7 @@ class _TurnWriter:
             images = (await self._media_text(blocks, missing)).strip()
             if images:
                 text = f"{text}\n\n{images}" if text else images
-                output.append(_turn_note_item(images))
+                output.append(_turn_note_item(images, media=True))
             if stopped and not text and not note:
                 # Stopped before any text: say so in the saved reply, not only in its status
                 # line, so a reload and the chat's preview show it (ELI-512).
@@ -10883,11 +10915,13 @@ class _TurnWriter:
             # already has them: a status event would add each one again.
             for line in status if not pushed else ():
                 await emit({"type": "status", "data": line})
-            # A reply that is only the Pipe's note ("sent together with your next one") is
-            # no news: it ends without a toast or notification in another chat (ELI-512).
-            done_emit = await self._emitter(internal=True) if _is_note_only(output) else emit
-            await done_emit({"type": "chat:completion", "data": {"done": True, "content": text,
-                                                                  "output": output}})
+            data = {"done": True, "content": text, "output": output}
+            if _is_note_only(output):
+                # Only the Pipe's note ("sent together with your next one"): no news, so no
+                # toast or notification in another chat (ELI-512).
+                await _note_only_completion(self.chat_id, self.message_id, self.user_id, data)
+            else:
+                await emit({"type": "chat:completion", "data": data})
             if not self.newer_run:
                 await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")
@@ -11027,7 +11061,7 @@ class _TurnWriter:
         if not hist or self.wake.get("at") is None or self.wake.get("end") is None:
             return
         rebuilt = _history_renderer(wake_span(hist.get("messages"), self.wake["at"],
-                                              self.wake["end"]))
+                                              self.wake["end"]), self.lang)
         # The transcript may lack a wake's tool calls (not imported while a
         # user turn is queued behind it).
         if (self._holds_streamed_calls(rebuilt, "wake's")
@@ -11043,7 +11077,7 @@ class _TurnWriter:
         spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
         if self.steered_into and self.runs == [self.run_id] and spans[0] is not None:
             # What streamed may be a later message's answer: the span decides.
-            return _history_renderer(spans[0])
+            return _history_renderer(spans[0], self.lang)
         if any(s is None for s in spans):
             pipe_log(f"  turn writer: the transcript does not show {self.message_id[:8]}...'s "
                      f"{len(self.runs)} run(s) closed; keeping what streamed")
@@ -11061,7 +11095,7 @@ class _TurnWriter:
             return out[o:end] if owner == run else []
 
         def covered(run, span):
-            rebuilt = _history_renderer(span)
+            rebuilt = _history_renderer(span, self.lang)
             calls = {i.get("id") for i in rebuilt.output if i.get("type") == "function_call"}
             seg = streamed(run)
             return ({i.get("id") for i in seg if i.get("type") == "function_call"} <= calls
@@ -11073,7 +11107,7 @@ class _TurnWriter:
             pipe_log(f"  turn writer: the transcript covers none of {self.message_id[:8]}...'s "
                      f"{len(self.runs)} run(s); keeping what streamed")
             return None
-        rest = _history_renderer([m for s in spans[k:] for m in s])
+        rest = _history_renderer([m for s in spans[k:] for m in s], self.lang)
         shown = self.shown.get(self.runs[k], "")
         if shown and not rest.drop_shown(shown):
             pipe_log(f"  turn writer: run {self.runs[k][:24]}... does not start with what earlier "
@@ -12679,7 +12713,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
     output: list | None = None
     text = ""
     if turn and (turn["by"] == "id" or not has_content):
-        rendered = _history_renderer(turn["messages"])
+        rendered = _history_renderer(turn["messages"], ui_lang_of(chat.user_id))
         if not rendered.text.strip() and not rendered.output and not has_content:
             rendered._add_text(ui_text("orphan_stub_silent", ui_lang_of(chat.user_id)))
         if rendered.output:
@@ -12935,7 +12969,8 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
                  for r in runs]
         if any(s is None for s in spans):
             continue  # a run written into it has not closed
-        rendered = _history_renderer([m for s in spans for m in s])
+        rendered = _history_renderer([m for s in spans for m in s],
+                                     ui_lang_of(session_key.rsplit("openwebui-", 1)[-1][:36]))
         output, text = await _transcript_view(
             conn, session_key=session_key, chat_id=chat_id,
             user_id=session_key.rsplit("openwebui-", 1)[-1][:36], message_id=mid,
@@ -15930,6 +15965,7 @@ class _TurnState:
     `unsent`, each ended with a note once those are sent or dropped (ELI-188).
     `handed_over`: the turn writer took the message over. `deferred`: the Gateway
     was unreachable, so the message waits in the chat for the pending worker (ELI-504).
+    `note_only`: the reply's whole text is a Pipe note saying where its answer is.
     """
     conn: object = None
     session_key: str | None = None
@@ -15945,6 +15981,7 @@ class _TurnState:
     queue: object = None
     run_text: dict | None = None
     parked: bool = False
+    note_only: bool = False
 
 
 class Pipe:
@@ -16486,8 +16523,9 @@ class Pipe:
                         and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
                 # A handed-over reply is published by its turn writer instead.
+                # A reply that is only the Pipe's note is no news: nothing to publish (ELI-512).
                 elif (not _task.cancelled() and _task.exception() is None and not turn.parked
-                        and not turn.handed_over and turn.reply
+                        and not turn.handed_over and turn.reply and not turn.note_only
                         and getattr(self.valves, "PUBLISH_CHAT_FINISHED", False)):
                     r = turn.reply
                     spawn_background(_publish_chat_finished(r["chat_id"], r["message_id"], r["user_id"]))
@@ -17846,7 +17884,8 @@ class _PipeTurn:
         """This reply's message, when it was stopped before showing any run text; else None."""
         chat_id, message_id = getattr(self, "owui_origin_chat_id", None), getattr(self, "owui_message_id", None)
         renderer = getattr(self, "renderer", None)
-        if (renderer is not None and (renderer.visible_text or "").strip()) or not chat_id or not message_id \
+        # What the reply shows, not the run's raw text: a held MEDIA line is in that but not shown.
+        if getattr(self, "visible_message_text", "").strip() or not chat_id or not message_id \
                 or getattr(self, "channel_id", None):
             return None
         return {"chat_id": chat_id, "message_id": message_id,
@@ -18008,6 +18047,7 @@ class _PipeTurn:
         if self.steered_into and not self.text_yielded and not self.aborted:
             # A later message was steered in first: the answer is in its reply.
             note = ui_text("sent_with_next", self.lang)
+            self.turn.note_only = not self.visible_message_text.strip()
             self.record_visible_chunk(note)
             yield note
             self.text_yielded = True
@@ -18047,6 +18087,7 @@ class _PipeTurn:
                 and steers_mid_run_messages(self.conn.gateway_version)):
             # Steered into a run no reply here shows (a wake, another tab's).
             note = ui_text("steered_into_running", self.lang)
+            self.turn.note_only = not self.visible_message_text.strip()
             self.record_visible_chunk(note)
             yield note
             self.text_yielded = True

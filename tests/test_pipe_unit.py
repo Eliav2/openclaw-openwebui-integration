@@ -4071,6 +4071,7 @@ class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
             async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
                 order.append("upsert")
                 upserts.append((chat_id, message_id, copy.deepcopy(message)))
+                return chat  # Open WebUI returns the chat; None when the write failed
 
         async def get_event_emitter(meta, update_db=True):
             async def emit(event):
@@ -4088,7 +4089,8 @@ class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
         chats_mod.Chats = Chats
         tasks_mod = types.ModuleType("open_webui.tasks")
         tasks_mod.tasks = {"task-2": req}
-        modules = {**owui_modules(get_event_emitter=get_event_emitter),
+        # A note-only reply also goes to the chat's room (`_note_only_completion`).
+        modules = {**owui_modules(get_event_emitter=get_event_emitter, sio=FakeSio()),
                    "open_webui.models": types.ModuleType("open_webui.models"),
                    "open_webui.models.chats": chats_mod, "open_webui.tasks": tasks_mod}
         conn = _GatewayConnection(lambda: None)
@@ -17462,7 +17464,7 @@ class MidRunSteeringTests(_TurnCase):
         renderer = openclaw_pipe._TurnRenderer()
         renderer.feed(self._delta(self.R1, "BROWSER_TWICE_B")["payload"])
         writer = types.SimpleNamespace(steered_into=self.R1, runs=[self.R2], run_id=self.R2,
-                                       run_started={}, renderer=renderer, message_id="w2")
+                                       run_started={}, renderer=renderer, message_id="w2", lang="en")
         with mock.patch.object(openclaw_pipe, "_history_span_messages", return_value=[]):
             rebuilt = openclaw_pipe._TurnWriter._from_transcript(writer, {"messages": []})
         self.assertIsNotNone(rebuilt)
