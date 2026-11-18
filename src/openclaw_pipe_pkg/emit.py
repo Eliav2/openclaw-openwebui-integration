@@ -29,9 +29,9 @@ def _is_background_agent_launch(name, result_text, is_error=False) -> bool:
             and (result_text or "").strip().startswith(_AGENT_LAUNCHED_PREFIX))
 
 
-def _background_agents_line(n: int) -> str:
+def _background_agents_line(n: int, lang: str = UI_LANG_DEFAULT) -> str:
     """The status row of a reply a background agent holds open."""
-    return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
+    return ui_text("background_agents_one", lang) if n == 1 else ui_text("background_agents", lang, n=n)
 
 
 # Live view ids go into the URL as they are.

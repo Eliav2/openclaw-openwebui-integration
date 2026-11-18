@@ -20,6 +20,16 @@ Internal scaffolding never reaches the reply: the Sender provenance block (see [
 
 Always on.
 
+## Status lines in your language
+
+The lines the Pipe itself shows in a reply follow Open WebUI's interface language: the status row while a reply works ("Thinking...", queued, sent while the agent works, waiting on a background agent, Stopped), and its notes in the reply text (no reply text, a message that went with your next one, a reply cut off by a restart, context compaction), plus the Sub-agent card's name. Hebrew and English are supported; any other language shows English. In Hebrew the lines use everyday words and each status line fits one line on a phone.
+
+<img src="../img/hebrew-status-light.png" alt="A reply in a Hebrew Open WebUI on a phone: the status row under it reads, in Hebrew, that it is waiting on a helper working in the background" width="320">
+
+The language is the one set in Open WebUI under Settings > General > Language, which Open WebUI sends with each message. A reply the Pipe finishes with no message behind it (after an Open WebUI restart, or one the agent starts) uses the language of your last message since the Pipe started, and English before that. Error messages follow the language of your own message instead, see [Troubleshooting](../troubleshooting.md).
+
+Always on.
+
 ## Tool cards
 
 Tool calls are sent as Responses-API output items, so Open WebUI draws them with its own two-phase tool card: a spinner while the tool runs, the result when it finishes. Nothing is hand-rolled HTML, so the cards match the rest of the UI and survive a reload.

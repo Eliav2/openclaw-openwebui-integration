@@ -29,6 +29,12 @@ Replies:
   `injected TOKEN: <count>`), until the file `done-TOKEN` says none is coming. It answers a
   message it took in once the file `say-TOKEN` or `done-TOKEN` exists, as a model answers
   after the Gateway recorded the message.
+* `E2E_CLI_SPAWN_YIELD TOKEN` -> calls the Gateway's MCP `sessions_spawn` (task `Respond with
+  exactly: E2E_YIELD_CHILD TOKEN`) and `sessions_yield` (acknowledgment `E2E_YIELD_ACK TOKEN`), as
+  Claude Code does; 2026.11.5 ends the turn there. The next input in the session (the
+  Gateway's settle announce, in a `--resume` process) is recorded as live Claude Code records it:
+  first its `<synthetic>` "No response requested." for the yielded turn, then the prompt as a
+  meta message. It is answered `E2E_YIELD_ANSWER TOKEN`.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * a message saying `No reply needed` -> a bare `NO_REPLY`, the agent's silence (ELI-336). The
@@ -61,6 +67,11 @@ HOLD = re.compile(r"E2E_CLI_HOLD\s+([A-Za-z0-9_]{3,})")
 TOOL_HOLD = re.compile(r"E2E_CLI_TOOL_HOLD\s+([A-Za-z0-9_]{3,})")
 ABORT_TOOL = re.compile(r"E2E_CLI_ABORT_TOOL\s+([A-Za-z0-9_]{3,})")
 LATE_STEER = re.compile(r"E2E_CLI_LATE_STEER\s+([A-Za-z0-9_]{3,})")
+SPAWN_YIELD = re.compile(r"E2E_CLI_SPAWN_YIELD\s+([A-Za-z0-9_]{3,})")
+# What Claude Code records for a turn it never answered (one a yield ended), at the next input.
+SYNTHETIC_MODEL = "<synthetic>"
+SYNTHETIC_NO_RESPONSE = "No response requested."
+NON_USER_PREFIX = "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\n"
 # A message the agent answers with silence, and that silence (OpenClaw's NO_REPLY sentinel).
 SILENT_ASK = "No reply needed"
 SILENT_REPLY = "NO_REPLY"
@@ -117,9 +128,10 @@ def text_of(msg):
     return str(content or "")
 
 
-def record(role, content, **message):
+def record(role, content, meta=False, **message):
     transcript.write(json.dumps({"type": role, "uuid": str(uuid.uuid4()), "sessionId": sid,
                                  "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                 **({"isMeta": True} if meta else {}),
                                  "message": {"role": role, "content": content, **message}}) + "\n")
     transcript.flush()
 
@@ -232,11 +244,40 @@ def abort_tool(token):
     sys.exit(143)
 
 
+def mcp_step(name, arguments):
+    """One call to the Gateway's MCP tool `name`, streamed and recorded as Claude Code does."""
+    call = {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": f"mcp__openclaw__{name}",
+            "input": arguments}
+    message = {"id": "msg_" + uuid.uuid4().hex[:20], "type": "message", "role": "assistant", "model": model,
+               "content": [call], "stop_reason": "tool_use", "stop_sequence": None,
+               "usage": {"input_tokens": 10, "output_tokens": 2, "cache_creation_input_tokens": 0,
+                         "cache_read_input_tokens": 0}}
+    emit({"type": "assistant", "message": message, "session_id": sid, "parent_tool_use_id": None})
+    record("assistant", message["content"], model=model, stop_reason="tool_use", usage=message["usage"])
+    status, reply = mcp_call(MCP, name, arguments)
+    note(f"mcp {name}: {status} {json.dumps(reply)[:400]}")
+    content = ((reply or {}).get("result") or {}).get("content") if isinstance(reply, dict) else None
+    output = [{"type": "tool_result", "tool_use_id": call["id"], "content": content or json.dumps(reply)}]
+    emit({"type": "user", "message": {"role": "user", "content": output}, "session_id": sid,
+          "parent_tool_use_id": None})
+    record("user", output)
+
+
 def take_in(msg):
-    """Start a user input: its lifecycle, its replay, its prompt hook."""
+    """Start a user input: its lifecycle, its replay, its prompt hook. After a
+    yield, Claude Code first records its placeholder for the turn the yield
+    ended, and keeps OpenClaw's routed prompt as a meta message (live
+    2026.11.5: the Gateway's import leaves both out of chat.history but the
+    placeholder, ELI-512)."""
     lifecycle("started", msg.get("uuid"))
     emit(msg | {"session_id": sid, "isReplay": True})
-    record("user", (msg.get("message") or {}).get("content"))
+    after_yield = os.path.exists(os.path.join(DIR, f"yielded-{sid}"))
+    if after_yield:
+        record("assistant", [{"type": "text", "text": SYNTHETIC_NO_RESPONSE}], model=SYNTHETIC_MODEL,
+               stop_reason="stop_sequence", usage={"input_tokens": 0, "output_tokens": 0})
+        record("user", NON_USER_PREFIX + text_of(msg), meta=True)
+    else:
+        record("user", (msg.get("message") or {}).get("content"))
     prompt_hook(text_of(msg))
 
 
@@ -269,6 +310,27 @@ while True:
         say("E2E_CLI_HOLD_END")
         lifecycle("completed", msg.get("uuid"))
         result("E2E_CLI_HOLD_END")
+        continue
+    yielded = os.path.join(DIR, f"yielded-{sid}")
+    if os.path.exists(yielded):
+        with open(yielded) as f:
+            token = f.read().strip()
+        os.remove(yielded)
+        note(f"answering after the yield {token}: {text_of(msg)[:300]}")
+        reply = f"E2E_YIELD_ANSWER {token}"
+        say(reply)
+        lifecycle("completed", msg.get("uuid"))
+        result(reply)
+        continue
+    spawn_yield = SPAWN_YIELD.search(text_of(msg))
+    if spawn_yield:
+        token = spawn_yield.group(1)
+        mcp_step("sessions_spawn", {"task": f"Respond with exactly: E2E_YIELD_CHILD {token}",
+                                     "label": f"yield helper {token}"})
+        with open(yielded, "w") as f:
+            f.write(token)
+        mcp_step("sessions_yield", {"acknowledgment": f"E2E_YIELD_ACK {token}"})
+        note(f"yielded {token}")
         continue
     late = LATE_STEER.search(text_of(msg))
     if late:

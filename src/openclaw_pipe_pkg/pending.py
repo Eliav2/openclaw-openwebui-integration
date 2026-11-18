@@ -47,16 +47,6 @@ PENDING_BACKOFF_MAX_S = 60.0
 PENDING_BACKOFF_FACTOR = 2
 # A message kept for later holds its whole body (images included).
 PENDING_PAYLOAD_MAX_BYTES = 16 * 1024 * 1024
-PENDING_LANG_DEFAULT = "en"
-PENDING_USER_LANGUAGE_VAR = "{{USER_LANGUAGE}}"
-PENDING_STATUS = {
-    "en": "Waiting for the gateway…",
-    "he": "ממתין לגייטווי…",
-}
-PENDING_SENT_NOTE = {
-    "en": "_(Sent at {when}, while the gateway was down. Delivered now.)_",
-    "he": "_(נשלחה ב-{when}, כשהגייטווי היה למטה. נמסרה עכשיו.)_",
-}
 PENDING_AGENT_NOTE = ("[system] The user wrote the message below at {when}. The Gateway was down, "
                       "so it reaches you late: answer it as written then.\n\n")
 # Metadata a client may send with a message it held back itself (ELI-403's browser outbox): when
@@ -82,18 +72,6 @@ def pending_retryable(ex) -> bool:
             or error.get("retryable") is True)
 
 
-def pending_lang(metadata) -> str:
-    """`he` or `en`: the UI language of the turn (Open WebUI's `{{USER_LANGUAGE}}`)."""
-    variables = (metadata or {}).get("variables") if isinstance(metadata, dict) else None
-    lang = (variables or {}).get(PENDING_USER_LANGUAGE_VAR) if isinstance(variables, dict) else None
-    code = str(lang or "").split("-", 1)[0].lower()
-    return code if code in PENDING_STATUS else PENDING_LANG_DEFAULT
-
-
-def pending_status_text(lang: str) -> str:
-    return PENDING_STATUS.get(lang) or PENDING_STATUS[PENDING_LANG_DEFAULT]
-
-
 def _pending_when(sent_at: float, now: float | None = None) -> str:
     """The send time, with the day when it was not today."""
     now = time.time() if now is None else now
@@ -103,8 +81,7 @@ def _pending_when(sent_at: float, now: float | None = None) -> str:
 
 
 def pending_sent_note(sent_at: float, lang: str, now: float | None = None) -> str:
-    return (PENDING_SENT_NOTE.get(lang) or PENDING_SENT_NOTE[PENDING_LANG_DEFAULT]).format(
-        when=_pending_when(sent_at, now))
+    return ui_text("pending_sent", lang, when=_pending_when(sent_at, now))
 
 
 def pending_agent_note(sent_at: float, now: float | None = None) -> str:

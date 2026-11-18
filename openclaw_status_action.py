@@ -175,6 +175,134 @@ def spawn_background(coro):
     return task
 
 
+# --- texts -----------------------------------------------------------------
+#
+# The language is Open WebUI's `{{USER_LANGUAGE}}` variable, which its page
+# sends with every chat request from the UI locale it keeps in the browser
+# (`localStorage.locale`, e.g. `he-IL`; `en-US` when unset). A reply written
+# with no request behind it (a turn writer after a restart, a cron wake) uses
+# the language of that user's last request (`ui_lang_of`).
+#
+# Hebrew is for people who are not developers: plain words, no "gateway",
+# "run" or "agent", and a status line short enough for one line on a 390 px
+# phone (UI_STATUS_MAX_CHARS).
+
+UI_LANG_DEFAULT = "en"
+UI_LANG_HEBREW = "he"
+UI_LANG_VAR = "{{USER_LANGUAGE}}"
+# A status row is clamped to one line by Open WebUI: at 390 px about this many characters fit.
+UI_STATUS_MAX_CHARS = 44
+
+UI_TEXT = {
+    # Status lines.
+    "thinking": {"en": "Thinking...", "he": "חושב…"},
+    "queued_behind": {"en": "Waiting -- your message is queued behind an active response...",
+                      "he": "ממתין: ההודעה בתור…"},
+    "queued_wait": {"en": "Queued: waiting for the current run to finish…",
+                    "he": "בתור: מחכה שהמשימה הנוכחית תסתיים…"},
+    "continuing": {"en": "Continuing the current task; your message is next…",
+                   "he": "מסיים משימה קודמת, ההודעה שלך הבאה…"},
+    "steer_pending": {"en": "Sent while the agent works: it reads it at its next step…",
+                      "he": "נשלח תוך כדי עבודה, ייקרא בצעד הבא…"},
+    "sending_message": {"en": "Sending your message…", "he": "שולח את ההודעה שלך…"},
+    "sending_answer": {"en": "Sending answer...", "he": "שולח את התשובה שלך…"},
+    "answer_sent": {"en": "Answer sent; continuing...", "he": "התשובה נשלחה, ממשיך…"},
+    "stopped": {"en": "Stopped", "he": "נעצר"},
+    "gateway_wait": {"en": "Waiting for the gateway…", "he": "אין חיבור כרגע, ממתין…"},
+    "background_agents_one": {"en": "Waiting on 1 background agent", "he": "מחכה לעוזר שעובד ברקע"},
+    "background_agents": {"en": "Waiting on {n} background agents", "he": "מחכה ל-{n} עוזרים שעובדים ברקע"},
+    # Notes in a reply's text.
+    "stopped_reason": {"en": "**Stopped.**", "he": "**נעצר.**"},
+    "no_reply_text": {"en": "_(This turn produced no reply text.)_", "he": "_(אין תשובה בכתב הפעם.)_"},
+    "sent_with_next": {"en": "_(This message was sent together with your next one: "
+                             "the answer is in the next reply.)_",
+                       "he": "_(ההודעה נשלחה יחד עם ההודעה הבאה שלך: התשובה בהודעה הבאה.)_"},
+    "not_sent": {"en": "_(Stopped: this message was not sent to the agent.)_",
+                 "he": "_(נעצר: ההודעה לא נשלחה.)_"},
+    "send_failed": {"en": "_(This message was to go together with your next one, "
+                          "which could not be sent: see the next reply.)_",
+                    "he": "_(ההודעה הייתה אמורה להישלח יחד עם הבאה, שלא נשלחה: ראו בתשובה הבאה.)_"},
+    # What a run that yielded without a word or an acknowledgment ends with.
+    "yield_wait": {"en": "_(Waiting for the sub-agents: their answer comes in the next reply.)_",
+                   "he": "_(מחכה לעוזרים שעובדים ברקע: התשובה שלהם תגיע בהודעה הבאה.)_"},
+    "steered_into_running": {"en": "_(Sent to the reply that was already running: the agent answers it there.)_",
+                             "he": "_(נוספה לתשובה שכבר הייתה בדרך: התשובה שם.)_"},
+    "image_not_relayed": {"en": "_(Note: that image couldn't be relayed to the agent -- "
+                                "only the text below was sent.)_",
+                          "he": "_(שימו לב: לא הצלחתי לקבל את התמונה, נשלח רק הטקסט.)_"},
+    "response_failed": {"en": "**The response failed.** Please try again.",
+                        "he": "**התשובה נכשלה.** כדאי לנסות שוב."},
+    "response_timed_out": {"en": "**The response timed out.** Please try again.",
+                           "he": "**התשובה לקחה יותר מדי זמן.** כדאי לנסות שוב."},
+    "pending_sent": {"en": "_(Sent at {when}, while the gateway was down. Delivered now.)_",
+                     "he": "_(נשלחה ב-{when}, כשלא היה חיבור. נמסרה עכשיו.)_"},
+    "gateway_lost_run": {"en": "_(The Gateway restarted while this reply was running and did not continue it.)_",
+                         "he": "_(המערכת הופעלה מחדש באמצע התשובה, והתשובה לא הושלמה. אפשר לשלוח שוב.)_"},
+    "turn_cut_off": {"en": "_(This reply was cut off: the run was interrupted again after "
+                           "{tries} attempts to continue it.)_",
+                     "he": "_(התשובה נקטעה ולא הצלחתי להשלים אותה. אפשר לשלוח שוב.)_"},
+    "orphan_stub": {"en": "*This reply was cut off before it finished (Open WebUI restarted or "
+                          "lost the run), and no reply for it could be recovered from OpenClaw. "
+                          "Send the message again if you still need an answer.*",
+                    "he": "*התשובה נקטעה לפני שהסתיימה ולא הצלחתי לשחזר אותה. "
+                          "אפשר לשלוח את ההודעה שוב.*"},
+    "orphan_stub_silent": {"en": "*The run for this message stopped without leaving a reply in the transcript.*",
+                           "he": "*הטיפול בהודעה הזו נעצר בלי תשובה.*"},
+    "compacting": {"en": "🧹 _Compacting context…_", "he": "🧹 _מסכם את השיחה כדי לפנות מקום…_"},
+    "compaction_failed": {"en": "🧹 _Context compaction did not complete: the conversation goes on uncompacted._",
+                          "he": "🧹 _הסיכום לא הושלם, השיחה ממשיכה כרגיל._"},
+    "compaction_skipped": {"en": "🧹 _Context compaction skipped: nothing to compact yet._",
+                           "he": "🧹 _אין עדיין מה לסכם._"},
+    "compaction_stopped": {"en": "🧹 _Context compaction stopped._", "he": "🧹 _הסיכום נעצר._"},
+    "compacted_summary": {"en": "🧹 Context compacted", "he": "🧹 השיחה סוכמה"},
+    "compacted_was": {"en": " · was ~{tokens} tokens", "he": ""},
+    "compacted_body": {"en": "Older messages in this conversation were summarized to free up the model's "
+                             "context. The agent continues from that summary plus the most recent messages; "
+                             "everything stays visible here.",
+                       "he": "הודעות ישנות בשיחה סוכמו כדי לפנות מקום. ההמשך מתבסס על הסיכום ועל "
+                             "ההודעות האחרונות, והכול עדיין מופיע כאן."},
+    # The Pipe's own card label.
+    "subagent_card": {"en": "Sub-agent", "he": "עוזר"},
+}
+
+# The last UI language each Open WebUI user sent: for replies written without a request.
+_UI_LANG_BY_USER: dict[str, str] = {}
+
+
+def ui_lang(metadata) -> str:
+    """`he` or `en`: the UI language of a request's metadata (`{{USER_LANGUAGE}}`)."""
+    variables = (metadata or {}).get("variables") if isinstance(metadata, dict) else None
+    lang = (variables or {}).get(UI_LANG_VAR) if isinstance(variables, dict) else None
+    code = str(lang or "").split("-", 1)[0].lower()
+    return code if code in (UI_LANG_DEFAULT, UI_LANG_HEBREW) else UI_LANG_DEFAULT
+
+
+def ui_lang_remember(user_id, metadata) -> str:
+    """The request's language, kept as this user's for replies written later without one."""
+    lang = ui_lang(metadata)
+    if user_id:
+        _UI_LANG_BY_USER[user_id] = lang
+    return lang
+
+
+def ui_lang_of(user_id) -> str:
+    """The language of `user_id`'s last request since this process started, else English."""
+    return _UI_LANG_BY_USER.get(user_id or "", UI_LANG_DEFAULT)
+
+
+def ui_text(key: str, lang: str = UI_LANG_DEFAULT, **values) -> str:
+    """Line `key` of UI_TEXT in `lang` (English when the table has no `lang` for it), formatted
+    with `values`. An empty line is a line: a part with nothing to say in that language."""
+    entry = UI_TEXT[key]
+    text = entry[lang] if lang in entry else entry[UI_LANG_DEFAULT]
+    return text.format(**values) if values else text
+
+
+def ui_texts(key: str, **values) -> tuple[str, ...]:
+    """Line `key` in every language: to recognise it in a saved reply whatever its language."""
+    return tuple(text.format(**values) if values else text for text in UI_TEXT[key].values())
+
+
 # --- identity --------------------------------------------------------------
 
 def _generate_device_identity():
@@ -1327,10 +1455,32 @@ def _event_frame(payload: dict) -> dict:
     return {"type": "event", "event": event, "payload": payload}
 
 
+# Claude Code's placeholder for a turn it never answered (one a yield or an
+# abort ended), with the model `<synthetic>`. 2026.11.5 drops it from the live
+# stream (`isClaudeSyntheticNoResponse`) but imports it into `chat.history`,
+# where it sorts inside the next run (ELI-512).
+_CLI_SYNTHETIC_MODEL = "<synthetic>"
+_CLI_SYNTHETIC_NO_RESPONSE = "No response requested."
+_TEXT_BLOCK = "text"   # a content block's type
+
+
+def _is_cli_synthetic_no_response(message) -> bool:
+    """An imported `<synthetic>` "No response requested.": no reply of any run."""
+    if not isinstance(message, dict) or message.get("model") != _CLI_SYNTHETIC_MODEL:
+        return False
+    content = message.get("content")
+    blocks = content if isinstance(content, list) else [{"type": _TEXT_BLOCK, "text": content}]
+    return (len(blocks) == 1 and isinstance(blocks[0], dict) and blocks[0].get("type") == _TEXT_BLOCK
+            and str(blocks[0].get("text") or "").strip() == _CLI_SYNTHETIC_NO_RESPONSE)
+
+
 def _history_item(message) -> dict | None:
-    """Flatten one `chat.history` message to {role, text}, text blocks only."""
+    """Flatten one `chat.history` message to {role, text}, text blocks only.
+    Claude Code's synthetic placeholder has no text."""
     if not isinstance(message, dict):
         return None
+    if _is_cli_synthetic_no_response(message):
+        return {"role": message.get("role"), "text": ""}
     content = message.get("content")
     if isinstance(content, str):
         text = content
@@ -1922,20 +2072,15 @@ CONTROL_LINK_NOTE = ("**[Take control ↗]({link})**: the agent is waiting for y
 # only when the Gateway sends `tokensBefore`; the session's `totalTokens` is
 # stale by then and no stand-in.
 COMPACTION_STREAM = "compaction"
-COMPACTING_NOTE = "🧹 _Compacting context…_"
-COMPACTION_FAILED_NOTE = "🧹 _Context compaction did not complete: the conversation goes on uncompacted._"
-COMPACTION_SKIPPED_NOTE = "🧹 _Context compaction skipped: nothing to compact yet._"
-COMPACTION_STOPPED_NOTE = "🧹 _Context compaction stopped._"
-COMPACTED_BODY = ("Older messages in this conversation were summarized to free up the model's "
-                  "context. The agent continues from that summary plus the most recent messages; "
-                  "everything stays visible here.")
+# Its texts are UI_TEXT's "compact*" lines (texts.py).
+COMPACTION_END_NOTES = {"skipped": "compaction_skipped", "aborted": "compaction_stopped"}
 
 
-def _compacted_note(tokens_before) -> str:
-    was = f" · was ~{_fmt_tokens(tokens_before)} tokens" if isinstance(tokens_before, int) \
-        and tokens_before > 0 else ""
-    return (f"<details>\n<summary>🧹 Context compacted{was}</summary>\n\n"
-            f"{COMPACTED_BODY}\n</details>")
+def _compacted_note(tokens_before, lang: str = UI_LANG_DEFAULT) -> str:
+    was = ui_text("compacted_was", lang, tokens=_fmt_tokens(tokens_before)) \
+        if isinstance(tokens_before, int) and tokens_before > 0 else ""
+    return (f"<details>\n<summary>{ui_text('compacted_summary', lang)}{was}</summary>\n\n"
+            f"{ui_text('compacted_body', lang)}\n</details>")
 
 
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
@@ -1996,6 +2141,23 @@ def _short_title(text: str) -> str:
     if space >= SUBAGENT_TITLE_MAX // 2:
         cut = cut[:space]
     return cut.rstrip(" ,;:(") + "…"
+
+
+# `sessions_yield`, and the status of its accepted result. From 2026.11.5 an
+# accepted yield ends the run; the children's answer comes as a new run (ELI-512).
+YIELD_TOOL = "sessions_yield"
+YIELD_ACCEPTED = "yielded"
+
+
+def _yield_acknowledgment(name: str, result_str: str, failed: bool) -> str | None:
+    """An accepted `sessions_yield` result's acknowledgment ("" when it has
+    none), else None."""
+    if failed or _bare_tool_name(name) != YIELD_TOOL:
+        return None
+    result = _json_object(result_str)
+    if result.get("status") != YIELD_ACCEPTED:
+        return None
+    return str(result.get("acknowledgment") or "").strip()
 
 
 def _is_spawn_tool(name: str) -> bool:
@@ -2171,7 +2333,8 @@ class _TurnRenderer:
     run text; MEDIA and ask-user rewrites come from `note_turn_rewrite`.
     """
 
-    def __init__(self):
+    def __init__(self, lang: str = UI_LANG_DEFAULT):
+        self.lang = lang  # of the Pipe's notes (texts.py)
         self.visible_text = ""
         # As OWUI 0.12 stores a reply: `text` is `content`, `output` the
         # Responses items. A card baked into `content` is no card (ELI-92).
@@ -2193,6 +2356,8 @@ class _TurnRenderer:
         self._held = ""
         # The run's reply was a silent sentinel alone, not lost text.
         self.silenced = False
+        # The run yielded with no text after: its yield's acknowledgment, else None.
+        self.yielded: str | None = None
         self._compactions = 0
         self._compaction_note_id: str | None = None
         self._compaction_before = None
@@ -2302,6 +2467,7 @@ class _TurnRenderer:
     def _append_text(self, chunk: str) -> str:
         if not chunk:
             return ""
+        self.yielded = None
         if self.run_boundary:
             self.run_boundary = False
             chunk = _message_boundary_separator(self.text, chunk) + chunk
@@ -2336,13 +2502,12 @@ class _TurnRenderer:
         if phase == "start":
             self._compaction_note_id = nid
             self._compaction_before = data.get("tokensBefore")
-            return {"id": nid, "text": COMPACTING_NOTE}
+            return {"id": nid, "text": ui_text("compacting", self.lang)}
         self._compaction_note_id = None
         if data.get("completed") is True:
-            return {"id": nid, "text": _compacted_note(self._compaction_before)}
-        return {"id": nid, "text": {"skipped": COMPACTION_SKIPPED_NOTE,
-                                    "aborted": COMPACTION_STOPPED_NOTE}.get(data.get("outcome"),
-                                                                           COMPACTION_FAILED_NOTE)}
+            return {"id": nid, "text": _compacted_note(self._compaction_before, self.lang)}
+        return {"id": nid, "text": ui_text(COMPACTION_END_NOTES.get(data.get("outcome"), "compaction_failed"),
+                                           self.lang)}
 
     def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
         """The call's card, opened on first sight (start or result)."""
@@ -2469,6 +2634,9 @@ class _TurnRenderer:
                     name, args_str = deferred
                     result_str = _deferred_call_result_text(result_str)
                 failed = data.get("isError") is True
+                acknowledgment = _yield_acknowledgment(name, result_str, failed)
+                if acknowledgment is not None:
+                    self.yielded = acknowledgment
                 if _is_spawn_tool(name) and not failed:
                     result_str, failed = _spawn_result_view(args_str, result_str)
                 card_name, card_args = _tool_card_view(name, args_str)
@@ -3371,7 +3539,8 @@ class _GatewayConnection:
                                   "thinking": thinking, "request_task_id": request_task_id,
                                   "span_run": span_run, "steer_pending": steer_pending,
                                   "before": list(before or [])}
-        self._run_renderers[key] = _TurnRenderer()
+        self._run_renderers[key] = _TurnRenderer(
+            ui_lang_of((self.parse_owui_session_key(session_key) or (None, None))[0]))
         # Bound memory for runs that never end.
         if len(self._run_targets) > 100:
             for stale in list(self._run_targets)[:50]:
@@ -4839,14 +5008,15 @@ def _history_events(messages: list):
     A claude-cli closer repeats its run's text, so it counts only when the
     run carried none, and in place. Text after a tool call gets the live
     stream's separator (`sawToolUseSinceText`). A `message` tool send's
-    duplicate record is shown once (ELI-324)."""
+    duplicate record is shown once (ELI-324). Claude Code's `<synthetic>`
+    placeholder is skipped: as text it hid the closer after it (ELI-512)."""
     text = ""                 # what the events so far said
     sent_by_tool: set[str] = set()   # texts the agent's `message` tool already delivered
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
     reply_ended = False       # a reply of this run ended since the last text
     for message in messages:
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or _is_cli_synthetic_no_response(message):
             continue
         role = message.get("role")
         if role == "toolResult" and message.get("toolCallId"):
@@ -5637,9 +5807,9 @@ def _is_background_agent_launch(name, result_text, is_error=False) -> bool:
             and (result_text or "").strip().startswith(_AGENT_LAUNCHED_PREFIX))
 
 
-def _background_agents_line(n: int) -> str:
+def _background_agents_line(n: int, lang: str = UI_LANG_DEFAULT) -> str:
     """The status row of a reply a background agent holds open."""
-    return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
+    return ui_text("background_agents_one", lang) if n == 1 else ui_text("background_agents", lang, n=n)
 
 
 # Live view ids go into the URL as they are.
@@ -9463,6 +9633,17 @@ def _spawn_task_of(messages: list) -> str | None:
 # Wait for a /compact run: poll every _COMPACT_POLL_S seconds, give up after _COMPACT_DEADLINE_S
 # (`openclaw sessions compact`'s own default RPC timeout).
 _COMPACT_POLL_S = 1.5
+# A compaction run is over at any of these row statuses: 2026.11.5 ends a stopped,
+# timed-out or restart-cut run `killed`, `timeout` or `interrupted`; `cancelled`
+# is an older Gateway's stop (ELI-512).
+_COMPACT_ENDED_STATUSES = ("done", "failed", "cancelled", "killed", "timeout", "interrupted")
+# A session row whose run is live, starting (`queued`) included.
+_SESSION_LIVE_STATUSES = ("running", "queued")
+
+
+def _session_row_live(row: dict) -> bool:
+    """Whether a session row has a live run: 2026.11.5 reads `queued` while it starts one."""
+    return row.get("hasActiveRun") is True or row.get("status") in _SESSION_LIVE_STATUSES
 _COMPACT_DEADLINE_S = 180
 _COMPACT_HISTORY_ROWS = 10
 # The row can say "done" before the run's reply is in the history (2026.11.5 commits it after the run ends):
@@ -9929,6 +10110,9 @@ class Action:
             }))
             return provider, session_row
 
+        # The limits fill last shown: its "in progress" note follows the run (ELI-512).
+        limits_shown: dict = {}
+
         async def fill_limits():
             provider, session_row = await context_ready
             if provider is None:
@@ -9946,16 +10130,24 @@ class Action:
             if not windows_data and provider == "anthropic":
                 windows_data = await _claude_cli_usage_windows(conn)
 
-            await emit(_render_limits_fill_js({
+            limits_shown.update({
                 "provider": provider,
                 "windows": windows_data,
                 "entry": None if windows_data else _limits_entry_for(usage, provider),
                 # A live run is when usage.status can report zero windows.
-                "sessionActive": session_row.get("status") == "running",
+                "sessionActive": _session_row_live(session_row),
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
-            }))
+            })
+            await emit(_render_limits_fill_js(limits_shown))
+
+        async def refill_limits_activity(session_row):
+            """The limits note again once the run started or ended."""
+            live = _session_row_live(session_row)
+            if limits_shown and limits_shown["sessionActive"] != live:
+                limits_shown["sessionActive"] = live
+                await emit(_render_limits_fill_js(limits_shown))
 
         async def fill_background():
             await emit(_render_background_fill_js(
@@ -10151,7 +10343,8 @@ class Action:
                 conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
             await asyncio.wait([described])
             if described.exception() is None:
-                await fill_context(described)
+                _provider, session_row = await fill_context(described)
+                await refill_limits_activity(session_row)
             else:
                 pipe_log(f"[status-action] sessions.describe (follow) failed: {described.exception()}")
             running = _running_row(described) or conn.has_reply(session_key)
@@ -10348,7 +10541,7 @@ class Action:
                 continue
             row = (desc or {}).get("session") or {}
             status = row.get("status")
-            if status in ("done", "failed", "cancelled"):
+            if status in _COMPACT_ENDED_STATUSES:
                 break
             # From 2026.11.5 a compaction clears the row's run fields, so its status never says "done":
             # the run is over when its own reply is in the history and no run is active.
@@ -10358,7 +10551,7 @@ class Action:
                     status = "done"
                     break
 
-        if status not in ("done", "failed", "cancelled"):
+        if status not in _COMPACT_ENDED_STATUSES:
             await __event_emitter__({
                 "type": "execute",
                 "data": {"code": _render_sections_error_js(

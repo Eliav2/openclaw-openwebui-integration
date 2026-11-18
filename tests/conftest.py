@@ -21,3 +21,17 @@ except ModuleNotFoundError as exc:
         raise
     # not installed here: the per-suite stub is the fallback
 
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ui_languages():
+    """Each test starts with no user's UI language remembered (texts.py `_UI_LANG_BY_USER`):
+    a Hebrew request in one test must not turn another test's writer Hebrew."""
+    yield
+    for name in ("openclaw_pipe", "openclaw_status_action"):
+        languages = getattr(sys.modules.get(name), "_UI_LANG_BY_USER", None)
+        if languages is not None:
+            languages.clear()

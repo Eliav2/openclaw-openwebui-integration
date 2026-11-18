@@ -22,18 +22,19 @@ CRON_RESULT_WAIT_S = 120
 OPEN_AT_END_LOCKED_TRIES = 6
 # M's final write waits this long for the handed-over request to end.
 FINAL_STATUS_REQUEST_WAIT_S = 30
-# A cancel's tail on a reply's status lines: "Stopped" from `park`, then the
-# empty closing line.
-_CANCEL_STATUS_TAIL = ("Stopped", "")
+# A cancel's tail on a reply's status lines: "Stopped" from `park` (in any
+# UI language), then the empty closing line.
+_CANCEL_STATUS_TAIL = (*ui_texts("stopped"), "")
 
 
-def _final_status_history(history: list | None, lines: list, stopped: bool) -> tuple[list, list]:
+def _final_status_history(history: list | None, lines: list, stopped: bool,
+                          lang: str = UI_LANG_DEFAULT) -> tuple[list, list]:
     """M's final status lines (cancel tail dropped) and the ones it adds."""
     kept = [h for h in (history or []) if isinstance(h, dict)]
     while kept and kept[-1].get("done") is not False and kept[-1].get("description") in _CANCEL_STATUS_TAIL:
         kept.pop()
     if stopped:
-        new = [{"description": "Stopped", "done": True}]
+        new = [{"description": ui_text("stopped", lang), "done": True}]
     else:
         new = [{"description": line, "done": True} for line in lines] or [{"description": "", "done": True}]
     return kept + new, new
@@ -318,10 +319,6 @@ def _owui_request_task(task_id: str | None):
 # From 2026.11.5 a crash is not resumed: the idle session a restart leaves reads like one the Gateway is
 # about to recover, so the message waits this long for a recovery run before it ends as cut off.
 GATEWAY_RECOVERY_GRACE_S = 90
-GATEWAY_LOST_RUN_NOTE = "_(The Gateway restarted while this reply was running and did not continue it.)_"
-
-TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
-                     f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
 
 def _run_prompt_text(span: list | None) -> str:
@@ -448,14 +445,6 @@ def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
         have.add(item.get("id"))
 
 
-# Notes for a reply interrupted before it sent its message (ELI-188).
-REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
-                             "the answer is in the next reply.)_")
-REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
-# The Gateway (2026.10.10+) steers a message sent mid-run into that run.
-STEER_PENDING_STATUS = "Sent while the agent works: it reads it at its next step…"
-REPLY_SEND_FAILED_NOTE = ("_(This message was to go together with your next one, "
-                          "which could not be sent: see the next reply.)_")
 
 
 async def _close_reply_status(ref: dict) -> None:
@@ -555,7 +544,8 @@ def _steer_chain(history: dict, refs: list) -> list:
 
 # The Pipe's notes that a steered message's answer is in another reply: no
 # run text, and wrong once the settle gives the reply its answer.
-_STEER_NOTES = (REPLY_SENT_WITH_NEXT_NOTE, REPLY_SEND_FAILED_NOTE)
+# Notes for a reply interrupted before it sent its message (ELI-188), in every language.
+_STEER_NOTES = (*ui_texts("sent_with_next"), *ui_texts("send_failed"))
 
 
 def _settle_shown(content: str) -> str:
@@ -656,9 +646,9 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
 
 
 def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool,
-                        note: str | None = None) -> None:
+                        note: str | None = None, lang: str = UI_LANG_DEFAULT) -> None:
     """End each reply in `refs` in the background (`_close_unsent_reply`)."""
-    note = note or (REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE)
+    note = note or ui_text("sent_with_next" if sent else "not_sent", lang)
     for ref in refs:
         spawn_background(_close_unsent_reply(conn, ref, note))
 
@@ -820,9 +810,11 @@ class _TurnWriter:
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
+        # The user's UI language (texts.py): no request is behind a writer, so their last one's.
+        self.lang = ui_lang_of(user_id)
         # A pipe run's message already exists (Open WebUI's stub) (DESIGN 2.6).
         self.takeover = takeover
-        self.renderer = renderer if renderer is not None else _TurnRenderer()
+        self.renderer = renderer if renderer is not None else _TurnRenderer(self.lang)
         self.thinking = thinking  # ELI-85: a resume keeps the user's level
         # A cron wake (ELI-103): its transcript span is a time window.
         self.wake = wake
@@ -973,7 +965,7 @@ class _TurnWriter:
     async def working(self) -> None:
         """M's message went into the running run: show it as working."""
         if self.opened and not self.closed:
-            line = {"description": "Thinking...", "done": False}
+            line = {"description": ui_text("thinking", self.lang), "done": False}
             emit = await self._emitter()
             await emit({"type": "status", "data": line})
             # Saved too, for a tab that loads the chat now.
@@ -1186,7 +1178,7 @@ class _TurnWriter:
             except Exception as ex:
                 saved = {}
                 pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
-            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped)
+            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped, self.lang)
             whole = await self._persist(done=True, output=output, text=text, status_history=history)
             if whole:
                 try:
@@ -1263,7 +1255,7 @@ class _TurnWriter:
             return
         note = None
         if turn_owner(row, stop_notice_before) == "pipe":
-            note = TURN_CUT_OFF_NOTE
+            note = ui_text("turn_cut_off", self.lang, tries=MAX_TURN_RESUMES)
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             if not _is_model_silence(row["lastRunError"]):
                 request = self.request or (await self._run_request())[0]
@@ -1495,7 +1487,7 @@ class _TurnWriter:
                     self.steered_message = True
                 if self.steered_message and not self._showable():
                     # The later message's reply has the answer.
-                    note = note or REPLY_SENT_WITH_NEXT_NOTE
+                    note = note or ui_text("sent_with_next", self.lang)
                 elif not self._showable():
                     await self._show_silent_announce(hist)
             _keep_pipe_notes(streamed, self.renderer)
@@ -1665,9 +1657,9 @@ class _TurnWriter:
                 label = _spawn_title(args[data["toolCallId"]])
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
-        call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
+        call = _tool_call_started_event(ui_text("subagent_card", self.lang), tcid, args_str)["item"]
         call["status"] = "completed"
-        self.renderer = _TurnRenderer()
+        self.renderer = _TurnRenderer(self.lang)
         self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
         if not self.opened:
             # A message of its own (ELI-217): 2026.10.5 retries a silent
@@ -1754,7 +1746,7 @@ class _TurnWriter:
         if sep:
             first = next(i for i in rest_out if i.get("type") == "message")
             first["content"][0]["text"] = sep + first["content"][0]["text"]
-        composed = _TurnRenderer()
+        composed = _TurnRenderer(self.lang)
         composed.output = prefix_out + rest_out
         composed.text = composed.visible_text = prefix_text + sep + rest.text
         pipe_log(f"  turn writer: {self.message_id[:8]}... keeps {len(prefix_out)} streamed item(s) of "
@@ -2287,7 +2279,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                     writer.awaiting_row = False
                     pipe_log(f"  turn writer: {writer.message_id[:8]}... no recovery came in "
                              f"{GATEWAY_RECOVERY_GRACE_S} s: ends as cut off")
-                    await writer.finalize(GATEWAY_LOST_RUN_NOTE)
+                    await writer.finalize(ui_text("gateway_lost_run", writer.lang))
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                     return
                 continue
@@ -2754,7 +2746,9 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
 def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One closed run's messages, back to the previous run's closing message;
     None until it closes. `started_ms` cuts a silent previous run's leftovers
-    (ELI-227). The walk goes past steered-in messages (ELI-271) and drops a
+    (ELI-227); so does Claude Code's `<synthetic>` placeholder, which ends the
+    turn a yield ended (2026.11.5 sends its successor no lifecycle start,
+    ELI-512). The walk goes past steered-in messages (ELI-271) and drops a
     wake prompt that sorts inside the run."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
@@ -2767,7 +2761,8 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
             continue
         start, queued = end, set()
         while start > 0 and _run_closed_by(messages[start - 1]) in (None, run_id) \
-                and not _stamped_before(messages[start - 1], started_ms):
+                and not _stamped_before(messages[start - 1], started_ms) \
+                and not _is_cli_synthetic_no_response(messages[start - 1]):
             if (messages[start - 1] or {}).get("role") == "user":
                 if _history_queued_prompt(messages, start - 1, run_id):
                     queued.add(start - 1)
@@ -3117,12 +3112,7 @@ async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
 # WebUI restart mid-turn the stub stays "running" forever, so the first load
 # finishes it from the Gateway transcript.
 
-ORPHAN_STUB_NOTE = (
-    "*This reply was cut off before it finished (Open WebUI restarted or "
-    "lost the run), and no reply for it could be recovered from OpenClaw. "
-    "Send the message again if you still need an answer.*"
-)
-ORPHAN_STUB_SILENT_NOTE = "*The run for this message stopped without leaving a reply in the transcript.*"
+# Their notes are UI_TEXT's "orphan_stub" and "orphan_stub_silent".
 
 
 def _run_id_sent_at(run_id: str) -> float | None:
@@ -3346,14 +3336,14 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
     if turn and (turn["by"] == "id" or not has_content):
         rendered = _history_renderer(turn["messages"])
         if not rendered.text.strip() and not rendered.output and not has_content:
-            rendered._add_text(ORPHAN_STUB_SILENT_NOTE)
+            rendered._add_text(ui_text("orphan_stub_silent", ui_lang_of(chat.user_id)))
         if rendered.output:
             output = rendered.finished_output()
             text = rendered.text.strip()
             fields.update(content=text, output=output)
     elif not has_content:
         rendered = _TurnRenderer()
-        rendered._add_text(ORPHAN_STUB_NOTE)
+        rendered._add_text(ui_text("orphan_stub", ui_lang_of(chat.user_id)))
         output, text = rendered.finished_output(), rendered.text
         fields.update(content=text, output=output)
     async with conn._chat_write_lock(chat_id):

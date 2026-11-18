@@ -384,14 +384,17 @@ def open_fold(page: Page, name: str) -> None:
 
 # ── Page helpers ────────────────────────────────────────────────────
 
-def signed_in_page(browser, token: str, device: dict) -> Page:
+def signed_in_page(browser, token: str, device: dict, ui_locale: str | None = None) -> Page:
     """A page in a new context that starts signed in, in the light theme.
     The token is in the context's storage before any page loads: writing it
     from a loaded /auth page raced that page's own boot, which read the
-    token, lost its session request to the next navigation and removed it."""
-    ctx = browser.new_context(**device, locale="en-US", timezone_id="UTC", color_scheme="light",
-                              storage_state={"cookies": [], "origins": [{"origin": BASE, "localStorage": [
-                                  {"name": "token", "value": token}, {"name": "theme", "value": "light"}]}]})
+    token, lost its session request to the next navigation and removed it.
+    `ui_locale` (`he-IL`) is Open WebUI's UI language, which it keeps in the browser."""
+    stored = [{"name": "token", "value": token}, {"name": "theme", "value": "light"}]
+    if ui_locale:
+        stored.append({"name": "locale", "value": ui_locale})
+    ctx = browser.new_context(**device, locale=ui_locale or "en-US", timezone_id="UTC", color_scheme="light",
+                              storage_state={"cookies": [], "origins": [{"origin": BASE, "localStorage": stored}]})
     page = ctx.new_page()
     page.goto(BASE + "/")
     page.wait_for_selector("#chat-input", timeout=60_000)
@@ -446,6 +449,16 @@ def wait_js(page: Page, js: str, what: str, timeout_ms: int = TURN_TIMEOUT_MS) -
 
 
 LAST_ASSISTANT = "[...document.querySelectorAll('.chat-assistant')].pop()"
+# The last reply, between the top bar and the composer, as a shot's clip.
+LAST_REPLY_CLIP = f"""() => {{
+  const a = {LAST_ASSISTANT};
+  a.scrollIntoView({{block: 'end'}});
+  const nav = document.querySelector('nav');
+  const top = Math.max(a.getBoundingClientRect().top - 36, nav ? nav.getBoundingClientRect().bottom : 0);
+  const box = document.getElementById('message-input-container');
+  const bottom = Math.min(a.getBoundingClientRect().bottom + 8, box ? box.getBoundingClientRect().top : innerHeight);
+  return {{x: 0, y: top, width: innerWidth, height: bottom - top}};
+}}"""
 # The Send now arrow of a message Open WebUI queued above the composer.
 SEND_NOW_ICON = "M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18"
 # The Status dialog's sub-agent elapsed cells (the only 10 px spans in it).
@@ -460,7 +473,7 @@ GOAL_ANSWER = "Goal set: the hourly view on staging"
 # model answers the new message, so the rebuild's closing line is never said
 # and the new message shows the Pipe's pending note, not "Queued". Before it,
 # the message waits and the rebuild finishes first (writer.py
-# STEER_PENDING_STATUS; the E2E suite's _steers).
+# UI_TEXT "steer_pending"; the E2E suite's _steers).
 STEER_RELEASE = (2026, 10, 10)
 STEER_PENDING = "it reads it at its next step"
 QUEUED_NOTE = "Queued"
@@ -953,18 +966,23 @@ class Scenes:
                 "the waiting line", 90_000)
         set_title(self.token, chat, "Station vendors")
         print("  reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:300]), flush=True)
-        clip = f"""() => {{
-          const a = {LAST_ASSISTANT};
-          a.scrollIntoView({{block: 'end'}});
-          const nav = document.querySelector('nav');
-          const top = Math.max(a.getBoundingClientRect().top - 36, nav ? nav.getBoundingClientRect().bottom : 0);
-          const box = document.getElementById('message-input-container');
-          const bottom = Math.min(a.getBoundingClientRect().bottom + 8, box ? box.getBoundingClientRect().top : innerHeight);
-          return {{x: 0, y: top, width: innerWidth, height: bottom - top}};
-        }}"""
-        self.s.shot(page, "background-agent-waiting", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
+        self.s.shot(page, "background-agent-waiting", clip_js=LAST_REPLY_CLIP, text_selector=".chat-assistant >> nth=-1")
         # The reply ends before the next scene starts.
         wait_js(page, last_text_has("when it is in"), "the reply's end", 90_000)
+
+    def hebrew_status(self, page: Page) -> None:
+        """ELI-512: in a Hebrew Open WebUI the reply's status row is Hebrew (texts.py), here the
+        background agent line of the scene above."""
+        new_chat(page)
+        chat = send(page, "תבדוק לי את ספקי תחנות מזג האוויר.")
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT}; if (!a) return false; const t = a.innerText;
+                  return t.includes('מחכה לעוזר שעובד ברקע') && t.includes('אותו חיישן'); }}""",
+                "the Hebrew waiting line", 90_000)
+        set_title(self.token, chat, "ספקי תחנות")
+        print("  reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:300],
+                                       ensure_ascii=False), flush=True)
+        self.s.shot(page, "hebrew-status", clip_js=LAST_REPLY_CLIP, text_selector=".chat-assistant >> nth=-1")
+        wait_js(page, last_text_has("כשהדוח יגיע"), "the reply's end", 90_000)
 
     def model_picker(self, page: Page) -> None:
         new_chat(page)
@@ -1594,6 +1612,9 @@ def main(argv=None) -> int:
                 shooter.run("status-dialog-scrolled", scenes.background_scrolled, small)
                 small.context.close()
             shooter.run("background-agent-waiting", scenes.background_agent, page)
+            hpage = signed_in_page(browser, token, PHONE, ui_locale="he-IL")
+            shooter.run("hebrew-status", scenes.hebrew_status, hpage)
+            hpage.context.close()
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("claude-login-prompts", scenes.claude_login_prompts, page)
             shooter.run("slash-commands", scenes.slash_commands, page)

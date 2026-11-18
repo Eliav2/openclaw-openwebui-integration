@@ -31,12 +31,12 @@ class CompactionNoteTests(unittest.TestCase):
         # A size shows only when the Gateway itself sends one.
         [started] = [e for e in r.feed(compaction("start", tokensBefore=182_000)) if e]
         self.assertEqual(started["type"], "response.output_item.added")
-        self.assertEqual(texts(r), ["before", ocp.COMPACTING_NOTE])
+        self.assertEqual(texts(r), ["before", ocp.ui_text("compacting")])
         [ended] = [e for e in r.feed(compaction("end", completed=True)) if e]
         self.assertEqual(ended["item"]["id"], started["item"]["id"], "the same note, replaced")
         note = texts(r)[-1]
         self.assertTrue(note.startswith("<details>\n<summary>🧹 Context compacted · was ~182k tokens</summary>"))
-        self.assertIn(ocp.COMPACTED_BODY, note)
+        self.assertIn(ocp.ui_text("compacted_body"), note)
         self.assertTrue(note.endswith("</details>"))
         self.assertEqual(r.text, "before", "a note is not run text")
 
@@ -59,11 +59,11 @@ class CompactionNoteTests(unittest.TestCase):
         r = ocp._TurnRenderer()
         r.feed(compaction("start"))
         r.feed(compaction("end", completed=False))
-        self.assertEqual(texts(r), [ocp.COMPACTION_FAILED_NOTE])
+        self.assertEqual(texts(r), [ocp.ui_text("compaction_failed")])
 
     def test_a_skipped_or_stopped_compaction_says_which(self):
-        for outcome, note in (("skipped", ocp.COMPACTION_SKIPPED_NOTE), ("aborted", ocp.COMPACTION_STOPPED_NOTE),
-                              ("failed", ocp.COMPACTION_FAILED_NOTE)):
+        for outcome, note in (("skipped", ocp.ui_text("compaction_skipped")), ("aborted", ocp.ui_text("compaction_stopped")),
+                              ("failed", ocp.ui_text("compaction_failed"))):
             r = ocp._TurnRenderer()
             r.feed(compaction("start"))
             r.feed(compaction("end", completed=False, outcome=outcome))
@@ -102,7 +102,7 @@ class CompactionNoteTests(unittest.TestCase):
         r.feed({"stream": "assistant", "data": {"delta": "NO"}})
         added = r.feed(compaction("start"))
         self.assertEqual(added[0], "NO")
-        self.assertEqual(texts(r), ["NO", ocp.COMPACTING_NOTE])
+        self.assertEqual(texts(r), ["NO", ocp.ui_text("compacting")])
 
     def test_a_rebuild_keeps_the_note(self):
         streamed = ocp._TurnRenderer()

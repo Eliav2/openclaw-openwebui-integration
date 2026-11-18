@@ -77,7 +77,7 @@ from openclaw_pipe import (
     _stub_turn,
     _history_user_run_id,
     _reconcile_stub,
-    ORPHAN_STUB_NOTE,
+    ui_text,
     TOOL_ERROR_MARK,
     TOOL_NO_RESULT_NOTE,
     _FALLBACK_MODELS,
@@ -790,7 +790,7 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.history, self.active = {"messages": []}, False
         await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
         self.assertIs(self._stub()["done"], True)
-        self.assertEqual(self._stub()["content"], ORPHAN_STUB_NOTE)
+        self.assertEqual(self._stub()["content"], ui_text("orphan_stub"))
 
     async def test_content_a_stub_already_shows_is_not_replaced_on_a_text_match(self):
         self.history, self.active = _turn_history(run="msg-c-1.0"), False
@@ -846,7 +846,7 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("openclaw_pipe._owui_process_started_at", return_value=1_000_000.5):
             self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "done")
         self.assertIs(self._stub()["done"], True)
-        self.assertEqual(self._stub()["content"], ORPHAN_STUB_NOTE)
+        self.assertEqual(self._stub()["content"], ui_text("orphan_stub"))
 
     async def test_a_stub_from_the_second_this_process_started_is_not_counted_as_older(self):
         self.history, self.active = {"messages": []}, False
@@ -1837,7 +1837,7 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
             p.stop()
 
     def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None, user_valves=None,
-               user_settings=None):
+               user_settings=None, variables=None):
         """`image`: base64 data of a PNG attached to the message. `user_valves`: the user's valves as
         Open WebUI passes them in `__user__`. `user_settings`: the user's Open WebUI settings (the
         Pipe's own key is in them, ELI-442), also in `__user__`."""
@@ -1857,7 +1857,8 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
                 "messages": [{"role": "user", "content": content}]}
         if thinking:
             body["reasoning_effort"] = thinking
-        meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id}
+        meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id,
+                **({"variables": variables} if variables else {})}
         user = ({"id": "u1", **({"valves": user_valves} if user_valves is not None else {}),
                  **({"settings": user_settings} if user_settings is not None else {})}
                 if user_valves is not None or user_settings is not None else None)
@@ -2406,6 +2407,75 @@ class NoDroppedMessagesTests(_TurnCase):
                  and (c.get("item") or {}).get("type") == "function_call"]
         self.assertEqual(len(cards), 1, "the card stays")
 
+    def _yield_events(self, run_id, result, is_error=False):
+        """A spawn, then a `sessions_yield` with `result` (claude-cli's MCP names, 2026.11.5)."""
+        def tool(tcid, name, phase, **data):
+            return {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": run_id, "stream": "tool",
+                "data": {"phase": phase, "name": name, "toolCallId": tcid, **data}}}
+        return [*self._spawn_card_events(run_id),
+                tool("t2", "mcp__openclaw__sessions_yield", "start",
+                     args={"acknowledgment": "Waiting for helper."}),
+                tool("t2", "mcp__openclaw__sessions_yield", "result",
+                     result=json.dumps(result), isError=is_error)]
+
+    async def _yield_reply_text(self, events, variables=None):
+        gen = self._reply("start one and wait", "m1", variables=variables)
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in events:
+            self._queue("run-1").put_nowait(ev)
+        chunks = [await asyncio.wait_for(first, 2)]
+        chunks += [c async for c in gen]
+        return "".join(c for c in chunks if isinstance(c, str))
+
+    async def test_a_run_that_yields_to_its_sub_agent_ends_with_its_acknowledgment(self):
+        """ELI-512: from 2026.11.5 an accepted yield ends the run; the reply said "(This turn
+        produced no reply text.)" while the sub-agent's answer was on its way as a new run."""
+        out = await self._yield_reply_text([
+            *self._yield_events("run-1", {"status": "yielded", "acknowledgment": "Waiting for helper."}),
+            self._final("run-1")])
+        self.assertNotIn("no reply text", out)
+        self.assertTrue(out.rstrip().endswith("Waiting for helper."), out)
+
+    async def test_a_yield_with_no_acknowledgment_says_the_answer_comes_next(self):
+        out = await self._yield_reply_text([*self._yield_events("run-1", {"status": "yielded"}),
+                                      self._final("run-1")])
+        self.assertNotIn("no reply text", out)
+        self.assertIn(openclaw_pipe.ui_text("yield_wait"), out)
+
+    async def test_the_answer_comes_next_line_is_in_the_users_language(self):
+        out = await self._yield_reply_text([*self._yield_events("run-1", {"status": "yielded"}),
+                                            self._final("run-1")],
+                                           variables={"{{USER_LANGUAGE}}": "he-IL"})
+        self.assertIn(openclaw_pipe.ui_text("yield_wait", "he"), out)
+
+    async def test_a_run_the_gateway_ends_as_yielded_says_the_answer_comes_next(self):
+        """2026.11.5's lifecycle end says `yielded: true` (live capture), on any runtime."""
+        out = await self._yield_reply_text([
+            {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+                "data": {"phase": "end", "stopReason": "end_turn", "yielded": True}}},
+            self._final("run-1")])
+        self.assertNotIn("no reply text", out)
+        self.assertIn(openclaw_pipe.ui_text("yield_wait"), out)
+
+    async def test_a_refused_yield_still_says_the_turn_had_no_text(self):
+        out = await self._yield_reply_text([
+            *self._yield_events("run-1", {"status": "error", "error": "nothing pending"}, is_error=True),
+            self._final("run-1")])
+        self.assertIn("no reply text", out)
+        self.assertNotIn(openclaw_pipe.ui_text("yield_wait"), out)
+
+    async def test_text_after_a_yield_is_the_reply_with_no_waiting_line(self):
+        """Before 2026.11.5 the run stays open through the yield and answers in it (ELI-56)."""
+        out = await self._yield_reply_text([
+            *self._yield_events("run-1", {"status": "yielded", "acknowledgment": "Waiting for helper."}),
+            self._delta("run-1", "It said 51."), self._final("run-1")])
+        self.assertIn("It said 51.", out)
+        self.assertNotIn("Waiting for helper.", out)
+        self.assertNotIn(openclaw_pipe.ui_text("yield_wait"), out)
+
     async def test_a_run_with_no_text_and_no_card_still_says_so(self):
         out = await self._reply_text([self._final("run-1")])
         self.assertIn("no reply text", out)
@@ -2890,7 +2960,7 @@ class NoDroppedMessagesTests(_TurnCase):
         await self._until_registered("run-1")
         self.assertEqual(self.sent, ["second\n\nthird"])
         await self._spin()
-        self.assertEqual(closed, [("m2", self.ocp.REPLY_SENT_WITH_NEXT_NOTE)])
+        self.assertEqual(closed, [("m2", self.ocp.ui_text("sent_with_next"))])
         self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
         self._queue("run-1").put_nowait(self._final("run-1"))
         await nxt
@@ -2911,7 +2981,7 @@ class NoDroppedMessagesTests(_TurnCase):
             if closed:
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(closed, [("m2", self.ocp.REPLY_NOT_SENT_NOTE)])
+        self.assertEqual(closed, [("m2", self.ocp.ui_text("not_sent"))])
         self.assertEqual(self.sent, [])
 
     async def test_two_interrupted_replies_both_end_when_the_third_sends(self):
@@ -2933,8 +3003,8 @@ class NoDroppedMessagesTests(_TurnCase):
         await self._until_registered("run-1")
         await self._spin()
         self.assertEqual(self.sent, ["a\n\nb\n\nc"])
-        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_SENT_WITH_NEXT_NOTE),
-                                          ("m3", self.ocp.REPLY_SENT_WITH_NEXT_NOTE)])
+        self.assertEqual(sorted(closed), [("m2", self.ocp.ui_text("sent_with_next")),
+                                          ("m3", self.ocp.ui_text("sent_with_next"))])
         self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
         self._queue("run-1").put_nowait(self._final("run-1"))
         await nxt
@@ -3054,7 +3124,7 @@ class NoDroppedMessagesTests(_TurnCase):
                 self._drain(self._reply("hi", "m2", image=self._noise_png((1600, 1200)))), 30)
         self.assertIn("Couldn't send the image", out)
         ended.assert_called_once_with(self.conn, ["earlier reply"], sent=False,
-                                      note=self.ocp.REPLY_SEND_FAILED_NOTE)
+                                      note=self.ocp.ui_text("send_failed"))
         self.assertEqual(self.sent, [])
 
     async def test_photos_of_different_chats_are_shrunk_one_at_a_time(self):
@@ -3158,8 +3228,8 @@ class NoDroppedMessagesTests(_TurnCase):
         await self._spin()
         self.assertEqual(self.sent, ["a\n\nb\n\nc"])
         self.assertEqual(self.sent_images, [[("image-1.png", "QUFB"), ("image-2.png", "Q0ND")]])
-        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_SENT_WITH_NEXT_NOTE),
-                                          ("m3", self.ocp.REPLY_SENT_WITH_NEXT_NOTE)])
+        self.assertEqual(sorted(closed), [("m2", self.ocp.ui_text("sent_with_next")),
+                                          ("m3", self.ocp.ui_text("sent_with_next"))])
         self.assertEqual(await reads[0][1], "")
         self.assertEqual(await reads[1][1], "")
         self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
@@ -3263,8 +3333,8 @@ class NoDroppedMessagesTests(_TurnCase):
             if len(closed) == 2:
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_NOT_SENT_NOTE),
-                                          ("m3", self.ocp.REPLY_NOT_SENT_NOTE)])
+        self.assertEqual(sorted(closed), [("m2", self.ocp.ui_text("not_sent")),
+                                          ("m3", self.ocp.ui_text("not_sent"))])
         self.assertEqual(self.sent, [])
 
     async def test_waiting_messages_with_other_thinking_levels_go_apart(self):
@@ -3294,7 +3364,7 @@ class NoDroppedMessagesTests(_TurnCase):
             if closed:
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(closed, [("m2", self.ocp.REPLY_SEND_FAILED_NOTE)])
+        self.assertEqual(closed, [("m2", self.ocp.ui_text("send_failed"))])
 
     async def test_a_stop_while_messages_wait_drops_them_all(self):
         """Stop while messages wait: each is dropped and says so."""
@@ -3315,8 +3385,8 @@ class NoDroppedMessagesTests(_TurnCase):
             if len(closed) == 2:
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_NOT_SENT_NOTE),
-                                          ("m3", self.ocp.REPLY_NOT_SENT_NOTE)])
+        self.assertEqual(sorted(closed), [("m2", self.ocp.ui_text("not_sent")),
+                                          ("m3", self.ocp.ui_text("not_sent"))])
         self.assertEqual(self.sent, [])
 
     def _record_status_closes(self):
@@ -4026,14 +4096,14 @@ class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
                "request_task_id": "task-2"}
         with mock.patch.dict(sys.modules, modules):
             close = asyncio.ensure_future(ocp._close_unsent_reply(
-                conn, ref, ocp.REPLY_SENT_WITH_NEXT_NOTE))
+                conn, ref, ocp.ui_text("sent_with_next")))
             for _ in range(20):
                 await asyncio.sleep(0)
             self.assertEqual(order, [], "Open WebUI's own end-of-request save comes first")
             release.set()
             await asyncio.wait_for(close, 5)
         self.assertEqual(order[0], "request-ended")
-        note = ocp.REPLY_SENT_WITH_NEXT_NOTE
+        note = ocp.ui_text("sent_with_next")
         (cid, mid, msg), = upserts
         self.assertEqual((cid, mid, msg["content"], msg["done"]), ("chat-1", "m2", note, True))
         self.assertEqual(msg["output"][-1]["content"][0]["text"], note)
@@ -4073,9 +4143,9 @@ class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(sys.modules, modules):
             await ocp._close_unsent_reply(
                 _GatewayConnection(lambda: None),
-                {"chat_id": "c", "user_id": "u", "message_id": "m"}, ocp.REPLY_NOT_SENT_NOTE)
+                {"chat_id": "c", "user_id": "u", "message_id": "m"}, ocp.ui_text("not_sent"))
         (msg,) = upserts
-        self.assertEqual(msg["content"], f"earlier run text\n\n{ocp.REPLY_NOT_SENT_NOTE}")
+        self.assertEqual(msg["content"], f"earlier run text\n\n{ocp.ui_text('not_sent')}")
         self.assertEqual(len(msg["output"]), 2)
 
 
@@ -9566,7 +9636,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         await w.feed({"runId": "steered-run", "sessionKey": self.KEY, "state": "final"})
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "active-run"})
         self.assertIs(self.m()["done"], True)
-        self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+        self.assertEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
 
     # A Pipe reply run, as `pipe_run_id` names it.
     STEERED = "msg-c0ffee00-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000002-1.0"
@@ -9780,7 +9850,7 @@ class TurnWriterEndTests(_TurnWriterCase):
              "stopReason": "stop", "__openclaw": {"runId": "R1"}}))
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
         self.assertIs(self.m()["done"], True)
-        self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+        self.assertEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
 
     async def test_a_gateway_that_never_steers_never_says_sent_with_next(self):
         """A Gateway before 2026.10.10 never steers, so the transcript shape alone does not set the
@@ -9797,7 +9867,7 @@ class TurnWriterEndTests(_TurnWriterCase):
              "stopReason": "stop", "__openclaw": {"runId": "R1"}}))
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
         self.assertIs(self.m()["done"], True)
-        self.assertNotEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+        self.assertNotEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
 
     async def test_a_steered_reply_waits_for_its_message_to_be_committed(self):
         """The idle row can come before the steered message is committed: the reply waits for the
@@ -10115,7 +10185,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertTrue(sends[0].startswith("msg-c1-m2-resume-"))
         self.assertTrue(mine.closed)
         self.assertIs(self.m()["done"], True)
-        self.assertIn(openclaw_pipe.TURN_CUT_OFF_NOTE, self.m()["content"])
+        self.assertIn(openclaw_pipe.ui_text("turn_cut_off", tries=openclaw_pipe.MAX_TURN_RESUMES), self.m()["content"])
 
     async def test_a_row_naming_the_writers_resume_run_resumes_again(self):
         w = await self.opened_writer()
@@ -10763,7 +10833,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         empty, until its answer ends it."""
         self.conn.gateway_version = "2026.10.10"
         run = pipe_run_id(self.CHAT, self.STUB)
-        pending = {"description": openclaw_pipe.STEER_PENDING_STATUS, "done": False}
+        pending = {"description": openclaw_pipe.ui_text("steer_pending"), "done": False}
         self.add_stub(self.STUB, statusHistory=[pending])
         request = asyncio.get_running_loop().create_future()
         self.owui.request_tasks["req-1"] = request
@@ -16947,7 +17017,7 @@ class MidRunSteeringTests(_TurnCase):
         await self._until_registered(self.R2)
         self.assertEqual(self.sent[-1], "Stop and say banana", "sent while the run works")
         self.assertFalse(any("Queued: waiting" in str(e) for e in self.emitted))
-        self.assertTrue(any(self.ocp.STEER_PENDING_STATUS in str(e) for e in self.emitted),
+        self.assertTrue(any(self.ocp.ui_text("steer_pending") in str(e) for e in self.emitted),
                         "the reply says its message went to the running agent")
 
         await self._dispatch(
@@ -17179,7 +17249,7 @@ class MidRunSteeringTests(_TurnCase):
         out_b, _ = await self._collect(first_b, gen_b)
         out_c, _ = await self._collect(first_c, gen_c)
         self.assertEqual(out_a.strip(), "ROUND 1")
-        self.assertEqual(out_b.strip(), self.ocp.REPLY_SENT_WITH_NEXT_NOTE)
+        self.assertEqual(out_b.strip(), self.ocp.ui_text("sent_with_next"))
         self.assertEqual(out_c.strip(), "Both asides answered.")
 
     async def test_a_steer_takes_the_run_over_from_its_turn_writer(self):
@@ -17363,7 +17433,7 @@ class MidRunSteeringTests(_TurnCase):
         """A message taken in after Stop finalized M leaves M finished (#300)."""
         emit = mock.AsyncMock()
         writer = types.SimpleNamespace(opened=True, closed=True, _emitter=mock.AsyncMock(return_value=emit),
-                                       conn=self.conn, chat_id=self.CHAT, message_id="w2")
+                                       conn=self.conn, chat_id=self.CHAT, message_id="w2", lang="en")
         saved = {"statusHistory": [{"description": "Sent while the agent works", "done": False}]}
         chats = types.SimpleNamespace(get_message_by_id_and_message_id=mock.AsyncMock(return_value=saved))
         models = types.ModuleType("open_webui.models.chats")
@@ -17857,7 +17927,7 @@ class MidRunSteeringTests(_TurnCase):
         reply its answer (#379 review)."""
         first, tomato, blue = self._refs()
         saved = {first["message_id"]: self._msg(self.WHOLE),
-                 tomato["message_id"]: self._msg(openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE),
+                 tomato["message_id"]: self._msg(openclaw_pipe.ui_text("sent_with_next")),
                  blue["message_id"]: self._msg("E2E_CLI_REPLY")}
         upserts, logged = await self._settle([first, tomato], saved, self._late_steer_transcript())
         self.assertEqual(sorted(upserts), sorted([first["message_id"], tomato["message_id"]]), (upserts, logged))
