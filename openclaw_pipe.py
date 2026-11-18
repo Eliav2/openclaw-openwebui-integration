@@ -5805,6 +5805,78 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
     )
 
 
+# Open WebUI (v0.13.3) renders a `<details>` block only in the shape of its own: `<details ...>`
+# ending its line and `<summary>...</summary>` ending the next (src/lib/utils/marked/extension.ts:
+# 34-35). Any other shape is an HTML token, which a chat shows as plain text (HTMLToken.svelte:139).
+_DETAILS_OPEN = "<details"
+_DETAILS_OPEN_TAG = re.compile(r"<details(?:\s[^>]*)?>")
+_SUMMARY_OPEN = "<summary>"
+_SUMMARY_TAG = re.compile(r"<summary>.*?</summary>")
+_CODE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_LINE_END = "\n"
+DETAILS_LINE_HOLD_MAX = 2000  # a line held as a possible `<details` line is let go past this
+
+
+class _DetailsShaper:
+    """Puts a model's `<details><summary>S</summary>...` block, written on one line, in the lines
+    Open WebUI renders as a collapsible (ELI-512), as text streams in. Only a line that starts
+    with the tag is touched, never one in a code fence. Such a line is held until it ends; any
+    other is passed on as it comes."""
+
+    def __init__(self):
+        self.line = ""           # the current line so far
+        self.held = True         # whether it is still held (it may be a `<details` line)
+        self.fence = ""          # the open code fence's marker, if any
+        self.after_open = False  # the last line opened a `<details` with no summary
+
+    def _may_shape(self, line: str) -> bool:
+        if self.fence or len(line) > DETAILS_LINE_HOLD_MAX:
+            return False
+        tags = (_DETAILS_OPEN, _SUMMARY_OPEN) if self.after_open else (_DETAILS_OPEN,)
+        return any(tag.startswith(line) or line.startswith(tag) for tag in tags)
+
+    def _shape(self, line: str) -> str:
+        body, end = (line[:-1], _LINE_END) if line.endswith(_LINE_END) else (line, "")
+        parts, opened = [], False
+        tag = _DETAILS_OPEN_TAG.match(body)
+        if tag:
+            parts, body, opened = [tag.group(0)], body[tag.end():].lstrip(), True
+        if tag or self.after_open:
+            summary = _SUMMARY_TAG.match(body)
+            if summary:
+                parts, body, opened = parts + [summary.group(0)], body[summary.end():].lstrip(), False
+        self.after_open = opened
+        if not parts:
+            return line
+        return _LINE_END.join(parts + ([body] if body else [])) + end
+
+    def _end_line(self) -> None:
+        fence = _CODE_FENCE.match(self.line)
+        if fence and (not self.fence or fence.group(1).startswith(self.fence)):
+            self.fence = "" if self.fence else fence.group(1)
+        self.line, self.held = "", True
+
+    def feed(self, chunk: str) -> str:
+        out = []
+        for ch in chunk:
+            self.line += ch
+            if not self.held:
+                out.append(ch)
+            elif ch == _LINE_END:
+                out.append(self._shape(self.line))
+            elif not self._may_shape(self.line):
+                out.append(self.line)
+                self.held, self.after_open = False, False
+            if ch == _LINE_END:
+                self._end_line()
+        return "".join(out)
+
+    def flush(self) -> str:
+        line, held = self.line, self.held
+        self._end_line()
+        return self._shape(line) if held else ""
+
+
 class _TurnRenderer:
     """Rebuild a run's visible content (text, tool cards, Pipe notes) from its
     Gateway events, as the inline reply renders it. The turn writer uses it to
@@ -5833,6 +5905,8 @@ class _TurnRenderer:
         self.run_boundary = False
         # A possible silent sentinel at a message start (`_add_text`).
         self._held = ""
+        # A model's `<details>` line, put in Open WebUI's shape (`_add_text`).
+        self._details = _DetailsShaper()
         # The run's reply was a silent sentinel alone, not lost text.
         self.silenced = False
         # The run yielded with no text after: its yield's acknowledgment, else None.
@@ -5916,6 +5990,10 @@ class _TurnRenderer:
         """Append `chunk`; returns it as added. A leading silent sentinel is
         held: followed by more text it is dropped (ELI-219), alone it stays out
         (`flush`)."""
+        return self._add_shaped(self._details.feed(chunk or ""))
+
+    def _add_shaped(self, chunk: str) -> str:
+        """`_add_text` for text the `<details` shaper already passed."""
         if not chunk:
             return ""
         last = self.output[-1] if self.output else None
@@ -5936,12 +6014,13 @@ class _TurnRenderer:
 
     def flush(self) -> str:
         """Release held text unless it is a sentinel; returns it as added."""
+        shaped = self._add_shaped(self._details.flush())
         held, self._held = self._held, ""
         if held.strip() in _SILENT_SENTINELS:
             self.silenced = True
         if not held.strip() or held.strip() in _SILENT_SENTINELS:
-            return ""
-        return self._append_text(held)
+            return shaped
+        return shaped + self._append_text(held)
 
     def _append_text(self, chunk: str) -> str:
         if not chunk:
@@ -9899,12 +9978,36 @@ STOPPED_SAVE_WAIT_S = 10.0
 STOPPED_SAVE_POLL_S = 0.25
 
 
+# The statuses Open WebUI's cancel save leaves on a card it found unfinished.
+STOPPED_CARD_STATUSES = frozenset({"incomplete", "in_progress"})
+
+
+def _close_stopped_cards(output: list, lang: str) -> bool:
+    """Close the cards a Stop left unfinished, in place, as a finished reply's are
+    (`_TurnRenderer.finished_output`): completed, a call with no result answered "Stopped".
+    Open WebUI's cancel save marks every card still `in_progress` `incomplete`, and a group
+    shows no labels for those, only the tools' names (ELI-512). Whether it changed any."""
+    answered = {i.get("call_id") for i in output if isinstance(i, dict) and i.get("type") == _CALL_OUTPUT_ITEM}
+    changed = False
+    for at in range(len(output) - 1, -1, -1):
+        item = output[at]
+        if not isinstance(item, dict) or item.get("type") != _CALL_ITEM \
+                or item.get("status") not in STOPPED_CARD_STATUSES:
+            continue
+        item["status"], changed = "completed", True
+        call_id = item.get("call_id") or item.get("id")
+        if call_id and call_id not in answered:
+            output.insert(at + 1, _tool_call_result_event(call_id, ui_text("stopped", lang))["item"])
+    return changed
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, *,
                               only_if_empty: bool = False) -> None:
     """End a reply cancelled before it sent its message, with `note`. Waits
     for the request to end first, or Open WebUI's own save lands over this.
-    `only_if_empty`: a reply stopped before any text gets `note` as its content,
-    one with content stays as it is, its "Stopped" status line too."""
+    `only_if_empty`: a stopped reply (ELI-512). One stopped before any text gets
+    `note` as its content; one with content keeps it and its "Stopped" status
+    line. Either way its cards are closed (`_close_stopped_cards`)."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
@@ -9929,12 +10032,25 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
             current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
             text = (current.get("content") or "").strip()
             if only_if_empty and text:
+                output = copy.deepcopy(list(current.get("output") or []))
+                if not _close_stopped_cards(output, ref.get("lang") or UI_LANG_DEFAULT):
+                    return
+                if not await _owui_upsert_message(chat_id, message_id, {"output": output}):
+                    pipe_log(f"  reply {message_id[:8]}...: closing its stopped cards failed")
+                    return
+                try:
+                    await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
+                        message_id, None, {**current, "output": output, "id": message_id}), None, message_id)
+                except Exception as ex:
+                    pipe_log(f"  reply {message_id[:8]}...: pushing its stopped cards failed: {ex!r}")
                 return
             text = f"{text}\n\n{note}" if text else note
             output = list(current.get("output") or [])
             # The cards the reply showed when it was stopped, should the save have missed one.
             have = {i.get("id") for i in output if isinstance(i, dict)}
             output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
+            if only_if_empty:
+                _close_stopped_cards(output, ref.get("lang") or UI_LANG_DEFAULT)
             output.append(_turn_note_item(note))
             fields = {"content": text, "output": output, "done": True}
             if only_if_empty:
@@ -17976,24 +18092,28 @@ class _PipeTurn:
         self.stopped_shown = True
         if self.status_closed:
             spawn_background(self.show_stopped())
-        reply = self.stopped_reply_ref()
+        reply = self.stopped_ref()
         if reply is not None:
-            # Stopped before any text: the saved reply says so, after Open WebUI's own
-            # end-of-reply save, so a reload and the chat's preview show it (ELI-512).
+            # After Open WebUI's own end-of-reply save: its cards are closed, and one stopped
+            # before any text says so, so a reload and the chat's preview show it (ELI-512).
             spawn_background(_close_unsent_reply(self.conn, reply, ui_text("stopped_reason", self.lang),
                                                  only_if_empty=True))
 
     def stopped_reply_ref(self) -> dict | None:
         """This reply's message, when it was stopped before showing any run text; else None."""
+        # What the reply shows, not the run's raw text: a held MEDIA line is in that but not shown.
+        return None if getattr(self, "visible_message_text", "").strip() else self.stopped_ref()
+
+    def stopped_ref(self) -> dict | None:
+        """This stopped reply's message, for `_close_unsent_reply`; None in a channel."""
         chat_id, message_id = getattr(self, "owui_origin_chat_id", None), getattr(self, "owui_message_id", None)
         renderer = getattr(self, "renderer", None)
-        # What the reply shows, not the run's raw text: a held MEDIA line is in that but not shown.
-        if getattr(self, "visible_message_text", "").strip() or not chat_id or not message_id \
-                or getattr(self, "channel_id", None):
+        if not chat_id or not message_id or getattr(self, "channel_id", None):
             return None
         return {"chat_id": chat_id, "message_id": message_id,
                 "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
                 "request_task_id": (self.__metadata__ or {}).get("task_id"),
+                "lang": getattr(self, "lang", UI_LANG_DEFAULT),
                 # Its cards as the run had them, closed: what it showed when it was stopped.
                 "output": [i for i in (renderer.finished_output() if renderer is not None else [])
                            if i.get("type") in ("function_call", "function_call_output")]}

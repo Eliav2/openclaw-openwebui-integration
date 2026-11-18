@@ -579,6 +579,8 @@ def test_a_hebrew_ui_shows_the_pipes_status_lines_in_hebrew(page, token):
         ctx.close()
 
 
+# Open WebUI's Stop button in Hebrew.
+HEBREW_STOP = "עצור"
 # A reply's body (Open WebUI's ResponseMessage), apart from its status rows.
 REPLY_BODY = "#response-content-container"
 
@@ -623,6 +625,43 @@ def test_a_reply_stopped_before_any_text_says_stopped(page, token):
     _wait(page, _body_text_js(0, "Stopped."), "Stopped. after a reload", 60_000)
     shown = page.evaluate(_message_text_js(0))
     assert shown.count("Stopped") == 1, shown[-200:]
+
+
+def test_a_models_one_line_details_block_renders_collapsed(page, token):
+    """ELI-512: a model's `<details><summary>...</summary>` on one line showed as plain text. The
+    Pipe puts it in the lines Open WebUI renders (its marked extension), so it is a collapsible."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: <details><summary>BROWSER_SOURCES</summary>BROWSER_SOURCE_LIST</details>")
+    _wait(page, _body_text_js(0, "BROWSER_SOURCES"), "the details block's summary")
+    body = page.evaluate(f"() => document.querySelector('.chat-assistant {REPLY_BODY}').innerText")
+    assert "<details" not in body and "<summary" not in body, body
+    assert "BROWSER_SOURCE_LIST" not in body, f"the block is not collapsed: {body}"
+
+
+def test_a_hebrew_stopped_card_keeps_its_hebrew_label(page, token):
+    """ELI-512: Open WebUI's cancel save marks a running card `incomplete`, and a card or group
+    shows no label for one, only the tool's name ("exec"). The Pipe closes it after that save,
+    so a stopped card reads as a finished one does, in Hebrew, after a reload too."""
+    hold_token = f"hestop{os.getpid()}_{len(_fake_llm_requests())}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    ctx = page.context.browser.new_context(
+        **capture.PHONE, locale="he-IL", timezone_id="UTC", color_scheme="light",
+        storage_state={"cookies": [], "origins": [{"origin": capture.BASE, "localStorage": [
+            {"name": "token", "value": token}, {"name": "theme", "value": "light"},
+            {"name": "locale", "value": "he-IL"}]}]})
+    try:
+        he = ctx.new_page()
+        capture.new_chat(he)
+        capture.send(he, f"E2E_HOLD_QUIET {hold_token}")
+        _wait(he, _reply_js(0, "!r.done && r.text.includes('מריץ פקודה')"), "the running card in Hebrew")
+        he.locator(f'button[aria-label="{HEBREW_STOP}"]').click()
+        _wait(he, _body_text_js(0, "נעצר."), "נעצר. in the reply's body")
+        _wait(he, _reply_js(0, "r.text.includes('הריץ פקודה')"), "the stopped card's Hebrew label")
+        _reload(he)
+        _wait(he, _reply_js(0, "r.text.includes('הריץ פקודה')"), "the Hebrew label after a reload", 60_000)
+    finally:
+        open(gate, "w").close()
+        ctx.close()
 
 
 # The usage line's context part (emit.py `_build_usage_status_lines`).

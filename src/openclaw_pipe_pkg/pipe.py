@@ -2094,24 +2094,28 @@ class _PipeTurn:
         self.stopped_shown = True
         if self.status_closed:
             spawn_background(self.show_stopped())
-        reply = self.stopped_reply_ref()
+        reply = self.stopped_ref()
         if reply is not None:
-            # Stopped before any text: the saved reply says so, after Open WebUI's own
-            # end-of-reply save, so a reload and the chat's preview show it (ELI-512).
+            # After Open WebUI's own end-of-reply save: its cards are closed, and one stopped
+            # before any text says so, so a reload and the chat's preview show it (ELI-512).
             spawn_background(_close_unsent_reply(self.conn, reply, ui_text("stopped_reason", self.lang),
                                                  only_if_empty=True))
 
     def stopped_reply_ref(self) -> dict | None:
         """This reply's message, when it was stopped before showing any run text; else None."""
+        # What the reply shows, not the run's raw text: a held MEDIA line is in that but not shown.
+        return None if getattr(self, "visible_message_text", "").strip() else self.stopped_ref()
+
+    def stopped_ref(self) -> dict | None:
+        """This stopped reply's message, for `_close_unsent_reply`; None in a channel."""
         chat_id, message_id = getattr(self, "owui_origin_chat_id", None), getattr(self, "owui_message_id", None)
         renderer = getattr(self, "renderer", None)
-        # What the reply shows, not the run's raw text: a held MEDIA line is in that but not shown.
-        if getattr(self, "visible_message_text", "").strip() or not chat_id or not message_id \
-                or getattr(self, "channel_id", None):
+        if not chat_id or not message_id or getattr(self, "channel_id", None):
             return None
         return {"chat_id": chat_id, "message_id": message_id,
                 "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
                 "request_task_id": (self.__metadata__ or {}).get("task_id"),
+                "lang": getattr(self, "lang", UI_LANG_DEFAULT),
                 # Its cards as the run had them, closed: what it showed when it was stopped.
                 "output": [i for i in (renderer.finished_output() if renderer is not None else [])
                            if i.get("type") in ("function_call", "function_call_output")]}
