@@ -1035,7 +1035,8 @@ def test_stop_after_send_now_stops_the_run(page, token):
 
 def _saved_status_lines(page, token: str, message_id: str) -> list:
     saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
-    return [h.get("description") for h in saved[message_id].get("statusHistory") or [] if isinstance(h, dict)]
+    message = saved[message_id.removeprefix("message-")]   # `_replies` ids are the DOM's
+    return [h.get("description") for h in message.get("statusHistory") or [] if isinstance(h, dict)]
 
 
 def _wait_saved_status(page, token: str, message_id: str, ok, what: str) -> list:
@@ -1047,25 +1048,34 @@ def _wait_saved_status(page, token: str, message_id: str, ok, what: str) -> list
 
 
 def test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped(page, token):
-    """ELI-512 P1-6 (W5, live 2/2): a correction sent while the agent runs a tool. Open WebUI
-    cancels the first reply's request for it, as for Stop; the run goes on with the message
-    (steered into it on 2026.10.10+). The first reply must not say "Stopped", saved or shown, and
-    the second reply carries the run to its end. The scripted run's tool waits for a file."""
+    """ELI-512 P1-6 (W5, live 2/2): a correction sent with Send now while the agent runs a tool.
+    Open WebUI cancels the first reply's request for it, as for Stop (the page says "send_now"),
+    and the message is steered into the run (2026.10.10+), which goes on under it. The first
+    reply must not say "Stopped", saved or shown. The scripted run's tool waits for a file."""
     hold_token = f"p16{os.getpid()}_{len(_fake_llm_requests())}"
     hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
-    capture.new_chat(page)
+    old = capture.pipe_valves(token, AUTO_SEND_WHILE_RUNNING=False)
     try:
+        capture.new_chat(page)
         capture.send(page, f"E2E_HOLD {hold_token}")
         _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
         _type_and_send(page, "E2E_ECHO: BROWSER_CORRECTION")
+        send_now = page.locator('button[aria-label="Send now"]').first
+        send_now.wait_for(timeout=30_000)
+        send_now.click()
         _wait(page, f"() => {_user_message_js('BROWSER_CORRECTION')}", "the correction in the chat")
+        _wait(page, _steer_pending_js(1) if _steers() else _reply_js(1, "!r.done"),
+              "the correction waiting for the run to take it in")
     finally:
         open(hold, "w").close()
+        capture.pipe_valves(token, **old)
     _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
     first, second = _replies(page)
     assert "BROWSER_CORRECTION" in second["text"] or "E2E_HOLD_END" in second["text"], second["text"]
-    # Saved last: the cancel's status lines and any writer's come before both replies settle.
-    lines = _wait_saved_status(page, token, second["id"], lambda ls: bool(ls), "the second reply's status")
+    _wait_saved_status(page, token, second["id"], lambda ls: bool(ls), "the second reply's status")
+    # In the open tab, where W5 saw it: the cancel's status event, never saved (live and here).
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in shown, f"the first reply shows Stopped: {shown[-200:]!r}"
     lines = _saved_status_lines(page, token, first["id"])
     assert "Stopped" not in lines, f"the first reply says Stopped: {lines}"
     _reload(page)
