@@ -3437,6 +3437,10 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")
+    # When Open WebUI went down: its last finished OpenClaw reply. Read first: a
+    # reply this process finishes is not done yet (ELI-513).
+    down_since = await _owui_last_reply_at(
+        _composer_model_prefixes(own_id=_composer_own_function_id()))
     # Each chat's last write before this process adopts anything: an adopted
     # writer's own saves are no proof that a result reached Open WebUI.
     written_before = {chat_id: await _chat_written_at(chat_id) for chat_id in {c for c, _ in stubs}}
@@ -3450,7 +3454,7 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {counts}")
     try:
-        await _reconcile_ended_while_down(conn, agent_id, written_before)
+        await _reconcile_ended_while_down(conn, agent_id, written_before, down_since=down_since)
     except Exception as ex:
         pipe_log(f"  ended-while-down reconcile failed: {ex!r}")
 
@@ -3483,6 +3487,27 @@ def _settled_run_span(history: dict, run_id: str) -> list | None:
     return None
 
 
+async def _owui_last_reply_at(prefixes: list[str]) -> int | None:
+    """When Open WebUI last finished an OpenClaw reply (seconds), None when
+    unknown. Read at startup, it is when the previous process last wrote: a
+    result committed before it was not committed while Open WebUI was down."""
+    try:
+        from sqlalchemy import func, or_, select
+        from open_webui.internal.db import get_async_db_context
+        from open_webui.models.chat_messages import ChatMessage
+        async with get_async_db_context() as db:
+            got = (await db.execute(
+                select(func.max(ChatMessage.updated_at))
+                .where(ChatMessage.role == _ASSISTANT_ROLE)
+                .where(ChatMessage.done.is_(True))
+                .where(or_(*[ChatMessage.model_id.startswith(p) for p in prefixes]))
+            )).scalar()
+    except Exception as ex:
+        pipe_log(f"  Open WebUI's last reply could not be read: {ex!r}")
+        return None
+    return int(got) if isinstance(got, (int, float)) and got > 0 else None
+
+
 async def _chat_written_at(chat_id: str) -> int | None:
     """The chat's `updated_at` (seconds), None when it cannot be read."""
     try:
@@ -3495,10 +3520,13 @@ async def _chat_written_at(chat_id: str) -> int | None:
 
 
 async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str,
-                                     written_before: dict | None = None) -> None:
+                                     written_before: dict | None = None, *,
+                                     down_since: int | None = None) -> None:
     """ELI-94 (agent-turns.md case 4): a graceful stop saves a reply `done:
     true`, and its run closes while Open WebUI is down. Chats whose session
-    `updatedAt` is newer than their `updated_at` get those runs rebuilt."""
+    `updatedAt` is newer than their `updated_at` get those runs rebuilt.
+    `down_since` (seconds): when Open WebUI went down; what closed before it
+    did so while Open WebUI was up, and is left as it is (ELI-513)."""
     from open_webui.models.chats import Chats
     lst = await _list_all_sessions(conn)
     prefix = f"agent:{agent_id}:openwebui-"
@@ -3520,6 +3548,8 @@ async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str,
         written = int(getattr(chat, "updated_at", 0) or 0)
         if (written_before or {}).get(chat_id) is not None:
             written = written_before[chat_id]
+        # A chat idle since before the stop: only what closed after the stop.
+        written = max(written, down_since or 0)
         if int(updated // 1000) <= written:
             continue
         fixed += await _reconcile_chat_ended_runs(conn, key, chat_id, written,
@@ -3621,7 +3651,7 @@ async def _reconcile_cron_results(conn: "_GatewayConnection", session_key: str, 
         execution = cron_result_execution(message)
         at = message.get("timestamp") if isinstance(message, dict) else None
         if execution is None or not isinstance(at, (int, float)) or int(at // 1000) <= written:
-            continue  # committed while Open WebUI still wrote this chat: its writer showed it
+            continue  # committed while Open WebUI was up: shown then, or never to be (ELI-513)
         result = _history_renderer([message])
         result_text = result.text.strip()
         if not _relay_content_is_showable(result_text):
@@ -3646,8 +3676,9 @@ async def _reconcile_cron_results(conn: "_GatewayConnection", session_key: str, 
             text = held_text + _message_boundary_separator(held_text, result_text) + result_text \
                 if held_text else result_text
             output = [*copy.deepcopy(current.get("output") or []), *result.finished_output()]
-            if await _owui_upsert_message(
-                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
+            # Dated when the run committed it, not when Open WebUI came back (ELI-513).
+            fields = {"content": text, "output": output, "done": True, "timestamp": int(at // 1000)}
+            if await _owui_upsert_message(chat_id, mid, fields) is None:
                 pipe_log(f"  ended-while-down cron result {mid[:8]}... in chat {chat_id[:8]}...: "
                          "Open WebUI did not save the write")
                 continue
