@@ -2116,6 +2116,8 @@ class _PipeTurn:
                 "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
                 "request_task_id": (self.__metadata__ or {}).get("task_id"),
                 "lang": getattr(self, "lang", UI_LANG_DEFAULT),
+                # The text it showed: it keeps it, whatever the saved content reads.
+                "shown": getattr(self, "visible_message_text", ""),
                 # Its cards as the run had them, closed: what it showed when it was stopped.
                 "output": [i for i in (renderer.finished_output() if renderer is not None else [])
                            if i.get("type") in ("function_call", "function_call_output")]}

@@ -2502,8 +2502,11 @@ class _DetailsShaper:
 
     def _end_line(self) -> None:
         fence = _CODE_FENCE.match(self.line)
-        if fence and (not self.fence or fence.group(1).startswith(self.fence)):
-            self.fence = "" if self.fence else fence.group(1)
+        if fence and not self.fence:
+            self.fence = fence.group(1)
+        elif fence and fence.group(1).startswith(self.fence) and not self.line[fence.end():].strip():
+            # Only a line of the fence's marks, at least as many, closes it (CommonMark).
+            self.fence = ""
         self.line, self.held = "", True
 
     def feed(self, chunk: str) -> str:
@@ -2522,9 +2525,13 @@ class _DetailsShaper:
         return "".join(out)
 
     def flush(self) -> str:
+        """The held line, shaped. The message ends here (a tool card or the run's end): a fence
+        or an open `<details` never runs on into the next one."""
         line, held = self.line, self.held
         self._end_line()
-        return self._shape(line) if held else ""
+        shaped = self._shape(line) if held else ""
+        self.fence, self.after_open = "", False
+        return shaped
 
 
 class _TurnRenderer:

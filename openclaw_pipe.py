@@ -5852,8 +5852,11 @@ class _DetailsShaper:
 
     def _end_line(self) -> None:
         fence = _CODE_FENCE.match(self.line)
-        if fence and (not self.fence or fence.group(1).startswith(self.fence)):
-            self.fence = "" if self.fence else fence.group(1)
+        if fence and not self.fence:
+            self.fence = fence.group(1)
+        elif fence and fence.group(1).startswith(self.fence) and not self.line[fence.end():].strip():
+            # Only a line of the fence's marks, at least as many, closes it (CommonMark).
+            self.fence = ""
         self.line, self.held = "", True
 
     def feed(self, chunk: str) -> str:
@@ -5872,9 +5875,13 @@ class _DetailsShaper:
         return "".join(out)
 
     def flush(self) -> str:
+        """The held line, shaped. The message ends here (a tool card or the run's end): a fence
+        or an open `<details` never runs on into the next one."""
         line, held = self.line, self.held
         self._end_line()
-        return self._shape(line) if held else ""
+        shaped = self._shape(line) if held else ""
+        self.fence, self.after_open = "", False
+        return shaped
 
 
 class _TurnRenderer:
@@ -9986,9 +9993,15 @@ def _close_stopped_cards(output: list, lang: str) -> bool:
     """Close the cards a Stop left unfinished, in place, as a finished reply's are
     (`_TurnRenderer.finished_output`): completed, a call with no result answered "Stopped".
     Open WebUI's cancel save marks every card still `in_progress` `incomplete`, and a group
-    shows no labels for those, only the tools' names (ELI-512). Whether it changed any."""
+    shows no labels for those, only the tools' names (ELI-512). A call answered only with the
+    generic no-result note (`finished_output`) says "Stopped" too. Whether it changed any."""
+    stopped = ui_text("stopped", lang)
     answered = {i.get("call_id") for i in output if isinstance(i, dict) and i.get("type") == _CALL_OUTPUT_ITEM}
     changed = False
+    for item in output:
+        parts = item.get("output") if isinstance(item, dict) and item.get("type") == _CALL_OUTPUT_ITEM else None
+        if isinstance(parts, list) and [p.get("text") for p in parts if isinstance(p, dict)] == [TOOL_NO_RESULT_NOTE]:
+            item["output"], changed = [{"type": OUTPUT_TEXT_PART, "text": stopped}], True
     for at in range(len(output) - 1, -1, -1):
         item = output[at]
         if not isinstance(item, dict) or item.get("type") != _CALL_ITEM \
@@ -9997,7 +10010,7 @@ def _close_stopped_cards(output: list, lang: str) -> bool:
         item["status"], changed = "completed", True
         call_id = item.get("call_id") or item.get("id")
         if call_id and call_id not in answered:
-            output.insert(at + 1, _tool_call_result_event(call_id, ui_text("stopped", lang))["item"])
+            output.insert(at + 1, _tool_call_result_event(call_id, stopped)["item"])
     return changed
 
 
@@ -10031,26 +10044,30 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str, 
         async with conn._chat_write_lock(chat_id):
             current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
             text = (current.get("content") or "").strip()
-            if only_if_empty and text:
-                output = copy.deepcopy(list(current.get("output") or []))
-                if not _close_stopped_cards(output, ref.get("lang") or UI_LANG_DEFAULT):
+            # What the reply showed: Open WebUI's cancel save writes no content, and the stop's
+            # own snapshot can fail, so a reply that showed text can read back with none.
+            shown = (ref.get("shown") or "").strip()
+            output = copy.deepcopy(list(current.get("output") or []))
+            # The cards the reply showed when it was stopped, should the save have missed one.
+            have = {i.get("id") for i in output if isinstance(i, dict)}
+            restored = [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
+            output += restored
+            closed = only_if_empty and _close_stopped_cards(output, ref.get("lang") or UI_LANG_DEFAULT)
+            if only_if_empty and (text or shown):
+                # It keeps its text and its "Stopped" line; only its cards change.
+                fields = {"output": output, **({} if text else {"content": shown})}
+                if not (restored or closed or not text):
                     return
-                if not await _owui_upsert_message(chat_id, message_id, {"output": output}):
+                if not await _owui_upsert_message(chat_id, message_id, fields):
                     pipe_log(f"  reply {message_id[:8]}...: closing its stopped cards failed")
                     return
                 try:
                     await _introduce_turn_message(chat_id, ref.get("user_id"), _turn_message_patch(
-                        message_id, None, {**current, "output": output, "id": message_id}), None, message_id)
+                        message_id, None, {**current, **fields, "id": message_id}), None, message_id)
                 except Exception as ex:
                     pipe_log(f"  reply {message_id[:8]}...: pushing its stopped cards failed: {ex!r}")
                 return
             text = f"{text}\n\n{note}" if text else note
-            output = list(current.get("output") or [])
-            # The cards the reply showed when it was stopped, should the save have missed one.
-            have = {i.get("id") for i in output if isinstance(i, dict)}
-            output += [copy.deepcopy(i) for i in ref.get("output") or [] if i.get("id") not in have]
-            if only_if_empty:
-                _close_stopped_cards(output, ref.get("lang") or UI_LANG_DEFAULT)
             output.append(_turn_note_item(note))
             fields = {"content": text, "output": output, "done": True}
             if only_if_empty:
@@ -18114,6 +18131,8 @@ class _PipeTurn:
                 "user_id": (self.__user__ or {}).get("id") if isinstance(self.__user__, dict) else None,
                 "request_task_id": (self.__metadata__ or {}).get("task_id"),
                 "lang": getattr(self, "lang", UI_LANG_DEFAULT),
+                # The text it showed: it keeps it, whatever the saved content reads.
+                "shown": getattr(self, "visible_message_text", ""),
                 # Its cards as the run had them, closed: what it showed when it was stopped.
                 "output": [i for i in (renderer.finished_output() if renderer is not None else [])
                            if i.get("type") in ("function_call", "function_call_output")]}

@@ -376,7 +376,7 @@ class ParkedStopTests(unittest.TestCase):
         args, kwargs = close.call_args
         self.assertEqual({k: v for k, v in args[1].items() if k != "output"},
                          {"chat_id": CHAT, "message_id": "m9", "user_id": GUEST, "request_task_id": "task-9",
-                          "lang": "he"})
+                          "lang": "he", "shown": ""})
         self.assertEqual(args[2], "**נעצר.**")
         self.assertEqual(kwargs, {"only_if_empty": True})
 

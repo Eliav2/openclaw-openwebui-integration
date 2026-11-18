@@ -632,7 +632,11 @@ def test_a_models_one_line_details_block_renders_collapsed(page, token):
     Pipe puts it in the lines Open WebUI renders (its marked extension), so it is a collapsible."""
     capture.new_chat(page)
     capture.send(page, "E2E_ECHO: <details><summary>BROWSER_SOURCES</summary>BROWSER_SOURCE_LIST</details>")
+    # The whole reply first: the summary can show before the block's body arrives.
+    _wait(page, _reply_js(0, "r.done"), "the whole reply")
     _wait(page, _body_text_js(0, "BROWSER_SOURCES"), "the details block's summary")
+    saved = _saved_assistant(page, token)
+    assert "BROWSER_SOURCE_LIST" in (saved.get("content") or ""), saved.get("content")
     body = page.evaluate(f"() => document.querySelector('.chat-assistant {REPLY_BODY}').innerText")
     assert "<details" not in body and "<summary" not in body, body
     assert "BROWSER_SOURCE_LIST" not in body, f"the block is not collapsed: {body}"

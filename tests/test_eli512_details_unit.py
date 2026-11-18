@@ -115,5 +115,61 @@ class StoppedCardsTests(_WriterCase):
         self.assertEqual(close.call_args.args[1]["lang"], "he")
 
 
+class StoppedWithTextTests(_WriterCase):
+    """CodeRabbit on #417: Open WebUI's cancel save writes no `content`, and the stop's own
+    snapshot can fail, so a reply that showed text can read back with none."""
+
+    def _saved(self, content, output):
+        self.owui.msgs()["m3"] = {"role": "assistant", "content": content, "done": True, "output": output,
+                                  "statusHistory": [{"description": "Stopped", "done": True}]}
+
+    async def _stop(self, shown, output=None):
+        ref = {"chat_id": self.CHAT, "message_id": "m3", "user_id": self.USER, "lang": "he", "shown": shown,
+               "output": output or []}
+        await ocp._close_unsent_reply(self.conn, ref, ocp.ui_text("stopped_reason", "he"), only_if_empty=True)
+        return self.owui.msgs()["m3"]
+
+    async def test_text_it_showed_is_kept_not_replaced_by_the_note(self):
+        text = {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "חצי תשובה"}]}
+        self._saved("", [text])
+        saved = await self._stop("חצי תשובה")
+        self.assertEqual(saved["content"], "חצי תשובה")
+        self.assertFalse([i for i in saved["output"] if str(i.get("id", "")).startswith("msg_note_")])
+        self.assertEqual(saved["statusHistory"][-1]["description"], "Stopped")
+
+    async def test_a_card_the_save_missed_is_restored(self):
+        card = {"type": "function_call", "id": "t9", "name": "web_search", "arguments": "{}", "status": "completed"}
+        self._saved("חצי תשובה", [])
+        saved = await self._stop("חצי תשובה", [card])
+        self.assertIn("t9", [i.get("id") for i in saved["output"]])
+
+    async def test_the_generic_no_result_note_says_stopped(self):
+        card = {"type": "function_call", "id": "t9", "name": "web_search", "arguments": "{}", "status": "completed"}
+        note = ocp._tool_call_result_event("t9", ocp.TOOL_NO_RESULT_NOTE)["item"]
+        real = ocp._tool_call_result_event("t8", "real result")["item"]
+        self._saved("", [])
+        saved = await self._stop("", [card, note, real])
+        texts = {i["call_id"]: i["output"][0]["text"] for i in saved["output"]
+                 if i.get("type") == "function_call_output"}
+        self.assertEqual(texts, {"t9": ocp.ui_text("stopped", "he"), "t8": "real result"})
+
+
+class ShaperFenceTests(unittest.TestCase):
+    def test_a_fence_closes_only_on_a_closing_line(self):
+        text = "```\n```not-a-close\n<details><summary>S</summary>\n```\n"
+        self.assertEqual(_shaped(text)[1], text)
+
+    def test_a_fence_left_open_ends_with_its_message(self):
+        """A tool card ends the message; Open WebUI starts the next one outside any fence."""
+        r = ocp._TurnRenderer("en")
+        shown = []
+        for p in ({"stream": "assistant", "data": {"delta": "```\ncode\n"}},
+                  {"stream": "tool", "data": {"phase": "start", "name": "exec", "toolCallId": "t1", "args": {}}},
+                  {"stream": "assistant", "data": {"delta": "<details><summary>S</summary>\nbody\n</details>"}}):
+            shown += [e for e in r.feed(p) if isinstance(e, str)]
+        shown.append(r.flush())
+        self.assertIn("<details>\n<summary>S</summary>\nbody", "".join(shown))
+
+
 if __name__ == "__main__":
     unittest.main()
