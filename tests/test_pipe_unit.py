@@ -17993,6 +17993,27 @@ class UnpublishedInputResendTests(_TurnCase):
         self.assertEqual(self.conn._consumers.get(f"{self.SK}:{refused}"), None,
                          "the refused key's consumer is gone")
 
+    async def test_a_turn_refused_for_unavailable_session_facts_gets_its_reply(self):
+        """ELI-528: 2026.11.5/11.6 refuse a `chat.send` right after a Gateway restart with an UNAVAILABLE
+        that is not marked retryable (`SessionMutationFactsUnavailableError`). The turn waits it out and
+        the message gets its reply, not "Your message couldn't be sent"."""
+        text = ("SessionMutationFactsUnavailableError: Session access facts are unavailable; "
+                "retry after session storage is ready.")
+        refusal = GatewayError(text, error={"code": "UNAVAILABLE", "message": text})
+        self._refuse_sends(refusal, refusal)
+        gen, first = await self._turn()
+        await self._until_registered("run-1")
+        self.assertEqual(self.rpc.count("chat.send"), 3)
+        self.assertEqual(len(set(self.keys)), 1, "the same key each time: the refused sends ran nothing")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi there"))
+        q.put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("hi there", out)
+        self.assertNotIn("Error sending message", out)
+
     async def test_the_resend_takes_the_same_route_and_wait_budget(self):
         """Both sends go through the owner router (`_run_request`), and the
         resend's wait budget is what the first one left, not a fresh one."""

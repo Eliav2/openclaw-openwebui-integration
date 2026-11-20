@@ -5973,6 +5973,10 @@ def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
 SESSION_CHANGED_REFUSAL = "session changed before"
 SESSION_CHANGED_RETRY = "retry the request"
 DEFAULT_RETRY_MS = 250
+# ELI-528: 2026.11.5 and 2026.11.6 answer a `chat.send` in the window after a restart, before the session's
+# access facts are readable, with an UNAVAILABLE that is not marked retryable and carries no `details`. The
+# error is a plain Error subclass, so its only stable token on the wire is its class name at the message's start.
+SESSION_FACTS_UNAVAILABLE_ERROR = "SessionMutationFactsUnavailableError:"
 
 
 def _session_changed_refusal(err: dict) -> bool:
@@ -5980,11 +5984,16 @@ def _session_changed_refusal(err: dict) -> bool:
     return SESSION_CHANGED_REFUSAL in message and SESSION_CHANGED_RETRY in message
 
 
+def _session_facts_unavailable_refusal(err: dict) -> bool:
+    return err.get("code") == UNAVAILABLE_CODE and str(err.get("message") or "").startswith(
+        SESSION_FACTS_UNAVAILABLE_ERROR)
+
+
 def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
-    """Retry wait for any other UNAVAILABLE + retryable refusal, or a request whose session changed
-    under it and says to retry it, else None."""
+    """Retry wait for any other UNAVAILABLE + retryable refusal, a request whose session changed under it
+    and says to retry it, or one refused for unavailable session facts (ELI-528), else None."""
     err = getattr(ex, "error", None) or {}
-    if _session_changed_refusal(err):
+    if _session_changed_refusal(err) or _session_facts_unavailable_refusal(err):
         return DEFAULT_RETRY_MS
     if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True:
         return None
