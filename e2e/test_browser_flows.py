@@ -1078,8 +1078,11 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
             other.goto(page.url)
             other.wait_for_selector("#chat-input", timeout=60_000)
             _type_and_send(other, f"E2E_ECHO: {word}")
-            _wait(page, f"() => {_user_message_js(word)}", f"{word} in the chat")
-        _wait(page, _steer_pending_js(-1) if _steers() else f"() => {_message_text_js(-1)}.includes('Queued: waiting')",
+            # In the tab that sent it: from Open WebUI 0.13.4 nothing cancels this tab's
+            # running reply (no Send now), and a tab whose own reply runs shows another
+            # tab's message only once that reply ends (Chat.svelte mergeChatMessages).
+            _wait(other, f"() => {_user_message_js(word)}", f"{word} in the chat")
+        _wait(tabs[-1], _steer_pending_js(-1) if _steers() else f"() => {_message_text_js(-1)}.includes('Queued: waiting')",
               "the last message waiting")
         open(gate, "w").close()
         # Joined into one turn or steered (separate messages, or merged into one
@@ -1682,6 +1685,16 @@ def _session_user_texts(key: str) -> list:
     return out
 
 
+# The side chat's panels, as elements whose text is the side chat's. Up to 0.13.3 a side
+# chat is ChatTabs/SideChat.svelte, whose messages sit in `side-chat-input-<uuid>-messages`.
+# From 0.13.4 it is a chat tab (Tabs/ChatTab.svelte, a whole embedded Chat) in its own
+# `chat-panel-<uuid>-view` tabpanel; the main chat is `chat-panel-main-chat-view` and a
+# channel or note opened beside it is `chat-panel-page%3A<id>-view`.
+SIDE_PANELS = ("[...document.querySelectorAll('[id^=\"side-chat-input-\"][id$=\"-messages\"], "
+               "[role=tabpanel][id^=\"chat-panel-\"][id$=\"-view\"]')]"
+               ".filter(e => e.id !== 'chat-panel-main-chat-view' && !e.id.startsWith('chat-panel-page'))")
+
+
 def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
     """`/btw` (Open WebUI 0.13): the side chat runs in its own session (a temporary
     one up to 0.13.0, its own saved chat's from 0.13.1), whose first message brings
@@ -1699,7 +1712,7 @@ def test_a_side_chat_answers_from_the_chat_it_was_opened_from(page):
     box.click()
     page.keyboard.type("/btw what did I ask you to say?", delay=5)
     page.locator("#send-message-button").click()
-    side = "[...document.querySelectorAll('[id^=\"side-chat-input-\"][id$=\"-messages\"]')]"
+    side = SIDE_PANELS
     _wait(page, f"() => {side}.some(e => e.innerText.includes({json.dumps(tag)}))",
           "the side chat's reply from the chat's message")
 
@@ -1725,7 +1738,7 @@ def test_the_claw_button_opens_the_chats_status_with_a_side_chat_open(page):
     page.locator("#chat-input").click()
     page.keyboard.type("/btw E2E_ECHO: side note", delay=5)
     page.locator("#send-message-button").click()
-    side = "[...document.querySelectorAll('[id^=\"side-chat-input-\"][id$=\"-messages\"]')]"
+    side = SIDE_PANELS
     _wait(page, f"() => {side}.some(e => e.innerText.includes('side note'))", "the side chat's reply")
     _open_status(page)
 
@@ -1745,7 +1758,7 @@ def test_an_ask_user_question_in_a_side_chat_is_answered_in_its_panel(page):
                 "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
           "the ask_user card in the side panel")
     page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
-    side = "[...document.querySelectorAll('[id^=\"side-chat-input-\"][id$=\"-messages\"]')]"
+    side = SIDE_PANELS
     _wait(page, f"() => {side}.some(e => e.innerText.includes('E2E_ASK_TOOL_RESULT answered Database: SQLite'))",
           "the side chat's reply with the tool's answer")
 
@@ -2667,7 +2680,9 @@ def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
                     {"content": f"CONTEXT_{n} anyone around?"}, token)
         root = post(f"<@M:{capture.MODEL}|OpenClaw> E2E_ECHO: CHAN_{n}")
         page.goto(f"{capture.BASE}/channels/{cid}")
-        page.wait_for_selector("#chat-input", timeout=60_000)
+        # From 0.13.4 a channel opens as a tab beside the (hidden) main chat, whose
+        # #chat-input stays in the page: wait for the channel's own message box.
+        page.wait_for_selector(f"#chat-input:visible, #channel-input-{cid}-main:visible", timeout=60_000)
         capture.dismiss_popups(page)
         replies = page.locator("button", has_text="Replies")
         replies.first.wait_for(timeout=TURN_MS)

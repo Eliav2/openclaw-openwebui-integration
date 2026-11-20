@@ -725,10 +725,12 @@ async def _settle_waits(conn: "_GatewayConnection", refs: list) -> None:
         pass  # no Open WebUI tasks to wait for
 
 
-async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, refs: list) -> None:
+async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, refs: list,
+                                  lang: str = UI_LANG_DEFAULT) -> None:
     """Re-split the replies around a steer from the transcript once the run
     ended. On claude-cli the Gateway forwards the answer before it commits
-    the steered message, so the switch can land late. Only the split moves."""
+    the steered message, so the switch can land late. Only the split moves;
+    a reply it leaves without text says its answer is in the next one."""
     refs = [r for r in refs if r and r.get("chat_id") and r.get("message_id") and r.get("span_run")]
     if len(refs) < 2:
         return
@@ -776,6 +778,10 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
                 continue
             # The Pipe's own notes are in no transcript (ELI-229).
             _keep_pipe_notes(list(message.get("output") or []), part)
+            if not part.text.strip() and ref is not refs[-1]:
+                # Its message went in at the same step as the next one (ELI-509: from
+                # Open WebUI 0.13.4 no Send now ends this reply with the note first).
+                part._append_text(ui_text("sent_with_next", lang))
             text, output = part.text.strip(), part.finished_output()
             async with conn._chat_write_lock(ref["chat_id"]):
                 await _owui_upsert_message(ref["chat_id"], ref["message_id"],
@@ -838,7 +844,8 @@ return true;
 """
 
 
-# Open WebUI queues a message sent mid-reply in the browser only. With
+# Up to 0.13.3 Open WebUI queues a message sent mid-reply in the browser only
+# (from 0.13.4 only where `_owui_sends_mid_run` is false). With
 # AUTO_SEND_WHILE_RUNNING on, this hook clicks Send now as soon as one
 # appears, marked as Send now so the run is kept. The button is found by its
 # untranslated icon. One click at a time: Open WebUI ignores a Send now while
@@ -874,9 +881,27 @@ if (!window.__ocAutoSendHook) {
 """
 
 
+def _owui_sends_mid_run(chat_id: str | None) -> bool:
+    """Whether Open WebUI sends a message typed while `chat_id`'s reply runs
+    straight away (ELI-509): from 0.13.4 a saved chat's goes to the backend
+    (Chat.svelte usesBackendQueue), which would hold it for the running reply
+    (`_ensure_no_owui_hold`). Its item in the queue above the composer is the
+    browser's guess until the send answers, and its Send now is a Stop
+    (sendQueuedMessageNow), so the auto-send hook must leave it alone."""
+    if not chat_id:
+        return False
+    try:
+        from open_webui.utils.chat_id import is_saved_chat_id
+        from open_webui.utils.subagents import queue_user_message  # noqa: F401
+    except ImportError:
+        return False  # Open WebUI before 0.13.4: the queue is the browser's
+    return bool(is_saved_chat_id(chat_id))
+
+
 def _page_hooks_js(chat_id: str | None, auto_send: bool) -> str:
     """The intent and auto-send page hooks, with this chat's setting."""
     code = "(function () {" + _INTENT_HOOK_JS + "})();\n(function () {" + _AUTO_SEND_HOOK_JS + "})();\n"
+    auto_send = auto_send and not _owui_sends_mid_run(chat_id)
     if chat_id:
         code += ("window.__ocAutoSend[" + json.dumps(chat_id) + "] = " + ("true" if auto_send else "false")
                  + ";\nwindow.__ocAutoSendScan();\n")

@@ -504,6 +504,7 @@ class Pipe:
         _ensure_pending_delivery(self)
         _ensure_channel_watcher(lambda: self.valves)
         _ensure_slash_prompts(lambda: self.valves, force=True)
+        _ensure_no_owui_hold()
         models, source = await _discover_models_with_source(self.valves)
 
         if len(models) > self.valves.MAX_MODELS:
@@ -688,6 +689,7 @@ class Pipe:
         """
         with log_scope(chat_id=(__metadata__ or {}).get("chat_id")):
             remember_owui_server()
+            _ensure_no_owui_hold()
             current = await _current_load(self, __request__)
             if current is not None:
                 pipe_log("Turn admitted by a superseded load of this Function: the current "
@@ -2377,7 +2379,7 @@ class _PipeTurn:
                 *self.steered_replies_before(),
                 {"chat_id": self.owui_origin_chat_id, "message_id": self.owui_message_id,
                  "request_task_id": (self.__metadata__ or {}).get("task_id"),
-                 "span_run": self.steered_span_run}]))
+                 "span_run": self.steered_span_run}], lang=self.lang))
 
         if not self.aborted and self.text_yielded:
             spawn_background(
