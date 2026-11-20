@@ -37,7 +37,9 @@ whole):
   newest message carries `E2E_ASIDE` -> `[skip]` (the stack has no utility
   model, so the judge may not be asked at all).
 * `E2E_ECHO: any text`                 -> replies with the rest of that line,
-  byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
+  byte for byte (Hebrew, emoji, markup), so a round trip can be exact. With
+  several markers in the newest part (messages merged into one user message by
+  the Gateway), the last one is echoed.
 * `E2E_MEDIA_PATH /abs/file.png`       -> replies `Here it is.` and, on a line
   of its own, `MEDIA:/abs/file.png`: a file named by path, which the Gateway
   takes out of the text and stores as an image block of the run's message.
@@ -703,9 +705,12 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
     m = _MEDIA_PATH.search(user_text)
     if m:
         return {"text": f"Here it is.\nMEDIA:{m.group(1)}"}
-    m = _ECHO.search(user_text)
-    if m:
-        return {"text": m.group(1)}
+    echoes = _ECHO.findall(user_text)
+    if echoes:
+        # The LAST marker: messages sent while a run works reach the model in one call, as separate
+        # user messages (this joins the newest part) or, on OpenClaw 2026.11.6, merged into one user
+        # message that holds each after the other. The newest message is the one answered.
+        return {"text": echoes[-1]}
     m = _EXACTLY.search(user_text)
     if m:
         return {"text": m.group(1)}

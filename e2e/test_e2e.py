@@ -1158,8 +1158,9 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     finally:
         open(gate, "w").close()
     # 2026.10.10+ steers them into the held run at its next boundary, all
-    # three in one model call; the fake model answers the newest. Older
-    # Gateways run them after it as one turn, answered by the first's echo.
+    # three in one model call (as separate user messages, or merged into one
+    # from 2026.11.6); the fake model answers the newest (its last echo marker).
+    # Older Gateways run them after it as one turn, answered by the first's echo.
     steered = _steers_mid_run_messages()
     answer = words[2] if steered else words[0]
     msgs = _wait_for(token, chat_id, [answer] if steered else ["E2E_HOLD_END", answer])

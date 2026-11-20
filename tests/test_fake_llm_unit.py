@@ -51,5 +51,24 @@ class SteeredScenes(unittest.TestCase):
         self.assertEqual((plan["text"], plan.get("tool")), ("b done", None))
 
 
+class EchoOfSteeredMessages(unittest.TestCase):
+    """Messages sent while a run works reach the model in one call: as separate user messages
+    (OpenClaw 2026.10.10, 2026.11.5) or merged into one user message that holds each message
+    after the other (2026.11.6). The scripted model answers the newest message either way."""
+
+    def echo(self, *messages):
+        return fake_llm.plan_reply({"messages": list(messages), "tools": TOOLS})["text"]
+
+    def test_separate_user_messages_are_answered_with_the_newest_echo(self):
+        self.assertEqual(self.echo(user("E2E_ECHO: A"), user("E2E_ECHO: B"), user("E2E_ECHO: C")), "C")
+
+    def test_one_merged_user_message_is_answered_with_its_last_echo(self):
+        merged = "[t] Conversation info\n\nE2E_ECHO: A [t] Conversation info\n\nE2E_ECHO: B [t] Conversation info\n\nE2E_ECHO: C"
+        self.assertEqual(self.echo(user(merged)), "C")
+
+    def test_one_echo_is_still_echoed_whole(self):
+        self.assertEqual(self.echo(user("E2E_ECHO: שלום 🙂 <b>x</b>")), "שלום 🙂 <b>x</b>")
+
+
 if __name__ == "__main__":
     unittest.main()
