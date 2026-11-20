@@ -16406,6 +16406,8 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
 # Nothing signals that: a socket drop reconnects with a new sid while the
 # page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
+# The page's answer for a Send now (`_intent_query_js`); a handover's cancel counts as one.
+CANCEL_SEND_NOW = "send_now"
 
 # The agent stream a Codex-runtime run reports its items on, images included.
 CODEX_ITEM_STREAM = "codex_app_server.item"
@@ -16444,8 +16446,8 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
     parked turn. A Stop also marks the reply stopped."""
     intent = None
     if conn.take_handover_cancel(session_key, task_id):
-        # Stopped by a message sent while it ran (`hand_over_running_reply`).
-        intent = "send_now"
+        # Stopped by a message sent while it ran (`_hand_over_running_reply`).
+        intent = CANCEL_SEND_NOW
     elif event_call and chat_id:
         try:
             resp = await asyncio.wait_for(
@@ -16460,7 +16462,7 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
     if intent == "stop" and chat_id and message_id:
         # Before the request's own `done: true` save, which follows.
         await _mark_stopped(chat_id, message_id, _owui_request_task(task_id))
-    elif intent == "send_now" and chat_id and message_id:
+    elif intent == CANCEL_SEND_NOW and chat_id and message_id:
         # Send now on a reply Open WebUI may hold messages under (0.13.4+): they follow now.
         _answer_held_on_send_now(chat_id, message_id)
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)

@@ -424,7 +424,7 @@ class ReplyCallRegistryTests(unittest.IsolatedAsyncioTestCase):
 
         async def boom():
             raise RuntimeError("boom")
-            yield  # noqa: unreachable: an async generator
+            yield  # makes this an async generator
 
         async def nothing():
             return
