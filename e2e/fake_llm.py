@@ -182,7 +182,9 @@ PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 DEFERRED_CALL_TOOLS = ("dispatch_action", "tool_call")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
-_ECHO = re.compile(r"E2E_ECHO: ([^\n]+)")
+# Each payload ends at its line's end or at the next marker, so a merged message with no newline
+# between its parts gives one payload per marker.
+_ECHO = re.compile(r"E2E_ECHO: ((?:(?!E2E_ECHO: )[^\n])+?)\s*(?=E2E_ECHO: |\n|$)")
 _MEDIA_PATH = re.compile(r"E2E_MEDIA_PATH (/[^\s]+)")
 # E2E_ASK_TOOL: one question with two options, as a model calls ask_user.
 ASK_TOOL_ARGS = {"questions": [{"id": "db", "header": "Database", "question": "Which database?",

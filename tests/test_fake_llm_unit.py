@@ -66,6 +66,11 @@ class EchoOfSteeredMessages(unittest.TestCase):
         merged = "[t] Conversation info\n\nE2E_ECHO: A [t] Conversation info\n\nE2E_ECHO: B [t] Conversation info\n\nE2E_ECHO: C"
         self.assertEqual(self.echo(user(merged)), "C")
 
+    def test_markers_on_one_line_are_answered_one_by_one(self):
+        # A merged message with no newline between the parts: each payload ends at the next marker.
+        self.assertEqual(self.echo(user("E2E_ECHO: A E2E_ECHO: B")), "B")
+        self.assertEqual(self.echo(user("E2E_ECHO: A E2E_ECHO: B E2E_ECHO: C")), "C")
+
     def test_one_echo_is_still_echoed_whole(self):
         self.assertEqual(self.echo(user("E2E_ECHO: שלום 🙂 <b>x</b>")), "שלום 🙂 <b>x</b>")
 
