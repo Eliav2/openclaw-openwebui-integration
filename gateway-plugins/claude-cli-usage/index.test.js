@@ -83,3 +83,9 @@ test("the profile request starts while the usage request is still in flight", as
   assert.equal(startedBeforeUsageDone, true);
   assert.equal(snap.plan, "Ultra");
 });
+
+test("manifest declares reload.turnHandover", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const manifest = JSON.parse(await readFile(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  assert.equal(manifest.reload?.turnHandover, true);
+});
