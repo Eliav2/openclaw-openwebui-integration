@@ -2208,12 +2208,14 @@ class _PipeTurn:
         closed the card before it ended the request (ELI-509)."""
         ask = asyncio.ensure_future(self.maybe_answer_user_input(self.pending_prompt_text))
         self.question_left = asyncio.Event()
-        self.question_ask = ask
+        self.question_ask, self.question_leaving = ask, False
         try:
             return await ask
         except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if not ask.cancelled() or (current is not None and current.cancelling()):
+            # Only a leave (`leave_question`) reads as unanswered; a cancel of this reply
+            # goes on. `cancelling` is Python 3.11+.
+            cancelling = getattr(asyncio.current_task(), "cancelling", None)
+            if not (ask.cancelled() and self.question_leaving) or (cancelling and cancelling()):
                 raise
             pipe_log("  question card left for a message sent meanwhile; the question ends the reply as text")
             return UserInputResult(False, None)
@@ -2228,6 +2230,7 @@ class _PipeTurn:
         ask, left = getattr(self, "question_ask", None), getattr(self, "question_left", None)
         if ask is None or left is None or ask.done():
             return
+        self.question_leaving = True
         ask.cancel()
         try:
             await asyncio.wait_for(left.wait(), timeout_s)
