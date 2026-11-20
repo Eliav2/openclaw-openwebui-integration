@@ -2,6 +2,8 @@
 the request is resent with the same key after the named wait."""
 import asyncio
 import json
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -139,11 +141,23 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slept, [0.25, 0.25])
         self.assertEqual(len([line for line in self.logged if "refused as retryable" in line]), 1)
 
-    async def test_unavailable_session_facts_keep_failing_the_request_within_the_retry_budget(self):
+    async def test_unavailable_session_facts_that_do_not_clear_fail_the_request_when_the_budget_ends(self):
+        """Resent every 250 ms for the whole 1 s budget on a controlled clock (no real waiting), and
+        the budget is not renewed by a resend: the 5th refusal is raised."""
+        now = [100.0]
+        slept = []
+
+        async def sleep(s):
+            slept.append(s)
+            now[0] += s
+        clock = types.SimpleNamespace(**{**vars(time), "monotonic": lambda: now[0]})
         conn = FakeConn([self.facts_unavailable()] * 1000)
-        with mock.patch.object(ocp, "RETRYABLE_REFUSAL_WAIT_S", 0.05):
+        with mock.patch.object(ocp, "time", clock), mock.patch.object(ocp.asyncio, "sleep", sleep), \
+                mock.patch.object(ocp, "RETRYABLE_REFUSAL_WAIT_S", 1.0):
             with self.assertRaisesRegex(ocp.GatewayError, "SessionMutationFactsUnavailableError"):
-                await asyncio.wait_for(ocp._send_when_prepared(conn, ocp.RUN_SEND, dict(self.PARAMS)), 5)
+                await ocp._send_when_prepared(conn, ocp.RUN_SEND, dict(self.PARAMS))
+        self.assertEqual(slept, [0.25] * 4)
+        self.assertEqual(len(conn.sent), 5, "the first send and four resends")
 
     async def test_another_unavailable_error_that_is_not_retryable_is_raised_at_once(self):
         text = "SessionMutationSomethingElseError: gone for good"
