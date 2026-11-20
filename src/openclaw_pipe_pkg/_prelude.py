@@ -18,6 +18,7 @@ import hashlib
 import io
 import contextlib
 import contextvars
+import collections
 import copy
 import functools
 import re

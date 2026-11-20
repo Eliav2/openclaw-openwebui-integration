@@ -401,3 +401,14 @@ class IdentityFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandoverStatusTests(unittest.TestCase):
+    """`install.py status` says whether a message sent while a reply runs keeps that reply (ELI-509)."""
+
+    def test_each_open_webui_says_where_it_stands(self):
+        self.assertTrue(inst.handover_status("0.13.3").startswith("not needed"))
+        self.assertTrue(inst.handover_status("0.13.2").startswith("not needed"))
+        self.assertTrue(inst.handover_status("0.13.4").startswith("ok"))
+        self.assertTrue(inst.handover_status("0.14.0").startswith("unverified"))
+        self.assertTrue(inst.handover_status(None).startswith("unknown"))

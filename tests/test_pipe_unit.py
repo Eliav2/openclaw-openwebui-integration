@@ -17854,6 +17854,26 @@ class MidRunSteeringTests(_TurnCase):
     def _msg(content, output=()):
         return {"content": content, "output": list(output)}
 
+    async def test_a_reply_the_settle_leaves_without_text_says_its_answer_is_in_the_next(self):
+        """ELI-509: tomato and blue went in at the same step, so tomato's part of the run is
+        empty. Its reply held run text the settle moves back to the first reply; on Open WebUI
+        0.13.4 no Send now ended it with the note before, so the settle gives it the note."""
+        user, said = SteeredTranscriptSpanTests._user, SteeredTranscriptSpanTests._said
+        result = {"role": "toolResult", "content": "done"}
+        history = {"messages": [user(self.R1, "E2E_CLI_LATE_STEER x"), said("E2E_LATE_PART_1", stop="toolUse"),
+                                result, user(self.R2, "say tomato"), user(self.R3, "say blue"),
+                                said("E2E_CLI_REPLY", stop="end_turn"),
+                                said("E2E_LATE_PART_1\n\nE2E_CLI_REPLY", run=self.R1,
+                                     key=f"cli-assistant:{self.R1}")]}
+        first, tomato, blue = self._refs()
+        saved = {first["message_id"]: self._msg("E2E_LATE"), tomato["message_id"]: self._msg("_PART_1"),
+                 blue["message_id"]: self._msg("E2E_CLI_REPLY")}
+        upserts, _ = await self._settle([first, tomato, blue], saved, history)
+        self.assertEqual(openclaw_pipe._settle_text(upserts[first["message_id"]]["content"]), "E2E_LATE_PART_1")
+        self.assertEqual(upserts[tomato["message_id"]]["content"], openclaw_pipe.ui_text("sent_with_next"))
+        self.assertTrue(upserts[tomato["message_id"]]["done"])
+        self.assertNotIn(blue["message_id"], upserts)
+
     async def test_a_late_steers_settle_waits_for_the_transcript_and_takes_the_whole_chain(self):
         """The late steer's settle (`_on_user_message_committed`) starts from [first, tomato]:
         it reads the replies once tomato's writer, still open, is done, which is when the
