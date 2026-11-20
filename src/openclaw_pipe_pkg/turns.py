@@ -166,13 +166,16 @@ async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
 _HOLD_ORIG_ATTR = "_openclaw_queue_user_message"
 
 
-def _ensure_no_owui_hold() -> None:
+def _ensure_no_owui_hold(auto_send=lambda: True) -> None:
     """Keep Open WebUI from holding a message sent while an OpenClaw reply
     runs (ELI-509). From 0.13.4 main.py holds it under the running reply
     (subagents.queue_user_message) until that reply's request ends with it
     done; the Pipe steers it into the run itself, in order, as before 0.13.4.
-    Once per deploy, replacing an earlier deploy's wrapper; other models'
-    replies are held as Open WebUI holds them. No-op before 0.13.4."""
+    With `auto_send()` false (AUTO_SEND_WHILE_RUNNING off) it is held, as
+    Open WebUI's queue held it up to 0.13.3: sent when the reply ends or on
+    Send now (`_answer_held_on_send_now`). Once per deploy, replacing an
+    earlier deploy's wrapper; other models' replies are held as Open WebUI
+    holds them. No-op before 0.13.4."""
     mod = sys.modules.get("open_webui.utils.subagents")
     if mod is None:
         try:
@@ -189,7 +192,7 @@ def _ensure_no_owui_hold() -> None:
     async def queue_user_message(request, chat_id, user, user_message, parent_id, *args, **kwargs):
         from open_webui.models.chats import Chats
         reply = await Chats.get_message_by_id_and_message_id(chat_id, parent_id) or {}
-        if str(reply.get("model") or "").startswith(prefixes):
+        if str(reply.get("model") or "").startswith(prefixes) and auto_send():
             return False
         return await orig(request, chat_id, user, user_message, parent_id, *args, **kwargs)
 
@@ -209,7 +212,15 @@ def _answer_held_messages(chat_id: str, reply_id: str) -> None:
     spawn_background(_answer_held_messages_now(chat_id, reply_id))
 
 
-async def _answer_held_messages_now(chat_id: str, reply_id: str) -> None:
+def _answer_held_on_send_now(chat_id: str, reply_id: str) -> None:
+    """Send now on a reply Open WebUI holds messages under (AUTO_SEND_WHILE_RUNNING
+    off, 0.13.4+): its cancel parked the run for the follow-up, and the held
+    messages are that follow-up. Open WebUI's own Send now only stops the
+    reply and answers them once it is done, which a parked run is not."""
+    spawn_background(_answer_held_messages_now(chat_id, reply_id, idle=True))
+
+
+async def _answer_held_messages_now(chat_id: str, reply_id: str, idle: bool = False) -> None:
     app = getattr(sys.modules.get("open_webui.main"), "app", None)
     if app is None:
         return
@@ -237,8 +248,10 @@ async def _answer_held_messages_now(chat_id: str, reply_id: str) -> None:
             return
         request = Request({"type": "http", "app": app, "method": "POST", "path": "/",
                            "headers": [], "query_string": b""})
+        # `idle`: once nothing runs in the chat, whether or not the reply is done.
         await process_pending_internal_messages(
-            request, chat_id, chat.user_id, get_pending_run({}, reply.get("model")), reply_id=reply_id)
+            request, chat_id, chat.user_id, get_pending_run({}, reply.get("model")),
+            reply_id=None if idle else reply_id)
         pipe_log(f"  messages held under reply {reply_id[:8]}... sent on, now it is done")
     except Exception as ex:
         pipe_log(f"  answering the messages held under reply {reply_id[:8]}... failed: {ex!r}")

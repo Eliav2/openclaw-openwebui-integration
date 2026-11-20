@@ -101,6 +101,11 @@ async def _current_load(pipe, request):
     return current
 
 
+def _pipe_auto_send() -> bool:
+    """AUTO_SEND_WHILE_RUNNING of the live Pipe."""
+    return _auto_send_on(getattr(Pipe._instance, "valves", None))
+
+
 async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
                                 message_id=None, task_id=None):
     """Ask the page whether the cancel was Stop or Send now and settle the
@@ -123,6 +128,9 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
     if intent == "stop" and chat_id and message_id:
         # Before the request's own `done: true` save, which follows.
         await _mark_stopped(chat_id, message_id, _owui_request_task(task_id))
+    elif intent == "send_now" and chat_id and message_id:
+        # Send now on a reply Open WebUI may hold messages under (0.13.4+): they follow now.
+        _answer_held_on_send_now(chat_id, message_id)
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
@@ -507,7 +515,7 @@ class Pipe:
         _ensure_pending_delivery(self)
         _ensure_channel_watcher(lambda: self.valves)
         _ensure_slash_prompts(lambda: self.valves, force=True)
-        _ensure_no_owui_hold()
+        _ensure_no_owui_hold(_pipe_auto_send)
         _note_handover_reach()
         models, source = await _discover_models_with_source(self.valves)
 
@@ -693,7 +701,7 @@ class Pipe:
         """
         with log_scope(chat_id=(__metadata__ or {}).get("chat_id")):
             remember_owui_server()
-            _ensure_no_owui_hold()
+            _ensure_no_owui_hold(_pipe_auto_send)
             current = await _current_load(self, __request__)
             if current is not None:
                 pipe_log("Turn admitted by a superseded load of this Function: the current "

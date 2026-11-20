@@ -27,6 +27,12 @@ CHAT = "00000000-0000-4000-8000-0000000000c1"
 REPLY = "00000000-0000-4000-8000-0000000000a1"
 
 
+async def _drain():
+    """This test's background tasks to their end (other tests' loops left theirs)."""
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*[t for t in list(ocp._BACKGROUND_TASKS) if t.get_loop() is loop])
+
+
 def _mod(name, **attrs):
     m = types.ModuleType(name)
     m.__dict__.update(attrs)
@@ -140,19 +146,19 @@ class AnswerHeldTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_held_message_is_answered_once_the_reply_is_saved_done(self):
         owui = _Owui(self)
         await ocp._owui_upsert_message(CHAT, REPLY, {"content": "x", "done": True})
-        await asyncio.gather(*list(ocp._BACKGROUND_TASKS))
+        await _drain()
         self.assertEqual(owui.calls, [("answer", CHAT, "user-1", "openclaw_gateway.default", REPLY, True)])
 
     async def test_a_reply_saved_still_running_answers_nothing(self):
         owui = _Owui(self)
         await ocp._owui_upsert_message(CHAT, REPLY, {"content": "x", "done": False})
-        await asyncio.gather(*list(ocp._BACKGROUND_TASKS))
+        await _drain()
         self.assertEqual(owui.calls, [])
 
     async def test_nothing_held_answers_nothing(self):
         owui = _Owui(self, held=False)
         await ocp._owui_upsert_message(CHAT, REPLY, {"done": True})
-        await asyncio.gather(*list(ocp._BACKGROUND_TASKS))
+        await _drain()
         self.assertEqual(owui.calls, [])
 
     async def test_a_request_still_running_in_the_chat_is_let_end_first(self):
@@ -164,13 +170,13 @@ class AnswerHeldTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(owui.calls, [])
         gate.set()
-        await asyncio.gather(*list(ocp._BACKGROUND_TASKS))
+        await _drain()
         self.assertEqual(owui.calls, [("answer", CHAT, "user-1", "openclaw_gateway.default", REPLY, True)])
 
     async def test_before_0_13_4_nothing_is_answered(self):
         owui = _Owui(self, version="0.13.3")
         await ocp._owui_upsert_message(CHAT, REPLY, {"done": True})
-        await asyncio.gather(*list(ocp._BACKGROUND_TASKS))
+        await _drain()
         self.assertEqual(owui.calls, [])
 
 
@@ -505,3 +511,40 @@ class QuestionLeftTests(unittest.IsolatedAsyncioTestCase):
         asking.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await asking
+
+
+class AutoSendOffTests(unittest.IsolatedAsyncioTestCase):
+    """AUTO_SEND_WHILE_RUNNING off on 0.13.4: the message waits in Open WebUI's queue, as up to
+    0.13.3, until the reply ends or the user's Send now, which sends it at once."""
+
+    async def test_with_auto_send_off_the_message_is_held(self):
+        owui = _Owui(self)
+        ocp._ensure_no_owui_hold(lambda: False)
+        self.assertIs(await owui.subagents.queue_user_message(None, CHAT, None, {"id": "u"}, REPLY), True)
+        self.assertEqual(owui.calls, [("hold", CHAT, REPLY)])
+
+    async def test_send_now_sends_the_held_messages_at_once(self):
+        owui = _Owui(self)
+        conn = types.SimpleNamespace(take_handover_cancel=lambda sk, t: False,
+                                     settle_parked_turn=mock.Mock())
+
+        async def page(_event):
+            return "send_now"
+        with mock.patch.object(ocp, "pipe_log"):
+            await ocp._settle_cancel_intent(conn, "sk", "run-1", CHAT, page, message_id=REPLY)
+            await _drain()
+        # reply_id None: answered once the chat is idle, though the parked reply is not done.
+        self.assertEqual(owui.calls, [("answer", CHAT, "user-1", "openclaw_gateway.default", None, True)])
+        conn.settle_parked_turn.assert_called_once()
+
+    async def test_a_stop_sends_nothing(self):
+        owui = _Owui(self)
+        conn = types.SimpleNamespace(take_handover_cancel=lambda sk, t: False,
+                                     settle_parked_turn=mock.Mock())
+
+        async def page(_event):
+            return "stop"
+        with mock.patch.object(ocp, "pipe_log"), mock.patch.object(ocp, "_mark_stopped", mock.AsyncMock()):
+            await ocp._settle_cancel_intent(conn, "sk", "run-1", CHAT, page, message_id=REPLY)
+            await _drain()
+        self.assertEqual(owui.calls, [])
