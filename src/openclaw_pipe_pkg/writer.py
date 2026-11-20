@@ -1022,6 +1022,20 @@ def _owui_sends_mid_run(chat_id: str | None) -> bool:
     return bool(is_saved_chat_id(chat_id))
 
 
+def _sent_from_a_page(metadata: dict | None, user_id: str | None) -> bool:
+    """Whether a request came from an open chat page of `user_id`: its
+    `session_id` is that user's live socket (socket/main.py SESSION_POOL, as
+    main.py checks it). An API client's is absent or made up."""
+    sid = (metadata or {}).get("session_id")
+    if not isinstance(sid, str) or not sid or not user_id:
+        return False
+    try:
+        from open_webui.socket.main import get_user_id_from_session_pool
+        return get_user_id_from_session_pool(sid) == user_id
+    except Exception:
+        return False
+
+
 def _page_hooks_js(chat_id: str | None, auto_send: bool) -> str:
     """The intent and auto-send page hooks, with this chat's setting."""
     code = "(function () {" + _INTENT_HOOK_JS + "})();\n(function () {" + _AUTO_SEND_HOOK_JS + "})();\n"

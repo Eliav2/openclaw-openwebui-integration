@@ -1114,9 +1114,12 @@ class _PipeTurn:
         self.adopted_queue = None
         self.adopted_run_text = None
         own_task_id = (self.__metadata__ or {}).get("task_id")
-        if self.owui_origin_chat_id and not self.channel_id:
-            # From Open WebUI 0.13.4 no Send now cancelled the running reply first:
-            # end it as one, so it is parked for this claim like on 0.13.3 (ELI-509).
+        if (self.owui_origin_chat_id and not self.channel_id
+                and _owui_sends_mid_run(self.owui_origin_chat_id)
+                and _sent_from_a_page(self.__metadata__, self.owui_origin_user_id)):
+            # From Open WebUI 0.13.4 a page sends this with no Send now cancelling the
+            # running reply first: end it as one, so it is parked for this claim like on
+            # 0.13.3 (ELI-509). An API client's message waits behind the run, as before.
             await _hand_over_running_reply(self.conn, self.session_key, own_task_id)
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
         if self.owui_origin_chat_id and not self.channel_id:

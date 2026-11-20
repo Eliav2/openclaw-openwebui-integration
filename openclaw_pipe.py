@@ -10647,6 +10647,20 @@ def _owui_sends_mid_run(chat_id: str | None) -> bool:
     return bool(is_saved_chat_id(chat_id))
 
 
+def _sent_from_a_page(metadata: dict | None, user_id: str | None) -> bool:
+    """Whether a request came from an open chat page of `user_id`: its
+    `session_id` is that user's live socket (socket/main.py SESSION_POOL, as
+    main.py checks it). An API client's is absent or made up."""
+    sid = (metadata or {}).get("session_id")
+    if not isinstance(sid, str) or not sid or not user_id:
+        return False
+    try:
+        from open_webui.socket.main import get_user_id_from_session_pool
+        return get_user_id_from_session_pool(sid) == user_id
+    except Exception:
+        return False
+
+
 def _page_hooks_js(chat_id: str | None, auto_send: bool) -> str:
     """The intent and auto-send page hooks, with this chat's setting."""
     code = "(function () {" + _INTENT_HOOK_JS + "})();\n(function () {" + _AUTO_SEND_HOOK_JS + "})();\n"
@@ -17446,9 +17460,12 @@ class _PipeTurn:
         self.adopted_queue = None
         self.adopted_run_text = None
         own_task_id = (self.__metadata__ or {}).get("task_id")
-        if self.owui_origin_chat_id and not self.channel_id:
-            # From Open WebUI 0.13.4 no Send now cancelled the running reply first:
-            # end it as one, so it is parked for this claim like on 0.13.3 (ELI-509).
+        if (self.owui_origin_chat_id and not self.channel_id
+                and _owui_sends_mid_run(self.owui_origin_chat_id)
+                and _sent_from_a_page(self.__metadata__, self.owui_origin_user_id)):
+            # From Open WebUI 0.13.4 a page sends this with no Send now cancelling the
+            # running reply first: end it as one, so it is parked for this claim like on
+            # 0.13.3 (ELI-509). An API client's message waits behind the run, as before.
             await _hand_over_running_reply(self.conn, self.session_key, own_task_id)
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
         if self.owui_origin_chat_id and not self.channel_id:

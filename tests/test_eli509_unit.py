@@ -548,3 +548,30 @@ class AutoSendOffTests(unittest.IsolatedAsyncioTestCase):
             await ocp._settle_cancel_intent(conn, "sk", "run-1", CHAT, page, message_id=REPLY)
             await _drain()
         self.assertEqual(owui.calls, [])
+
+
+class SentFromAPageTests(unittest.TestCase):
+    """Only a message a chat page sends gets the handover: an API client's request waits behind
+    the run as before (E2E oldest: test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn)."""
+
+    def setUp(self):
+        pool = {"sid-page": {"id": "user-1"}}
+        p = mock.patch.dict(sys.modules, {
+            "open_webui": _mod("open_webui"), "open_webui.socket": _mod("open_webui.socket"),
+            "open_webui.socket.main": _mod("open_webui.socket.main",
+                                           get_user_id_from_session_pool=lambda sid: (pool.get(sid) or {}).get("id"))})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_users_live_page_socket_is_a_page(self):
+        self.assertIs(ocp._sent_from_a_page({"session_id": "sid-page"}, "user-1"), True)
+
+    def test_a_made_up_session_id_is_an_api_client(self):
+        self.assertIs(ocp._sent_from_a_page({"session_id": "e2e-1234"}, "user-1"), False)
+
+    def test_another_users_socket_is_not_this_users_page(self):
+        self.assertIs(ocp._sent_from_a_page({"session_id": "sid-page"}, "user-2"), False)
+
+    def test_no_session_id_is_an_api_client(self):
+        self.assertIs(ocp._sent_from_a_page({}, "user-1"), False)
+        self.assertIs(ocp._sent_from_a_page(None, "user-1"), False)
