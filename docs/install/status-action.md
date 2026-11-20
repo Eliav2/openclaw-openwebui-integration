@@ -63,7 +63,7 @@ The Action needs the same Python packages as the Pipe, `websockets` and `cryptog
 
 Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anthropic credential is a Claude CLI login, recent OpenClaw versions (2026.9.1 and later) report no Anthropic windows there. The Action then falls back to the optional [`gateway-plugins/claude-cli-usage`](../../gateway-plugins/claude-cli-usage) Gateway plugin, which serves the weekly window (and the 5h window on plans that have one) read-only from the Claude CLI login. It never refreshes, writes or copies that login's token.
 
-The plugin runs inside the Gateway, so it goes on the **Gateway host**. Its folder holds an OpenClaw plugin manifest (`openclaw.plugin.json`, id `claude-cli-usage`) that starts with the Gateway, and adds the Gateway method `claudeCliUsage.status`. It finds the login in `CLAUDE_CONFIG_DIR`, or `~/.claude` when that is unset.
+The plugin runs inside the Gateway, so it goes on the **Gateway host**. Its folder holds an OpenClaw plugin manifest (`openclaw.plugin.json`, id `claude-cli-usage`) that starts with the Gateway, and adds the Gateway method `claudeCliUsage.status`. It finds the login in `CLAUDE_CONFIG_DIR`, or `~/.claude` when that is unset. The manifest declares `reload.turnHandover`: the plugin keeps only two short caches (usage and plan), so a plugin or config reload does not wait for running agent turns, and model switches on the Gateway are not held behind them.
 
 Without the plugin the rate-limit section shows a note instead, and the Open WebUI backend log has a `claudeCliUsage.status unavailable` line. With another Anthropic credential on the Gateway you don't need it.
 

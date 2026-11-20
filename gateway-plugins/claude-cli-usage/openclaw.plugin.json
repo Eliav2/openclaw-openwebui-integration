@@ -2,6 +2,7 @@
   "id": "claude-cli-usage",
   "name": "Claude CLI usage",
   "description": "Gateway RPC claudeCliUsage.status: Claude subscription rate-limit windows via Claude CLI's login, read-only.",
+  "reload": { "turnHandover": true },
   "activation": {
     "onStartup": true
   },
