@@ -2,6 +2,8 @@
 the request is resent with the same key after the named wait."""
 import asyncio
 import json
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -116,6 +118,54 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p for _m, p in conn.sent], [self.PARAMS] * 3, "the same request, same key")
         self.assertEqual(slept, [0.25, 0.25])
         self.assertEqual(len([line for line in self.logged if "refused as retryable" in line]), 1)
+
+    def facts_unavailable(self):
+        """2026.11.5 and 2026.11.6's chat.send in the window after a restart: the session's access facts are
+        not readable yet. A plain Error subclass, so the Gateway answers UNAVAILABLE with `String(error)` and
+        no `retryable`, `retryAfterMs` or `details` (error-shape: `errorShapeFromError`); the class name is the
+        one stable token."""
+        text = ("SessionMutationFactsUnavailableError: Session access facts are unavailable; "
+                "retry after session storage is ready.")
+        return ocp.GatewayError(text, error={"code": "UNAVAILABLE", "message": text})
+
+    async def test_a_send_refused_for_unavailable_session_facts_is_sent_again(self):
+        conn = FakeConn([self.facts_unavailable(), self.facts_unavailable(), {"runId": "run-1"}])
+        slept = []
+
+        async def sleep(s):
+            slept.append(s)
+        with mock.patch.object(ocp.asyncio, "sleep", sleep):
+            got = await ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True, timeout=30)
+        self.assertEqual(got, {"runId": "run-1"})
+        self.assertEqual([p for _m, p in conn.sent], [self.PARAMS] * 3, "the same request, same key")
+        self.assertEqual(slept, [0.25, 0.25])
+        self.assertEqual(len([line for line in self.logged if "refused as retryable" in line]), 1)
+
+    async def test_unavailable_session_facts_that_do_not_clear_fail_the_request_when_the_budget_ends(self):
+        """Resent every 250 ms for the whole 1 s budget on a controlled clock (no real waiting), and
+        the budget is not renewed by a resend: the 5th refusal is raised."""
+        now = [100.0]
+        slept = []
+
+        async def sleep(s):
+            slept.append(s)
+            now[0] += s
+        clock = types.SimpleNamespace(**{**vars(time), "monotonic": lambda: now[0]})
+        conn = FakeConn([self.facts_unavailable()] * 1000)
+        with mock.patch.object(ocp, "time", clock), mock.patch.object(ocp.asyncio, "sleep", sleep), \
+                mock.patch.object(ocp, "RETRYABLE_REFUSAL_WAIT_S", 1.0):
+            with self.assertRaisesRegex(ocp.GatewayError, "SessionMutationFactsUnavailableError"):
+                await ocp._send_when_prepared(conn, ocp.RUN_SEND, dict(self.PARAMS))
+        self.assertEqual(slept, [0.25] * 4)
+        self.assertEqual(len(conn.sent), 5, "the first send and four resends")
+
+    async def test_another_unavailable_error_that_is_not_retryable_is_raised_at_once(self):
+        text = "SessionMutationSomethingElseError: gone for good"
+        err = ocp.GatewayError(text, error={"code": "UNAVAILABLE", "message": text})
+        conn = FakeConn([err, {"runId": "never"}])
+        with self.assertRaises(ocp.GatewayError):
+            await ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True)
+        self.assertEqual(len(conn.sent), 1)
 
     async def test_an_invalid_request_that_does_not_say_retry_is_raised_at_once(self):
         err = ocp.GatewayError("Invalid session key", error={"code": "INVALID_REQUEST", "message": "Invalid session key"})
