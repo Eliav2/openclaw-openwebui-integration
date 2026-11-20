@@ -106,7 +106,10 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
     """Ask the page whether the cancel was Stop or Send now and settle the
     parked turn. A Stop also marks the reply stopped."""
     intent = None
-    if event_call and chat_id:
+    if conn.take_handover_cancel(session_key, task_id):
+        # Stopped by a message sent while it ran (`hand_over_running_reply`).
+        intent = "send_now"
+    elif event_call and chat_id:
         try:
             resp = await asyncio.wait_for(
                 event_call({"type": "execute",
@@ -505,6 +508,7 @@ class Pipe:
         _ensure_channel_watcher(lambda: self.valves)
         _ensure_slash_prompts(lambda: self.valves, force=True)
         _ensure_no_owui_hold()
+        _note_handover_reach()
         models, source = await _discover_models_with_source(self.valves)
 
         if len(models) > self.valves.MAX_MODELS:
@@ -785,7 +789,8 @@ class Pipe:
                     run_text=turn.run_text,
                     settle=functools.partial(
                         _settle_cancel_intent, turn.conn, turn.session_key,
-                        turn.run_id, turn.chat_id, __event_call__),
+                        turn.run_id, turn.chat_id, __event_call__,
+                        task_id=(__metadata__ or {}).get("task_id")),
                     waiting=waiting,
                 )
             raise
@@ -865,6 +870,8 @@ class _PipeTurn:
                     if self.ended:
                         return
             finally:
+                if getattr(self, "reply_call_registered", False):
+                    self.conn.unregister_reply_call(self.session_key, id(self))
                 try:
                     # Lines no end snapshot saved (a cancel before it) still get saved.
                     await self.save_final_statuses()
@@ -1096,7 +1103,15 @@ class _PipeTurn:
         self.adopted_run_id = None
         self.adopted_queue = None
         self.adopted_run_text = None
+        own_task_id = (self.__metadata__ or {}).get("task_id")
+        if self.owui_origin_chat_id and not self.channel_id:
+            # From Open WebUI 0.13.4 no Send now cancelled the running reply first:
+            # end it as one, so it is parked for this claim like on 0.13.3 (ELI-509).
+            await _hand_over_running_reply(self.conn, self.session_key, own_task_id)
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
+        if self.owui_origin_chat_id and not self.channel_id:
+            self.conn.register_reply_call(self.session_key, id(self), own_task_id, call=self)
+            self.reply_call_registered = True
         if claimed:
             self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
             if claimed["carried"]:
@@ -2145,7 +2160,7 @@ class _PipeTurn:
         if self.pending_prompt_text:
             # The held tail is a full trigger, or the run ended mid-buffer.
             # `maybe_answer_user_input` re-checks; a non-match shows as text.
-            answer_res = await self.maybe_answer_user_input(self.pending_prompt_text)
+            answer_res = await self.ask_held_prompt()
             if answer_res.handled:
                 # Answered: the outer `while adopt_new_run` consumes the follow-up
                 # with the same loop, not a separate copy.
@@ -2182,6 +2197,42 @@ class _PipeTurn:
                     yield fallback
                     self.text_yielded = True
                 self.pending_prompt_text = ""
+                left = getattr(self, "question_left", None)
+                if left is not None:
+                    # Open WebUI has the question as text: the handover may end the request.
+                    left.set()
+
+    async def ask_held_prompt(self) -> UserInputResult:
+        """`maybe_answer_user_input` for the held prompt, which a message sent
+        meanwhile can leave unanswered (`leave_question`), as 0.13.3's Send now
+        closed the card before it ended the request (ELI-509)."""
+        ask = asyncio.ensure_future(self.maybe_answer_user_input(self.pending_prompt_text))
+        self.question_left = asyncio.Event()
+        self.question_ask = ask
+        try:
+            return await ask
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if not ask.cancelled() or (current is not None and current.cancelling()):
+                raise
+            pipe_log("  question card left for a message sent meanwhile; the question ends the reply as text")
+            return UserInputResult(False, None)
+        finally:
+            self.question_ask = None
+            if not ask.done():
+                ask.cancel()
+
+    async def leave_question(self, timeout_s: float) -> None:
+        """End the question card this reply waits on, unanswered, and wait until
+        the question is in the reply as text (`ask_held_prompt`); at most `timeout_s`."""
+        ask, left = getattr(self, "question_ask", None), getattr(self, "question_left", None)
+        if ask is None or left is None or ask.done():
+            return
+        ask.cancel()
+        try:
+            await asyncio.wait_for(left.wait(), timeout_s)
+        except asyncio.TimeoutError:
+            pipe_log(f"  the question card's reply did not show its question within {timeout_s:g}s")
 
     async def finish_held_media(self):
         """The run ended with a MEDIA: directive held back: resolve it now."""

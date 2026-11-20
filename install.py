@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -927,6 +928,36 @@ def route_smoke_test(client: OwuiClient) -> bool:
     return False
 
 
+# From Open WebUI 0.13.4 a message sent while a reply runs reaches the Pipe with that reply's
+# request still live, and the Pipe ends it the way Open WebUI's Stop does
+# (open_webui.tasks.stop_task(redis, task_id)), as a Send now (ELI-509). Releases it was
+# tested on; a newer one may have changed that internal.
+HANDOVER_FROM_OWUI = (0, 13, 4)
+HANDOVER_TESTED_OWUI = ("0.13.4",)
+
+
+def owui_version(client: OwuiClient) -> str | None:
+    status, payload = client.request("GET", "/api/version")
+    if status == HTTPStatus.OK and isinstance(payload, dict) and isinstance(payload.get("version"), str):
+        return payload["version"]
+    return None
+
+
+def handover_status(version: str | None) -> str:
+    """Whether a message sent while a reply runs keeps that reply on this Open WebUI."""
+    parts = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", version or "")
+    if not parts:
+        return "unknown: Open WebUI's version could not be read"
+    release = tuple(int(n) for n in parts.groups())
+    if release < HANDOVER_FROM_OWUI:
+        return "not needed: Open WebUI before 0.13.4 ends the running reply itself (Send now)"
+    if ".".join(map(str, release)) in HANDOVER_TESTED_OWUI:
+        return f"ok: tested on Open WebUI {version}"
+    return (f"unverified: Open WebUI {version} is newer than the tested "
+            f"{HANDOVER_TESTED_OWUI[-1]}; if the Pipe's log says 'stop_task is missing', a "
+            "message sent while a reply runs no longer ends that reply's request")
+
+
 def print_status(client: OwuiClient) -> bool:
     summary = get_function_summary(client)
     valves = get_valves(client) if summary else {}
@@ -936,6 +967,7 @@ def print_status(client: OwuiClient) -> bool:
     model = model_exists(client)
     ident = parse_identity(valves.get("DEVICE_IDENTITY"))
     paired = bool(ident and is_device_paired(ident["id"]))
+    version = owui_version(client)
 
     console.print_json(json.dumps({
         "function_exists": exists,
@@ -947,6 +979,8 @@ def print_status(client: OwuiClient) -> bool:
         "has_device_identity": bool(ident),
         "device_id": ident.get("id") if ident else None,
         "device_paired": paired,
+        "open_webui_version": version,
+        "send_while_running_handover": handover_status(version),
     }))
     return all([exists, active, global_, model, ident, paired])
 

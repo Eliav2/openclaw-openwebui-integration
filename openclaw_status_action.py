@@ -3213,6 +3213,11 @@ class _GatewayConnection:
         # Parked cancelled turns (`park_cancelled_turn`). An immediate
         # chat.abort would also kill every subagent the turn spawned.
         self._pending_cancel_aborts: dict[str, dict] = {}
+        # Live reply requests per session (`register_reply_call`): {token: (OWUI task id, call)}.
+        # The task by id only: a finished request's task is not kept alive by this map.
+        self._reply_calls: dict[str, dict[int, tuple]] = {}
+        # Task ids a handover cancelled, per session: their cancel was a Send now.
+        self._handover_cancels: dict[str, set] = {}
 
         # {session_key: (model, ts)} and `model_patch_lock`s (ELI-59), per worker.
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
@@ -4687,6 +4692,30 @@ class _GatewayConnection:
         if queue is not None:
             self.unregister_consumer(session_key, run_id, queue=queue)
         entry.update(run_id=None, queue=None, reply=None, run_text=None)
+        return True
+
+    def register_reply_call(self, session_key: str, token: int, task_id: str | None,
+                            call=None) -> None:
+        """A reply's Open WebUI request is live in this process (`_hand_over_running_reply`).
+        `call`: the reply, for a question card it waits on (`leave_question`)."""
+        if session_key and task_id:
+            self._reply_calls.setdefault(session_key, {})[token] = (task_id, call)
+
+    def unregister_reply_call(self, session_key: str, token: int) -> None:
+        calls = self._reply_calls.get(session_key)
+        if calls is not None:
+            calls.pop(token, None)
+            if not calls:
+                self._reply_calls.pop(session_key, None)
+
+    def take_handover_cancel(self, session_key: str, task_id: str | None) -> bool:
+        """Whether `task_id`'s cancel came from a handover, which is a Send now."""
+        cancels = self._handover_cancels.get(session_key)
+        if not cancels or task_id not in cancels:
+            return False
+        cancels.discard(task_id)
+        if not cancels:
+            self._handover_cancels.pop(session_key, None)
         return True
 
     async def claim_cancelled_turn(self, session_key: str) -> dict | None:

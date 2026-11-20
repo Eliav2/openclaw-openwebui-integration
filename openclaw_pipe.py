@@ -6563,6 +6563,11 @@ class _GatewayConnection:
         # Parked cancelled turns (`park_cancelled_turn`). An immediate
         # chat.abort would also kill every subagent the turn spawned.
         self._pending_cancel_aborts: dict[str, dict] = {}
+        # Live reply requests per session (`register_reply_call`): {token: (OWUI task id, call)}.
+        # The task by id only: a finished request's task is not kept alive by this map.
+        self._reply_calls: dict[str, dict[int, tuple]] = {}
+        # Task ids a handover cancelled, per session: their cancel was a Send now.
+        self._handover_cancels: dict[str, set] = {}
 
         # {session_key: (model, ts)} and `model_patch_lock`s (ELI-59), per worker.
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
@@ -8037,6 +8042,30 @@ class _GatewayConnection:
         if queue is not None:
             self.unregister_consumer(session_key, run_id, queue=queue)
         entry.update(run_id=None, queue=None, reply=None, run_text=None)
+        return True
+
+    def register_reply_call(self, session_key: str, token: int, task_id: str | None,
+                            call=None) -> None:
+        """A reply's Open WebUI request is live in this process (`_hand_over_running_reply`).
+        `call`: the reply, for a question card it waits on (`leave_question`)."""
+        if session_key and task_id:
+            self._reply_calls.setdefault(session_key, {})[token] = (task_id, call)
+
+    def unregister_reply_call(self, session_key: str, token: int) -> None:
+        calls = self._reply_calls.get(session_key)
+        if calls is not None:
+            calls.pop(token, None)
+            if not calls:
+                self._reply_calls.pop(session_key, None)
+
+    def take_handover_cancel(self, session_key: str, task_id: str | None) -> bool:
+        """Whether `task_id`'s cancel came from a handover, which is a Send now."""
+        cancels = self._handover_cancels.get(session_key)
+        if not cancels or task_id not in cancels:
+            return False
+        cancels.discard(task_id)
+        if not cancels:
+            self._handover_cancels.pop(session_key, None)
         return True
 
     async def claim_cancelled_turn(self, session_key: str) -> dict | None:
@@ -10289,6 +10318,130 @@ def _tool_card_ids(output: list) -> set:
     """The tool cards in `output`, by `call_id or id` (how consumers read them)."""
     return {i.get("call_id") or i.get("id") for i in output or ()
             if isinstance(i, dict) and i.get("type") == _TOOL_CARD_TYPE}
+
+
+# How long a message sent while a reply runs waits for that reply's request to
+# end after the handover stopped it (ELI-509). Parking runs on the cancel path
+# itself, so this only bounds a request that does not end on its cancel.
+HANDOVER_PARK_TIMEOUT_S = 5.0
+# `open_webui.tasks.stop_task(redis, task_id)` as of Open WebUI 0.13.2 to 0.13.4, by module.
+_STOP_TASK: dict[int, object] = {}
+
+
+def _owui_stop_task():
+    """Open WebUI's own per-task Stop (`tasks.stop_task`, what its stop endpoint
+    calls), resolved once per loaded module; None when it is missing or its
+    signature is not `(redis, task_id)`, as in 0.13.2 to 0.13.4."""
+    import inspect
+    mod = sys.modules.get("open_webui.tasks")
+    if mod is None:
+        try:
+            import open_webui.tasks as mod
+        except Exception:
+            return None
+    if id(mod) not in _STOP_TASK:
+        fn = getattr(mod, "stop_task", None)
+        try:
+            params = list(inspect.signature(fn).parameters) if fn is not None else []
+        except (TypeError, ValueError):
+            params = []
+        ok = params == ["redis", "task_id"] and inspect.iscoroutinefunction(fn)
+        _STOP_TASK[id(mod)] = fn if ok else None
+        if not ok:
+            pipe_log("  [warn] open_webui.tasks.stop_task is missing or not (redis, task_id): "
+                     "a message sent while a reply runs is steered without ending that "
+                     "reply's request (ELI-509)")
+    return _STOP_TASK[id(mod)]
+
+
+_HANDOVER_REACH_NOTED: list = []
+
+
+def _note_handover_reach() -> None:
+    """Say once per load when Open WebUI runs several workers: the handover
+    (`_hand_over_running_reply`) reaches only a reply whose request is in the
+    same worker as the new message."""
+    if _HANDOVER_REACH_NOTED:
+        return
+    _HANDOVER_REACH_NOTED.append(True)
+    try:
+        from open_webui.env import UVICORN_WORKERS
+    except Exception:
+        return
+    if int(UVICORN_WORKERS or 1) > 1:
+        pipe_log(f"  Open WebUI runs {UVICORN_WORKERS} workers: a message sent while a reply runs "
+                 "ends that reply as a Send now only when both requests are in the same worker")
+
+
+async def _hand_over_running_reply(conn: "_GatewayConnection", session_key: str,
+                              own_task_id: str | None) -> bool:
+    """End the session's running reply requests as 0.13.3's Send now did, so
+    the new message claims their runs (`claim_cancelled_turn`) (ELI-509).
+
+    From Open WebUI 0.13.4 a message sent while a reply runs reaches the
+    Pipe with that reply's request still live; up to 0.13.3 a Send now
+    cancelled it first, and then this finds it parked and does nothing.
+    Each request is stopped the way Open WebUI's Stop does it, as a Send
+    now, and parks its run. A request that has not parked within
+    `HANDOVER_PARK_TIMEOUT_S` is left: the message goes on without the
+    handover. True when the runs were parked for the claim."""
+    if session_key in conn._pending_cancel_aborts:
+        return False  # a Send now's cancel parked them already
+    calls = {t: call for t, call in (conn._reply_calls.get(session_key) or {}).values() if t != own_task_id}
+    requests = {t: _owui_request_task(t) for t in calls}
+    running = {t: task for t, task in requests.items() if task is not None and not task.done()}
+    if not running:
+        await _log_remote_reply_requests(conn, session_key, own_task_id)
+        return False
+    stop_task = _owui_stop_task()
+    if stop_task is None:
+        pipe_log(f"  [warn] handover skipped for {session_key}: this Open WebUI's "
+                 "open_webui.tasks.stop_task is missing or changed; the message is "
+                 "steered without ending the running reply")
+        return False
+    # As Open WebUI's Stop: the open question card first (cancelBrowserInteractions), so its
+    # reply ends with the question as text, then the request.
+    left = [calls[t].leave_question(HANDOVER_PARK_TIMEOUT_S) for t in running
+            if getattr(calls[t], "leave_question", None) is not None]
+    if left:
+        await asyncio.gather(*left)
+    conn._handover_cancels[session_key] = set(running)
+    redis = _owui_redis()
+
+    async def stop(task_id):
+        try:
+            await stop_task(redis, task_id)
+        except Exception as ex:
+            pipe_log(f"  [warn] handover: stopping request {task_id[:8]}... failed: {ex!r}")
+    # In the background: without Redis, stop_task awaits the request itself, unbounded.
+    for task_id in running:
+        spawn_background(stop(task_id))
+    _, pending = await asyncio.wait(set(running.values()), timeout=HANDOVER_PARK_TIMEOUT_S)
+    if pending:
+        pipe_log(f"  [warn] handover for {session_key}: {len(pending)} running reply "
+                 f"request(s) did not end within {HANDOVER_PARK_TIMEOUT_S:g}s of their "
+                 "stop; the message is steered without the handover")
+        return False
+    pipe_log(f"  message sent while a reply ran: ended {len(running)} running reply "
+             "request(s) as a Send now; their run goes on in their own message")
+    return True
+
+async def _log_remote_reply_requests(conn: "_GatewayConnection", session_key: str,
+                                 own_task_id: str | None) -> None:
+    """One line when the chat has a request running that this process does
+    not hold: in another Open WebUI worker, out of the handover's reach."""
+    parsed = conn.parse_owui_session_key(session_key)
+    if not parsed or not conn.live_runs(session_key):
+        return
+    try:
+        from open_webui.tasks import list_task_ids_by_item_id
+        ids = await list_task_ids_by_item_id(_owui_redis(), parsed[1])
+    except Exception:
+        return
+    remote = [t for t in ids or () if t != own_task_id and _owui_request_task(t) is None]
+    if remote:
+        pipe_log(f"  handover skipped for {session_key}: the running reply's request is "
+                 "in another Open WebUI worker (one worker per Pipe process only)")
 
 
 async def _settle_waits(conn: "_GatewayConnection", refs: list) -> None:
@@ -16272,7 +16425,10 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
     """Ask the page whether the cancel was Stop or Send now and settle the
     parked turn. A Stop also marks the reply stopped."""
     intent = None
-    if event_call and chat_id:
+    if conn.take_handover_cancel(session_key, task_id):
+        # Stopped by a message sent while it ran (`hand_over_running_reply`).
+        intent = "send_now"
+    elif event_call and chat_id:
         try:
             resp = await asyncio.wait_for(
                 event_call({"type": "execute",
@@ -16671,6 +16827,7 @@ class Pipe:
         _ensure_channel_watcher(lambda: self.valves)
         _ensure_slash_prompts(lambda: self.valves, force=True)
         _ensure_no_owui_hold()
+        _note_handover_reach()
         models, source = await _discover_models_with_source(self.valves)
 
         if len(models) > self.valves.MAX_MODELS:
@@ -16951,7 +17108,8 @@ class Pipe:
                     run_text=turn.run_text,
                     settle=functools.partial(
                         _settle_cancel_intent, turn.conn, turn.session_key,
-                        turn.run_id, turn.chat_id, __event_call__),
+                        turn.run_id, turn.chat_id, __event_call__,
+                        task_id=(__metadata__ or {}).get("task_id")),
                     waiting=waiting,
                 )
             raise
@@ -17031,6 +17189,8 @@ class _PipeTurn:
                     if self.ended:
                         return
             finally:
+                if getattr(self, "reply_call_registered", False):
+                    self.conn.unregister_reply_call(self.session_key, id(self))
                 try:
                     # Lines no end snapshot saved (a cancel before it) still get saved.
                     await self.save_final_statuses()
@@ -17262,7 +17422,15 @@ class _PipeTurn:
         self.adopted_run_id = None
         self.adopted_queue = None
         self.adopted_run_text = None
+        own_task_id = (self.__metadata__ or {}).get("task_id")
+        if self.owui_origin_chat_id and not self.channel_id:
+            # From Open WebUI 0.13.4 no Send now cancelled the running reply first:
+            # end it as one, so it is parked for this claim like on 0.13.3 (ELI-509).
+            await _hand_over_running_reply(self.conn, self.session_key, own_task_id)
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
+        if self.owui_origin_chat_id and not self.channel_id:
+            self.conn.register_reply_call(self.session_key, id(self), own_task_id, call=self)
+            self.reply_call_registered = True
         if claimed:
             self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
             if claimed["carried"]:
@@ -18311,7 +18479,7 @@ class _PipeTurn:
         if self.pending_prompt_text:
             # The held tail is a full trigger, or the run ended mid-buffer.
             # `maybe_answer_user_input` re-checks; a non-match shows as text.
-            answer_res = await self.maybe_answer_user_input(self.pending_prompt_text)
+            answer_res = await self.ask_held_prompt()
             if answer_res.handled:
                 # Answered: the outer `while adopt_new_run` consumes the follow-up
                 # with the same loop, not a separate copy.
@@ -18348,6 +18516,42 @@ class _PipeTurn:
                     yield fallback
                     self.text_yielded = True
                 self.pending_prompt_text = ""
+                left = getattr(self, "question_left", None)
+                if left is not None:
+                    # Open WebUI has the question as text: the handover may end the request.
+                    left.set()
+
+    async def ask_held_prompt(self) -> UserInputResult:
+        """`maybe_answer_user_input` for the held prompt, which a message sent
+        meanwhile can leave unanswered (`leave_question`), as 0.13.3's Send now
+        closed the card before it ended the request (ELI-509)."""
+        ask = asyncio.ensure_future(self.maybe_answer_user_input(self.pending_prompt_text))
+        self.question_left = asyncio.Event()
+        self.question_ask = ask
+        try:
+            return await ask
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if not ask.cancelled() or (current is not None and current.cancelling()):
+                raise
+            pipe_log("  question card left for a message sent meanwhile; the question ends the reply as text")
+            return UserInputResult(False, None)
+        finally:
+            self.question_ask = None
+            if not ask.done():
+                ask.cancel()
+
+    async def leave_question(self, timeout_s: float) -> None:
+        """End the question card this reply waits on, unanswered, and wait until
+        the question is in the reply as text (`ask_held_prompt`); at most `timeout_s`."""
+        ask, left = getattr(self, "question_ask", None), getattr(self, "question_left", None)
+        if ask is None or left is None or ask.done():
+            return
+        ask.cancel()
+        try:
+            await asyncio.wait_for(left.wait(), timeout_s)
+        except asyncio.TimeoutError:
+            pipe_log(f"  the question card's reply did not show its question within {timeout_s:g}s")
 
     async def finish_held_media(self):
         """The run ended with a MEDIA: directive held back: resolve it now."""

@@ -9,6 +9,7 @@ shows the held message in the queue above the composer, where the Pipe's
 auto-send hook clicked its Send now: a Stop (sendQueuedMessageNow), which
 cancelled the run. Open WebUI is stubbed: only the calls the Pipe makes."""
 import asyncio
+import functools
 import sys
 import types
 import unittest
@@ -198,3 +199,309 @@ class AutoSendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SK = "agent:main:openwebui-00000000-0000-4000-8000-0000000000e1-" + CHAT
+OTHER_SK = "agent:main:openwebui-00000000-0000-4000-8000-0000000000e2-" + CHAT
+
+
+def _stop_task_module(test, *, stop_task="default"):
+    """`open_webui.tasks` of a single-process Open WebUI: `stop_task` cancels the local task,
+    as tasks.py does without Redis. `stop_task=None`: a release without it."""
+    local, stopped = {}, []
+
+    async def default_stop_task(redis, task_id: str):
+        stopped.append(task_id)
+        task = local.pop(task_id, None)
+        if task is None:
+            return {"status": False}
+        task.cancel()
+        await asyncio.wait({task})
+        return {"status": True}
+
+    async def list_task_ids_by_item_id(redis, item_id):
+        return list(local) + list(test.remote_ids)
+    attrs = {"tasks": local, "list_task_ids_by_item_id": list_task_ids_by_item_id}
+    fn = default_stop_task if stop_task == "default" else stop_task
+    if fn is not None:
+        attrs["stop_task"] = fn
+    p = mock.patch.dict(sys.modules, {
+        "open_webui": _mod("open_webui"), "open_webui.main": _mod("open_webui.main", app=None),
+        "open_webui.tasks": _mod("open_webui.tasks", **attrs)})
+    p.start()
+    test.addCleanup(p.stop)
+    test.addCleanup(ocp._STOP_TASK.clear)
+    return local, stopped
+
+
+class HandoverTests(unittest.IsolatedAsyncioTestCase):
+    """A message sent while a reply runs ends that reply's request as 0.13.3's Send now did,
+    so the run is parked and claimed: kept in its own message, never "Stopped" (ELI-509)."""
+
+    async def asyncSetUp(self):
+        self.remote_ids = []
+        self.conn = ocp._GatewayConnection(lambda: None)
+        self.local, self.stopped = _stop_task_module(self)
+        self.page_asked, self.stops, self.logged = [], [], []
+        p = mock.patch.object(ocp, "pipe_log", lambda *a, **k: self.logged.append(a[0]))
+        p.start()
+        self.addCleanup(p.stop)
+
+    async def asyncTearDown(self):
+        for entry in list(self.conn._pending_cancel_aborts.values()):
+            if entry["task"] is not None:
+                entry["task"].cancel()
+
+    def _request(self, task_id, sk=SK, run_id="run-1", ignores_cancel=False):
+        """A reply's live request: parks its run when cancelled, as `_PipeTurn.park` does."""
+        conn, test = self.conn, self
+        release = asyncio.Event()
+
+        async def page(_event):
+            test.page_asked.append(task_id)
+            return "send_now"
+
+        async def request():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if ignores_cancel:
+                    await release.wait()
+                conn.park_cancelled_turn(
+                    sk, run_id, None, [], 10.0, send_stop=False,
+                    settle=functools.partial(ocp._settle_cancel_intent, conn, sk, run_id, CHAT, page,
+                                             task_id=task_id),
+                    on_stop=lambda: test.stops.append(run_id))
+                raise
+            finally:
+                conn.unregister_reply_call(sk, id(task_id))
+        task = asyncio.ensure_future(request())
+        self.local[task_id] = task
+        conn.register_reply_call(sk, id(task_id), task_id)
+        self.addCleanup(release.set)
+        self.addCleanup(task.cancel)
+        return task, release
+
+    async def _claim(self, sk=SK):
+        claimed = await self.conn.claim_cancelled_turn(sk)
+        for entry in self.conn._pending_cancel_aborts.values():
+            if entry["task"] is not None:
+                entry["task"].cancel()
+        return claimed
+
+    async def test_a_live_reply_request_is_ended_as_a_send_now_and_its_run_claimed(self):
+        task, _ = self._request("t-run")
+        await asyncio.sleep(0)
+        self.assertIs(await ocp._hand_over_running_reply(self.conn, SK, "t-new"), True)
+        self.assertTrue(task.cancelled())
+        claimed = await self._claim()
+        self.assertEqual(claimed["run_id"], "run-1")
+        self.assertEqual(self.page_asked, [], "the page decided whether the running reply survives")
+        self.assertEqual(self.stops, [], "the running reply was stopped")
+        self.assertEqual(self.conn._reply_calls, {}, "an ended request left its entry")
+
+    async def test_a_send_now_that_parked_it_first_is_left_as_it_is(self):
+        """0.13.3: Send now cancelled the reply before the message came."""
+        task, _ = self._request("t-run")
+        await asyncio.sleep(0)
+        await ocp._owui_stop_task()(None, "t-run")   # Open WebUI's own Send now cancel
+        self.assertIs(await ocp._hand_over_running_reply(self.conn, SK, "t-new"), False)
+        self.assertEqual(self.stopped, ["t-run"], "stopped twice")
+        claimed = await self._claim()
+        self.assertEqual(claimed["run_id"], "run-1")
+        self.assertEqual(self.page_asked, ["t-run"], "a Send now's cancel is still the page's to name")
+        self.assertEqual(self.stops, [])
+
+    async def test_a_send_now_cancel_after_the_handover_changes_nothing(self):
+        """0.13.3 with the message first: Open WebUI's own cancel lands on an ended request."""
+        self._request("t-run")
+        await asyncio.sleep(0)
+        await ocp._hand_over_running_reply(self.conn, SK, "t-new")
+        self.assertEqual((await ocp._owui_stop_task()(None, "t-run"))["status"], False)
+        claimed = await self._claim()
+        self.assertEqual(claimed["run_id"], "run-1")
+        self.conn.settle_parked_turn(SK, "run-1", "send_now", hold_s=120)   # the page's late answer
+        self.assertIsNone(await self.conn.claim_cancelled_turn(SK), "parked twice")
+        self.assertEqual(self.stops, [])
+
+    async def test_a_request_that_never_ends_falls_back_within_the_bound(self):
+        task, release = self._request("t-run", ignores_cancel=True)
+        await asyncio.sleep(0)
+        with mock.patch.object(ocp, "HANDOVER_PARK_TIMEOUT_S", 0.05):
+            self.assertIs(await ocp._hand_over_running_reply(self.conn, SK, "t-new"), False)
+        self.assertTrue(any("did not end within" in line and SK in line for line in self.logged), self.logged)
+        release.set()
+        await asyncio.wait({task})
+
+    async def test_another_users_session_is_left_running(self):
+        """0.13.3 stops only the sender's own tasks in a saved chat (main.py stop endpoint,
+        filter_task_ids_by_user_id): another user's message never ended this reply."""
+        task, _ = self._request("t-run", sk=OTHER_SK)
+        await asyncio.sleep(0)
+        self.assertIs(await ocp._hand_over_running_reply(self.conn, SK, "t-new"), False)
+        self.assertFalse(task.done())
+        self.assertEqual(self.stopped, [])
+
+    async def test_its_own_request_is_never_stopped(self):
+        task, _ = self._request("t-new")
+        await asyncio.sleep(0)
+        self.assertIs(await ocp._hand_over_running_reply(self.conn, SK, "t-new"), False)
+        self.assertFalse(task.done())
+
+    async def test_a_real_stop_after_the_handover_is_still_a_stop(self):
+        """Only the requests the handover ended are a Send now; the next cancel asks the page."""
+        self._request("t-run")
+        await asyncio.sleep(0)
+        await ocp._hand_over_running_reply(self.conn, SK, "t-new")
+        await self._claim()
+        self.assertIs(self.conn.take_handover_cancel(SK, "t-new"), False)
+        self.assertIs(self.conn.take_handover_cancel(SK, "t-run"), False, "a handover cancel counted twice")
+
+    async def test_a_request_in_another_worker_is_logged_not_touched(self):
+        self.remote_ids.append("t-remote")
+        with mock.patch.object(self.conn, "live_runs", lambda sk: {"run-1"}), \
+                mock.patch.object(self.conn, "parse_owui_session_key", lambda sk: ("u", CHAT)):
+            self.assertIs(await ocp._hand_over_running_reply(self.conn, SK, "t-new"), False)
+        self.assertTrue(any("another Open WebUI worker" in line for line in self.logged), self.logged)
+        self.assertEqual(self.stopped, [])
+
+
+class StopTaskAdapterTests(unittest.TestCase):
+    """`open_webui.tasks.stop_task` is Open WebUI's: used only with the shape it has had."""
+
+    def test_the_signature_of_0_13_2_to_0_13_4_is_used(self):
+        # backend/open_webui/tasks.py:311 at v0.13.2, v0.13.3 and v0.13.4 alike.
+        async def stop_task(redis, task_id: str):
+            return {}
+        for version in ("0.13.2", "0.13.3", "0.13.4"):
+            with self.subTest(version=version):
+                _stop_task_module(self, stop_task=stop_task)
+                self.assertIs(ocp._owui_stop_task(), stop_task)
+                ocp._STOP_TASK.clear()
+
+    def test_a_missing_or_changed_one_is_not_used_and_says_so(self):
+        async def changed(redis, task_id, reason):
+            return {}
+
+        def not_async(redis, task_id):
+            return {}
+        for fn in (None, changed, not_async):
+            with self.subTest(fn=fn), mock.patch.object(ocp, "pipe_log") as log:
+                _stop_task_module(self, stop_task=fn)
+                self.assertIsNone(ocp._owui_stop_task())
+                self.assertIn("stop_task", log.call_args[0][0])
+                ocp._STOP_TASK.clear()
+
+
+class HandoverFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_without_stop_task_the_message_goes_on_and_the_reply_keeps_running(self):
+        self.remote_ids = []
+        conn = ocp._GatewayConnection(lambda: None)
+        local, _ = _stop_task_module(self, stop_task=None)
+        task = asyncio.ensure_future(asyncio.Event().wait())
+        self.addCleanup(task.cancel)
+        local["t-run"] = task
+        conn.register_reply_call(SK, 1, "t-run")
+        with mock.patch.object(ocp, "pipe_log") as log:
+            self.assertIs(await ocp._hand_over_running_reply(conn, SK, "t-new"), False)
+        self.assertFalse(task.done())
+        self.assertTrue(any("handover skipped" in c[0][0] for c in log.call_args_list))
+
+
+class ReplyCallRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_reply_that_raises_leaves_no_entry(self):
+        conn = ocp._GatewayConnection(lambda: None)
+        turn = ocp._PipeTurn.__new__(ocp._PipeTurn)
+        turn.conn, turn.session_key, turn.ended = conn, SK, False
+        conn.register_reply_call(SK, id(turn), "t-run")
+        turn.reply_call_registered = True
+
+        async def boom():
+            raise RuntimeError("boom")
+            yield  # noqa: unreachable: an async generator
+
+        async def nothing():
+            return
+        turn.prepare = boom
+        turn.save_final_statuses = nothing
+        with mock.patch.object(ocp, "_secret_asker_leave", lambda t: None):
+            with self.assertRaises(RuntimeError):
+                async for _ in turn.run():
+                    pass
+        self.assertEqual(conn._reply_calls, {})
+
+    def test_the_map_holds_task_ids_not_tasks(self):
+        conn = ocp._GatewayConnection(lambda: None)
+        conn.register_reply_call(SK, 1, "t-run")
+        self.assertEqual(conn._reply_calls, {SK: {1: ("t-run", None)}})
+
+
+class HandoverReachTests(unittest.TestCase):
+    def _note(self, workers):
+        with mock.patch.dict(sys.modules, {"open_webui": _mod("open_webui"),
+                                           "open_webui.env": _mod("open_webui.env", UVICORN_WORKERS=workers)}), \
+                mock.patch.object(ocp, "_HANDOVER_REACH_NOTED", []), mock.patch.object(ocp, "pipe_log") as log:
+            ocp._note_handover_reach()
+            ocp._note_handover_reach()
+        return [c[0][0] for c in log.call_args_list]
+
+    def test_several_workers_are_named_once(self):
+        lines = self._note(4)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("4 workers", lines[0])
+
+    def test_one_worker_says_nothing(self):
+        self.assertEqual(self._note(1), [])
+
+
+class QuestionLeftTests(unittest.IsolatedAsyncioTestCase):
+    """A message sent while a question card waits: the card is left first and the question ends
+    its reply as text, then the request ends, in the order of 0.13.3's Send now (ELI-200)."""
+
+    async def test_the_card_is_left_before_the_request_is_stopped(self):
+        self.remote_ids = []
+        conn = ocp._GatewayConnection(lambda: None)
+        local, stopped = _stop_task_module(self)
+        order = []
+
+        class Call:
+            async def leave_question(self, timeout_s):
+                order.append(("left", list(stopped)))
+        task = asyncio.ensure_future(asyncio.Event().wait())
+        local["t-run"] = task
+        conn.register_reply_call(SK, 1, "t-run", call=Call())
+        with mock.patch.object(ocp, "pipe_log"):
+            await ocp._hand_over_running_reply(conn, SK, "t-new")
+        self.assertEqual(order, [("left", [])], "the request was stopped before its card was left")
+        self.assertEqual(stopped, ["t-run"])
+
+    def _turn(self, ask):
+        turn = ocp._PipeTurn.__new__(ocp._PipeTurn)
+        turn.pending_prompt_text = "Which color?"
+        turn.maybe_answer_user_input = ask
+        return turn
+
+    async def test_a_left_card_reads_as_unanswered(self):
+        gate = asyncio.Event()
+
+        async def ask(_text):
+            await gate.wait()
+        turn = self._turn(ask)
+        with mock.patch.object(ocp, "pipe_log"):
+            asking = asyncio.ensure_future(turn.ask_held_prompt())
+            await asyncio.sleep(0)
+            leaving = asyncio.ensure_future(turn.leave_question(1.0))
+            result = await asking
+        self.assertIs(result.handled, False)
+        turn.question_left.set()   # what finish_held_prompt does once the question is shown
+        await leaving
+
+    async def test_a_cancel_of_the_reply_itself_still_cancels(self):
+        async def ask(_text):
+            await asyncio.Event().wait()
+        turn = self._turn(ask)
+        asking = asyncio.ensure_future(turn.ask_held_prompt())
+        await asyncio.sleep(0)
+        asking.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asking
