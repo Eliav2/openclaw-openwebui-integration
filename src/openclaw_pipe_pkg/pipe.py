@@ -800,6 +800,7 @@ class Pipe:
                     settle=functools.partial(
                         _settle_cancel_intent, turn.conn, turn.session_key,
                         turn.run_id, turn.chat_id, __event_call__,
+                        message_id=(__metadata__ or {}).get("message_id"),
                         task_id=(__metadata__ or {}).get("task_id")),
                     waiting=waiting,
                 )
@@ -1124,6 +1125,8 @@ class _PipeTurn:
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
         if self.owui_origin_chat_id and not self.channel_id:
             self.conn.register_reply_call(self.session_key, id(self), own_task_id, call=self)
+            _remember_reply_run(self.owui_origin_chat_id, (self.__metadata__ or {}).get("message_id"),
+                                self.__metadata__)
             self.reply_call_registered = True
         if claimed:
             self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
@@ -2239,9 +2242,14 @@ class _PipeTurn:
 
     async def leave_question(self, timeout_s: float) -> None:
         """End the question card this reply waits on, unanswered, and wait until
-        the question is in the reply as text (`ask_held_prompt`); at most `timeout_s`."""
+        the question is in the reply as text (`ask_held_prompt`); at most `timeout_s`.
+        A card already answered is not ended: its answer's delivery finishes first."""
         ask, left = getattr(self, "question_ask", None), getattr(self, "question_left", None)
         if ask is None or left is None or ask.done():
+            return
+        if not getattr(self, "question_in_modal", False):
+            # Answered: its delivery to the run is not cut; the handover waits for it.
+            await asyncio.wait({ask}, timeout=timeout_s)
             return
         self.question_leaving = True
         ask.cancel()
@@ -2844,6 +2852,7 @@ class _PipeTurn:
             if self.owui_origin_user_id and self.owui_origin_user_id != "unknown"
             else None
         )
+        self.question_in_modal = True
         try:
             answer = await _ask_user_input_modal(
                 self.__event_call__,
@@ -2856,6 +2865,9 @@ class _PipeTurn:
         except Exception as ex:
             pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
             answer = None
+        finally:
+            # From here the answer is delivered: `leave_question` lets that finish.
+            self.question_in_modal = False
         if answer is None:
             pipe_log("  user input modal cancelled or empty answer")
             # The agent is told once per reply that the secret never came.

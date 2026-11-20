@@ -203,9 +203,6 @@ class AutoSendTests(unittest.TestCase):
         self.assertEqual(self._flag(ocp._page_hooks_js(CHAT, True), CHAT), "true")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 SK = "agent:main:openwebui-00000000-0000-4000-8000-0000000000e1-" + CHAT
 OTHER_SK = "agent:main:openwebui-00000000-0000-4000-8000-0000000000e2-" + CHAT
@@ -491,6 +488,7 @@ class QuestionLeftTests(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()
 
         async def ask(_text):
+            turn.question_in_modal = True   # waiting in the card, as maybe_answer_user_input does
             await gate.wait()
         turn = self._turn(ask)
         with mock.patch.object(ocp, "pipe_log"):
@@ -575,3 +573,124 @@ class SentFromAPageTests(unittest.TestCase):
     def test_no_session_id_is_an_api_client(self):
         self.assertIs(ocp._sent_from_a_page({}, "user-1"), False)
         self.assertIs(ocp._sent_from_a_page(None, "user-1"), False)
+
+
+class ReviewFixTests(unittest.IsolatedAsyncioTestCase):
+    """#421 review (CodeRabbit): the handover path's edges."""
+
+    async def test_an_answered_card_is_not_cut_while_its_answer_is_delivered(self):
+        """#3: once the card has its answer, leaving it lets the delivery finish."""
+        delivered = asyncio.Event()
+
+        async def ask(_text):
+            turn.question_in_modal = True
+            await asyncio.sleep(0)          # the user answers
+            turn.question_in_modal = False
+            await delivered.wait()          # the answer goes to the run
+            return ocp.UserInputResult(True, None)
+        turn = QuestionLeftTests._turn(self, ask)
+        asking = asyncio.ensure_future(turn.ask_held_prompt())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        leaving = asyncio.ensure_future(turn.leave_question(1.0))
+        await asyncio.sleep(0)
+        self.assertFalse(asking.done(), "the delivery was cut")
+        delivered.set()
+        self.assertIs((await asking).handled, True)
+        await leaving
+
+    async def test_the_outer_cancel_settles_with_its_reply_id(self):
+        """#2: a cancel before `consume` (the reply's outer park) still names its reply, so a
+        Send now there sends the messages held under it."""
+        seen = []
+
+        async def settle(conn, sk, run, chat, event_call, message_id=None, task_id=None):
+            seen.append((message_id, task_id))
+        pipe = ocp.Pipe()
+        conn = types.SimpleNamespace(park_cancelled_turn=lambda *a, **k: spawn(k["settle"]()))
+
+        def spawn(coro):
+            spawned.append(asyncio.ensure_future(coro))
+        spawned = []
+
+        async def turn_gen(*a, turn=None, **k):
+            turn.conn, turn.session_key, turn.run_id, turn.chat_id = conn, SK, "run-1", CHAT
+            raise asyncio.CancelledError()
+            yield
+        with mock.patch.object(ocp, "_settle_cancel_intent", settle), \
+                mock.patch.object(ocp.Pipe, "_pipe_turn", turn_gen), mock.patch.object(ocp, "pipe_log"):
+            with self.assertRaises(asyncio.CancelledError):
+                async for _ in pipe._pipe_impl({}, None, __metadata__={"message_id": REPLY, "task_id": "t1"}):
+                    pass
+        await asyncio.gather(*spawned)
+        self.assertEqual(seen, [(REPLY, "t1")])
+
+    async def test_a_held_message_is_sent_with_its_replys_own_request_settings(self):
+        """#1: as Open WebUI sends them (get_pending_run(metadata) of the reply's request):
+        Controls' system prompt and variables, not the model alone."""
+        owui = _Owui(self)
+        runs = []
+
+        async def process(source_request, parent_chat_id, user_id, run, reply_id=None):
+            runs.append(run)
+        owui.subagents.process_pending_internal_messages = process
+        owui.subagents.get_pending_run = lambda metadata, model_id=None: {
+            "model_id": metadata.get("model_id") or model_id, "chat_context": metadata.get("chat_context")}
+        ocp._remember_reply_run(CHAT, REPLY, {"model_id": "openclaw_gateway.default",
+                                              "chat_context": {"messages": [{"role": "system", "content": "Be brief"}]}})
+        await ocp._owui_upsert_message(CHAT, REPLY, {"done": True})
+        await _drain()
+        self.assertEqual(runs[0]["chat_context"], {"messages": [{"role": "system", "content": "Be brief"}]})
+
+    async def test_a_reply_with_no_known_request_falls_back_to_its_model(self):
+        owui = _Owui(self)
+        await ocp._owui_upsert_message(CHAT, "00000000-0000-4000-8000-0000000000a9", {"done": True})
+        await _drain()
+        self.assertEqual(owui.calls[0][3], "openclaw_gateway.default")
+
+    async def test_a_cancel_after_the_done_save_still_sends_the_held_messages(self):
+        """#4: the caller cancelled during the save; the row committed, so they are sent."""
+        owui = _Owui(self)
+        saving = asyncio.Event()
+        Chats = sys.modules["open_webui.models.chats"].Chats
+
+        async def slow_upsert(chat_id, message_id, fields):
+            saving.set()
+            await asyncio.sleep(0.01)
+            return {"id": message_id, **fields}
+        with mock.patch.object(Chats, "upsert_message_to_chat_by_id_and_message_id", slow_upsert):
+            save = asyncio.ensure_future(ocp._owui_upsert_message(CHAT, REPLY, {"done": True}))
+            await saving.wait()
+            save.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await save
+            await _drain()
+        self.assertEqual([c[0] for c in owui.calls], ["answer"])
+
+
+class PerFunctionHoldTests(unittest.IsolatedAsyncioTestCase):
+    """Review body: two OpenClaw Functions each decide for their own replies' models."""
+
+    async def test_each_function_uses_its_own_auto_send(self):
+        owui = _Owui(self, reply_model="claw_two.default")
+        with mock.patch.object(ocp, "_composer_own_function_id", lambda: "claw_one"):
+            ocp._ensure_no_owui_hold(lambda: True)
+        with mock.patch.object(ocp, "_composer_own_function_id", lambda: "claw_two"):
+            ocp._ensure_no_owui_hold(lambda: False)
+        with mock.patch.object(ocp, "_composer_own_function_id", lambda: "claw_one"):
+            ocp._ensure_no_owui_hold(lambda: True)   # claw_one loaded last: claw_two's reply still holds
+        self.assertIs(await owui.subagents.queue_user_message(None, CHAT, None, {"id": "u"}, REPLY), True)
+
+
+    async def test_the_default_prefix_is_decided_by_its_own_function(self):
+        """`openclaw_gateway.` is in every load's prefixes: another install loaded first must not
+        decide for the default Function's replies."""
+        owui = _Owui(self, reply_model="openclaw_gateway.default")
+        with mock.patch.object(ocp, "_composer_own_function_id", lambda: "claw_one"):
+            ocp._ensure_no_owui_hold(lambda: True)
+        with mock.patch.object(ocp, "_composer_own_function_id", lambda: None):
+            ocp._ensure_no_owui_hold(lambda: False)   # the default Function, auto-send off
+        self.assertIs(await owui.subagents.queue_user_message(None, CHAT, None, {"id": "u"}, REPLY), True)
+
+if __name__ == "__main__":
+    unittest.main()
