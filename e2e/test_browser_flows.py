@@ -1083,9 +1083,9 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
         _wait(page, _steer_pending_js(-1) if _steers() else f"() => {_message_text_js(-1)}.includes('Queued: waiting')",
               "the last message waiting")
         open(gate, "w").close()
-        # Joined into one turn, the first message's word is answered; steered,
-        # the three are separate messages and the newest is.
-        answer = words[2] if _steers() else words[0]
+        # Joined into one turn or steered (separate messages, or merged into one
+        # from 2026.11.6), the fake model answers the newest: its last echo marker.
+        answer = words[2]
         _wait(page, _reply_js(-1, f"all.length === 4 && all.every(a => a.done) && r.text.includes({json.dumps(answer)})"),
               "the last message's reply answering all three")
     finally:
