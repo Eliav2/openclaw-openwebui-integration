@@ -1036,14 +1036,13 @@ def test_a_reply_interrupted_while_queued_says_its_message_went_with_the_next(pa
     capture.send(page, "E2E_SLOW:15 BROWSER_TWICE")
     _wait(page, _reply_js(0, "r.text.includes('BROWSER_TWICE slow-1 slow-2')"), "the reply part way through")
     _type_and_send(page, "E2E_ECHO: BROWSER_TWICE_A")
+    # Steered into the run at its next boundary, or run after it as one turn, both
+    # reach the model together; the newest one is answered.
+    answer = "BROWSER_TWICE_B"
     if _steers():
-        # Both are steered into the run at its next boundary and reach the
-        # model together; the newest one is answered.
         _wait(page, _steer_pending_js(-1), "the 2nd message sent, to be steered into the run")
-        answer = "BROWSER_TWICE_B"
     else:
         _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the 2nd reply queued")
-        answer = "BROWSER_TWICE_A"
     _type_and_send(page, "E2E_ECHO: BROWSER_TWICE_B")
     _wait(page, _reply_js(-1, "all.length === 3 && all[0].done && r.done"
                               f" && r.text.includes({json.dumps(answer)})"),
@@ -1083,9 +1082,9 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
         _wait(page, _steer_pending_js(-1) if _steers() else f"() => {_message_text_js(-1)}.includes('Queued: waiting')",
               "the last message waiting")
         open(gate, "w").close()
-        # Joined into one turn, the first message's word is answered; steered,
-        # the three are separate messages and the newest is.
-        answer = words[2] if _steers() else words[0]
+        # Joined into one turn or steered (separate messages, or merged into one
+        # from 2026.11.6), the fake model answers the newest: its last echo marker.
+        answer = words[2]
         _wait(page, _reply_js(-1, f"all.length === 4 && all.every(a => a.done) && r.text.includes({json.dumps(answer)})"),
               "the last message's reply answering all three")
     finally:
