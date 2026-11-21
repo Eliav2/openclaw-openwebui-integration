@@ -2586,6 +2586,34 @@ class NoDroppedMessagesTests(_TurnCase):
         async for _ in gen:
             pass
 
+    async def test_claude_cli_message_that_meets_a_new_run_is_steered_not_taken_back(self):
+        """The precondition of the deleted claude-cli take-back (ELI-87, ELI-356): a run starts
+        between the idle read and the send, and the message's own run ends in a lone empty final.
+        On 2026.10.10+ claude-cli steers it into that run, so the steered branch claims it: no
+        abort, no resend, and the reply says where the message went. On an older Gateway the
+        take-back aborted and resent it, which fails here."""
+        self.conn.gateway_version = getattr(self, "GATEWAY_VERSION", "2026.10.10")
+        self.runtime = "claude-cli"
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self.active = True  # the other run won the race
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await self._spin()
+        self.active = False
+        self._settled(False)
+        out = ""
+        with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError):
+            chunk = await asyncio.wait_for(first, 2)
+            while True:
+                out += chunk if isinstance(chunk, str) else ""
+                chunk = await asyncio.wait_for(gen.__anext__(), 1)
+        first.cancel()
+        await gen.aclose()
+        self.assertEqual(self.aborts, [], "taken back")
+        self.assertEqual(self.sent, ["hello"], "resent")
+        self.assertIn(openclaw_pipe.ui_text("steered_into_running"), out)
+
     async def test_api_runtime_steered_message_is_not_taken_back(self):
         """An API runtime injects a mid-run message into the live run, so a lone empty final there
         is not a lost message."""
@@ -14081,11 +14109,11 @@ class GapHandoverReplayTests(_RoutingCase):
     M1 = "11111111-1111-4111-8111-111111111111"
     M2 = "22222222-2222-4222-8222-222222222222"
 
-    async def _send_now_mid_tool(self, cancel_event=False, waits=False):
+    async def _send_now_mid_tool(self, cancel_event=False):
         """Reply 1 streams 1..10 and starts a tool call; Send now; reply 2 brings MSG2. Returns
         reply 2 and run 1's id. `cancel_event`: `chat:tasks:cancel` reaches the tab first
-        (`self.cancel_at`, `self.cancelled_output`). `waits`: run 1 went out at another model,
-        so MSG2 is not steered into it and waits for it."""
+        (`self.cancel_at`, `self.cancelled_output`). Run 1 went out at another model, so MSG2
+        is not steered into it (2026.10.10+) and waits for it: ELI-158's case."""
         first = await self.start_reply("count to 20", self.M1, intent="send_now")
         run1 = self.run
         self.frame(_delta(self._nums(1, 10)))
@@ -14108,8 +14136,7 @@ class GapHandoverReplayTests(_RoutingCase):
                 await asyncio.sleep(0.005)
             self.cancel_at = len(self.owui.emits)
             self.cancelled_output = _owui_cancelled_output(_owui_stream(first["chunks"])[1])
-        if waits:
-            self.conn.sent_settings[self.key] = ("another/model", None)
+        self.conn.sent_settings[self.key] = ("another/model", None)
         second = await self.start_reply("MSG2", self.M2, intent="send_now", sends=False)
         for _ in range(400):
             if (self.M1 in [k[1] for k in self.conn._turn_writers]
@@ -14163,7 +14190,7 @@ class GapHandoverReplayTests(_RoutingCase):
     async def test_send_now_keeps_a_running_tool_card_running_in_its_own_message(self):
         """ELI-158: Send now while a tool runs. The run stays in its own message, its card running
         until the tool ends; the new message gets only its own answer."""
-        second, run1 = await self._send_now_mid_tool(waits=True)
+        second, run1 = await self._send_now_mid_tool()
         self.assertEqual(self._calls(self.M1), (["toolu_1"], []), "the card is still running")
         self.assertEqual(len(self.chat_sends), 1, "MSG2 waits for the run")
         self.history = self._history(
