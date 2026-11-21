@@ -7,3 +7,5 @@ Applies to: Pipe
 Valves: the Pipe's [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished)
 
 What stays here is the Pipe's side. The push function listens for Open WebUI's `chat.finished` event, and the Pipe publishes it for every reply it writes (agent turns, cron and sub-agent replies included) when `PUBLISH_CHAT_FINISHED` is on, with `source` `openclaw-pipe`. Turn it on, then follow the install guide in the other repository.
+
+Before you turn it on: a notification target (Settings > Notifications) with `chat.finished` on then gets two events for a reply to a chat message, Open WebUI's and the Pipe's. See [Two notifications with a notification target](../features/agent-turns.md#telling-other-functions-a-reply-finished) for how to keep one.
