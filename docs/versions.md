@@ -9,13 +9,15 @@ Applies to: Pipe, Action
 | | Minimum | Tested in CI |
 |---|---|---|
 | Open WebUI | 0.12.4 | 0.13.2 |
-| OpenClaw Gateway | 2026.9.3 | 2026.10.10, and 2026.10.5 as the oldest supported |
+| OpenClaw Gateway | 2026.10.10 | 2026.10.10 |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
-The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). The blocking lane runs what the live install runs; a second lane on the oldest supported OpenClaw (2026.10.5) reports without blocking. A pull request that only changes docs, Markdown, `tests/` or comments and docstrings skips the end-to-end suite. The OpenClaw minimum, and the Open WebUI releases below 0.12.0, come from the same suite run once on each older release; the results are below. The Open WebUI minimum, 0.12.4, does not: the suite passes on 0.12.0 to 0.12.3, and 0.12.4 is the first release without the two page bugs listed under What each feature needs.
+The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). The lane runs what the live install runs, which is also the OpenClaw minimum. A pull request that only changes docs, Markdown, `tests/` or comments and docstrings skips the end-to-end suite. The Open WebUI releases below 0.12.0 come from the same suite run once on each older release; the results are below. The Open WebUI minimum, 0.12.4, does not: the suite passes on 0.12.0 to 0.12.3, and 0.12.4 is the first release without the two page bugs listed under What each feature needs.
 
-Below the minimums the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, and on OpenClaw 2026.9.1 or older, cron replies never appear; on Open WebUI 0.12.0 to 0.12.3, a tab that was loading the chat can show a reply cut, and an approval or question dialog can lose its answer.
+Below the Open WebUI minimum the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, cron replies never appear; on Open WebUI 0.12.0 to 0.12.3, a tab that was loading the chat can show a reply cut, and an approval or question dialog can lose its answer.
+
+An OpenClaw Gateway older than 2026.10.10 gets no messages: the Pipe answers every message with "OpenClaw needs an update" and sends nothing. The Pipe relies on what 2026.10.10 added: a message sent while the agent works is steered into the running run, on every runtime. The tables below keep the results measured while older Gateways were supported.
 
 ## What each feature needs
 
@@ -28,16 +30,13 @@ Below the minimums the chat itself still works, but some features break (the tab
 | Status button in the composer on chat open | Open WebUI 0.12.0 | Appears after the next reply instead |
 | A reply that finishes while a tab is loading the chat | Open WebUI 0.12.4 | 0.12.0 to 0.12.3: that tab can show the reply cut until it is reloaded. Those releases replace what reached the page during a load with what the load fetched; 0.12.4 keeps it ([open-webui#32761](https://github.com/open-webui/open-webui/issues/32761)) |
 | An input dialog (an approval, a question) while the agent works | Open WebUI 0.12.4 | 0.12.0 to 0.12.3: a page update that reaches the tab while the dialog is open can take the dialog's answer, so Confirm reaches nobody ([open-webui#32742](https://github.com/open-webui/open-webui/issues/32742)) |
-| Cron replies, and finishing a reply a Gateway restart cut off | OpenClaw 2026.9.3 | 2026.9.1 and older: a cron run in the chat's session is not recognised, so its reply is never shown; and in the restart test, a reply cut by a Gateway restart did not finish |
-| A message sent while the agent works, answered in the same run | OpenClaw 2026.10.10 | Earlier Gateways: the message waits for the run to end and gets its own reply ([Reliability](./features/reliability.md#messages-sent-while-the-agent-works)). On `claude-cli` with 2026.9.3 the Gateway would drop it, so the Pipe holds it |
-| The Status dialog's Scheduled section, matched by the Gateway | OpenClaw 2026.10.5 (`cron.list` with `sessionKey`) | 2026.9.3: the dialog reads the whole job list once and matches `session:<key>` targets and a job's `sessionKey` itself; a job tied to the chat only by the conversation it came from is not listed ([Scheduled](./features/status.md#scheduled)) |
 | Rate limits for a Gateway that only has a Claude CLI login | The `claude-cli-usage` Gateway plugin | OpenClaw 2026.9.1 and later report no Anthropic windows for that login; the dialog says so ([Status button](./install/status-action.md)) |
 
 ## Test runs
 
 Each row is the full end-to-end suite on one pair, on GitHub's runners. The suite was not changed to suit older releases: a failure is the integration's behaviour on that release.
 
-### Open WebUI, with OpenClaw 2026.9.3
+### Open WebUI, with OpenClaw 2026.9.3 (before the 2026.10.10 minimum)
 
 | Open WebUI | Result | Failed tests | Run |
 | --- | --- | --- | --- |
@@ -51,7 +50,9 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.13.0 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660471297) |
 | 0.13.2 | pass (on OpenClaw 2026.10.10) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/42592174456) |
 
-### OpenClaw, with Open WebUI 0.12.0
+### OpenClaw, with Open WebUI 0.12.0 (before the 2026.10.10 minimum)
+
+Measured while older Gateways were supported. The Pipe now refuses to send to any release below 2026.10.10.
 
 | OpenClaw | Result | Failed tests | Run |
 | --- | --- | --- | --- |
@@ -59,7 +60,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 2026.9.1 | 14 of 17 pass | the same as 2026.8.35 | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641691738) |
 | 2026.9.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 2026.10.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641695395) |
-| 2026.10.5 | pass | | every pull request that can change runtime behaviour (reports, never blocks) |
+| 2026.10.5 | pass | | the non-blocking "E2E oldest" lane, until the minimum moved to 2026.10.10 |
 | 2026.10.10 | pass (on Open WebUI 0.13.2) | | every pull request that can change runtime behaviour ([first run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41675560751)) |
 
 ## Keeping this page true

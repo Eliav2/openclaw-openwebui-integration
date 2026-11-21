@@ -199,7 +199,7 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="oc-slash-")
         for patcher in (mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": self.dir}),
-                        mock.patch.dict(ocp._slash_prompts_state, {"legacy_at": None, "pending": False})):
+                        mock.patch.dict(ocp._slash_prompts_state, {"pending": False})):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -289,7 +289,8 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.sync(store, conn, SYNC_SLASH_COMMANDS=False), "off")
         self.assertIn("status", store.rows)
 
-    async def test_an_older_gateway_is_read_with_commands_list_and_its_hash(self):
+    async def test_an_older_gateway_is_an_error_and_writes_nothing(self):
+        """Before 2026.10.10 is not supported (ELI-356): no `commands.list` fallback."""
         class Older(FakeConn):
             async def send_request(self, method, params, timeout=10):
                 self.requests.append((method, dict(params)))
@@ -297,15 +298,9 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
                     raise ocp.GatewayError("invalid chat.metadata params: at root: unexpected property 'includeModels'")
                 return {"commands": self.commands}
         store, conn = FakeStore(), Older([STATUS])
-        self.assertEqual(await self.sync(store, conn), "synced")
-        self.assertEqual(set(store.rows), {"status"})
-        store.calls.clear()
-        self.assertEqual(await self.sync(store, conn), "unchanged")
-        self.assertEqual([m for m, _ in conn.requests], ["chat.metadata", "commands.list", "commands.list"])
-        self.assertEqual(conn.requests[-1][1], {"agentId": "main", "scope": "text", "includeArgs": True})
-        conn.commands = [STATUS, SKILL]
-        self.assertEqual(await self.sync(store, conn), "synced")
-        self.assertEqual(set(store.rows), {"status", "skill"})
+        self.assertEqual(await self.sync(store, conn), "error")
+        self.assertEqual([m for m, _ in conn.requests], ["chat.metadata"])
+        self.assertEqual(store.calls, [])
 
     async def test_a_prompt_an_admin_turned_off_is_kept_and_not_added_again(self):
         store, conn = FakeStore(), FakeConn([STATUS, SKILL])
@@ -390,22 +385,6 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         store, conn = FakeStore(), WrongAgent([STATUS])
         self.assertEqual(await self.sync(store, conn, AGENT_ID="nope"), "error")
         self.assertEqual([m for m, _ in conn.requests], ["chat.metadata"])
-        self.assertIsNone(ocp._slash_prompts_state["legacy_at"])
-
-    async def test_a_gateway_without_chat_metadata_uses_commands_list_and_retries_a_day_later(self):
-        class NoMethod(FakeConn):
-            async def send_request(self, method, params, timeout=10):
-                self.requests.append((method, dict(params)))
-                if method == "chat.metadata":
-                    raise ocp.GatewayError("unknown method: chat.metadata")
-                return {"commands": self.commands}
-        store, conn = FakeStore(), NoMethod([STATUS])
-        self.assertEqual(await self.sync(store, conn), "synced")
-        self.assertEqual(await self.sync(store, conn), "unchanged")
-        self.assertEqual([m for m, _ in conn.requests], ["chat.metadata", "commands.list", "commands.list"])
-        ocp._slash_prompts_state["legacy_at"] -= ocp._SLASH_PROMPTS_LEGACY_RETRY_S
-        await self.sync(store, conn)
-        self.assertEqual(conn.requests[-2][0], "chat.metadata")
 
     async def test_a_gateway_error_writes_nothing(self):
         class Down:

@@ -3,6 +3,7 @@
 CI-pinned versions, and wording rules (no em dash, no internal terms)."""
 
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -312,6 +313,18 @@ class VersionsTests(unittest.TestCase):
             with self.subTest(rel(path)):
                 self.assertIn(self.owui, self._row(path, "Open WebUI"))
                 self.assertIn(self.openclaw, self._row(path, "OpenClaw Gateway"))
+
+    def test_the_documented_openclaw_minimum_is_the_pipes_gate(self):
+        """ELI-356: versions.md, both frontmatters and the Pipe's refusal name one minimum."""
+        sys.path.insert(0, str(ROOT))
+        import openclaw_pipe
+        minimum = openclaw_pipe.MIN_GATEWAY_VERSION_TEXT
+        self.assertEqual(self._row(ROOT / "docs" / "versions.md", "OpenClaw Gateway").split("|")[2].strip(), minimum)
+        for name in ("frontmatter.txt", "frontmatter-action.txt"):
+            with self.subTest(name):
+                self.assertIn(f"OpenClaw Gateway {minimum}+", (ROOT / "src" / name).read_text())
+        for lang in (openclaw_pipe.LANG_EN, openclaw_pipe.LANG_HE):
+            self.assertIn(minimum, openclaw_pipe._ERROR_TEXT[lang][openclaw_pipe.ERROR_OLD_GATEWAY])
 
     def test_functions_require_the_minimum_open_webui(self):
         """`required_open_webui_version` must be the documented minimum: higher is

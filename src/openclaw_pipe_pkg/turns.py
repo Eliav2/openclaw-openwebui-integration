@@ -36,6 +36,11 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
     return {"chat": m.group("chat"), "message": m.group("message"), "kind": kind}
 
 
+# Every run the Gateway starts to announce something (a sub-agent's result,
+# a requester settle) has an id with this prefix; none carries a user message.
+ANNOUNCE_RUN_PREFIX = "announce:"
+
+
 def parse_announce_run_id(run_id: str) -> dict | None:
     """{child_session, child_run} of a sub-agent announce run, else None.
     Id shape: `announce:v1:<childSessionKey>:<childRunId>[:wake|:retry-<n>]` (announce-idempotency-D7LnUTJR.mjs:4-10)."""
@@ -432,13 +437,6 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     if status == "killed" and stop_notice_before:
         return "pipe"
     return "none"
-
-
-def judges_cut_runs_after_listening(version) -> bool:
-    """A 2026.10+ Gateway serves rows before its recovery pass judged cut runs
-    (about 8 s). 2026.9.3 marks within ms. Unknown versions count as old."""
-    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.", str(version or ""))
-    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
 def resumes_a_crash(version) -> bool:

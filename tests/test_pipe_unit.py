@@ -614,10 +614,14 @@ class StubTurnTests(unittest.TestCase):
 
     def test_open_turn_is_not_closed_until_the_transcript_says_so(self):
         self.assertFalse(_stub_turn(_turn_history(closed=False), "stub-1", "")["closed"])
-        # A later turn means this one is over even without a closing message.
-        turn = _stub_turn(_turn_history(closed=False, later=True), "stub-1", "")
+        # A later turn means a run that wrote is over even without a closing message.
+        hist = _turn_history(closed=False, later=True)
+        hist["messages"][5]["idempotencyKey"] = "msg-c-stub-1-1.0"     # it wrote: it ran
+        turn = _stub_turn(hist, "stub-1", "")
         self.assertTrue(turn["closed"])
         self.assertNotIn("later answer", json.dumps(turn["messages"]))
+        # One that never wrote was steered into the run before it (2026.10.10+): not this turn's to close.
+        self.assertFalse(_stub_turn(_turn_history(closed=False, later=True), "stub-1", "")["closed"])
 
     def test_a_repeated_text_matches_the_first_run_sent_after_the_stub(self):
         hist = _turn_history(run="msg-c-100.5", text="works?")
@@ -1885,6 +1889,55 @@ class _TurnCase(unittest.IsolatedAsyncioTestCase):
         self.fail(f"{run_id} never registered")
 
 
+class MinimumGatewayTests(_TurnCase):
+    """The Pipe supports OpenClaw 2026.10.10+ (ELI-356): an older Gateway gets no message."""
+
+    def test_versions_below_the_minimum(self):
+        below = openclaw_pipe.gateway_below_minimum
+        for version in ("2026.9.3", "2026.10.5", "2026.10.9", "2025.12.31"):
+            self.assertTrue(below(version), version)
+        for version in ("2026.10.10", "2026.10.10-beta.1", "2026.11.5", "2026.11.6", "2027.1.1"):
+            self.assertFalse(below(version), version)
+
+    def test_an_unknown_version_is_not_refused(self):
+        for version in (None, "", "dev", "unknown"):
+            self.assertFalse(openclaw_pipe.gateway_below_minimum(version), version)
+
+    async def test_an_older_gateway_gets_no_message_and_the_user_is_told(self):
+        self.conn.gateway_version = "2026.10.5"
+        out = await asyncio.wait_for(self._drain(self._reply("hello", "m1")), 5)
+        self.assertNotIn("chat.send", self.rpc)
+        en = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_EN]
+        self.assertTrue(out.startswith(en[openclaw_pipe.ERROR_OLD_GATEWAY]), out)
+        self.assertIn("2026.10.5", out.split("<details>")[1])
+
+    async def test_the_refusal_is_in_the_language_of_the_message(self):
+        self.conn.gateway_version = "2026.9.3"
+        out = await asyncio.wait_for(self._drain(self._reply(HEBREW_ASK, "m1")), 5)
+        he = openclaw_pipe._ERROR_TEXT[openclaw_pipe.LANG_HE]
+        self.assertTrue(out.startswith(he[openclaw_pipe.ERROR_OLD_GATEWAY]), out)
+        self.assertEqual(self.sent, [])
+
+    @staticmethod
+    async def _drain(gen):
+        return "".join([c async for c in gen if isinstance(c, str)])
+
+    async def test_a_supported_or_unknown_gateway_gets_the_message(self):
+        for version in ("2026.10.10", None):
+            self.sent.clear()
+            self.conn.gateway_version = version
+            gen = self._reply("hello", f"m-{version}")
+            first = asyncio.ensure_future(gen.__anext__())
+            run = f"run-{len(self.keys) + 1}"
+            await self._until_registered(run)
+            self._queue(run).put_nowait(self._delta(run, "hi"))
+            self._queue(run).put_nowait(self._final(run))
+            await asyncio.wait_for(first, 2)
+            async for _ in gen:
+                pass
+            self.assertEqual(self.sent, ["hello"], version)
+
+
 class NoDroppedMessagesTests(_TurnCase):
     """Drive real reply generators through OWUI's ways of ending a response. A generator close must
     not skip the cancel handler or lose lines in the gap before the next reply registers."""
@@ -2477,7 +2530,11 @@ class NoDroppedMessagesTests(_TurnCase):
         self.assertNotIn(openclaw_pipe.ui_text("yield_wait"), out)
 
     async def test_a_run_with_no_text_and_no_card_still_says_so(self):
-        out = await self._reply_text([self._final("run-1")])
+        """A run that started; a lone empty final as the first event is a steered message."""
+        out = await self._reply_text([
+            {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle", "data": {"phase": "start"}}},
+            self._final("run-1")])
         self.assertIn("no reply text", out)
 
     async def test_a_lifecycle_error_is_not_shown_twice(self):
@@ -2529,30 +2586,33 @@ class NoDroppedMessagesTests(_TurnCase):
         async for _ in gen:
             pass
 
-    async def test_claude_cli_message_queued_behind_a_new_run_is_taken_back_and_resent(self):
-        """A run starting between the idle read and the send queues the message (a lone empty
-        final), which claude-cli drops. The pipe aborts that runId and resends after the settle."""
+    async def test_claude_cli_message_that_meets_a_new_run_is_steered_not_taken_back(self):
+        """The precondition of the deleted claude-cli take-back (ELI-87, ELI-356): a run starts
+        between the idle read and the send, and the message's own run ends in a lone empty final.
+        On 2026.10.10+ claude-cli steers it into that run, so the steered branch claims it: no
+        abort, no resend, and the reply says where the message went. On an older Gateway the
+        take-back aborted and resent it, which fails here."""
+        self.conn.gateway_version = getattr(self, "GATEWAY_VERSION", "2026.10.10")
         self.runtime = "claude-cli"
         gen = self._reply("hello", "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
-        self.active = True  # the resume won the race
+        self.active = True  # the other run won the race
         self._queue("run-1").put_nowait(self._final("run-1"))
         await self._spin()
-        self.assertEqual(self.aborts, [{"sessionKey": self.SK, "runId": "run-1"}])
-        self.assertEqual(self.sent, ["hello"], "not resent while the run is going")
-
+        self.active = False
         self._settled(False)
-        await self._until_registered("run-2")
-        self.assertEqual(self.sent, ["hello", "hello"])
-        q = self._queue("run-2")
-        q.put_nowait(self._delta("run-2", "answer"))
-        q.put_nowait(self._final("run-2"))
-        out = await asyncio.wait_for(first, 2)
-        async for chunk in gen:
-            out += chunk if isinstance(chunk, str) else ""
-        self.assertIn("answer", out)
-        self.assertEqual(len(self.aborts), 1)
+        out = ""
+        with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError):
+            chunk = await asyncio.wait_for(first, 2)
+            while True:
+                out += chunk if isinstance(chunk, str) else ""
+                chunk = await asyncio.wait_for(gen.__anext__(), 1)
+        first.cancel()
+        await gen.aclose()
+        self.assertEqual(self.aborts, [], "taken back")
+        self.assertEqual(self.sent, ["hello"], "resent")
+        self.assertIn(openclaw_pipe.ui_text("steered_into_running"), out)
 
     async def test_api_runtime_steered_message_is_not_taken_back(self):
         """An API runtime injects a mid-run message into the live run, so a lone empty final there
@@ -9856,23 +9916,6 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], True)
         self.assertEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
 
-    async def test_a_gateway_that_never_steers_never_says_sent_with_next(self):
-        """A Gateway before 2026.10.10 never steers, so the transcript shape alone does not set the
-        steered note (#278)."""
-        self.conn.gateway_version = "2026.10.5"
-        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
-                                  "content": "", "done": True,
-                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
-        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
-                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
-        self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(
-            {"role": "user", "content": "second", "__openclaw": {"idempotencyKey": "R3:user"}},
-            {"role": "assistant", "content": [{"type": "text", "text": "both"}],
-             "stopReason": "stop", "__openclaw": {"runId": "R1"}}))
-        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
-        self.assertIs(self.m()["done"], True)
-        self.assertNotEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
-
     async def test_a_steered_reply_waits_for_its_message_to_be_committed(self):
         """The idle row can come before the steered message is committed: the reply waits for the
         commit, then the answer."""
@@ -12822,13 +12865,6 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         await self.spin()
         return self.owui.msgs().get(turn_message_id(self.key, self.RUN, self.CHAT), {})
 
-    async def test_on_9_3_an_idle_row_with_no_status_after_a_restart_finalizes(self):
-        """9.3 keeps `running` across a restart and recovers within ms, so a no-status row there is
-        never recovered: M must not wait."""
-        self.crash("2026.9.3")
-        m = await self.restarted("2026.9.3", {})
-        self.assertIs(m.get("done"), True, "9.3: nothing would ever close M")
-
     async def test_on_11_5_a_crash_nothing_continues_ends_the_message_after_the_grace(self):
         """2026.11.5 does not resume a crash: the idle session reads like one about to be recovered,
         so M waits the grace for a recovery run, then ends as cut off (not open for ever)."""
@@ -14076,7 +14112,8 @@ class GapHandoverReplayTests(_RoutingCase):
     async def _send_now_mid_tool(self, cancel_event=False):
         """Reply 1 streams 1..10 and starts a tool call; Send now; reply 2 brings MSG2. Returns
         reply 2 and run 1's id. `cancel_event`: `chat:tasks:cancel` reaches the tab first
-        (`self.cancel_at`, `self.cancelled_output`)."""
+        (`self.cancel_at`, `self.cancelled_output`). Run 1 went out at another model, so MSG2
+        is not steered into it (2026.10.10+) and waits for it: ELI-158's case."""
         first = await self.start_reply("count to 20", self.M1, intent="send_now")
         run1 = self.run
         self.frame(_delta(self._nums(1, 10)))
@@ -14099,6 +14136,7 @@ class GapHandoverReplayTests(_RoutingCase):
                 await asyncio.sleep(0.005)
             self.cancel_at = len(self.owui.emits)
             self.cancelled_output = _owui_cancelled_output(_owui_stream(first["chunks"])[1])
+        self.conn.sent_settings[self.key] = ("another/model", None)
         second = await self.start_reply("MSG2", self.M2, intent="send_now", sends=False)
         for _ in range(400):
             if (self.M1 in [k[1] for k in self.conn._turn_writers]
@@ -15034,14 +15072,8 @@ class SessionIdRunTests(_RoutingCase):
         await HandoverRewriteTests.settle(self, run)
 
     def cron_task_gateway(self, abortable=False, run_abortable=False):
-        """The Gateway's answers for stopping a wake: on 2026.9 tasks.cancel (ELI-192);
-        `run_abortable`: 2026.10.5's sessions.abort by run id."""
+        """The Gateway's answers for stopping a wake. `run_abortable`: sessions.abort by run id."""
         inner, test = self.conn.send_request, self
-        self.cron_tasks = [{"taskId": "task-wake", "kind": "automation_run", "runtime": "cron",
-                            "status": "running", "childSessionKey": self.key, "sourceId": self.JOB,
-                            "runId": f"cron:{self.JOB}:1:x"},
-                           {"taskId": "task-other", "kind": "automation_run", "runtime": "cron",
-                            "status": "running", "childSessionKey": "agent:main:other", "sourceId": "job-other"}]
 
         async def send_request(method, params, timeout=10):
             if method == "chat.abort":
@@ -15051,14 +15083,6 @@ class SessionIdRunTests(_RoutingCase):
                 test.sent.append((method, copy.deepcopy(params)))
                 return ({"ok": True, "abortedRunId": params.get("runId"), "status": "aborted"} if run_abortable
                         else {"ok": True, "abortedRunId": None, "status": "no-active-run"})
-            if method == "tasks.list" and run_abortable:
-                raise RuntimeError("unknown method: tasks.list")
-            if method == "tasks.list":
-                test.sent.append((method, copy.deepcopy(params)))
-                return {"tasks": copy.deepcopy(test.cron_tasks)}
-            if method == "tasks.cancel":
-                test.sent.append((method, copy.deepcopy(params)))
-                return {"found": True, "cancelled": True}
             return await inner(method, params, timeout)
         self.conn.send_request = send_request
 
@@ -15071,24 +15095,8 @@ class SessionIdRunTests(_RoutingCase):
         await self.spin()
         return w
 
-    async def test_stop_on_a_wake_in_the_open_tab_stops_its_run(self):
-        """ELI-192: on 2026.9 Stop on a wake cancels its cron task, since chat.abort finds no run
-        under the sessionId."""
-        self.tab_on_chat()
-        self.cron_task_gateway()
-        self.wake_turn(self.W1)
-        _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
-        await self.spin()
-        mid = turn_message_id(self.key, self.W1, self.CHAT)
-        w = await self.stop_on_the_tab(mid)
-        self.assertIn(("tasks.cancel", {"taskId": "task-wake"}), self.sent)
-        self.assertNotIn(("tasks.cancel", {"taskId": "task-other"}), self.sent)
-        self.assertTrue(w.closed)
-        self.assertIs(self.new_messages()[mid]["done"], True)
-
-    async def test_stop_on_a_wake_on_2026_10_aborts_its_run_by_id(self):
-        """2026.10.5 has no tasks.cancel: sessions.abort with the run id, without clearQueued, so
-        queued turns stay."""
+    async def test_stop_on_a_wake_aborts_its_run_by_id(self):
+        """sessions.abort with the run id, without clearQueued, so queued turns stay (ELI-192)."""
         self.tab_on_chat()
         self.cron_task_gateway(run_abortable=True)
         self.wake_turn(self.W1)
@@ -15097,22 +15105,20 @@ class SessionIdRunTests(_RoutingCase):
         mid = turn_message_id(self.key, self.W1, self.CHAT)
         w = await self.stop_on_the_tab(mid)
         self.assertIn(("sessions.abort", {"key": self.key, "runId": w.run_id}), self.sent)
-        self.assertNotIn("tasks.list", [m for m, _ in self.sent])
         # chat.abort on a 2026.10.5 wake only stops its running command, so it is never sent first.
         self.assertNotIn("chat.abort", [m for m, _ in self.sent])
         self.assertTrue(w.closed)
         self.assertIs(self.new_messages()[mid]["done"], True)
 
-    async def test_stop_on_a_run_chat_abort_stops_cancels_no_task(self):
-        """A run chat.abort aborts is not cancelled again as a task."""
+    async def test_stop_on_a_run_chat_abort_stops_is_aborted_once(self):
+        """A run chat.abort aborts is not aborted again."""
         self.tab_on_chat()
         self.cron_task_gateway(abortable=True)
         self.wake_turn(self.W1)
         _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
         await self.spin()
         await self.stop_on_the_tab(turn_message_id(self.key, self.W1, self.CHAT))
-        self.assertIn("chat.abort", [m for m, _ in self.sent])
-        self.assertNotIn("tasks.cancel", [m for m, _ in self.sent])
+        self.assertEqual([m for m, _ in self.sent].count("chat.abort"), 1)
 
     async def test_a_wake_that_ends_with_a_question_asks_it_on_the_tab(self):
         """On 2026.9 a wake ends on its own terminal event; it asks its closing question like any
@@ -16710,7 +16716,7 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
             self._user("R1", "hold"), copy("hold"), self._said("HOLD_START", stop="end_turn"),
             self._user(r2, "aside"), copy("aside"), self._said("STEERED: aside", stop="end_turn"),
             self._said("HOLD_START\n\nSTEERED: aside", run="R1", key="cli-assistant:R1")]}
-        turn = openclaw_pipe._stub_turn(hist, stub, "", steers=True)
+        turn = openclaw_pipe._stub_turn(hist, stub, "")
         self.assertTrue(turn["closed"])
         self.assertEqual(self._texts(turn["messages"]), ["STEERED: aside"])
 
@@ -17012,6 +17018,19 @@ class MidRunSteeringTests(_TurnCase):
         self.active = True
         await self._dispatch(self._lifecycle(self.R1, "start"), self._delta(self.R1, "ROUND 1"))
         return gen, first
+
+    async def test_a_gateway_of_unknown_version_steers_too(self):
+        """Every supported Gateway steers (ELI-356): no version check holds the message back."""
+        self.conn.gateway_version = None
+        gen_a, first_a = await self._running_first_reply()
+        gen_b = self._reply("Stop and say banana", "m2")
+        first_b = asyncio.ensure_future(gen_b.__anext__())
+        await self._until_registered(self.R2)
+        self.assertEqual(self.sent[-1], "Stop and say banana", "sent while the run works")
+        for task, gen in ((first_a, gen_a), (first_b, gen_b)):
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await gen.aclose()
 
     async def test_a_mid_run_message_is_steered_and_answered_in_its_own_reply(self):
         self.conn.gateway_version = "2026.10.10"
@@ -17672,18 +17691,6 @@ class MidRunSteeringTests(_TurnCase):
         await self._dispatch(self._final(self.R1, "ROUND 1"))
         await self._collect(first_a, gen_a)
         await gen_b.aclose()
-
-    async def test_a_gateway_without_claude_steering_still_queues(self):
-        self.conn.gateway_version = "2026.10.5"
-        gen_a, first_a = await self._running_first_reply()
-        gen_b = self._reply("Stop and say banana", "m2")
-        first_b = asyncio.ensure_future(gen_b.__anext__())
-        await self._spin()
-        self.assertNotIn("Stop and say banana", self.sent)
-        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
-        first_b.cancel()
-        first_a.cancel()
-        await self._spin()
 
     async def test_a_message_with_an_image_still_queues(self):
         self.conn.gateway_version = "2026.10.10"

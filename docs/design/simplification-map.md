@@ -131,8 +131,8 @@ Order (decided): the AST check with cut 1, then 5, 6 and 9, with the other prose
 | 4 | Prose diet in tests, a file at a time (AST-identical outside docstrings) | −2,000 | none | - |
 | 5 | Delete `owui_internals_diff.py`, `probe_cancelled_owui_write.py`, `migrate_stale_chat_models.py` (+ test, docs), `_parse_channel_session_key` | −560 | low | decided |
 | 6 | Drop the ELI-230 tab probe and the ELI-195 dialog hold (fixed in Open WebUI 0.12.4) | −180 src / −400 tests | low | decided: minimum Open WebUI 0.12.4 |
-| 7 | Drop the 2026.9.3 paths | −150 / −400 | medium | waits for ELI-356 (minimum OpenClaw 2026.10.10, ~2026-11-22..26) |
-| 8 | Drop the branches steering makes unreachable on 2026.10.10 | −300 to −600 / −1,000 | medium | waits for ELI-356 |
+| 7 | Drop the 2026.9.3 paths | −150 / −400 | medium | done with 8 in ELI-356 (minimum OpenClaw 2026.10.10) |
+| 8 | Drop the branches steering makes unreachable on 2026.10.10 | −300 to −600 / −1,000 | medium | done in ELI-356: much smaller than estimated, mostly version clauses and the claude-cli take-back (ELI-87). The hold stays for images, channel threads, model and thinking changes, and runs the agent started |
 | 9 | One "wait on transcript/row/session change" helper; one row-read helper | - | - | closed: measured at about −10 lines. Only 3 of 5 first-event waits fit one helper, and the row read repeats 3 times, one line each. Not worth a gated change |
 | 10 | Split `_PipeTurn` and `Action._run_status` into smaller steps | - | - | closed: measured. Only about 50 repeated lines across `pipe.py` and `action.py`; splitting into steps adds signatures and state passing, so lines go up. A readability refactor only if Eliav asks |
 | 11 | Merge duplicate unit tests (shared fixtures, parametrize) | −2,000 to −4,000 | low (no assert lost) | - |
@@ -144,7 +144,7 @@ Each PR reports src/tests/scripts lines before and after, runs the unit suite an
 ## Decisions (2026-11-05)
 
 1. **Open WebUI minimum: 0.12.4, now (Eliav).** Cut 6 goes ahead. The PR also records the new minimum in [Versions](../versions.md) and the release notes.
-2. **OpenClaw minimum: unchanged for now (Eliav).** The pre-10.10 and pre-steering paths stay, so cuts 7 and 8 wait. The minimum moves to 2026.10.10 around 2026-11-22..26 ([ELI-356](https://linear.app/eliavb/issue/ELI-356)).
+2. **OpenClaw minimum: 2026.10.10 ([ELI-356](https://linear.app/eliavb/issue/ELI-356)).** First unchanged (Eliav, 2026-11-05); ELI-356 raised it and made cuts 7 and 8. An older Gateway gets no message: the Pipe says OpenClaw needs an update.
 3. **Scripts (Eliav):** `migrate_stale_chat_models.py` goes, with its test and its docs mention (in cut 5). `social_preview.py` and `record_live.py` stay. Cut 12 is closed.
 4. **Gate for prose-only PRs (manager):** they skip the live gate when a CI check proves it. The check compares the AST with docstrings and comments stripped, for `src/` and the built bundles, between base and head, and fails on any difference. A PR labelled `prose-only` must pass it; a PR that does not pass it gets the live gate as usual.
 5. **Prose rule (manager):** keep a comment that explains a non-obvious why (an upstream bug with its link, an ordering constraint). Drop retold incident stories and comments that restate the code. Keep every upstream issue link, since cuts 7 and 8 need them.
