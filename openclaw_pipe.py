@@ -17303,6 +17303,12 @@ class _PipeTurn:
         # Skip OWUI background tasks. image_prompt_generation and
         # function_calling have a silent OWUI fallback for an empty answer;
         # moa_response_generation does not, so it is not skipped.
+        # context_compaction (Open WebUI 0.12+, when its context compaction is
+        # on) runs before the user's message is forwarded: passed through, it is
+        # a full agent run on a summary prompt of the whole chat, the real
+        # message waits behind it, and its answer lands in a hidden request.
+        # OpenClaw keeps and compacts its own session history, and the Pipe
+        # never forwards Open WebUI's whole history, so the summary is never used.
         if self.__task__ and self.__task__ in (
             "title_generation",
             "tags_generation",
@@ -17312,6 +17318,7 @@ class _PipeTurn:
             "query_generation",
             "image_prompt_generation",
             "function_calling",
+            "context_compaction",
         ):
             pipe_log(f"Skipping OWUI background task: {self.__task__}")
             self.ended = True
