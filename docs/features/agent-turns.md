@@ -17,7 +17,7 @@ When a run starts on a chat's session that you did not start from Open WebUI, th
 - **When the run fails,** the message ends with the run's error.
 - **When the run ends,** the message is rebuilt from the run's own transcript (`chat.history`), so text or tool cards lost on the way are filled in. Anything the transcript lacks keeps what streamed.
 
-The message appears with the run's first tool call or first real text. A run that only answers with a silent sentinel (`NO_REPLY`, `ANNOUNCE_SKIP`) gets no message; one that ran tools first keeps its tool cards, with no text.
+The message appears with the run's first tool call or first real text. A run that only answers with a silent sentinel (`NO_REPLY`, `ANNOUNCE_SKIP`) gets no message; one that ran tools first keeps its tool cards, with no text. A run the Gateway sent into a reply that was still working (a background command's completion, taken in mid-turn) and that shows no text or tool call of its own gets no message either: its answer is in that reply. One that does show something keeps it in a message of its own.
 
 Two such replies in a row chain one after the other in the order they started. They never become 1/2 and 2/2 variants of one message.
 

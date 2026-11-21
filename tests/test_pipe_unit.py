@@ -9856,6 +9856,39 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], True)
         self.assertEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
 
+    WAKE = "50a62149-c75d-47f7-9c9d-e68049b97a39"   # a Gateway-started (uuid) run
+
+    async def test_a_steered_gateway_started_run_with_nothing_to_show_opens_no_message(self):
+        """A background command's completion steered into the running turn has no message in the
+        chat: a note-only message would push the real reply off the end of the chat."""
+        self.conn.gateway_version = "2026.11.5"
+        before = copy.deepcopy(self.owui.msgs())
+        w = self.writer(run=self.WAKE, message_id="m-wake")
+        await w.feed({"runId": self.WAKE, "sessionKey": self.KEY, "state": "final"})
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.WAKE})
+        self.assertEqual(self.owui.msgs(), before, "no message opened, none changed")
+
+    async def test_a_steered_takeover_still_says_where_its_message_went(self):
+        """The mirror: a message the user sent, steered with nothing of its own, keeps the note."""
+        self.conn.gateway_version = "2026.11.5"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.WAKE, message_id="m1", takeover=True)
+        await w.feed({"runId": self.WAKE, "sessionKey": self.KEY, "state": "final"})
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.WAKE})
+        self.assertEqual(self.m()["content"], openclaw_pipe.ui_text("sent_with_next"))
+
+    async def test_a_gateway_started_run_that_showed_something_keeps_it(self):
+        """A Gateway-started run whose text streamed keeps that text, with no note."""
+        self.conn.gateway_version = "2026.11.5"
+        w = self.writer(run=self.WAKE, message_id="m-wake")
+        await w.feed({**_delta("The build finished."), "runId": self.WAKE})
+        await w.feed({"runId": self.WAKE, "sessionKey": self.KEY, "state": "final"})
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.WAKE})
+        m = self.owui.msgs()["m-wake"]
+        self.assertEqual((m["content"], m["done"]), ("The build finished.", True))
+
     async def test_a_gateway_that_never_steers_never_says_sent_with_next(self):
         """A Gateway before 2026.10.10 never steers, so the transcript shape alone does not set the
         steered note (#278)."""
