@@ -715,11 +715,17 @@ def _settle_ref(run_id: str) -> dict | None:
             "span_run": run_id}
 
 
-def steers_mid_run_messages(version) -> bool:
-    """True for a 2026.10.10+ Gateway, which steers mid-run messages into the
-    run (claude-cli included). An unknown version counts as older."""
+# The oldest OpenClaw this Pipe supports (ELI-356): it steers mid-run
+# messages into the run, claude-cli included.
+MIN_GATEWAY_VERSION = (2026, 10, 10)
+MIN_GATEWAY_VERSION_TEXT = ".".join(str(n) for n in MIN_GATEWAY_VERSION)
+
+
+def gateway_below_minimum(version) -> bool:
+    """True for a Gateway older than `MIN_GATEWAY_VERSION`. An unknown
+    version is not refused: only a stated older one is."""
     m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
-    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
+    return bool(m) and tuple(int(g) for g in m.groups()) < MIN_GATEWAY_VERSION
 
 
 # Tail length that anchors a cumulative text with a hole in it. Long enough
@@ -2994,7 +3000,7 @@ class _GatewayConnection:
             return False
         if (not consumer.started and msg.get("event") == "chat"
                 and payload.get("state") == "final" and not payload.get("message")
-                and steers_mid_run_messages(self.gateway_version) and self._steer(consumer)):
+                and self._steer(consumer)):
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
             return False
         consumer.started = True
@@ -3020,15 +3026,14 @@ class _GatewayConnection:
         return True
 
     def _on_user_message_committed(self, session_key: str, message: dict) -> None:
-        """A user message was committed. On 2026.10.10+ a commit naming a
-        steer target applies the steer from here. The Gateway publishes the
+        """A user message was committed. A commit naming a steer target
+        applies the steer from here. The Gateway publishes the
         target in a second commit, once the runtime took the message in
         (`confirmSteerTargetRunIdForPersistence`), with no order to the
         run's events or to later messages' commits: it can come after the
         run ended."""
         idem = str((message.get("__openclaw") or {}).get("idempotencyKey") or "")
-        if not (message.get("role") == "user" and idem.endswith(":user")
-                and steers_mid_run_messages(self.gateway_version)):
+        if not (message.get("role") == _USER_ROLE and idem.endswith(":user")):
             return
         # A queued (not steered) message is committed with no target.
         into = (message.get("__openclaw") or {}).get("steerTargetRunId")
@@ -3625,6 +3630,9 @@ class _GatewayConnection:
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
         self.gateway_version = (hello_ok.get("server") or {}).get("version")
+        if gateway_below_minimum(self.gateway_version):
+            pipe_log(f"Gateway {self.gateway_version} is older than {MIN_GATEWAY_VERSION_TEXT}, "
+                     "the oldest this Pipe supports: messages are refused")
         self.gateway_max_image_bytes = _hello_max_image_bytes(hello_ok)
         features = hello_ok.get("features") or {}
         self.gateway_methods = frozenset(features.get("methods") or ())
@@ -3890,6 +3898,7 @@ def _idempotency_keys(message) -> tuple[str, str]:
 
 
 _ASSISTANT_ROLE = "assistant"
+_USER_ROLE = "user"
 # A `cron` event's action once a job run is over.
 _CRON_FINISHED = "finished"
 # What a reply reads from its run's messages: the usage, image and

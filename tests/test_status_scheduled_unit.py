@@ -135,7 +135,6 @@ class ReadTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         action._scheduled_cache.clear()
-        action._all_jobs_cache.clear()
 
     async def test_the_gateway_filters_by_this_chats_session(self):
         conn = _Conn([_job("mine"), _job("theirs", target="session:agent:main:openwebui-u-c")])
@@ -182,22 +181,12 @@ class ReadTests(unittest.IsolatedAsyncioTestCase):
         conn = _Conn([_job("on"), {**_job("off"), "enabled": False}])
         self.assertEqual([j["name"] for j in await action._read_scheduled(conn, KEY)], ["on"])
 
-    async def test_without_the_filter_one_shared_list_matched_here(self):
-        """2026.9.3: `sessionKey` refused, so one full list for every session,
-        matched on "session:<key>" and the job's `sessionKey`, bare or prefixed."""
-        other = "agent:main:openwebui-u2-c2"
-        conn = _Conn([
-            _job("target"), _job("made-here", target="current", sessionKey=KEY),
-            _job("bare", target="session:" + KEY.split(":", 2)[2]),
-            _job("heartbeat", target="main"), _job("theirs", target=f"session:{other}"),
-        ], no_session_filter=True)
-        conn.jobs[1]["sessionKey"] = KEY
-        mine = await action._read_scheduled(conn, KEY)
-        self.assertEqual([j["name"] for j in mine], ["target", "made-here", "bare"])
-        theirs = await action._read_scheduled(conn, other)
-        self.assertEqual([j["name"] for j in theirs], ["theirs"])
-        # One filtered try per session, one full list for both.
-        self.assertEqual(sum("sessionKey" not in c for c in conn.calls), 1)
+    async def test_a_gateway_that_refuses_the_filter_is_an_error(self):
+        """Before 2026.10.5 `sessionKey` was refused: no unfiltered fallback (ELI-356)."""
+        conn = _Conn([_job("mine")], no_session_filter=True)
+        with self.assertRaisesRegex(RuntimeError, "unexpected property 'sessionKey'"):
+            await action._read_scheduled(conn, KEY)
+        self.assertEqual(len(conn.calls), 1)
 
     async def test_no_cron_list_is_unavailable_and_a_failure_is_an_error(self):
         self.assertIsNone(await action._read_scheduled(_Conn([], unknown=True), KEY))

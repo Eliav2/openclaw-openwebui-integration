@@ -20,11 +20,6 @@ _SLASH_PROMPT_NAME_MAX = 120
 # OWUI's prompt editor allows only these; the backend checks nothing.
 _SLASH_PROMPT_CMD_BAD = re.compile(r"[^A-Za-z0-9_-]")
 _SLASH_PROMPTS_PUSH_SETTLE_S = 2.0
-# How a Gateway older than 2026.10 refuses `chat.metadata`'s params.
-_SLASH_PROMPTS_OLD_GATEWAY = re.compile(
-    r"unexpected property '(?:includeModels|ifRevision)'|unknown method:? chat\.metadata\b")
-# Retry `chat.metadata` after this long; the Gateway may have been upgraded.
-_SLASH_PROMPTS_LEGACY_RETRY_S = 24 * 3600
 
 _slash_prompts_lock = asyncio.Lock()
 _slash_prompts_state = {
@@ -34,7 +29,6 @@ _slash_prompts_state = {
     "settings": None,
     "ledger_empty": None,
     "valves": None,
-    "legacy_at": None,
 }
 
 
@@ -303,41 +297,20 @@ async def _slash_prompts_half_added(store, want: dict) -> "str | None":
     return row["id"]
 
 
-def _slash_prompts_legacy() -> bool:
-    at = _slash_prompts_state.get("legacy_at")
-    return at is not None and time.monotonic() - at < _SLASH_PROMPTS_LEGACY_RETRY_S
-
-
 async def _slash_prompts_fetch(conn, agent_id: str, revision) -> "tuple[list | None, str | None]":
     """(commands, revision), or (None, revision) when unchanged.
 
-    Before 2026.10, falls back to `commands.list` with its hash as revision.
-    Other refusals (a wrong AGENT_ID) stay errors."""
-    if not _slash_prompts_legacy():
-        params = {"agentId": agent_id, "includeModels": False}
-        if revision:
-            params["ifRevision"] = revision
-        try:
-            resp = await conn.send_request("chat.metadata", params, timeout=30)
-        except GatewayError as ex:
-            if not _SLASH_PROMPTS_OLD_GATEWAY.search(str(ex)):
-                raise
-            pipe_log(f"[slash prompts] chat.metadata refused its params ({ex}); using commands.list")
-            _slash_prompts_state["legacy_at"] = time.monotonic()
-        else:
-            if resp.get("unchanged"):
-                return None, resp.get("revision") or revision
-            commands = resp.get("commands")
-            if not isinstance(commands, list):
-                raise GatewayError("chat.metadata returned no command list")
-            return commands, resp.get("revision")
-    resp = await conn.send_request("commands.list", {"agentId": agent_id, "scope": "text",
-                                                     "includeArgs": True}, timeout=30)
+    A refusal (a wrong AGENT_ID) stays an error."""
+    params = {"agentId": agent_id, "includeModels": False}
+    if revision:
+        params["ifRevision"] = revision
+    resp = await conn.send_request("chat.metadata", params, timeout=30)
+    if resp.get("unchanged"):
+        return None, resp.get("revision") or revision
     commands = resp.get("commands")
     if not isinstance(commands, list):
-        raise GatewayError("commands.list returned no command list")
-    digest = "list:" + hashlib.sha256(json.dumps(commands, sort_keys=True).encode()).hexdigest()
-    return (None, digest) if digest == revision else (commands, digest)
+        raise GatewayError("chat.metadata returned no command list")
+    return commands, resp.get("revision")
 
 
 async def _slash_prompts_sync(valves, conn_getter, store=None) -> str:

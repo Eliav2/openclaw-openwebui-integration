@@ -37,7 +37,7 @@ How it works
 
 Requirements
 ------------
-- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.9.3+
+- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.10.10+
 - The OpenClaw Gateway Pipe (openclaw_pipe.py) installed in the same OWUI
   instance -- this Action is a companion to it, not a replacement
 - Python modules: websockets, cryptography, pydantic (same as the Pipe).

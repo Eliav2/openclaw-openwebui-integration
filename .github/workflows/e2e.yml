@@ -14,7 +14,7 @@ on:
         type: string
         default: ""
       openclaw_version:
-        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "oldest" = OPENCLAW_OLDEST_VERSION, "next" = OPENCLAW_NEXT_VERSION there)
+        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "next" = OPENCLAW_NEXT_VERSION there)
         type: string
         default: ""
       lane:

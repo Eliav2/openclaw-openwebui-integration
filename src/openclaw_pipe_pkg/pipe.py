@@ -1247,7 +1247,6 @@ class _PipeTurn:
                      f"{prior['run_id'][:20]}... (a second call from Open WebUI); "
                      "following that run instead of sending it again")
             found = None
-            steers = steers_mid_run_messages(self.conn.gateway_version)
             while True:
                 changed = self.conn.session_change_event(self.session_key)
                 try:
@@ -1255,14 +1254,14 @@ class _PipeTurn:
                 except Exception as ex:
                     pipe_log(f"  chat.history for the sent run failed: {ex!r}")
                     break
-                found = _stub_turn(hist, reply_id, "", steers=steers)
+                found = _stub_turn(hist, reply_id, "")
                 if found is None or found["closed"]:
                     break
                 if not await self._session_run_active():
                     # The closing message can land after the read above: read once more.
                     try:
                         hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-                        found = _stub_turn(hist, reply_id, "", steers=steers) or found
+                        found = _stub_turn(hist, reply_id, "") or found
                     except Exception as ex:
                         pipe_log(f"  chat.history after the run ended failed: {ex!r}")
                     break
@@ -1289,8 +1288,7 @@ class _PipeTurn:
             self.turn.run_text = None
         if self.adopted_run_id:
             # Stream the adopted run's rest here; this message is sent afterwards
-            # as its own run. claude-cli has no steering hook: the Gateway acks
-            # "started", then drops a steered message.
+            # as its own run.
             self.our_run_id = self.adopted_run_id
             self.resolved_thinking = None
             self.pending_clamp_note = ""
@@ -1407,17 +1405,27 @@ class _PipeTurn:
 
     def steers_into_active_run(self) -> bool:
         """Whether this message is steered into the session's running run
-        (2026.10.10+). Text only, since the Gateway keeps images for a later
-        turn; never in a channel thread; only into this chat's own run at the
-        same model and thinking level."""
-        return (steers_mid_run_messages(self.conn.gateway_version)
-                and not self.turn.attachments and not self.channel_id
+        Text only, since the Gateway keeps images for a later turn; never in a
+        channel thread; only into this chat's own run at the same model and
+        thinking level."""
+        return (not self.turn.attachments and not self.channel_id
                 and self.conn.user_turn_run_active(self.session_key, self.chat_id)
                 and self.conn.sent_settings.get(self.session_key)
                 == (self.model_override, self.requested_thinking))
 
     async def wait_and_send(self, reply_id):
         """Wait for the run to settle, then send as a fresh run (ELI-56) or hand on."""
+        if gateway_below_minimum(self.conn.gateway_version):
+            pipe_log(f"  not sent: Gateway {self.conn.gateway_version} is older than "
+                     f"{MIN_GATEWAY_VERSION_TEXT}")
+            await _emit_status(self.__event_emitter__, "", done=True)
+            yield _plain_error(ERROR_OLD_GATEWAY,
+                               f"OpenClaw Gateway {self.conn.gateway_version} is older than "
+                               f"{MIN_GATEWAY_VERSION_TEXT}, the oldest this Pipe supports.",
+                               self.text)
+            self.end_waiting_replies_unsent()
+            self.ended = True
+            return
         async with self.conn.send_section(self.session_key):
             # Wait on `sessions.changed` pushes, re-reading state after each.
             # No poll and no ceiling (ELI-88): a ceiling would release a message
@@ -2393,48 +2401,13 @@ class _PipeTurn:
         if self.handed_over:
             # The turn writer owns the message now (DESIGN 2.6, ELI-147).
             return
-        if (self.enqueued_not_started and not self.text_yielded and not self.aborted
-                and steers_mid_run_messages(self.conn.gateway_version)):
+        if self.enqueued_not_started and not self.text_yielded and not self.aborted:
             # Steered into a run no reply here shows (a wake, another tab's).
             note = ui_text("steered_into_running", self.lang)
             self.turn.note_only = not self.visible_message_text.strip()
             self.record_visible_chunk(note)
             yield note
             self.text_yielded = True
-        if (self.enqueued_not_started and not self.text_yielded and not self.aborted
-                and not self.adopted_run_id and self.session_runtime == "claude-cli"
-                and self.our_run_id and self.sent_texts):
-            # A run started between the idle read and the send, and the Gateway
-            # queued this message behind it. claude-cli fails a queued turn
-            # ("no active tool authority snapshot", ELI-87), so take it back,
-            # wait for that run to settle, and send again.
-            try:
-                await _run_request(
-                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.our_run_id},
-                    timeout=15,
-                )
-                took_back = True
-            except Exception as ex:
-                took_back = False
-                pipe_log(f"  could not take back queued message: {ex}")
-            if took_back:
-                pipe_log(
-                    f"  message was queued behind a run that started first "
-                    f"(run {str(self.our_run_id)[:20]}...); took it back, resending once idle"
-                )
-                self.conn.unregister_run_target(self.session_key, self.our_run_id)
-                async with contextlib.aclosing(self.pipe._pipe_impl(
-                    self.body, self.__event_emitter__,
-                    __event_call__=self.__event_call__, __user__=self.__user__,
-                    __metadata__=self.__metadata__, __request__=self.__request__,
-                    __task__=self.__task__, __task_body__=self.__task_body__,
-                    _initial_visible_text=self.visible_message_text,
-                    _send_texts=self.sent_texts,
-                    _send_attachments=self.sent_attachments,
-                )) as again:
-                    async for item in again:
-                        yield item
-                return
 
         if not self.text_yielded:
             pipe_log(

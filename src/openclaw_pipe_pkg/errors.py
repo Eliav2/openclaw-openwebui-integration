@@ -14,6 +14,7 @@
 # ---------------------------------------------------------------------------
 
 ERROR_SEND = "send"              # chat.send was refused or failed
+ERROR_OLD_GATEWAY = "old_gateway"  # the Gateway is older than the Pipe supports
 ERROR_RUN = "run"                # the run ended in an error
 ERROR_TIMEOUT = "timeout"        # the Gateway did not answer in time
 ERROR_UNFINISHED = "unfinished"  # the run ended without a reply or a reason
@@ -63,6 +64,8 @@ _MIN_FENCE = 3
 _ERROR_TEXT = {
     LANG_EN: {
         ERROR_SEND: "**Your message couldn't be sent.** Please try sending it again.",
+        ERROR_OLD_GATEWAY: ("**Your message couldn't be sent: OpenClaw needs an update.** "
+                            "This chat needs OpenClaw 2026.10.10 or newer."),
         ERROR_RUN: "**Something went wrong while answering.** Please try again.",
         ERROR_TIMEOUT: ("**The assistant took too long to respond.** This is usually "
                         "temporary: please send your message again."),
@@ -71,6 +74,8 @@ _ERROR_TEXT = {
     },
     LANG_HE: {
         ERROR_SEND: "**לא הצלחתי לשלוח את ההודעה.** אפשר לנסות לשלוח אותה שוב.",
+        ERROR_OLD_GATEWAY: ("**לא הצלחתי לשלוח את ההודעה: צריך לעדכן את OpenClaw.** "
+                            "הצ'אט הזה צריך OpenClaw בגרסה 2026.10.10 ומעלה."),
         ERROR_RUN: "**משהו השתבש בזמן שעניתי.** אפשר לנסות שוב.",
         ERROR_TIMEOUT: ("**לא קיבלתי תשובה בזמן.** זה בדרך כלל חולף, "
                         "אפשר לשלוח את ההודעה שוב."),
