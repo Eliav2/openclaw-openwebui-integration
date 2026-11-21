@@ -223,3 +223,22 @@ class PreRetireBuildTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectionSlotTests(unittest.TestCase):
+    """One stash slot per Pipe function id: a second copy of the Pipe must not
+    retire the first copy's connection as an older deploy."""
+
+    def test_each_function_id_gets_its_own_slot(self):
+        hexid = "0123456789abcdef" * 2
+        first = ocp._conn_slot(f"function_openclaw_gateway_{hexid}")
+        second = ocp._conn_slot(f"function_openclaw_second_{hexid}")
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, f"{ocp._STALE_CONN_ATTR}_openclaw_gateway")
+
+    def test_a_redeploy_of_the_same_function_finds_its_slot(self):
+        self.assertEqual(ocp._conn_slot("function_openclaw_gateway_" + "a" * 32),
+                         ocp._conn_slot("function_openclaw_gateway_" + "b" * 32))
+
+    def test_outside_open_webui_it_is_the_bare_name(self):
+        self.assertEqual(ocp._conn_slot("openclaw_pipe"), ocp._STALE_CONN_ATTR)

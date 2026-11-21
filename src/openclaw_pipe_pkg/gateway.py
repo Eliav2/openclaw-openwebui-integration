@@ -4257,12 +4257,29 @@ def _function_module_prefix(module_name: str) -> str:
     return module_name
 
 
+# Open WebUI loads a Function as the module `function_<id>_<32 hex>`.
+_FUNCTION_MODULE_HEAD = "function_"
+
+
+def _conn_slot(module_name: str) -> str:
+    """The attribute on OWUI's socket module holding this Pipe function's live
+    connection: one per function id, as for the composer watcher
+    (`_composer_watch_slot`). A second copy of the Pipe (its own function id,
+    as the channel and owner-users docs suggest) stashes its own, so its first
+    turn no longer retires the first copy's connection as "a previous deploy".
+    Outside Open WebUI (tests) it is the bare name."""
+    prefix = _function_module_prefix(module_name)
+    if not prefix.startswith(_FUNCTION_MODULE_HEAD):
+        return _STALE_CONN_ATTR
+    return f"{_STALE_CONN_ATTR}_{prefix[len(_FUNCTION_MODULE_HEAD):]}"
+
+
 def _orphaned_gateway_connections(current) -> list:
     """Live `_GatewayConnection`s of OLDER loads of this Function, found on
     the heap: the stash names only the previous one."""
     import gc
     prefix = _function_module_prefix(__name__)
-    if not prefix.startswith("function_"):
+    if not prefix.startswith(_FUNCTION_MODULE_HEAD):
         return []
     found = []
     for obj in gc.get_objects():
@@ -4369,7 +4386,7 @@ async def _reap_stale_gateway_connection() -> None:
     except Exception:
         return
     stale_conns = []
-    stale = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
+    stale = getattr(_owui_socket_main, _conn_slot(__name__), None)
     if stale is not None and stale is not _gateway_connection:
         stale_conns.append(stale)
     try:
@@ -4395,7 +4412,7 @@ def _remember_gateway_connection(conn: _GatewayConnection) -> None:
         import open_webui.socket.main as _owui_socket_main
     except Exception:
         return
-    setattr(_owui_socket_main, _STALE_CONN_ATTR, conn)
+    setattr(_owui_socket_main, _conn_slot(__name__), conn)
 
 
 async def _replace_moved_connection(old: _GatewayConnection, make) -> _GatewayConnection:
