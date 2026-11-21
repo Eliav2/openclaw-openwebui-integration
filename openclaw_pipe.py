@@ -11459,8 +11459,14 @@ class _TurnWriter:
                     # Also when its lone final came after the settle.
                     self.steered_message = True
                 if self.steered_message and not self._showable():
-                    # The later message's reply has the answer.
-                    note = note or ui_text("sent_with_next", self.lang)
+                    if self.takeover or self.opened:
+                        # The later message's reply has the answer.
+                        note = note or ui_text("sent_with_next", self.lang)
+                    else:
+                        # A Gateway-started run (a background command's completion) steered into
+                        # the running turn: no message of its own in the chat, so none is opened.
+                        pipe_log(f"  turn writer: run {self.run_id[:24]}... went into the running "
+                                 f"turn; nothing to write")
                 elif not self._showable():
                     await self._show_silent_announce(hist)
             _keep_pipe_notes(streamed, self.renderer)
