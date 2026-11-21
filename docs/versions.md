@@ -17,7 +17,9 @@ The "Tested in CI" versions are the ones the end-to-end suite runs on for every 
 
 Below the Open WebUI minimum the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, cron replies never appear; on Open WebUI 0.12.0 to 0.12.3, a tab that was loading the chat can show a reply cut, and an approval or question dialog can lose its answer.
 
-An OpenClaw Gateway older than 2026.10.10 gets no messages: the Pipe answers every message with "OpenClaw needs an update" and sends nothing. The Pipe relies on what 2026.10.10 added: a message sent while the agent works is steered into the running run, on every runtime. The tables below keep the results measured while older Gateways were supported.
+**Minimum OpenClaw is now 2026.10.10. On an older Gateway, pin [v1.1.0](https://github.com/Eliav2/openclaw-openwebui-integration/releases/tag/v1.1.0)**, the last release that supports it.
+
+An OpenClaw Gateway older than 2026.10.10 gets no messages: the Pipe answers every message with "OpenClaw needs an update" and sends nothing. The Pipe relies on what 2026.10.10 added: a message sent while the agent works is steered into the running run, on every runtime.
 
 ## What each feature needs
 
