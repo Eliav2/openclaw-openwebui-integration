@@ -79,7 +79,6 @@ Every push and PR runs `.github/workflows/ci.yml`. The E2E lanes run on every pu
 | OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source: the copy the tests run against the pinned version (`--copy pinned`), and the next release's `_v<tag>` copy, or that same copy, against `OWUI_NEXT_REF` (`--copy next`). A stale copy is how the tool cards once vanished while the suite stayed green. `scripts/check_owui_frontend_fixture.py` does the same for the chat tab's live reducer (`applyResponseStreamEvent`, run with bun by the live-order tests). |
 | Secret scan | gitleaks over the full history. |
 | E2E | The whole stack, real everywhere except the model (below), on the pinned Open WebUI and OpenClaw, which are what the live install runs. |
-| E2E oldest | The same suite on the oldest supported OpenClaw (`OPENCLAW_OLDEST_VERSION`), with the pinned Open WebUI. Reports, never blocks. Removed when the documented minimum moves up (ELI-356). |
 
 **E2E** (`.github/workflows/e2e.yml`, `e2e/`): starts a deterministic fake
 OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at

@@ -34,7 +34,7 @@ How it works
 
 Requirements
 ------------
-- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.9.3+, reachable from the
+- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.10.10+, reachable from the
   Open WebUI backend. What an older release loses:
   https://github.com/Eliav2/openclaw-openwebui-integration/blob/main/docs/versions.md
 - Python modules: websockets, cryptography, pydantic

@@ -171,19 +171,3 @@ jobs:
     uses: ./.github/workflows/e2e.yml
     with:
       lane: pinned
-
-  e2e-oldest:
-    # The oldest OpenClaw release still supported (OPENCLAW_OLDEST_VERSION in
-    # e2e/versions.env), on the pinned Open WebUI. Reports, never blocks: a red
-    # lane is a fact about that release, not about the PR. Remove it when the
-    # documented minimum moves up (ELI-356).
-    name: E2E oldest
-    needs: [lint, test, scope]
-    if: needs.scope.outputs.runtime == 'true'
-    uses: ./.github/workflows/e2e.yml
-    with:
-      lane: oldest
-      openclaw_version: oldest
-      # An expression, so actionlint reads the string input as a string (a bare
-      # "false" is typed bool there).
-      blocking: ${{ 'false' }}

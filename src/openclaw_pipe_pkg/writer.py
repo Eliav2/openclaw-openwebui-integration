@@ -1311,7 +1311,8 @@ class _TurnWriter:
                 elif (payload.get("state") == "final" and not payload.get("message")
                       and payload.get("runId") == self.run_id and not self.renderer.output
                       and self.cron_run is None and not self.silent_announce
-                      and steers_mid_run_messages(self.conn.gateway_version)):
+                      and not str(self.run_id).startswith(ANNOUNCE_RUN_PREFIX)):
+                    # A user message's lone final: steered. An announce run has none.
                     self.steered_message = True
                 if (payload.get("stream") == _STREAM_LIFECYCLE and data.get("phase") == _PHASE_END
                         and (data.get("terminalReply") or {}).get("disposition") == _DISPOSITION_SILENT
@@ -1627,8 +1628,7 @@ class _TurnWriter:
         was steered into. The idle push can come before the Gateway stores that
         answer, or commits the message. Ends on the answer, a failed run, or a
         restart without the run."""
-        if not (self.takeover and steers_mid_run_messages(self.conn.gateway_version)
-                and (parse_pipe_run_id(self.run_id) or {}).get("kind") == "reply"):
+        if not (self.takeover and (parse_pipe_run_id(self.run_id) or {}).get("kind") == PIPE_RUN_REPLY):
             return
         await _await_steered_answer(self.conn, self.session_key, self.run_id,
                                     f"turn writer: {self.message_id[:8]}...", steered=self.steered_message)
@@ -1790,8 +1790,7 @@ class _TurnWriter:
                 if rebuilt is not None:
                     self.renderer = rebuilt
                 self.renderer.flush()
-                if (hist and steers_mid_run_messages(self.conn.gateway_version)
-                        and _history_steered_host(hist, self.run_id) is not None):
+                if hist and _history_steered_host(hist, self.run_id) is not None:
                     # Also when its lone final came after the settle.
                     self.steered_message = True
                 if self.steered_message and not self._showable():
@@ -2097,7 +2096,6 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        wake = bool(self.wake and self.wake.get("job"))
         # An agent-started run first, by its id: on 2026.10.5 chat.abort says
         # `aborted` but stops only the running command.
         aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
@@ -2108,14 +2106,12 @@ class _TurnWriter:
                 aborted = bool((resp or {}).get("aborted"))
             except Exception as ex:
                 pipe_log(f"  turn writer: chat.abort failed: {ex}")
-        if not aborted and wake:
-            await self._cancel_wake_run()
         await _mark_stopped(self.chat_id, self.message_id, self.request_task)
         await self.finalize(stopped=True)
 
     async def _abort_agent_run(self) -> bool:
         """`sessions.abort` by run id: stops that run only, keeping the queue
-        (2026.10.x). On 2026.9 it finds no run."""
+        (2026.10.x)."""
         try:
             res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
                                                timeout=15)
@@ -2126,30 +2122,6 @@ class _TurnWriter:
         if aborted:
             pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
         return aborted
-
-    async def _cancel_wake_run(self) -> None:
-        """Stop a cron wake's run on 2026.9 via its job's task (ELI-192):
-        chat.abort finds no run under the sessionId."""
-        job = self.wake["job"]
-        try:
-            resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
-                                                timeout=10)
-        except Exception as ex:
-            pipe_log(f"  turn writer: tasks.list for the wake's run failed: {ex}")
-            return
-        tasks = [t for t in (resp or {}).get("tasks") or []
-                 if t.get("runtime") == "cron" and t.get("sourceId") == job
-                 and t.get("status") in ("queued", "running")
-                 and self.session_key in (t.get("childSessionKey"), t.get("sessionKey"))]
-        if not tasks:
-            pipe_log(f"  turn writer: no running task of wake job {job[:8]}...: its run is not stopped")
-        for task in tasks:
-            try:
-                res = await self.conn.send_request("tasks.cancel", {"taskId": task["taskId"]}, timeout=15)
-                pipe_log(f"  turn writer: wake job {job[:8]}... run cancelled: "
-                         f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
-            except Exception as ex:
-                pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
 
     def saving(self) -> bool:
         """It may still save its message: open, or closed and finalizing."""
@@ -2643,8 +2615,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 continue  # the row is about the session's visible runs; the hidden run goes on
             # Only the pump of the writer's current run ends it.
             if writer is not None and writer.run_id == run:
-                unjudged = (conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set()
-                            and judges_cut_runs_after_listening(conn.gateway_version))
+                unjudged = conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set()
                 await writer.end(item, stop_notice_before=pump.stop_notice_before,
                                  after_restart=unjudged)
                 if writer.closed:
@@ -3451,7 +3422,7 @@ def _run_id_sent_at(run_id: str) -> float | None:
 
 
 def _stub_turn(history: dict, stub_id: str, user_text: str,
-               stub_ts: float | None = None, steers: bool = False) -> dict | None:
+               stub_ts: float | None = None) -> dict | None:
     """The transcript turn a reply stub waited for: {"run_id", "messages",
     "closed", "by"} or None. Found by message id in the run id, else by user
     text: the first match sent after `stub_ts`, since short texts recur."""
@@ -3477,7 +3448,7 @@ def _stub_turn(history: dict, stub_id: str, user_text: str,
     if pick is None:
         return None
     run_id = _history_user_run_id(messages[pick])
-    if steers and _history_steered_host(history, run_id) is not None:
+    if _history_steered_host(history, run_id) is not None:
         span = _history_steered_span(history, run_id)
         return {"run_id": run_id, "messages": span or [], "closed": span is not None, "by": by}
     end = next((i for i in starts if i > pick), len(messages))
@@ -3637,8 +3608,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             return "skip"
         parent = msgs.get(stub.get("parentId")) or {}
         user_text = _coerce_text(parent.get("content")) if parent.get("role") == "user" else ""
-        turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub),
-                          steers=steers_mid_run_messages(conn.gateway_version))
+        turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub))
         if turn is None or turn["closed"]:
             break  # no run to wait for, or it is over
         active = await _session_list_active(conn, session_key)

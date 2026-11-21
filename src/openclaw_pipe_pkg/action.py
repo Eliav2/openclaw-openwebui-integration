@@ -2365,9 +2365,6 @@ def _subagent_previews(previews_resp) -> tuple:
 # creation, any target); and the session of the conversation it came from
 # (`sourceConversation`, not in the public job). "main" binds to the agent's
 # main session and "isolated"/"current" to `cron:<jobId>`, never a chat.
-# A Gateway without the parameter (2026.9.3) gets one shared full list,
-# matched here on the forms the public job carries: "session:<key>" and
-# `sessionKey`; a job bound only through its source conversation is missed.
 #
 # One read per session, shared by every dialog of that chat, kept until the
 # Gateway's `cron` event (a job added, changed, removed, started or
@@ -2386,8 +2383,6 @@ _SCHEDULED_MESSAGE_MAX = 200
 _scheduled_cache: dict = {}
 # Chats whose jobs are kept at once.
 _SCHEDULED_CACHE_MAX = 256
-# connection -> (cron_revision, jobs): the full list, without the filter.
-_all_jobs_cache: dict = {}
 
 
 def _cron_token(conn):
@@ -2395,15 +2390,6 @@ def _cron_token(conn):
     None for a connection without them (a Pipe older than this Action)."""
     epoch, revision = getattr(conn, "cron_epoch", None), getattr(conn, "cron_revision", None)
     return f"{epoch}:{revision}" if isinstance(epoch, str) and isinstance(revision, int) else None
-
-
-# How a Gateway before 2026.10.5 refuses `sessionKey` (its closed schema), lowercased.
-_NO_SESSION_FILTER_TEXT = "unexpected property 'sessionkey'"
-
-
-def _no_session_filter(ex: Exception) -> bool:
-    """`cron.list` refused `sessionKey`: a Gateway before 2026.10.5."""
-    return _NO_SESSION_FILTER_TEXT in str(ex).lower()
 
 
 async def _cron_pages(conn, params: dict) -> list:
@@ -2419,22 +2405,6 @@ async def _cron_pages(conn, params: dict) -> list:
         offset = nxt
 
 
-def _job_key_form(job: dict, key: str) -> str:
-    """A key as the Gateway writes it for the job's agent: bare keys get the prefix."""
-    agent = job.get("effectiveAgentId") or job.get("agentId") or "main"
-    return key if key.startswith("agent:") else f"agent:{agent}:{key}"
-
-
-def _job_bound_to(job: dict, session_key: str) -> bool:
-    """The fallback match (no `sessionKey` filter): "session:<key>", or the
-    job's `sessionKey`, as the Gateway resolves them."""
-    target = job.get("sessionTarget") or ""
-    keys = [target[len("session:"):]] if target.startswith("session:") else []
-    if isinstance(job.get("sessionKey"), str) and job["sessionKey"].strip():
-        keys.append(job["sessionKey"].strip())
-    return session_key in {_job_key_form(job, k) for k in keys}
-
-
 async def _read_scheduled(conn, session_key: str) -> "list | None":
     """The enabled automations bound to the session, or None when this
     Gateway has no `cron.list`."""
@@ -2447,13 +2417,7 @@ async def _read_scheduled(conn, session_key: str) -> "list | None":
     except Exception as ex:
         if _is_unknown_method(ex):
             return None
-        if not _no_session_filter(ex):
-            raise
-        everything = _all_jobs_cache.get(conn)
-        if not everything or everything[0] != token:
-            _all_jobs_cache.clear()
-            everything = _all_jobs_cache[conn] = (token, await _cron_pages(conn, {}))
-        jobs = [j for j in everything[1] if _job_bound_to(j, session_key)]
+        raise
     jobs = [j for j in jobs if j.get("enabled", True)]
     # Only the current connection's reads at the current revision are kept,
     # and at most _SCHEDULED_CACHE_MAX of them (the oldest go first).
@@ -2588,7 +2552,7 @@ async def _background_data(tasks_task, chat_task, session_key: str, source: str)
     try:
         tasks = await tasks_task
     except Exception as ex:
-        pipe_log(f"[status-action] tasks.list failed: {ex}")
+        pipe_log(f"[status-action] sessions.processes.list failed: {ex}")
         tasks = []
         errors.append(f"Could not read background tasks: {ex}")
     chat = await chat_task
@@ -2619,14 +2583,8 @@ def _is_unknown_method(ex: Exception) -> bool:
 
 
 async def _read_background_tasks(conn, session_key: str) -> "list | None":
-    """This session's background work as task rows: `tasks.list` (2026.9) or
-    `sessions.processes.list` (2026.10). None when the Gateway has neither."""
-    try:
-        resp = await conn.send_request("tasks.list", dict(sessionKey=session_key, limit=100), timeout=5)
-        return (resp or {}).get("tasks") or []
-    except Exception as ex:
-        if not _is_unknown_method(ex):
-            raise
+    """This session's background commands as task rows, from
+    `sessions.processes.list`. None when the Gateway has none."""
     try:
         resp = await conn.send_request("sessions.processes.list", dict(key=session_key), timeout=5)
     except Exception as ex:
@@ -2791,17 +2749,11 @@ def _task_row(task: dict, commands: dict) -> dict:
     }
 
 
-# 2026.9's command summaries, which the status chip already says.
-_GENERIC_COMMAND_SUMMARIES = {"Command running", "Command completed", "Command failed"}
-
-
 def _command_row(task: dict, card: dict, live: bool) -> dict:
     """A background command row (ELI-232), titled by the agent's title, else
     its first real command."""
     command = card.get("command") or ""
-    # 2026.9 titles every one "CLI command"; 2026.10 uses the first words.
-    own = (task.get("title") or "").strip()
-    short = _short_command(command or ("" if own == "CLI command" else own))
+    short = _short_command(command or (task.get("title") or "").strip())
     title = card.get("title") or short or "Shell command"
     if live:
         preview = short if card.get("title") and short != title else None
@@ -2809,7 +2761,7 @@ def _command_row(task: dict, card: dict, live: bool) -> dict:
         code, signal = task.get("exitCode"), task.get("exitSignal")
         ended = signal or (f"exit {code}" if code not in (None, 0) else None)
         said = _clean_line(task.get("error") or task.get("terminalSummary") or "")
-        preview = " · ".join(p for p in (ended, None if said in _GENERIC_COMMAND_SUMMARIES else said) if p) or None
+        preview = " · ".join(p for p in (ended, said) if p) or None
     return {
         "id": task.get("id") or task.get("taskId"),
         "kind": _BACKGROUND_KINDS["exec"],
