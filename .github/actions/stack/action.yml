@@ -10,7 +10,7 @@ inputs:
     description: Open WebUI image (empty = the pinned one in e2e/versions.env, "next" = OWUI_NEXT_IMAGE there, which exists only while a release is being moved to)
     default: ""
   openclaw_version:
-    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "oldest" = OPENCLAW_OLDEST_VERSION there, "next" = OPENCLAW_NEXT_VERSION there, which exists only while a release is being moved to)
+    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "next" = OPENCLAW_NEXT_VERSION there, which exists only while a release is being moved to)
     default: ""
   log_dir:
     description: Where the stack writes its logs
@@ -29,7 +29,6 @@ runs:
         # A named lane whose pin is not in versions.env fails here, instead of
         # silently running the pinned versions under another name.
         case "$IN_OPENCLAW_VERSION" in
-          oldest) IN_OPENCLAW_VERSION=${OPENCLAW_OLDEST_VERSION:?no OPENCLAW_OLDEST_VERSION in e2e/versions.env} ;;
           next) IN_OPENCLAW_VERSION=${OPENCLAW_NEXT_VERSION:?no OPENCLAW_NEXT_VERSION in e2e/versions.env} ;;
         esac
         if [ "$IN_OWUI_IMAGE" = next ]; then IN_OWUI_IMAGE=${OWUI_NEXT_IMAGE:?no OWUI_NEXT_IMAGE in e2e/versions.env}; fi

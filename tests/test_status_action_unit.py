@@ -677,8 +677,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 ]}
             if method == "sessions.preview":
                 return {"previews": []}
-            if method == "tasks.list":
-                return {"tasks": []}
+            if method == "sessions.processes.list":
+                return {"processes": []}
             if method == "cron.list":
                 return {"jobs": []}
             raise AssertionError(f"unexpected RPC: {method}")
@@ -737,8 +737,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 return {"providers": []}
             if method == "sessions.list":
                 return {"sessions": []}
-            if method == "tasks.list":
-                return {"tasks": []}
+            if method == "sessions.processes.list":
+                return {"processes": []}
             if method == "cron.list":
                 return {"jobs": []}
             return {}
@@ -807,7 +807,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 return {"providers": []}
             if method == "sessions.list":
                 raise RuntimeError("children unavailable")
-            if method in ("tasks.list", "cron.list"):
+            if method in ("sessions.processes.list", "cron.list"):
                 return {}
             raise AssertionError(f"unexpected RPC: {method}")
 

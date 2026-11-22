@@ -111,10 +111,11 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
 
     def test_every_run_request_call_site_is_routed(self):
         """The 11 call sites in PHASE-B-PLAN.md, the card answer (#21), channel follow-ups,
-        archiving a forgotten temporary chat's session (history.py)."""
+        archiving a forgotten temporary chat's session (history.py). The claude-cli take-back
+        (ELI-87) went with the 2026.10.10 minimum (ELI-356)."""
         calls = [f"{name}:{n.lineno}" for name, tree in self._trees() for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_run_request"]
-        self.assertEqual(len(calls), 14, calls)
+        self.assertEqual(len(calls), 13, calls)
 
 
 

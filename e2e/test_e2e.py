@@ -458,11 +458,6 @@ def _openclaw_version() -> tuple:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed."""
-    return _openclaw_version()[:2]
-
-
 def _hides_cron_run_output() -> bool:
     """2026.11.5+ runs a cron job into a chat's session as a hidden automation
     run: its prompt, text and closing stay out of `chat.history`
@@ -478,15 +473,6 @@ def _empty_reply_error() -> str:
     if _openclaw_version() >= (2026, 11, 5):
         return "No answer was returned"
     return "couldn't generate a response"
-
-
-def _skip_known_105_gap(issue: str, what: str) -> None:
-    """A known gap of the Pipe on OpenClaw 2026.10 before 2026.10.10 (the
-    pinned lane, the version live runs): skipped there under its issue, so the
-    lane stays honest. 2026.10.10 (the next lane) still runs the test."""
-    version = _openclaw_version()
-    if (2026, 10, 0) <= version < (2026, 10, 10):
-        pytest.skip(f"OpenClaw {'.'.join(map(str, version))}: {what} ({issue})")
 
 
 def _gw(method: str, params: dict) -> dict:
@@ -776,13 +762,6 @@ def test_a_running_reply_does_not_say_it_is_queued(token):
 STEER_PENDING = "it reads it at its next step"  # texts.py UI_TEXT "steer_pending", English
 
 
-def _steers_mid_run_messages() -> bool:
-    """The stack's Gateway steers a message sent while a run works into that
-    run (2026.10.10+), rather than running it after (the Pipe's own gate)."""
-    m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,3})", os.environ.get("OPENCLAW_VERSION", ""))
-    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
-
-
 def _post_turn(token: str, chat_id: str, prompt: str, model: str = DEFAULT_MODEL) -> str:
     """Send `prompt` in `chat_id` under its current leaf, as a client with no
     page does (the API, a script), and return its reply's id at once."""
@@ -810,7 +789,6 @@ def _post_turn(token: str, chat_id: str, prompt: str, model: str = DEFAULT_MODEL
     return aid
 
 
-@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
 def test_a_message_sent_while_a_run_works_is_steered_into_it(token):
     """Eliav 2026-11-04 (c9dc45f0): a message sent while a turn runs its tools
     reaches the agent at the run's next tool boundary, not after the whole
@@ -864,7 +842,6 @@ def _is_cli_closing(m: dict) -> bool:
 CLI_MODEL = "openclaw_gateway.anthropic/claude-opus-5-5"  # e2e/start_stack.sh: claude-cli, e2e/fake_claude.py
 
 
-@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
 def test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it(token):
     """The claude-cli runtime's own steering path (OpenClaw 2026.10.10): the
     Gateway writes the message into the running Claude Code process, which
@@ -969,7 +946,6 @@ def test_no_tool_runs_after_the_run_is_aborted(token):
     assert refused, f"the call after the abort was not refused: {got}"
 
 
-@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
 def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     """Eliav's chat c9dc45f0, test 2: "say tomato" was sent while a claude-cli
     turn ran, and Claude Code took it in only at its next tool boundary, after
@@ -1037,7 +1013,6 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     os.remove(done)
 
 
-@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
 def test_two_follow_ups_sent_during_a_tool_each_get_their_own_answer_once(token):
     """W5's live QA on 9a5bddd (chat bcab96b2): "add tomatoes" and then "remove
     the milk" were sent while a claude-cli turn ran its tool. The second one's
@@ -1147,23 +1122,21 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
             _until(f"{word}'s request running", lambda n=len(replies): len(
                 (_request("GET", f"/api/tasks/chat/{chat_id}", token=token)[1] or {}).get("task_ids") or []) >= n + 1,
                 timeout_s=60, every_s=0.2)
-            if _steers_mid_run_messages():
-                # Its message is at the Gateway, to be steered in at the run's
-                # next boundary (the reply's saved status says so), so all
-                # three reach the model in one call once the run goes on.
-                _until(f"{word} sent, to be steered in", lambda r=replies[-1]: any(
-                    STEER_PENDING in str(h.get("description"))
-                    for h in _chat_messages(token, chat_id).get(r, {}).get("statusHistory") or []),
-                    timeout_s=60, every_s=0.2)
+            # Its message is at the Gateway, to be steered in at the run's
+            # next boundary (the reply's saved status says so), so all three
+            # reach the model in one call once the run goes on.
+            _until(f"{word} sent, to be steered in", lambda r=replies[-1]: any(
+                STEER_PENDING in str(h.get("description"))
+                for h in _chat_messages(token, chat_id).get(r, {}).get("statusHistory") or []),
+                timeout_s=60, every_s=0.2)
     finally:
         open(gate, "w").close()
-    # 2026.10.10+ steers them into the held run at its next boundary, all
+    # The Gateway steers them into the held run at its next boundary, all
     # three in one model call (as separate user messages, or merged into one
-    # from 2026.11.6). Older Gateways run them after it as one turn. Either way
-    # the fake model answers the newest message: its last echo marker.
-    steered = _steers_mid_run_messages()
+    # from 2026.11.6). The fake model answers the newest message: its last
+    # echo marker.
     answer = words[2]
-    msgs = _wait_for(token, chat_id, [answer] if steered else ["E2E_HOLD_END", answer])
+    msgs = _wait_for(token, chat_id, [answer])
     _until("every reply done", lambda: all(
         _chat_messages(token, chat_id)[r].get("done") for r in replies))
     msgs = _chat_messages(token, chat_id)
@@ -1655,13 +1628,12 @@ def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
     assert content.strip() == "E2E_DURING_RESTART", f"the reply: {content[:300]!r}"
     _until("the Gateway to finish starting", _gateway_up, timeout_s=180, every_s=2)
     seen = _preparation_window(log_path, start, relaunched_at)
-    if _openclaw_release() >= (2026, 10):
-        # The startup window: the Gateway refused the message or a transcript
-        # subscription the Pipe renews on connect, or the Pipe's first request
-        # was sent while main was preparing and answered once it was ready.
-        met = _met_the_preparation(seen)
-        print(f"ELI-275 preparation window: {met} {json.dumps(seen)}")
-        assert met, f"the Pipe did not meet the Gateway's startup preparation: that window was not tested ({seen})"
+    # The startup window: the Gateway refused the message or a transcript
+    # subscription the Pipe renews on connect, or the Pipe's first request
+    # was sent while main was preparing and answered once it was ready.
+    met = _met_the_preparation(seen)
+    print(f"ELI-275 preparation window: {met} {json.dumps(seen)}")
+    assert met, f"the Pipe did not meet the Gateway's startup preparation: that window was not tested ({seen})"
     # A renewal given up would leave the chat without tool events until the
     # next reconnect; the Gateway logs a renewal only when it is refused.
     gave_up = [line for line in _pipe_log_since(since).splitlines()
@@ -1962,8 +1934,6 @@ def _section_data(codes: list, element_id: str, index: int = -1) -> dict:
 
 
 def test_a_subagent_result_ends_like_an_inline_reply(token):
-    if _openclaw_release() < (2026, 10):
-        pytest.skip("OpenClaw 2026.9: a sub-agent's result message never finishes (ELI-138, fixed in 2026.10.3)")
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
     chat_id, inline = _chat_turn(token, "E2E_SPAWN one helper", chat_id=chat_id)
     assert inline.get("content", "").strip() == "E2E_SPAWNED", inline
@@ -1978,8 +1948,6 @@ def test_two_subagent_results_that_land_together_both_stay_in_the_chat(token):
     lands while the parent still streams its answer to the first. 2026.10
     steers it into that run: one run, two replies. The chat kept only the
     second until the end (ELI-271)."""
-    if _openclaw_release() < (2026, 10):
-        pytest.skip("OpenClaw 2026.9: a sub-agent's result message never finishes (ELI-138, fixed in 2026.10.3)")
     chat_id, inline = _chat_turn(token, "E2E_SPAWN_TWINS")
     assert inline.get("content", "").strip() == "E2E_TWINS_SPAWNED", inline
     _wait_for(token, chat_id, ["E2E_TWIN_B_HEARD"])
@@ -2623,7 +2591,6 @@ def _wakes_ended_while_down_get_their_results(token: str) -> None:
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
-@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a wake after the run")
 def test_a_cron_wake_a_second_wake_fired_into_is_completed_whole_on_start(token):
     if _hides_cron_run_output():
         return _wakes_ended_while_down_get_their_results(token)

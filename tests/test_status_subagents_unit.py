@@ -46,8 +46,8 @@ def _list_rpc(rows, previews, calls):
         if method == "sessions.preview":
             return {"previews": [{"key": k, "status": "ok", "items": previews.get(k, [])}
                                  for k in params["keys"]]}
-        if method == "tasks.list":
-            return {"tasks": []}
+        if method == "sessions.processes.list":
+            return {"processes": []}
         if method == "cron.list":
             return {"jobs": []}
         raise AssertionError(f"unexpected RPC: {method}")
@@ -389,16 +389,15 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NoTasksApiTests(unittest.TestCase):
-    """No Tasks API for sub-agents; Background's `tasks.list` degrades (ELI-163)."""
+    """No Tasks API: 2026.10.10+ has none; Background reads `sessions.processes.list` (ELI-163, ELI-356)."""
 
-    def test_only_the_background_adapter_calls_the_tasks_api(self):
+    def test_nothing_calls_the_tasks_api(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(here, "openclaw_status_action.py"), encoding="utf-8") as f:
-            source = f.read()
-        self.assertNotIn('"tasks.get"', source)
-        self.assertEqual(source.count('"tasks.list"'), 1)
-        adapter = source.split("async def _read_background_tasks", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn('"tasks.list"', adapter)
+        for bundle in ("openclaw_status_action.py", "openclaw_pipe.py"):
+            with open(os.path.join(here, bundle), encoding="utf-8") as f:
+                source = f.read()
+            for method in ('"tasks.get"', '"tasks.list"', '"tasks.cancel"'):
+                self.assertNotIn(method, source, bundle)
 
 
 class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):

@@ -132,15 +132,14 @@ class RowTests(unittest.TestCase):
         # 2026.10.5 says "completed" whatever the exit code.
         nonzero = action._process_task({"processId": "z", "name": "ls /nope", "status": "completed",
                                         "startedAt": NOW - 9500, "endedAt": NOW, "exitCode": 1, "tail": ""}, KEY)
-        data = self.rows([failed, killed, nonzero, _task("exec", "completed", id="t9", sourceId="y", endedAt=NOW,
-                                                         terminalSummary="Command completed")])
+        data = self.rows([failed, killed, nonzero, _task("exec", "completed", id="t9", sourceId="y", endedAt=NOW)])
         self.assertEqual([(r["title"], r["status"], r["preview"]) for r in data["rows"] if r["kind"] == "Command"],
                          [("sleep 25", "failed", "exit 2 · Error: no such file"), ("make", "cancelled", "SIGTERM"),
                           ("ls /nope", "failed", "exit 1"), ("Shell command", "completed", None)])
 
     def test_kinds_this_section_lists_and_the_ones_it_leaves_to_others(self):
         data = self.rows([
-            _task("exec", "completed", sourceId="x", endedAt=NOW, terminalSummary="Command completed"),
+            _task("exec", "completed", sourceId="x", endedAt=NOW),
             _task("image_generation", "running", title="image_generate"),
             _task("subagent", "running", childSessionKey=CHILD),       # the Subagents section's
             _task("exec", "running", sessionKey=OTHER_KEY, ownerKey=OTHER_KEY),   # another chat's
@@ -199,11 +198,11 @@ def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs
         if method == "sessions.preview":
             return {"previews": [{"key": k, "items": [{"role": "assistant", "text": "halfway"}]}
                                  for k in params["keys"]]}
-        if method == "tasks.list":
-            return {"tasks": [_task("exec", "running", title="CLI command", sourceId="good-lagoon")]}
         if method == "sessions.processes.list":
             assert params == {"key": KEY}, params
-            return {"sessionId": "s1", "processes": processes or [], "truncated": False}
+            listed = processes if processes is not None else [
+                {"processId": "good-lagoon", "name": "sleep 25;", "status": "running", "startedAt": NOW - 60_000}]
+            return {"sessionId": "s1", "processes": listed, "truncated": False}
         if method == "cron.list":
             if cron_params is not None:
                 cron_params.append(dict(params))
@@ -265,7 +264,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         calls, chat_reads = [], []
         await self._open(_gateway(calls), chat_reads=chat_reads)
         self.assertEqual(collections.Counter(calls), {
-            "sessions.describe": 1, "usage.status": 1, "sessions.list": 1, "tasks.list": 1, "cron.list": 1})
+            "sessions.describe": 1, "usage.status": 1, "sessions.list": 1, "sessions.processes.list": 1, "cron.list": 1})
         self.assertEqual(chat_reads, [CHAT])
 
     async def test_with_a_running_child_the_open_reads_its_transcript_and_follows(self):
@@ -275,7 +274,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "following")
         self.assertEqual(collections.Counter(calls), {
             "sessions.describe": 1, "usage.status": 1, "sessions.list": 2, "sessions.preview": 1,
-            "tasks.list": 1, "cron.list": 1})
+            "sessions.processes.list": 1, "cron.list": 1})
         self.assertEqual(_fills(emitted)["subagents"]["tasks"][0]["progressSummary"], "halfway")
 
     async def test_every_section_fills(self):
@@ -290,7 +289,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_failing_source_leaves_the_other_sections_intact(self):
         """Each source in turn fails; only the sections that read it say so."""
         readers = {"sessions.describe": {"context", "limits"}, "usage.status": {"limits"},
-                   "sessions.list": {"subagents"}, "tasks.list": {"background"}, "cron.list": {"scheduled"}}
+                   "sessions.list": {"subagents"}, "sessions.processes.list": {"background"}, "cron.list": {"scheduled"}}
         for method, hit in readers.items():
             with self.subTest(failing=method):
                 _result, emitted = await self._open(_gateway([], fail=(method,)))
@@ -302,10 +301,10 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(broken, name in hit, (name, data))
 
     async def test_a_slow_source_holds_up_its_own_section_only(self):
-        """tasks.list answers last: every other section is filled first."""
+        """sessions.processes.list answers last: every other section is filled first."""
         gate = asyncio.Event()
         emitted = []
-        conn = _gateway([], slow={"tasks.list": gate})
+        conn = _gateway([], slow={"sessions.processes.list": gate})
         with action_gateway(conn), mock.patch.dict(sys.modules, _owui([])):
             opening = asyncio.ensure_future(_open_dialog(Action().action(
                 {"chat_id": CHAT}, __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted)), conn))
@@ -323,7 +322,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             return {"processId": pid, "instanceId": "i-" + pid, "name": name, "status": status,
                     "startedAt": NOW - 60_000, "tail": "", "truncated": False, "canStop": False, **kw}
         calls = []
-        _result, emitted = await self._open(_gateway(calls, unknown=("tasks.list",), processes=[
+        _result, emitted = await self._open(_gateway(calls, processes=[
             proc("good-lagoon", "sleep 25;", "running", canStop=True),
             proc("calm-reef", "cd /home/user/.openclaw", "failed", endedAt=NOW - 50_000, exitCode=2,
                  tail="ls: cannot access '/nope'\n"),
@@ -347,7 +346,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         def proc(pid, name, status, **kw):
             return {"processId": pid, "instanceId": "i-" + pid, "name": name, "status": status,
                     "startedAt": NOW - 60_000, "tail": "", "truncated": False, "canStop": False, **kw}
-        _result, emitted = await self._open(_gateway([], unknown=("tasks.list",), processes=[
+        _result, emitted = await self._open(_gateway([], processes=[
             proc("good-lagoon:f016cec5d14a", "sleep 25;", "running", canStop=True),
             proc("calm-reef:0a1b2c3d4e5f", "cd /home/user/.openclaw", "failed", endedAt=NOW - 50_000, exitCode=2,
                  tail="ls: cannot access '/nope'\n"),
@@ -361,7 +360,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_gateway_with_neither_list_says_so_and_still_lists_automations(self):
         mine = _job("mine", f"session:{KEY}")
         _result, emitted = await self._open(
-            _gateway([], unknown=("tasks.list", "sessions.processes.list"), jobs=[mine]))
+            _gateway([], unknown=("sessions.processes.list",), jobs=[mine]))
         fills = _fills(emitted)
         self.assertFalse(fills["background"]["tasksAvailable"])
         self.assertEqual(fills["background"]["errors"], [])
@@ -395,7 +394,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             result = await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
                                            __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
         self.assertEqual(result, {"status": "ok"})
-        self.assertEqual(collections.Counter(calls), {"tasks.list": 1})
+        self.assertEqual(collections.Counter(calls), {"sessions.processes.list": 1})
         self.assertEqual(chat_reads, [CHAT])
         fills = _fills(emitted)
         self.assertEqual(sorted(fills), ["background"])
@@ -406,7 +405,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_refill_that_could_not_read_leaves_the_section_to_the_page(self):
         """ELI-261: a failed read refills with its error; no connection, no fill."""
         emitted = []
-        with action_gateway(_gateway([], fail=("tasks.list",))), mock.patch.dict(sys.modules, _owui([])):
+        with action_gateway(_gateway([], fail=("sessions.processes.list",))), mock.patch.dict(sys.modules, _owui([])):
             await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
                                   __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
         bg = _fills(emitted)["background"]

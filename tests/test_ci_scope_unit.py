@@ -108,10 +108,11 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("scripts/ci_scope.py", scope)
         self.assertIn("fetch-depth: 0", scope)
 
-    def test_only_the_oldest_lane_is_non_blocking(self):
+    def test_every_e2e_lane_of_a_push_blocks(self):
+        """The oldest-release lane went with the 2026.10.10 minimum (ELI-356): every lane blocks."""
         lanes = {name: re.search(r"^\s*blocking: (.+)$", body, re.M) for name, body in self.jobs
                  if "uses: ./.github/workflows/e2e.yml" in body}
-        self.assertEqual({n for n, m in lanes.items() if m and "'false'" in m.group(1)}, {"e2e-oldest"})
+        self.assertEqual({n for n, m in lanes.items() if m and "'false'" in m.group(1)}, set())
 
 
 if __name__ == "__main__":

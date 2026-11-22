@@ -37,7 +37,7 @@ How it works
 
 Requirements
 ------------
-- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.9.3+
+- Open WebUI 0.12.4+ and an OpenClaw Gateway 2026.10.10+
 - The OpenClaw Gateway Pipe (openclaw_pipe.py) installed in the same OWUI
   instance -- this Action is a companion to it, not a replacement
 - Python modules: websockets, cryptography, pydantic (same as the Pipe).
@@ -592,6 +592,11 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
     return {"chat": m.group("chat"), "message": m.group("message"), "kind": kind}
 
 
+# Every run the Gateway starts to announce something (a sub-agent's result,
+# a requester settle) has an id with this prefix; none carries a user message.
+ANNOUNCE_RUN_PREFIX = "announce:"
+
+
 def parse_announce_run_id(run_id: str) -> dict | None:
     """{child_session, child_run} of a sub-agent announce run, else None.
     Id shape: `announce:v1:<childSessionKey>:<childRunId>[:wake|:retry-<n>]` (announce-idempotency-D7LnUTJR.mjs:4-10)."""
@@ -988,13 +993,6 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     if status == "killed" and stop_notice_before:
         return "pipe"
     return "none"
-
-
-def judges_cut_runs_after_listening(version) -> bool:
-    """A 2026.10+ Gateway serves rows before its recovery pass judged cut runs
-    (about 8 s). 2026.9.3 marks within ms. Unknown versions count as old."""
-    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.", str(version or ""))
-    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
 
 
 def resumes_a_crash(version) -> bool:
@@ -2122,11 +2120,17 @@ def _settle_ref(run_id: str) -> dict | None:
             "span_run": run_id}
 
 
-def steers_mid_run_messages(version) -> bool:
-    """True for a 2026.10.10+ Gateway, which steers mid-run messages into the
-    run (claude-cli included). An unknown version counts as older."""
+# The oldest OpenClaw this Pipe supports (ELI-356): it steers mid-run
+# messages into the run, claude-cli included.
+MIN_GATEWAY_VERSION = (2026, 10, 10)
+MIN_GATEWAY_VERSION_TEXT = ".".join(str(n) for n in MIN_GATEWAY_VERSION)
+
+
+def gateway_below_minimum(version) -> bool:
+    """True for a Gateway older than `MIN_GATEWAY_VERSION`. An unknown
+    version is not refused: only a stated older one is."""
     m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
-    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
+    return bool(m) and tuple(int(g) for g in m.groups()) < MIN_GATEWAY_VERSION
 
 
 # Tail length that anchors a cumulative text with a hole in it. Long enough
@@ -4401,7 +4405,7 @@ class _GatewayConnection:
             return False
         if (not consumer.started and msg.get("event") == "chat"
                 and payload.get("state") == "final" and not payload.get("message")
-                and steers_mid_run_messages(self.gateway_version) and self._steer(consumer)):
+                and self._steer(consumer)):
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
             return False
         consumer.started = True
@@ -4427,15 +4431,14 @@ class _GatewayConnection:
         return True
 
     def _on_user_message_committed(self, session_key: str, message: dict) -> None:
-        """A user message was committed. On 2026.10.10+ a commit naming a
-        steer target applies the steer from here. The Gateway publishes the
+        """A user message was committed. A commit naming a steer target
+        applies the steer from here. The Gateway publishes the
         target in a second commit, once the runtime took the message in
         (`confirmSteerTargetRunIdForPersistence`), with no order to the
         run's events or to later messages' commits: it can come after the
         run ended."""
         idem = str((message.get("__openclaw") or {}).get("idempotencyKey") or "")
-        if not (message.get("role") == "user" and idem.endswith(":user")
-                and steers_mid_run_messages(self.gateway_version)):
+        if not (message.get("role") == _USER_ROLE and idem.endswith(":user")):
             return
         # A queued (not steered) message is committed with no target.
         into = (message.get("__openclaw") or {}).get("steerTargetRunId")
@@ -5032,6 +5035,9 @@ class _GatewayConnection:
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
         self.gateway_version = (hello_ok.get("server") or {}).get("version")
+        if gateway_below_minimum(self.gateway_version):
+            pipe_log(f"Gateway {self.gateway_version} is older than {MIN_GATEWAY_VERSION_TEXT}, "
+                     "the oldest this Pipe supports: messages are refused")
         self.gateway_max_image_bytes = _hello_max_image_bytes(hello_ok)
         features = hello_ok.get("features") or {}
         self.gateway_methods = frozenset(features.get("methods") or ())
@@ -5297,6 +5303,7 @@ def _idempotency_keys(message) -> tuple[str, str]:
 
 
 _ASSISTANT_ROLE = "assistant"
+_USER_ROLE = "user"
 # A `cron` event's action once a job run is over.
 _CRON_FINISHED = "finished"
 # What a reply reads from its run's messages: the usage, image and
@@ -9502,9 +9509,6 @@ def _subagent_previews(previews_resp) -> tuple:
 # creation, any target); and the session of the conversation it came from
 # (`sourceConversation`, not in the public job). "main" binds to the agent's
 # main session and "isolated"/"current" to `cron:<jobId>`, never a chat.
-# A Gateway without the parameter (2026.9.3) gets one shared full list,
-# matched here on the forms the public job carries: "session:<key>" and
-# `sessionKey`; a job bound only through its source conversation is missed.
 #
 # One read per session, shared by every dialog of that chat, kept until the
 # Gateway's `cron` event (a job added, changed, removed, started or
@@ -9523,8 +9527,6 @@ _SCHEDULED_MESSAGE_MAX = 200
 _scheduled_cache: dict = {}
 # Chats whose jobs are kept at once.
 _SCHEDULED_CACHE_MAX = 256
-# connection -> (cron_revision, jobs): the full list, without the filter.
-_all_jobs_cache: dict = {}
 
 
 def _cron_token(conn):
@@ -9532,15 +9534,6 @@ def _cron_token(conn):
     None for a connection without them (a Pipe older than this Action)."""
     epoch, revision = getattr(conn, "cron_epoch", None), getattr(conn, "cron_revision", None)
     return f"{epoch}:{revision}" if isinstance(epoch, str) and isinstance(revision, int) else None
-
-
-# How a Gateway before 2026.10.5 refuses `sessionKey` (its closed schema), lowercased.
-_NO_SESSION_FILTER_TEXT = "unexpected property 'sessionkey'"
-
-
-def _no_session_filter(ex: Exception) -> bool:
-    """`cron.list` refused `sessionKey`: a Gateway before 2026.10.5."""
-    return _NO_SESSION_FILTER_TEXT in str(ex).lower()
 
 
 async def _cron_pages(conn, params: dict) -> list:
@@ -9556,22 +9549,6 @@ async def _cron_pages(conn, params: dict) -> list:
         offset = nxt
 
 
-def _job_key_form(job: dict, key: str) -> str:
-    """A key as the Gateway writes it for the job's agent: bare keys get the prefix."""
-    agent = job.get("effectiveAgentId") or job.get("agentId") or "main"
-    return key if key.startswith("agent:") else f"agent:{agent}:{key}"
-
-
-def _job_bound_to(job: dict, session_key: str) -> bool:
-    """The fallback match (no `sessionKey` filter): "session:<key>", or the
-    job's `sessionKey`, as the Gateway resolves them."""
-    target = job.get("sessionTarget") or ""
-    keys = [target[len("session:"):]] if target.startswith("session:") else []
-    if isinstance(job.get("sessionKey"), str) and job["sessionKey"].strip():
-        keys.append(job["sessionKey"].strip())
-    return session_key in {_job_key_form(job, k) for k in keys}
-
-
 async def _read_scheduled(conn, session_key: str) -> "list | None":
     """The enabled automations bound to the session, or None when this
     Gateway has no `cron.list`."""
@@ -9584,13 +9561,7 @@ async def _read_scheduled(conn, session_key: str) -> "list | None":
     except Exception as ex:
         if _is_unknown_method(ex):
             return None
-        if not _no_session_filter(ex):
-            raise
-        everything = _all_jobs_cache.get(conn)
-        if not everything or everything[0] != token:
-            _all_jobs_cache.clear()
-            everything = _all_jobs_cache[conn] = (token, await _cron_pages(conn, {}))
-        jobs = [j for j in everything[1] if _job_bound_to(j, session_key)]
+        raise
     jobs = [j for j in jobs if j.get("enabled", True)]
     # Only the current connection's reads at the current revision are kept,
     # and at most _SCHEDULED_CACHE_MAX of them (the oldest go first).
@@ -9725,7 +9696,7 @@ async def _background_data(tasks_task, chat_task, session_key: str, source: str)
     try:
         tasks = await tasks_task
     except Exception as ex:
-        pipe_log(f"[status-action] tasks.list failed: {ex}")
+        pipe_log(f"[status-action] sessions.processes.list failed: {ex}")
         tasks = []
         errors.append(f"Could not read background tasks: {ex}")
     chat = await chat_task
@@ -9756,14 +9727,8 @@ def _is_unknown_method(ex: Exception) -> bool:
 
 
 async def _read_background_tasks(conn, session_key: str) -> "list | None":
-    """This session's background work as task rows: `tasks.list` (2026.9) or
-    `sessions.processes.list` (2026.10). None when the Gateway has neither."""
-    try:
-        resp = await conn.send_request("tasks.list", dict(sessionKey=session_key, limit=100), timeout=5)
-        return (resp or {}).get("tasks") or []
-    except Exception as ex:
-        if not _is_unknown_method(ex):
-            raise
+    """This session's background commands as task rows, from
+    `sessions.processes.list`. None when the Gateway has none."""
     try:
         resp = await conn.send_request("sessions.processes.list", dict(key=session_key), timeout=5)
     except Exception as ex:
@@ -9928,17 +9893,11 @@ def _task_row(task: dict, commands: dict) -> dict:
     }
 
 
-# 2026.9's command summaries, which the status chip already says.
-_GENERIC_COMMAND_SUMMARIES = {"Command running", "Command completed", "Command failed"}
-
-
 def _command_row(task: dict, card: dict, live: bool) -> dict:
     """A background command row (ELI-232), titled by the agent's title, else
     its first real command."""
     command = card.get("command") or ""
-    # 2026.9 titles every one "CLI command"; 2026.10 uses the first words.
-    own = (task.get("title") or "").strip()
-    short = _short_command(command or ("" if own == "CLI command" else own))
+    short = _short_command(command or (task.get("title") or "").strip())
     title = card.get("title") or short or "Shell command"
     if live:
         preview = short if card.get("title") and short != title else None
@@ -9946,7 +9905,7 @@ def _command_row(task: dict, card: dict, live: bool) -> dict:
         code, signal = task.get("exitCode"), task.get("exitSignal")
         ended = signal or (f"exit {code}" if code not in (None, 0) else None)
         said = _clean_line(task.get("error") or task.get("terminalSummary") or "")
-        preview = " · ".join(p for p in (ended, None if said in _GENERIC_COMMAND_SUMMARIES else said) if p) or None
+        preview = " · ".join(p for p in (ended, said) if p) or None
     return {
         "id": task.get("id") or task.get("taskId"),
         "kind": _BACKGROUND_KINDS["exec"],
