@@ -172,7 +172,7 @@ Always on.
 
 ## Open WebUI background tasks
 
-Open WebUI quietly calls the selected model for chores: a title after the first exchange, tags, a follow-up suggestion, an emoji, autocomplete as you type, a search query for its built-in search, an image prompt, and tool selection. Each call reaches the Pipe tagged with its task name: `title_generation`, `tags_generation`, `follow_up_generation`, `emoji_generation`, `autocomplete_generation`, `query_generation`, `image_prompt_generation`, `function_calling`.
+Open WebUI quietly calls the selected model for chores: a title after the first exchange, tags, a follow-up suggestion, an emoji, autocomplete as you type, a search query for its built-in search, an image prompt, tool selection, and, with its context compaction turned on, a summary of a long chat. Each call reaches the Pipe tagged with its task name: `title_generation`, `tags_generation`, `follow_up_generation`, `emoji_generation`, `autocomplete_generation`, `query_generation`, `image_prompt_generation`, `function_calling`, `context_compaction`.
 
 In the log:
 
@@ -180,7 +180,7 @@ In the log:
 [openclaw-pipe] Skipping OWUI background task: follow_up_generation
 ```
 
-The Pipe checks that tag before anything else: a match is logged and the Pipe returns at once, so none of these ever reaches your agent. Unhandled, each would be an extra run in your real session: wasted tokens, a title prompt in the agent's context, and confusing entries in its history. Open WebUI falls back on its own for an empty answer to each of these. "Merge Responses" is not skipped, since its only output is the answer itself.
+The Pipe checks that tag before anything else: a match is logged and the Pipe returns at once, so none of these ever reaches your agent. Unhandled, each would be an extra run in your real session: wasted tokens, a title prompt in the agent's context, and confusing entries in its history. Open WebUI falls back on its own for an empty answer to each of these. A compaction summary would otherwise be a full agent run on the whole chat before your message is sent, and it is never needed: OpenClaw keeps and compacts the session's history itself, and the Pipe never sends it Open WebUI's whole history. "Merge Responses" is not skipped, since its only output is the answer itself.
 
 This is separate from the Pipe's own [chat titles](./chat.md#chat-titles), which run on a dedicated agent instead.
 

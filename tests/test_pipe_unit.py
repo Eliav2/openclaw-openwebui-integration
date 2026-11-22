@@ -1320,6 +1320,10 @@ class OwuiTaskNoopTests(unittest.TestCase):
         self.assertIn("image_prompt_generation", values)
         self.assertIn("function_calling", values)
 
+    def test_context_compaction_is_noop(self):
+        # A full agent run on a summary of the whole chat, ahead of the real message.
+        self.assertIn("context_compaction", self._noop_task_values())
+
     def test_moa_response_generation_still_gets_a_full_agent_turn(self):
         values = self._noop_task_values()
         self.assertNotIn("moa_response_generation", values)
