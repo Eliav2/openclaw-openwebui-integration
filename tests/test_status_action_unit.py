@@ -430,6 +430,49 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source, "pipe")
         fake_conn.ensure_connected.assert_awaited_once()
 
+    @staticmethod
+    def _pipe_conn(endpoint):
+        conn = mock.AsyncMock()
+        conn.endpoint_moved = mock.Mock(return_value=False)
+        conn.cron_epoch, conn.cron_revision = "pipe", 0
+        conn._endpoint = endpoint
+        return conn
+
+    async def test_reuses_a_second_pipe_copys_connection(self):
+        """Each Pipe copy stashes its connection under its own function id."""
+        copy = self._pipe_conn(None)
+        stub_modules = {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.socket": types.ModuleType("open_webui.socket"),
+            "open_webui.socket.main": types.SimpleNamespace(
+                _openclaw_gateway_connection_v1_openclaw_second=copy),
+        }
+        with mock.patch.dict(sys.modules, stub_modules):
+            conn, source = await _get_action_connection(lambda: None)
+        self.assertIs(conn, copy)
+        self.assertEqual(source, "pipe")
+
+    async def test_a_copy_on_another_gateway_is_passed_over(self):
+        import openclaw_status_action as mod
+
+        here = mod._parse_gateway_url("ws://gateway-a:18789")
+        other = self._pipe_conn(mod._parse_gateway_url("ws://gateway-b:18789"))
+        mine = self._pipe_conn(here)
+        stub_modules = {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.socket": types.ModuleType("open_webui.socket"),
+            # Sorted first: the other Gateway's copy is the first candidate.
+            "open_webui.socket.main": types.SimpleNamespace(
+                _openclaw_gateway_connection_v1_a_other=other,
+                _openclaw_gateway_connection_v1_b_mine=mine),
+        }
+        valves = types.SimpleNamespace(GATEWAY_URL="ws://gateway-a:18789")
+        with mock.patch.dict(sys.modules, stub_modules):
+            conn, source = await _get_action_connection(lambda: valves)
+        self.assertIs(conn, mine)
+        self.assertEqual(source, "pipe")
+        other.ensure_connected.assert_not_awaited()
+
     async def test_an_older_pipe_connection_is_not_reused(self):
         """A Pipe deployed before this Action has no cron revision: the
         Scheduled follow could not wait on it, so the Action opens its own."""
@@ -449,7 +492,7 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch.dict(sys.modules, stub_modules), \
                  mock.patch("openclaw_status_action._GatewayConnection", return_value=own):
                 conn, source = await _get_action_connection(lambda: None)
-                self.assertIs(mod._known_action_connection(), own)   # what the follow waits on
+                self.assertIs(mod._known_action_connection(lambda: None), own)   # what the follow waits on
         finally:
             mod._action_fallback_connection = None
         self.assertIs(conn, own)

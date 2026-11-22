@@ -6,10 +6,10 @@
 
 # ---------------------------------------------------------------------------
 # Gateway connection for the Status Action.
-#   1. Reuse the Pipe's `_GatewayConnection`, stashed on `open_webui.socket.main`
-#      (see `_STALE_CONN_ATTR` in gateway.py). Only ever READ that slot: writing
-#      it would let the Pipe's `_reap_stale_gateway_connection()` tear down a
-#      connection it does not own.
+#   1. Reuse a Pipe's `_GatewayConnection`, stashed on `open_webui.socket.main`
+#      in one slot per Pipe copy (see `_conn_slot` in gateway.py). Only ever
+#      READ those slots: writing one would let that Pipe's
+#      `_reap_stale_gateway_connection()` tear down a connection it does not own.
 #   2. Else open our own, owned by this module only. It reuses the Pipe's
 #      persisted device identity, so no second `openclaw devices approve`.
 # gateway.py is reused verbatim, without the turn writer.
@@ -25,13 +25,33 @@ def _pipe_conn_reusable(pipe_conn) -> bool:
     return pipe_conn is not None and _cron_token(pipe_conn) is not None and not pipe_conn.endpoint_moved()
 
 
-def _known_action_connection():
+def _pipe_connection(valves_getter):
+    """A reusable connection of a Pipe copy for this Action's GATEWAY_URL, or
+    None. Each copy stashes its own (`_conn_slot` in gateway.py), so every slot
+    is a candidate; one opened for another Gateway is passed over."""
+    import open_webui.socket.main as _owui_socket_main
+    try:
+        want = _parse_gateway_url(valves_getter().GATEWAY_URL)
+    except Exception:   # no valves yet, or an unparseable URL: any Gateway
+        want = None
+    for name in sorted(vars(_owui_socket_main)):
+        if name != _STALE_CONN_ATTR and not name.startswith(_STALE_CONN_ATTR + "_"):
+            continue
+        conn = getattr(_owui_socket_main, name, None)
+        if not _pipe_conn_reusable(conn):
+            continue
+        if want is not None and getattr(conn, "_endpoint", None) not in (None, want):
+            continue
+        return conn
+    return None
+
+
+def _known_action_connection(valves_getter):
     """The connection `_get_action_connection` would use, up or down, without
     connecting: something to wait on while the Gateway is unreachable."""
     try:
-        import open_webui.socket.main as _owui_socket_main
-        pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
-        if _pipe_conn_reusable(pipe_conn):
+        pipe_conn = _pipe_connection(valves_getter)
+        if pipe_conn is not None:
             return pipe_conn
     except Exception:
         pass
@@ -41,10 +61,9 @@ def _known_action_connection():
 async def _get_action_connection(valves_getter):
     """Return (connection, source) where source is "pipe" or "action-own"."""
     try:
-        import open_webui.socket.main as _owui_socket_main
-        pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
         # A connection opened for an earlier GATEWAY_URL is not reused.
-        if _pipe_conn_reusable(pipe_conn):
+        pipe_conn = _pipe_connection(valves_getter)
+        if pipe_conn is not None:
             await pipe_conn.ensure_connected()
             return pipe_conn, "pipe"
     except Exception as ex:
@@ -3691,7 +3710,7 @@ class Action:
         while True:
             if ended():
                 return {"status": "ok"}
-            known = _known_action_connection()
+            known = _known_action_connection(lambda: self.valves)
             back = known.cron_event() if known is not None else None
             try:
                 conn, source = await _get_action_connection(lambda: self.valves)
