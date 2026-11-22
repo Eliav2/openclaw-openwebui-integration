@@ -10988,7 +10988,7 @@ class _TurnWriter:
                       and payload.get("runId") == self.run_id and not self.renderer.output
                       and self.cron_run is None and not self.silent_announce
                       and not str(self.run_id).startswith(ANNOUNCE_RUN_PREFIX)):
-                    # A user message's lone final: steered. An announce run has none.
+                    # A lone final: steered into the running turn. Never an announce run.
                     self.steered_message = True
                 if (payload.get("stream") == _STREAM_LIFECYCLE and data.get("phase") == _PHASE_END
                         and (data.get("terminalReply") or {}).get("disposition") == _DISPOSITION_SILENT
