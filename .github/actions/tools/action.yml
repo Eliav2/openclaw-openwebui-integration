@@ -46,7 +46,7 @@ runs:
         path: ${{ runner.tool_cache }}/uv/${{ env.UV_VERSION }}
         key: uv-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.UV_VERSION }}
     - if: inputs.uv == 'true'
-      uses: astral-sh/setup-uv@v10.3.3
+      uses: astral-sh/setup-uv@v10.4.0
       with:
         version: ${{ env.UV_VERSION }}
 
