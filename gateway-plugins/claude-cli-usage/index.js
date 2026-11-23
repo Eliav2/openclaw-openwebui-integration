@@ -115,7 +115,7 @@ async function fetchPlan(oauth, headers, fetchFn, now) {
 }
 
 // -> { snapshot, retryUntil? }: retryUntil (epoch ms) is the failed answer's own Retry-After, counted from when it arrived.
-async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
+async function fetchSnapshot(fetchFn = fetch, now = Date.now(), clock = Date.now) {
   const base = { provider: "anthropic", displayName: "Claude", source: "claude-cli" };
   let oauth;
   try {
@@ -138,9 +138,9 @@ async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
   // Both requests start together: two 8 s timeouts in a row would pass the
   // caller's 10 s budget and lose the windows. fetchPlan never rejects.
   const planPromise = fetchPlan(oauth, headers, fetchFn, now);
-  const startedAt = Date.now();
+  const startedAt = clock();
   const res = await fetchFn(USAGE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-  const receivedAt = now + (Date.now() - startedAt); // `now` is the caller's clock (a test's, or Date.now()); the wait for the answer is real
+  const receivedAt = now + (clock() - startedAt); // `now` is the caller's time (a test's, or Date.now()); `clock` measures the wait for the answer
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
     return {
@@ -158,7 +158,7 @@ function servedStale(reason) {
   return { ...cached.snapshot, stale: true, staleReason: reason };
 }
 
-export async function getClaudeCliUsage({ fetchFn, now = Date.now() } = {}) {
+export async function getClaudeCliUsage({ fetchFn, now = Date.now(), clock = Date.now } = {}) {
   if (cached && now - cached.at < CACHE_TTL_MS) return cached.snapshot;
   // A failure holds every caller off the endpoint until its Retry-After (or one cache period) is over:
   // asking again on each call while it answers 429 only prolongs the 429.
@@ -167,14 +167,14 @@ export async function getClaudeCliUsage({ fetchFn, now = Date.now() } = {}) {
   }
   let snapshot;
   let retryUntil;
-  const startedAt = Date.now();
+  const startedAt = clock();
   try {
-    ({ snapshot, retryUntil } = await fetchSnapshot(fetchFn, now));
+    ({ snapshot, retryUntil } = await fetchSnapshot(fetchFn, now, clock));
   } catch (err) {
     snapshot = { provider: "anthropic", displayName: "Claude", source: "claude-cli", windows: [], error: String(err?.message ?? err) };
   }
   if (snapshot.error) {
-    const settledAt = now + (Date.now() - startedAt); // the hold runs from when the answer (or the failure) arrived, not from when we asked
+    const settledAt = now + (clock() - startedAt); // the hold runs from when the answer (or the failure) arrived, not from when we asked
     failure = { until: Math.max(settledAt + CACHE_TTL_MS, retryUntil ?? 0), snapshot };
     // A transient failure (429, timeout) keeps serving the last good windows, marked stale.
     if (cached?.snapshot.windows.length) return servedStale(snapshot.error);

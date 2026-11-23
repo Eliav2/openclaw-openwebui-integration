@@ -104,12 +104,18 @@ function scriptedFetch(answers, calls) {
 }
 
 const T0 = 2e12;
+// A controlled clock for the time a response takes: frozen, and a slow answer advances it by hand. No test depends on real elapsed time.
+function fakeClock() {
+  const c = { t: 0, now: () => c.t, advance: (ms) => { c.t += ms; } };
+  return c;
+}
 
 test("a 429 with Retry-After is not retried before it is over, and the last good windows are served stale", async () => {
   const fresh = await import("./index.js?retry-after");
   const calls = [];
   const answers = ["ok", { status: 429, retryAfter: 300 }, "ok"];
-  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn: scriptedFetch(answers, calls), now: T0 + dt });
+  const clock = fakeClock();
+  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn: scriptedFetch(answers, calls), now: T0 + dt, clock: clock.now });
   assert.equal((await get(0)).stale, undefined);
   const first = await get(61_000);                       // cache expired: asks, gets the 429
   assert.equal(first.stale, true);
@@ -122,9 +128,9 @@ test("a 429 with Retry-After is not retried before it is over, and the last good
     assert.equal(held.staleReason, "Anthropic usage HTTP 429");
   }
   assert.equal(calls.length, 2);                         // the first success and the 429, nothing else
-  const back = await get(61_000 + 300_100);              // Retry-After over (it runs from receipt): asks again, a success clears the stale flag
+  const back = await get(61_000 + 300_000);              // Retry-After over: asks again, and a success clears the stale flag
   assert.equal(back.stale, undefined);
-  assert.equal(back.fetchedAt, T0 + 361_100);
+  assert.equal(back.fetchedAt, T0 + 361_000);
   assert.equal(calls.length, 3);
 });
 
@@ -132,12 +138,13 @@ test("a 429 without Retry-After holds one cache period, the same one-fetch-per-m
   const fresh = await import("./index.js?no-retry-after");
   const calls = [];
   const answers = ["ok", { status: 429 }, { status: 429 }, "ok"];
-  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn: scriptedFetch(answers, calls), now: T0 + dt });
+  const clock = fakeClock();
+  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn: scriptedFetch(answers, calls), now: T0 + dt, clock: clock.now });
   await get(0);
   await get(61_000);                                     // 429
   for (const dt of [70_000, 100_000, 120_000]) assert.equal((await get(dt)).stale, true);
   assert.equal(calls.length, 2);                         // held until 61 s + 60 s
-  await get(121_100);                                    // asks again (the hold runs from receipt, so a little past 121 s): another 429, held again
+  await get(121_000);                                    // the hold is over exactly one cache period after the 429: asks again, another 429
   assert.equal(calls.length, 3);
   assert.equal((await get(150_000)).stale, true);
   assert.equal(calls.length, 3);
@@ -154,20 +161,27 @@ test("Retry-After as seconds or an HTTP date, absolute from receipt, capped at 5
 
 test("a relative Retry-After runs from when the answer arrived, not from when the request was sent", async () => {
   const fresh = await import("./index.js?receipt");
+  const clock = fakeClock();
   const calls = [];
-  let delay = 0;
+  const SLOW_MS = 7_000;                                        // the 429 takes seven seconds to come back
+  let slow = false;
   const fetchFn = async (url) => {
-    if (!url.endsWith("/usage")) return new Response(JSON.stringify({}));
-    calls.push(delay);
-    if (delay) await new Promise((r) => setTimeout(r, delay));   // a slow answer
-    return delay ? new Response("{}", { status: 429, headers: { "retry-after": "300" } }) : new Response(JSON.stringify(USAGE));
+    if (!url.endsWith("/usage")) return new Response("{}");
+    calls.push(url);
+    if (!slow) return new Response(JSON.stringify(USAGE));
+    clock.advance(SLOW_MS);
+    return new Response("{}", { status: 429, headers: { "retry-after": "300" } });
   };
-  await fresh.getClaudeCliUsage({ fetchFn, now: T0 });
-  delay = 80;
-  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 });  // answers 429 after 80 ms: held until receipt + 300 s
-  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 + 300_040 });   // 40 ms after the naive deadline, before receipt + 300 s
+  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn, now: T0 + dt, clock: clock.now });
+  await get(0);
+  slow = true;
+  await get(61_000);                                            // asked at 61 s, answered at 68 s: held until 368 s, not 361 s
   assert.equal(calls.length, 2);
-  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 + 300_200 });
+  await get(61_000 + 300_000);                                  // the naive deadline (request time + 300 s): still held
+  await get(61_000 + 300_000 + SLOW_MS - 1);
+  assert.equal(calls.length, 2);
+  slow = false;
+  await get(61_000 + 300_000 + SLOW_MS);                        // receipt + 300 s: asks again
   assert.equal(calls.length, 3);
 });
 
@@ -175,7 +189,8 @@ test("a failure with nothing cached yet is held too", async () => {
   const fresh = await import("./index.js?cold");
   const calls = [];
   const answers = [{ status: 429, retryAfter: 600 }, "ok"];
-  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn: scriptedFetch(answers, calls), now: T0 + dt });
+  const clock = fakeClock();
+  const get = (dt) => fresh.getClaudeCliUsage({ fetchFn: scriptedFetch(answers, calls), now: T0 + dt, clock: clock.now });
   const cold = await get(0);
   assert.deepEqual(cold.windows, []);
   assert.equal(cold.error, "Anthropic usage HTTP 429");
@@ -187,6 +202,7 @@ test("a failure with nothing cached yet is held too", async () => {
 
 test("a thrown fetch (timeout, network) is held one cache period as well", async () => {
   const fresh = await import("./index.js?throws");
+  const clock = fakeClock();
   let n = 0;
   const fetchFn = async (url) => {
     if (!url.endsWith("/usage")) return new Response("{}", { status: 500 });
@@ -194,10 +210,10 @@ test("a thrown fetch (timeout, network) is held one cache period as well", async
     if (n === 1) return new Response(JSON.stringify(USAGE));
     throw new Error("The operation was aborted due to timeout");
   };
-  await fresh.getClaudeCliUsage({ fetchFn, now: T0 });
-  const a = await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 });
+  await fresh.getClaudeCliUsage({ fetchFn, now: T0, clock: clock.now });
+  const a = await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000, clock: clock.now });
   assert.equal(a.stale, true);
   assert.match(a.staleReason, /timeout/);
-  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 90_000 });
+  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 90_000, clock: clock.now });
   assert.equal(n, 2);
 });
