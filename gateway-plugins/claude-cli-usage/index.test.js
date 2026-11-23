@@ -122,9 +122,9 @@ test("a 429 with Retry-After is not retried before it is over, and the last good
     assert.equal(held.staleReason, "Anthropic usage HTTP 429");
   }
   assert.equal(calls.length, 2);                         // the first success and the 429, nothing else
-  const back = await get(61_000 + 300_000);              // Retry-After over: asks again, and a success clears the stale flag
+  const back = await get(61_000 + 300_100);              // Retry-After over (it runs from receipt): asks again, a success clears the stale flag
   assert.equal(back.stale, undefined);
-  assert.equal(back.fetchedAt, T0 + 361_000);
+  assert.equal(back.fetchedAt, T0 + 361_100);
   assert.equal(calls.length, 3);
 });
 
@@ -137,19 +137,38 @@ test("a 429 without Retry-After holds one cache period, the same one-fetch-per-m
   await get(61_000);                                     // 429
   for (const dt of [70_000, 100_000, 120_000]) assert.equal((await get(dt)).stale, true);
   assert.equal(calls.length, 2);                         // held until 61 s + 60 s
-  await get(121_000);                                    // asks again: another 429, held again
+  await get(121_100);                                    // asks again (the hold runs from receipt, so a little past 121 s): another 429, held again
   assert.equal(calls.length, 3);
   assert.equal((await get(150_000)).stale, true);
   assert.equal(calls.length, 3);
 });
 
-test("Retry-After as an HTTP date, and one longer than 5 h is capped at 5 h", () => {
-  const now = Date.parse("2026-11-23T10:00:00Z");
-  assert.equal(parseRetryAfter("120", now), 120_000);
-  assert.equal(parseRetryAfter("Mon, 23 Nov 2026 10:05:00 GMT", now), 300_000);
-  assert.equal(parseRetryAfter("Mon, 23 Nov 2026 09:00:00 GMT", now), 0);       // a date in the past: no extra hold
-  assert.equal(parseRetryAfter("999999999", now), 5 * 3600_000);
-  for (const bad of [undefined, null, "", "soon", "-5"]) assert.equal(parseRetryAfter(bad, now), undefined);
+test("Retry-After as seconds or an HTTP date, absolute from receipt, capped at 5 h", () => {
+  const at = Date.parse("2026-11-23T10:00:00Z");
+  assert.equal(parseRetryAfter("120", at), at + 120_000);
+  assert.equal(parseRetryAfter("Mon, 23 Nov 2026 10:05:00 GMT", at), at + 300_000);   // absolute, whatever the receipt time
+  assert.equal(parseRetryAfter("Mon, 23 Nov 2026 09:00:00 GMT", at), at);              // a date in the past: no extra hold
+  assert.equal(parseRetryAfter("999999999", at), at + 5 * 3600_000);
+  for (const bad of [undefined, null, "", "soon", "-5"]) assert.equal(parseRetryAfter(bad, at), undefined);
+});
+
+test("a relative Retry-After runs from when the answer arrived, not from when the request was sent", async () => {
+  const fresh = await import("./index.js?receipt");
+  const calls = [];
+  let delay = 0;
+  const fetchFn = async (url) => {
+    if (!url.endsWith("/usage")) return new Response(JSON.stringify({}));
+    calls.push(delay);
+    if (delay) await new Promise((r) => setTimeout(r, delay));   // a slow answer
+    return delay ? new Response("{}", { status: 429, headers: { "retry-after": "300" } }) : new Response(JSON.stringify(USAGE));
+  };
+  await fresh.getClaudeCliUsage({ fetchFn, now: T0 });
+  delay = 80;
+  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 });  // answers 429 after 80 ms: held until receipt + 300 s
+  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 + 300_040 });   // 40 ms after the naive deadline, before receipt + 300 s
+  assert.equal(calls.length, 2);
+  await fresh.getClaudeCliUsage({ fetchFn, now: T0 + 61_000 + 300_200 });
+  assert.equal(calls.length, 3);
 });
 
 test("a failure with nothing cached yet is held too", async () => {

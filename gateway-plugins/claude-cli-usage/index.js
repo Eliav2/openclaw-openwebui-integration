@@ -24,7 +24,8 @@ const CACHE_TTL_MS = 60_000;
 // After a failed fetch the endpoint is not asked again before the 429's own Retry-After, and never sooner
 // than one cache period (the same one-fetch-per-minute the success path keeps). A Retry-After longer than
 // the shortest window (5 h) is capped there: a bogus header must not blind the dialog for days.
-const RETRY_AFTER_MAX_MS = 5 * 3600_000;
+const RETRY_AFTER_MAX_MS = 18_000_000;
+const MS_PER_SECOND = 1000;
 
 let cached = null; // { at, snapshot }, set by a successful fetch (or a first failure with nothing to fall back on)
 let failure = null; // { until, snapshot }: the last failed fetch and the time before which nothing asks again
@@ -33,12 +34,14 @@ const PLAN_TTL_MS = 6 * 3600_000;
 // Keyed on the access token: another login (or a token refresh) asks again.
 let cachedPlan = null; // { key, at, plan }
 
-// Retry-After: delta-seconds or an HTTP date; undefined when absent or unparseable.
-export function parseRetryAfter(raw, now = Date.now()) {
-  if (typeof raw !== "string" || !raw.trim()) return undefined;
-  const text = raw.trim();
-  const ms = /^\d+$/.test(text) ? Number(text) * 1000 : /[a-z]/i.test(text) ? Date.parse(text) - now : NaN;
-  return Number.isFinite(ms) ? Math.min(Math.max(ms, 0), RETRY_AFTER_MAX_MS) : undefined;
+// Retry-After as an absolute time (epoch ms), counted from `receivedAt`, the moment the answer arrived: delta-seconds run from
+// receipt (RFC 9110), an HTTP date is absolute. Never before receipt, never more than RETRY_AFTER_MAX_MS after it; undefined
+// when absent or unparseable.
+export function parseRetryAfter(raw, receivedAt = Date.now()) {
+  const text = String(raw ?? "").trim();
+  if (!text) return undefined;
+  const at = /^\d+$/.test(text) ? receivedAt + Number(text) * MS_PER_SECOND : /[a-z]/i.test(text) ? Date.parse(text) : NaN;
+  return Number.isFinite(at) ? Math.min(Math.max(at, receivedAt), receivedAt + RETRY_AFTER_MAX_MS) : undefined;
 }
 
 function credentialsPath() {
@@ -111,7 +114,7 @@ async function fetchPlan(oauth, headers, fetchFn, now) {
   return plan ?? planLabel(oauth);
 }
 
-// -> { snapshot, retryAfterMs? }: retryAfterMs is the failed answer's own Retry-After.
+// -> { snapshot, retryUntil? }: retryUntil (epoch ms) is the failed answer's own Retry-After, counted from when it arrived.
 async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
   const base = { provider: "anthropic", displayName: "Claude", source: "claude-cli" };
   let oauth;
@@ -135,12 +138,14 @@ async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
   // Both requests start together: two 8 s timeouts in a row would pass the
   // caller's 10 s budget and lose the windows. fetchPlan never rejects.
   const planPromise = fetchPlan(oauth, headers, fetchFn, now);
+  const startedAt = Date.now();
   const res = await fetchFn(USAGE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  const receivedAt = now + (Date.now() - startedAt); // `now` is the caller's clock (a test's, or Date.now()); the wait for the answer is real
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
     return {
       snapshot: { ...base, windows: [], error: `Anthropic usage HTTP ${res.status}` },
-      retryAfterMs: parseRetryAfter(res.headers?.get?.("retry-after"), now),
+      retryUntil: parseRetryAfter(res.headers?.get?.("retry-after"), receivedAt),
     };
   }
   const windows = buildWindows(await res.json());
@@ -161,14 +166,16 @@ export async function getClaudeCliUsage({ fetchFn, now = Date.now() } = {}) {
     return cached?.snapshot.windows.length ? servedStale(failure.snapshot.error) : failure.snapshot;
   }
   let snapshot;
-  let retryAfterMs;
+  let retryUntil;
+  const startedAt = Date.now();
   try {
-    ({ snapshot, retryAfterMs } = await fetchSnapshot(fetchFn, now));
+    ({ snapshot, retryUntil } = await fetchSnapshot(fetchFn, now));
   } catch (err) {
     snapshot = { provider: "anthropic", displayName: "Claude", source: "claude-cli", windows: [], error: String(err?.message ?? err) };
   }
   if (snapshot.error) {
-    failure = { until: now + Math.max(CACHE_TTL_MS, retryAfterMs ?? 0), snapshot };
+    const settledAt = now + (Date.now() - startedAt); // the hold runs from when the answer (or the failure) arrived, not from when we asked
+    failure = { until: Math.max(settledAt + CACHE_TTL_MS, retryUntil ?? 0), snapshot };
     // A transient failure (429, timeout) keeps serving the last good windows, marked stale.
     if (cached?.snapshot.windows.length) return servedStale(snapshot.error);
   } else {
