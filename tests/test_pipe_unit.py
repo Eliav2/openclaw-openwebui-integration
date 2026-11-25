@@ -13416,12 +13416,12 @@ class SilentTurnTests(_TurnCase):
         self.assert_silent(text)
         self.assertEqual(text.strip(), "")
 
-    async def _accepted_silent_turn(self, end_data):
+    async def _accepted_silent_turn(self, end_data, earlier=(), closing=()):
         """2026.11.7 (upstream 9bec8f8) accepts a person's NO_REPLY in a webchat turn: no error,
         the run ends `done` with no text, and the lifecycle end says why (CI compat run 45419239133)."""
         self.describe_extra = {"status": "done"}
-        self.history = {"messages": [{"role": "user", "content": "[manager] a note for you",
-                                      "idempotencyKey": "run-1:user"}]}
+        self.history = {"messages": [*earlier, {"role": "user", "content": "[manager] a note for you",
+                                                "idempotencyKey": "run-1:user"}, *closing]}
         gen = self._reply("[manager] a note for you", "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
@@ -13444,6 +13444,32 @@ class SilentTurnTests(_TurnCase):
     async def test_a_no_reply_the_gateway_accepts_shows_nothing(self):
         text = await self._accepted_silent_turn({"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}})
         self.assert_silent(text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_silent_end_shows_the_runs_own_text_the_transcript_holds(self):
+        """A socket gap lost every delta of the run; its closing text is in chat.history under its run id."""
+        text = await self._accepted_silent_turn(
+            {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+            closing=[{"role": "assistant", "content": [{"type": "text", "text": "Noted, thanks."}],
+                      "idempotencyKey": "cli-assistant:run-1"}])
+        self.assertIn("Noted, thanks.", text)
+        self.assertNotIn("no reply text", text)
+
+    async def test_a_silent_end_does_not_take_an_earlier_answer_to_the_same_words(self):
+        text = await self._accepted_silent_turn(
+            {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+            earlier=[{"role": "user", "content": "[manager] a note for you", "idempotencyKey": "run-0:user"},
+                     {"role": "assistant", "content": [{"type": "text", "text": "An older answer."}],
+                      "idempotencyKey": "cli-assistant:run-0"}])
+        self.assertNotIn("An older answer.", text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_silent_end_whose_closer_is_the_sentinel_stays_silent(self):
+        text = await self._accepted_silent_turn(
+            {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+            closing=[{"role": "assistant", "content": [{"type": "text", "text": "NO_REPLY"}],
+                      "idempotencyKey": "cli-assistant:run-1"}])
+        self.assertNotIn("NO_REPLY", text)
         self.assertEqual(text.strip(), "")
 
     async def test_an_end_with_no_text_that_is_not_silence_still_says_so(self):
