@@ -1026,6 +1026,27 @@ def _yield_acknowledgment(name: str, result_str: str, failed: bool) -> str | Non
     return str(result.get("acknowledgment") or "").strip()
 
 
+_TOOL_RESULT_BLOCK = "tool_result"  # an imported claude-cli message's tool result block
+
+
+def _ends_with_accepted_yield(message) -> bool:
+    """An imported claude-cli message holding an accepted `sessions_yield` result: the turn the yield
+    ended stops here. 2026.11.8 no longer imports Claude Code's `<synthetic>` placeholder after it
+    (upstream cb98a28, #189210), which used to mark that end in `chat.history` (ELI-512)."""
+    if not isinstance(message, dict) or message.get("role") != _ASSISTANT_ROLE:
+        return False
+    content = message.get("content")
+    for block in content if isinstance(content, list) else ():
+        if not isinstance(block, dict) or block.get("type") != _TOOL_RESULT_BLOCK:
+            continue
+        parts = block.get("content")
+        text = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict)) \
+            if isinstance(parts, list) else str(parts or "")
+        if _yield_acknowledgment(str(block.get("name") or ""), text, bool(block.get("is_error"))) is not None:
+            return True
+    return False
+
+
 def _is_spawn_tool(name: str) -> bool:
     """`sessions_spawn`, bare or as a claude-cli MCP tool name."""
     return name == "sessions_spawn" or (name.startswith("mcp__")
