@@ -2055,6 +2055,11 @@ class _PipeTurn:
             if (payload.get("data") or {}).get("yielded") is True and self.renderer.yielded is None:
                 # The Gateway says the run yielded (2026.11.5), whatever its tool said.
                 self.renderer.yielded = ""
+            if ((payload.get("data") or {}).get("terminalReply") or {}).get("disposition") == _DISPOSITION_SILENT:
+                # From 2026.11.7 a person's NO_REPLY in a webchat turn is accepted (upstream 9bec8f8): the run
+                # ends `done` with no text and no error, where it used to fail with EMPTY_RESPONSE_ERROR (ELI-336).
+                self.model_silent = True
+                pipe_log("  lifecycle end: the model ended silent -> done, nothing shown")
             pipe_log("  lifecycle end -> done")
         elif _is_model_silence(err):
             self.model_silent = self.done = True

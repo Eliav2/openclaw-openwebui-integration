@@ -13416,6 +13416,40 @@ class SilentTurnTests(_TurnCase):
         self.assert_silent(text)
         self.assertEqual(text.strip(), "")
 
+    async def _accepted_silent_turn(self, end_data):
+        """2026.11.7 (upstream 9bec8f8) accepts a person's NO_REPLY in a webchat turn: no error,
+        the run ends `done` with no text, and the lifecycle end says why (CI compat run 45419239133)."""
+        self.describe_extra = {"status": "done"}
+        self.history = {"messages": [{"role": "user", "content": "[manager] a note for you",
+                                      "idempotencyKey": "run-1:user"}]}
+        gen = self._reply("[manager] a note for you", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._event("agent", stream="lifecycle", data={"phase": "end", **end_data}))
+        q.put_nowait(self._event("chat", state="final"))
+        items = []
+
+        async def drain():
+            try:
+                items.append(await first)
+            except StopAsyncIteration:
+                return
+            async for chunk in gen:
+                items.append(chunk)
+        # Bounds the test only.
+        await asyncio.wait_for(drain(), 5)
+        return "".join(i for i in items if isinstance(i, str))
+
+    async def test_a_no_reply_the_gateway_accepts_shows_nothing(self):
+        text = await self._accepted_silent_turn({"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}})
+        self.assert_silent(text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_an_end_with_no_text_that_is_not_silence_still_says_so(self):
+        text = await self._accepted_silent_turn({"stopReason": "end_turn"})
+        self.assertIn("no reply text", text)
+
     async def test_silence_after_a_tool_call_keeps_only_the_card(self):
         tool = self._event("agent", stream="tool", data={
             "phase": "start", "name": "Bash", "toolCallId": "toolu_1", "args": {"command": "ls"}})
