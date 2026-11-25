@@ -13472,6 +13472,37 @@ class SilentTurnTests(_TurnCase):
         self.assertNotIn("NO_REPLY", text)
         self.assertEqual(text.strip(), "")
 
+    async def _steered_silent_turn(self, after_message):
+        """The reply's message was steered into a host run (`steered_span_run` is its own run, `our_run_id` the
+        host's), which ends silent with every delta lost. The host's closer is the whole host run."""
+        orig = openclaw_pipe._PipeTurn.finish
+
+        def finish(turn):
+            turn.steered_span_run, turn.our_run_id = "run-1", "host-1"
+            return orig(turn)
+
+        async def steered_answer(*_args, **_kw):
+            return self.history
+
+        host_closer = {"role": "assistant", "content": [{"type": "text", "text": "The host run's own answer."}],
+                       "idempotencyKey": "cli-assistant:host-1"}
+        with unittest.mock.patch.object(openclaw_pipe._PipeTurn, "finish", finish), \
+                unittest.mock.patch.object(openclaw_pipe, "_await_steered_answer", steered_answer):
+            return await self._accepted_silent_turn(
+                {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+                closing=[*after_message, host_closer])
+
+    async def test_a_steered_silent_end_does_not_show_the_host_runs_answer(self):
+        text = await self._steered_silent_turn([])
+        self.assertNotIn("The host run's own answer.", text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_steered_silent_end_shows_its_own_spans_text(self):
+        text = await self._steered_silent_turn(
+            [{"role": "assistant", "content": [{"type": "text", "text": "The steered answer."}]}])
+        self.assertIn("The steered answer.", text)
+        self.assertNotIn("The host run's own answer.", text)
+
     async def test_an_end_with_no_text_that_is_not_silence_still_says_so(self):
         text = await self._accepted_silent_turn({"stopReason": "end_turn"})
         self.assertIn("no reply text", text)

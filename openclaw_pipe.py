@@ -18824,8 +18824,10 @@ class _PipeTurn:
         elif not self.aborted and not self.text_yielded and self.model_silent:
             # The model's silence is its answer: no error and no fallback line (ELI-336). Unless this run's own
             # text is in the transcript (a socket gap lost its deltas): by run id only, never by user text,
-            # which could be an earlier answer to the same words.
-            recovered = await self.run_text_by_id()
+            # which could be an earlier answer to the same words. A steered reply's run id is the host run's,
+            # whose closer is the whole host run: it reads its own span (recover_from_transcript's steered path).
+            recovered = await (self.recover_from_transcript() if getattr(self, "steered_span_run", None)
+                               else self.run_text_by_id())
             if recovered:
                 pipe_log("  the run ended silent, but its text is in the transcript: shown")
                 self.record_visible_chunk(recovered)
