@@ -32,6 +32,12 @@ def _history():
     return {"messages": ocp._transcript_roles(copy.deepcopy(FX["messages"]))}
 
 
+def _history_11_8():
+    """The same chat as 2026.11.8 records it: no `<synthetic>` placeholder."""
+    return {"messages": ocp._transcript_roles([copy.deepcopy(m) for m in FX["messages"]
+                                               if m.get("model") != "<synthetic>"])}
+
+
 class SyntheticNoResponseTests(unittest.TestCase):
     def test_the_fixture_holds_the_synthetic_line_before_the_announce_closer(self):
         models = [m.get("model") for m in FX["messages"] if m.get("role") == "assistant"]
@@ -50,6 +56,22 @@ class SyntheticNoResponseTests(unittest.TestCase):
         the placeholder does. Its calls were shown by the reply the yield ended."""
         r = ocp._history_renderer(ocp._history_span_messages(_history(), ANNOUNCE))
         self.assertEqual([i for i in r.output if i["type"] == "function_call"], [])
+
+    def test_on_11_8_the_announce_run_holds_none_of_the_yielded_runs_calls(self):
+        """2026.11.8 no longer imports the `<synthetic>` placeholder (upstream cb98a28, #189210): the
+        accepted yield's message ends the yielded turn (compat runs 45419239133, 45683995603)."""
+        r = ocp._history_renderer(ocp._history_span_messages(_history_11_8(), ANNOUNCE))
+        self.assertEqual([i for i in r.output if i["type"] == "function_call"], [])
+        self.assertTrue(r.text.startswith(ANSWER), r.text)
+
+    def test_a_run_that_goes_on_past_its_yield_keeps_its_calls(self):
+        """Before 2026.11.5 a yield keeps the run open and the answer is in the same run (ELI-56)."""
+        history = _history_11_8()
+        closer = history["messages"][-1]
+        closer["idempotencyKey"] = "cli-assistant:run-old"
+        names = [i["name"] for i in ocp._history_renderer(ocp._history_span_messages(history, "run-old")).output
+                 if i["type"] == "function_call"]
+        self.assertTrue(any(n.endswith("sessions_yield") for n in names), names)
 
     def test_the_run_text_read_by_its_key_is_the_answer(self):
         found, text = ocp._history_text_for_run(_history(), ANNOUNCE)

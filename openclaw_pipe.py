@@ -5781,6 +5781,27 @@ def _yield_acknowledgment(name: str, result_str: str, failed: bool) -> str | Non
     return str(result.get("acknowledgment") or "").strip()
 
 
+_TOOL_RESULT_BLOCK = "tool_result"  # an imported claude-cli message's tool result block
+
+
+def _ends_with_accepted_yield(message) -> bool:
+    """An imported claude-cli message holding an accepted `sessions_yield` result: the turn the yield
+    ended stops here. 2026.11.8 no longer imports Claude Code's `<synthetic>` placeholder after it
+    (upstream cb98a28, #189210), which used to mark that end in `chat.history` (ELI-512)."""
+    if not isinstance(message, dict) or message.get("role") != _ASSISTANT_ROLE:
+        return False
+    content = message.get("content")
+    for block in content if isinstance(content, list) else ():
+        if not isinstance(block, dict) or block.get("type") != _TOOL_RESULT_BLOCK:
+            continue
+        parts = block.get("content")
+        text = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict)) \
+            if isinstance(parts, list) else str(parts or "")
+        if _yield_acknowledgment(str(block.get("name") or ""), text, bool(block.get("is_error"))) is not None:
+            return True
+    return False
+
+
 def _is_spawn_tool(name: str) -> bool:
     """`sessions_spawn`, bare or as a claude-cli MCP tool name."""
     return name == "sessions_spawn" or (name.startswith("mcp__")
@@ -12720,13 +12741,16 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
 def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One closed run's messages, back to the previous run's closing message;
     None until it closes. `started_ms` cuts a silent previous run's leftovers
-    (ELI-227); so does Claude Code's `<synthetic>` placeholder, which ends the
-    turn a yield ended (2026.11.5 sends its successor no lifecycle start,
-    ELI-512). The walk goes past steered-in messages (ELI-271) and drops a
-    wake prompt that sorts inside the run."""
+    (ELI-227); so does the end of the turn a yield ended, as 2026.11.5 sends
+    its successor no lifecycle start (ELI-512): Claude Code's `<synthetic>`
+    placeholder, or from 2026.11.8, which no longer imports it, the accepted
+    yield's own message. The walk goes past steered-in messages (ELI-271) and
+    drops a wake prompt that sorts inside the run."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
+    # Only an announce run follows a yield that ended the turn; before 2026.11.5 the run went on past it (ELI-56).
+    announce = str(run_id).startswith(ANNOUNCE_RUN_PREFIX)
     for end in range(len(messages) - 1, -1, -1):
         message = messages[end]
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -12736,7 +12760,8 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
         start, queued = end, set()
         while start > 0 and _run_closed_by(messages[start - 1]) in (None, run_id) \
                 and not _stamped_before(messages[start - 1], started_ms) \
-                and not _is_cli_synthetic_no_response(messages[start - 1]):
+                and not _is_cli_synthetic_no_response(messages[start - 1]) \
+                and not (announce and _ends_with_accepted_yield(messages[start - 1])):
             if (messages[start - 1] or {}).get("role") == "user":
                 if _history_queued_prompt(messages, start - 1, run_id):
                     queued.add(start - 1)
