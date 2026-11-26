@@ -8336,13 +8336,14 @@ class ExitTextFixtureTest(unittest.TestCase):
 
     def setUp(self):
         self.fx = json.load(open(self.FIXTURE))
-        self.templates = re.findall(r"`([^`]*\$\{(?:signal|code)\}[^`]*)`", self.fx["source"])
+        # By the text, not the variable names: a minified dist calls them `t` and `e` (2026.11.10).
+        self.templates = re.findall(r"`([^`]*exited with (?:signal|code) \$\{[^}]*\}[^`]*)`", self.fx["source"])
 
     def render(self, **values):
         for t in self.templates:
-            key = "signal" if "${signal}" in t else "code"
+            key = "signal" if "exited with signal " in t else "code"
             if key in values:
-                return t.replace("${" + key + "}", str(values[key]))
+                return re.sub(r"\$\{[^}]*\}", str(values[key]), t)
         raise AssertionError(f"no template for {values}")
 
     def test_the_fixture_has_both_templates(self):
@@ -8402,7 +8403,7 @@ class CronPromptFixtureTest(unittest.TestCase):
         return {"role": "user", "content": text, "idempotencyKey": "turn-1:user", "timestamp": 5}
 
     def test_the_openclaw_lines_are_pinned(self):
-        self.assertEqual(sorted(f["openclaw_version"].split(".")[1] for f in self.forms), ["10", "11", "9"])
+        self.assertEqual(sorted({f["openclaw_version"].split(".")[1] for f in self.forms}), ["10", "11", "9"])
 
     def test_a_rendered_wake_prompt_is_a_wake_turn_of_its_job(self):
         for form in self.forms:
@@ -8443,6 +8444,61 @@ class CronPromptFixtureTest(unittest.TestCase):
         self.assertIn(parts(got), [parts(f) for f in self.forms],
                       f"OpenClaw {got['openclaw_version']} changed the cron prompt; re-check "
                       "_CRON_PROMPT_RE, then re-extract with scripts/extract_openclaw_cron_prompt.py --write")
+
+
+class MinifiedDistExtractTest(unittest.TestCase):
+    """ELI-537: OpenClaw 2026.11.10 ships its dist minified onto a few lines, no spaces around `=`, template
+    literals in backticks. The three extract_openclaw_* scripts read it line by line with the spaces of the older
+    dists and found nothing (or a whole 5 kB line), so "Fixtures still match the installed OpenClaw" failed on
+    11.10 though what they pin did not change. The snippets are verbatim from the 2026.11.10 package."""
+
+    EXIT = ("const MAX_LINE_CHARS=8388608;const CLOSE_GRACE_MS=500;\n"
+            "const x=1;\n"
+            "const didExit=()=>{if(d)return;d=true;if(process.platform!==`win32`||!c)n.kill(`SIGKILL`);_()};"
+            "n.onExit((e,t)=>{if(e!==0)f=/* @__PURE__ */ new Error(t?`Claude Code process exited with signal ${t}`"
+            ":`Claude Code process exited with code ${e}`);didExit()});const send=e=>{if(p)return p.then(e=>{throw e})};\n")
+    CRON = ("async function buildCronCommandBody(e){const{job:t,message:n,baseSessionKey:r,hookExternalContentSource:i,"
+            "timeLine:a}=e;const o=`[cron:${t.id} ${t.name}]`;const s=`${o} ${n}`.trim();const c=i!==void 0;"
+            "let d;if(c){d=1}else d=`${s}\\n${a}`.trim();d=appendCronUnattendedRunPreamble(d,{externalHook:c});"
+            "return{sourcePromptPrefix:o,isExternalHook:c,commandBody:d}}\nexport{buildCronCommandBody as n};\n")
+    THINKING = ("const CLAUDE_SONNET_55_THINKING_PROFILE={levels:[{id:`off`},{id:`low`},{id:`medium`},{id:`high`},"
+                "{id:`xhigh`},{id:`max`}],defaultLevel:`high`};const CLAUDE_HAIKU_55_THINKING_PROFILE="
+                "{...CLAUDE_SONNET_55_THINKING_PROFILE,defaultLevel:`medium`};function resolveClaudeHaiku55ModelIdentity(e){}\n")
+
+    def dist(self, name, text):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        dist = os.path.join(root, "dist")
+        os.makedirs(dist)
+        open(os.path.join(dist, name), "w").write(text)
+        open(os.path.join(root, "package.json"), "w").write('{"version": "2026.11.10"}')
+        return dist
+
+    def test_the_exit_error_statement_is_cut_out_of_the_minified_line(self):
+        with _scripts_on_path():
+            from extract_openclaw_exit_errors import extract
+        got = extract(self.dist("cli-transport-X.mjs", self.EXIT))
+        self.assertEqual(got["source"], "if(e!==0)f=/* @__PURE__ */ new Error(t?`Claude Code process exited with "
+                                        "signal ${t}`:`Claude Code process exited with code ${e}`);")
+        self.assertEqual(got["line"], 3)
+
+    def test_the_cron_prompt_lines_are_found_in_a_minified_file(self):
+        with _scripts_on_path():
+            from extract_openclaw_cron_prompt import extract
+        got = extract(self.dist("run-prompt-X.mjs", self.CRON))
+        self.assertIsNotNone(got, "no cron prompt lines in a minified run-prompt file")
+        self.assertEqual({k: got[k]["source"] for k in ("prefix", "base", "command_body")},
+                         {"prefix": "const _ = `[cron:${job.id} ${job.name}]`;",
+                          "base": "const _ = `${} ${}`.trim();",
+                          "command_body": "} else _ = `${}\\n${}`.trim();"})
+
+    def test_the_claude_thinking_profiles_are_read_from_a_minified_file(self):
+        with _scripts_on_path():
+            from extract_openclaw_claude_thinking_profiles import extract
+        got = extract(self.dist("anthropic-X.mjs", self.THINKING))
+        self.assertIsNotNone(got, "no thinking profiles in a minified anthropic file")
+        levels = ["off", "low", "medium", "high", "xhigh", "max"]
+        self.assertEqual(got["profiles"], {"claude-sonnet-5-5": levels, "claude-haiku-5-5": levels})
 
 
 class OomResumeLoopTest(unittest.TestCase):

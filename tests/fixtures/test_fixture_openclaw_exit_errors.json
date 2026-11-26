@@ -2,8 +2,8 @@
  "observed_row_texts": {
   "window1_container_stop_2026-10-12T23:54Z": "Claude Code process exited with code 143"
  },
- "openclaw_version": "2026.9.3",
- "file": "cli-transport-CXSP7FlN.mjs",
- "line": 96,
- "source": "if (code !== 0) exitError = /* @__PURE__ */ new Error(signal ? `Claude Code process exited with signal ${signal}` : `Claude Code process exited with code ${code}`);"
+ "openclaw_version": "2026.11.10",
+ "file": "cli-transport-BE2s9MPe.mjs",
+ "line": 3,
+ "source": "if(e!==0)f=/* @__PURE__ */ new Error(t?`Claude Code process exited with signal ${t}`:`Claude Code process exited with code ${e}`);"
 }

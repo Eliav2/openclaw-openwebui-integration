@@ -1,6 +1,6 @@
 {
- "openclaw_version": "2026.10.10",
- "file": "anthropic-B3HirzdP.mjs",
+ "openclaw_version": "2026.11.10",
+ "file": "anthropic-kgWPELba.mjs",
  "profiles": {
   "claude-sonnet-5-5": [
    "off",

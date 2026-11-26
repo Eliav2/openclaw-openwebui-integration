@@ -26,7 +26,9 @@ PROFILES = {"claude-sonnet-5-5": "CLAUDE_SONNET_55_THINKING_PROFILE",
 FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures",
                        "test_fixture_openclaw_claude_thinking_profiles.json")
 WRITE_FLAG = "--write"
-_DEF_RE = re.compile(r"const (CLAUDE_\w+_THINKING_PROFILE) = (.*?);\n(?=const |function |/\*\*|//|export )", re.S)
+# 2026.11.10 minifies the file onto a few lines (`const A={...};const B=A;function f(){`, ids in backticks), so the
+# definition ends at a `;` that starts the next statement, not at a line end, and a level id may be quoted any way.
+_DEF_RE = re.compile(r"const (CLAUDE_\w+_THINKING_PROFILE)\s*=\s*(.*?);\s*(?=const |let |function |/\*|//|export |$)", re.S)
 
 
 def _levels(defs: dict, name: str, seen=()) -> list | None:
@@ -38,7 +40,7 @@ def _levels(defs: dict, name: str, seen=()) -> list | None:
         return _levels(defs, alias.group(1), (*seen, name))
     own = re.search(r"levels:\s*\[(.*?)\]", body, re.S)
     if own:
-        return re.findall(r'id:\s*"([^"]+)"', own.group(1))
+        return re.findall(r"id:\s*[\"'`]([^\"'`]+)[\"'`]", own.group(1))
     spread = re.search(r"\.\.\.(CLAUDE_\w+_THINKING_PROFILE)", body)
     return _levels(defs, spread.group(1), (*seen, name)) if spread else None
 
