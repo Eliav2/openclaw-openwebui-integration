@@ -3,7 +3,7 @@
 What to protect when you run this integration: the secrets it keeps, the optional media file server on port 18791, the agent privileges every chat user gets, and the scripts it runs in your browser.
 
 Applies to: Pipe, Action
-Valves: `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `USE_OWUI_FILES`, `FILE_SERVER_BASE_URL`, `AGENT_ID`, `OWNER_USERS`, `COMPOSER_STATUS_BUTTON`
+Valves: `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `ENABLE_FILE_SERVER`, `USE_OWUI_FILES`, `FILE_SERVER_BASE_URL`, `AGENT_ID`, `OWNER_USERS`, `COMPOSER_STATUS_BUTTON`
 
 ## Secrets
 
@@ -11,7 +11,6 @@ Treat these as secrets:
 
 - **[`GATEWAY_TOKEN`](./configuration.md#gateway_token)** is your Gateway API token (`gateway.auth.token` in your OpenClaw config).
 - **[`DEVICE_IDENTITY`](./configuration.md#device_identity)** holds an Ed25519 **private key**: the device identity the Gateway approved. Whoever has it connects as that approved device.
-- **[`OWUI_API_KEY`](./configuration.md#owui_api_key)**, if you set it, is an Open WebUI API key.
 
 Where copies of them end up:
 
@@ -37,9 +36,9 @@ Then delete `STATE_DIR/identity.json` and `STATE_DIR/device-token.json`, clear t
 
 ## The media file server
 
-When the agent sends a file (`MEDIA:<filename>`), the Pipe first uploads it through Open WebUI's own Files API ([`USE_OWUI_FILES`](./configuration.md#use_owui_files), on by default). That path is same-origin and uses Open WebUI's own login: the request's login token, or [`OWUI_API_KEY`](./configuration.md#owui_api_key) if set.
+When the agent sends a file (`MEDIA:<filename>`), the Pipe first uploads it through Open WebUI's own Files API ([`USE_OWUI_FILES`](./configuration.md#use_owui_files), on by default). That path is same-origin and uses Open WebUI's own login: a two-minute login the Pipe makes with Open WebUI's `create_token` for the chat's owner, read from Open WebUI's database by the chat id. It is the server-side token type Open WebUI signs itself when it acts for a user (`typ` `automation`, with the account's `session_stamp`), so it works for accounts with MFA or no password, and an inactive account gets none. Nothing in a message, its metadata or the agent's text decides the owner; a chat with no known owner gets no upload. In a channel the file is the mentioning user's, the account Open WebUI authenticated for that request.
 
-As a fallback, the Pipe also runs a small HTTP file server, and that server is **unauthenticated**. With [`ENABLE_FILE_SERVER`](./configuration.md#enable_file_server) on (the default), the Pipe starts it the first time it handles a chat in an Open WebUI process:
+With uploads off, the Pipe serves files from a small HTTP file server instead, and that server is **unauthenticated**. With [`ENABLE_FILE_SERVER`](./configuration.md#enable_file_server) on (the default), the Pipe starts it the first time it handles a chat in an Open WebUI process:
 
 - it listens on port **18791** on all interfaces (`0.0.0.0`); the port is fixed;
 - it serves the folder `/tmp/openclaw-pipe-media`, with `Access-Control-Allow-Origin: *` and no auth;
@@ -47,12 +46,12 @@ As a fallback, the Pipe also runs a small HTTP file server, and that server is *
 - it also accepts uploads: a `PUT` or `POST` of a plain file name writes that file into the folder. This is how an agent on another host can hand the Pipe a file, and it means anyone who can reach the port can write files there too;
 - a redeploy shuts down the previous server first, so a reinstall never leaves a stale one holding the port.
 
-The browser loads fallback links from [`FILE_SERVER_BASE_URL`](./configuration.md#file_server_base_url) (default `http://localhost:18791`), so the fallback only works where your browser can reach that address.
+The browser loads those links from [`FILE_SERVER_BASE_URL`](./configuration.md#file_server_base_url) (default `http://localhost:18791`), so they only work where your browser can reach that address.
 
 To stay safe:
 
 - keep port 18791 off untrusted networks (do not publish it from the container, or firewall it);
-- or set `ENABLE_FILE_SERVER` to off if you do not need the fallback. If your agent runs on another host and puts files there with `PUT`, it then needs another way to place them in the Pipe's media folder, such as a shared volume. Every `install.py install` or `repair` turns it back on ([valves the installer sets](./install/installer.md#valves-the-installer-sets)), so set it off again after one.
+- or set `ENABLE_FILE_SERVER` to off if uploads are on (it is then never used). If your agent runs on another host and puts files there with `PUT`, it then needs another way to place them in the Pipe's media folder, such as a shared volume. Every `install.py install` or `repair` turns it back on ([valves the installer sets](./install/installer.md#valves-the-installer-sets)), so set it off again after one.
 
 How media works: [Chat features](./features/chat.md).
 

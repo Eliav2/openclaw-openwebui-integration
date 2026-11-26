@@ -277,11 +277,9 @@ class Pipe:
         ENABLE_FILE_SERVER: bool = Field(
             default=True,
             description="Start a small HTTP server on port 18791 to serve "
-                "agent-generated images and files. Only used as a fallback when "
-                "USE_OWUI_FILES is off or an upload fails. Note it is "
-                "unauthenticated -- leave off if port 18791 is exposed. With "
-                "it off, a file that cannot be uploaded shows as an error "
-                "in the reply, not as a link that never loads. Turning it off "
+                "agent-generated images and files. Only used when USE_OWUI_FILES "
+                "is off; a failed upload is never sent here. Note it is "
+                "unauthenticated -- leave off if port 18791 is exposed. Turning it off "
                 "closes the port at the next model list or message, no "
                 "Open WebUI restart needed."
         )
@@ -289,7 +287,9 @@ class Pipe:
             default=True,
             description="Recommended. Upload agent-generated images and files "
                 "through Open WebUI's own Files API so they attach natively and "
-                "work over HTTPS. Falls back to the file server if it fails."
+                "work over HTTPS. Each file is stored as the chat owner's (a channel "
+                "reply's: the mentioning user's). A file that cannot be uploaded "
+                "shows as an error in the reply, never as a file-server link."
         )
         SEND_STOP_ON_CANCEL: bool = Field(
             default=True,
@@ -327,18 +327,13 @@ class Pipe:
                 "for a standard single-container install; change it only if "
                 "Open WebUI cannot reach itself at 127.0.0.1:8080."
         )
-        OWUI_API_KEY: str = Field(
-            default="",
-            description="(Optional.) Only needed if media uploads fail with an "
-                "auth error -- the pipe normally reuses your own login token."
-        )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
-            description="Legacy fallback only: base URL of the built-in media file "
-                "server, used when USE_OWUI_FILES is off or an upload fails. The "
+            description="Base URL of the built-in media file "
+                "server, used only when USE_OWUI_FILES is off. The "
                 "browser resolves this URL, not OWUI, so the default only works when "
                 "you browse OWUI from the same host. Point it at an address your "
-                "browser can reach if you depend on this fallback."
+                "browser can reach if you turn uploads off."
         )
         DEFAULT_MODEL: str = Field(
             default="",
@@ -2333,7 +2328,8 @@ class _PipeTurn:
         if not blocks and not missing:
             return
         shown = await _gateway_images_text(
-            blocks, valves=self.pipe.valves, __request__=self.__request__,
+            blocks, valves=self.pipe.valves, chat_id=self.owui_origin_chat_id,
+            request_user_id=self._request_user_id(),
             __event_emitter__=self.__event_emitter__, missing=missing)
         if shown:
             pipe_log(f"  showed {len(blocks)} gateway image block(s), {len(missing)} missing")
@@ -2966,6 +2962,11 @@ class _PipeTurn:
         if shown_as is not text:
             await self.maybe_emit_snapshot()
 
+    def _request_user_id(self):
+        """The id of the user Open WebUI authenticated for this request (`__user__`), for a channel
+        reply's upload owner (ELI-540). Never read from the message or its metadata text."""
+        return self.__user__.get("id") if isinstance(self.__user__, dict) else None
+
     async def settle_held_media(self, held: str) -> str:
         """Resolve held `MEDIA:` text once its message item ends; one in code
         stays text (ELI-111). A path directive is dropped: its image is the
@@ -2976,7 +2977,8 @@ class _PipeTurn:
         resolved, handled = await _resolve_media_text(
             text,
             valves=self.pipe.valves,
-            __request__=self.__request__,
+            chat_id=self.owui_origin_chat_id,
+            request_user_id=self._request_user_id(),
             __event_emitter__=self.__event_emitter__,
             ctx=ctx,
         )

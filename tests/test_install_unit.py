@@ -251,7 +251,7 @@ class UpdateValvesTests(unittest.TestCase):
 
     CFG = dict(owui_url="http://o", owui_email="e", owui_password="p", gateway_url="localhost:18789",
                gateway_token="t", agent_id="main", state_dir="/data/openclaw-bridge",
-               owui_api_base_url="http://127.0.0.1:8080", owui_api_key="", file_server_base_url="")
+               owui_api_base_url="http://127.0.0.1:8080", file_server_base_url="")
 
     def _run(self, stored):
         owui = _FakeOwui([{"id": inst.FUNCTION_ID, "type": "pipe", "content": "pipe"}],

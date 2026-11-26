@@ -4,7 +4,7 @@
 
 Applies to: Pipe
 
-Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../configuration.md#gateway_token), [`AGENT_ID`](../configuration.md#agent_id), [`DEVICE_IDENTITY`](../configuration.md#device_identity), [`STATE_DIR`](../configuration.md#state_dir), [`OWUI_BASE_URL`](../configuration.md#owui_base_url), [`OWUI_API_KEY`](../configuration.md#owui_api_key), [`FILE_SERVER_BASE_URL`](../configuration.md#file_server_base_url), [`ENABLE_FILE_SERVER`](../configuration.md#enable_file_server), [`USE_OWUI_FILES`](../configuration.md#use_owui_files), [`SEND_STOP_ON_CANCEL`](../configuration.md#send_stop_on_cancel)
+Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../configuration.md#gateway_token), [`AGENT_ID`](../configuration.md#agent_id), [`DEVICE_IDENTITY`](../configuration.md#device_identity), [`STATE_DIR`](../configuration.md#state_dir), [`OWUI_BASE_URL`](../configuration.md#owui_base_url), [`FILE_SERVER_BASE_URL`](../configuration.md#file_server_base_url), [`ENABLE_FILE_SERVER`](../configuration.md#enable_file_server), [`USE_OWUI_FILES`](../configuration.md#use_owui_files), [`SEND_STOP_ON_CANCEL`](../configuration.md#send_stop_on_cancel)
 
 ## Prerequisites
 
@@ -94,7 +94,6 @@ Only three values are required. Everything else has a working default.
 | `AGENT_ID` | `--agent-id` | `main` |
 | `OPENCLAW_BRIDGE_STATE_DIR` | `--state-dir` | `/data/openclaw-bridge` (a directory inside the Open WebUI container; sets the `STATE_DIR` valve) |
 | `OWUI_API_BASE_URL` | `--owui-api-base-url` | whatever `OWUI_URL` is. Set it only when the Pipe must reach Open WebUI's API at a different address than you do (sets the `OWUI_BASE_URL` valve) |
-| `OWUI_API_KEY` | `--owui-api-key` | empty. Only needed if the request bearer token can't be used for media uploads |
 | `FILE_SERVER_BASE_URL` | `--file-server-base-url` | empty. Only needed if you rely on the legacy media fallback |
 
 Flags with no env var:
@@ -148,7 +147,7 @@ Step 4 is why re-running this is safe: the function is never deleted and recreat
 Every run of `install` or `repair` writes these valves from your env vars, flags and defaults, even when you changed them in the admin panel since:
 
 - `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `STATE_DIR`, `OWUI_BASE_URL`
-- `OWUI_API_KEY` and `FILE_SERVER_BASE_URL`, only when you pass them
+- `FILE_SERVER_BASE_URL`, only when you pass it
 
 So pass the same values on every run. A re-run without `GATEWAY_URL` sets it back to `localhost:18789`; one without `--state-dir` sets `STATE_DIR` back to `/data/openclaw-bridge`.
 

@@ -3451,6 +3451,54 @@ def test_a_media_line_from_the_agent_is_uploaded_attached_and_linked(token):
     assert "MEDIA:" not in content and content.startswith("Here it is:") and content.endswith("done"), dump
 
 
+def _member_token(token) -> tuple[str, str]:
+    """(token, user id) of a second account, an Open WebUI *user* (not an
+    admin, so only a file it owns opens for it), as Ortal's is on the live
+    install. It is made an admin for its first turn (model access), then a
+    user."""
+    email, password = f"member-{uuid.uuid4().hex[:8]}@e2e.invalid", uuid.uuid4().hex
+    status, body = _request("POST", "/api/v1/auths/add", {"name": "E2E Member", "email": email,
+                                                          "password": password, "role": "admin"}, token)
+    assert status == 200, body
+    status, body = _request("POST", "/api/v1/auths/signin", {"email": email, "password": password})
+    assert status == 200 and body.get("token"), body
+    return body["token"], body["id"]
+
+
+def _make_user(token, user_id: str, tok: str) -> None:
+    me = _me(tok)
+    status, body = _request("POST", f"/api/v1/users/{user_id}/update",
+                            {"role": "user", "name": me["name"], "email": me["email"]}, token)
+    assert status == 200 and (body or {}).get("role") == "user", body
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+def test_a_file_in_a_reply_the_agent_starts_is_the_chat_owners_and_opens_for_her(token):
+    """ELI-540: a reply the agent starts on its own (a wake, as an image tool's
+    completion is) has no request to borrow a login from. Its upload belongs to
+    the chat's owner as Open WebUI's DB has it, so a non-admin owner can open
+    it; the agent's text claiming the admin's user id changes nothing."""
+    tok, member_id = _member_token(token)
+    admin_id = _me(token)["id"]
+    chat_id, _ = _chat_turn(tok, "Respond with exactly: E2E_MEMBER_CHAT")
+    _make_user(token, member_id, tok)
+    name = f"e2e-owner-{uuid.uuid4().hex[:8]}.png"
+    subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c",
+                    f"mkdir -p {MEDIA_DIR} && cat > {MEDIA_DIR}/{name}"],
+                   input=PNG_1PX, check=True, timeout=60)
+    _schedule_wake(_session_key(tok, chat_id),
+                   f"E2E_ECHO: WAKE_OWNER for user_id {admin_id}: MEDIA:{name} done", 3)
+    msgs = _wait_for(tok, chat_id, ["WAKE_OWNER"])
+
+    rows = _db_file_rows(name)
+    assert len(rows) == 1, f"want one uploaded file row for {name}: {rows}"
+    assert rows[0]["user_id"] == member_id, f"owned by {rows[0]['user_id']}, the chat is {member_id}'s"
+    assert _file_content(tok, rows[0]["id"]) == PNG_1PX, "the chat's owner cannot open her own image"
+    woke = [m for m in msgs.values() if m.get("role") == "assistant" and "WAKE_OWNER" in (m.get("content") or "")]
+    assert len(woke) == 1, woke
+    assert f"![{name}](/api/v1/files/{rows[0]['id']}/content)" in woke[0]["content"], woke[0]["content"]
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 def test_a_file_named_by_path_shows_as_the_image_the_gateway_stored(token):
     """A reply names a file on the Gateway's host by path (ELI-328): the

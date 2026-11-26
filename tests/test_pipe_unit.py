@@ -138,6 +138,23 @@ from openclaw_pipe import (
 )
 
 
+
+def _chat_owners_known(test, owner="u-chat-owner"):
+    """Open WebUI's DB as these tests' chats have it: every chat id is owned by
+    `owner`, and an upload signs in as them (ELI-540). No chat id has no owner.
+    test_upload_owner_unit runs the real lookup."""
+    async def owner_of(chat_id):
+        if not chat_id:
+            raise openclaw_pipe._UploadOwnerUnknown("no chat id")
+        return owner
+
+    async def token_of(user_id):
+        return f"upload-token:{user_id}"
+    for name, fake in (("_chat_owner_id", owner_of), ("_upload_token", token_of)):
+        patcher = mock.patch.object(openclaw_pipe, name, fake)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
 class RecoveryItemsTests(unittest.TestCase):
     def test_recovers_assistant_after_matching_user_message(self):
         items = [
@@ -3649,6 +3666,10 @@ class GatewayImageBlockTests(_TurnCase):
     """ELI-322: a tool-made image reaches only the stored message as an `image` block; the live
     final has only text (lifecycle end, then the final)."""
 
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        _chat_owners_known(self)
+
     SK = None
     _collect = staticmethod(NoDroppedMessagesTests._collect)
 
@@ -3697,7 +3718,6 @@ class GatewayImageBlockTests(_TurnCase):
         media_dir = self._media_dir()
         self.pipe.valves.GATEWAY_URL = "localhost:18789"
         self.pipe.valves.GATEWAY_TOKEN = "gw-token"
-        self.pipe.valves.OWUI_API_KEY = "owui-key"
         self._stored("run-1", self.BLOCK)
         uploads = []
 
@@ -3713,7 +3733,7 @@ class GatewayImageBlockTests(_TurnCase):
         fetch.assert_called_once_with("localhost:18789", "gw-token", self.BLOCK["url"])
         self.assertEqual(len(uploads), 1)
         fname, raw, token = uploads[0]
-        self.assertEqual((raw, token), (b"PNG", "owui-key"))
+        self.assertEqual((raw, token), (b"PNG", "upload-token:u-chat-owner"))
         self.assertRegex(fname, r"^codex-image-generation-2---05e44654-[0-9a-f-]+-[0-9a-f]{8}\.png$")
         self.assertTrue(os.path.isfile(os.path.join(media_dir, fname)))
         self.assertTrue(out.startswith("Here it is."))
@@ -5329,6 +5349,9 @@ class ResolveMediaTests(unittest.TestCase):
 class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
     """The native-OWUI-upload MEDIA: path, same cases as ResolveMediaTests."""
 
+    def setUp(self):
+        _chat_owners_known(self)
+
     async def test_resolves_multiple_directives_in_one_chunk(self):
         uploads = []
 
@@ -5342,7 +5365,7 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
             result, handled = await _resolve_media_via_owui(
                 "caption\nMEDIA:a.png\n\nMEDIA:b.png\nend",
                 base_url="https://owui.example.com",
-                token="tok",
+                owner="u-1",
                 __event_emitter__=None,
             )
 
@@ -5361,7 +5384,7 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
             result, handled = await _resolve_media_via_owui(
                 "MEDIA:missing.png",
                 base_url="https://owui.example.com",
-                token="tok",
+                owner="u-1",
                 __event_emitter__=None,
             )
         self.assertFalse(handled)
@@ -5375,7 +5398,7 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
             result, handled = await _resolve_media_via_owui(
                 text,
                 base_url="https://owui.example.com",
-                token="tok",
+                owner="u-1",
                 __event_emitter__=None,
             )
         upload_mock.assert_not_called()
@@ -5387,6 +5410,9 @@ class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
     """With ENABLE_FILE_SERVER off nothing serves a fallback link, so a file
     that cannot be uploaded is an error in the reply, not an image that
     never loads."""
+
+    def setUp(self):
+        _chat_owners_known(self)
 
     def test_a_bare_filename_is_an_error_when_the_file_server_is_off(self):
         result, handled = _resolve_media(
@@ -5405,7 +5431,7 @@ class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
         v = Pipe.Valves(**valves)
         with mock.patch("openclaw_pipe._upload_owui_file", side_effect=OSError("upload refused")), \
              mock.patch("os.path.isfile", return_value=True):
-            return await _resolve_media_text(text, valves=v)
+            return await _resolve_media_text(text, valves=v, chat_id="chat-1")
 
     async def test_a_failed_upload_with_the_file_server_off_is_an_error(self):
         result, handled = await self._resolve(
@@ -5414,9 +5440,16 @@ class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "here _(a file could not be uploaded: chart.png)_\nnow")
         self.assertNotIn("https://x", result)
 
-    async def test_a_failed_upload_with_the_file_server_on_still_links_to_it(self):
+    async def test_a_failed_upload_with_the_file_server_on_is_an_error_too(self):
+        """ELI-540: a failed upload never becomes a file-server link; only USE_OWUI_FILES off uses the server."""
         result, handled = await self._resolve(
             "MEDIA:chart.png", ENABLE_FILE_SERVER=True, FILE_SERVER_BASE_URL="https://x")
+        self.assertTrue(handled)
+        self.assertEqual(result, "_(a file could not be uploaded: chart.png)_")
+
+    async def test_with_uploads_off_the_file_server_on_links_to_it(self):
+        result, handled = await self._resolve(
+            "MEDIA:chart.png", USE_OWUI_FILES=False, ENABLE_FILE_SERVER=True, FILE_SERVER_BASE_URL="https://x")
         self.assertTrue(handled)
         self.assertEqual(result, "![chart.png](https://x/chart.png)")
 
@@ -7363,6 +7396,9 @@ class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
     """ELI-76: a bare `MEDIA:<file>.png` reply was saved with the name doubled (stream half fixed
     in ELI-80). A filename ends at the next `MEDIA:` and a glued copy is dropped."""
 
+    def setUp(self):
+        _chat_owners_known(self)
+
     BASE = "https://pipe.example.invalid:18791"
     F = "baseline-test2-0102-1785351819.png"
     MALFORMED = (f"![{F}MEDIA:{F}]"
@@ -7427,7 +7463,7 @@ class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
              mock.patch("os.path.isfile", return_value=True):
             result, handled = await _resolve_media_via_owui(
                 f"MEDIA:{self.F}MEDIA:{self.F}",
-                base_url="https://owui.example.com", token="tok", __event_emitter__=None,
+                base_url="https://owui.example.com", owner="u-1", __event_emitter__=None,
             )
         self.assertTrue(handled)
         self.assertEqual(uploads, [self.F])
@@ -14539,11 +14575,13 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
     PROMPT = "OpenClaw needs input: Which branch?\n1. main\n2. dev"
     # The documented form, marker on its own line (ELI-151).
     PROMPT_OWN_LINE = "OpenClaw needs input:\nWhich branch?\n1. main\n2. dev"
-    IMG = "![chart.png](http://localhost:18791/chart.png)"
+    # The file is not in the media dir, so it is not uploaded: both sides show the note (ELI-540: never a file-server link).
+    IMG = "_(a file could not be uploaded: chart.png)_"
 
     async def asyncSetUp(self):
         await self.asyncSetUp_inline()
         self.owui = _FakeOwuiChat(self, self.CHAT)
+        _chat_owners_known(self)
 
     @staticmethod
     def A(text):
@@ -15763,7 +15801,7 @@ class MediaDirectiveCodeAwareTests(_TurnCase):
             with self.subTest(text=text), \
                  mock.patch("openclaw_pipe._upload_owui_file") as upload, \
                  mock.patch("os.path.isfile", return_value=True):
-                got = await _resolve_media_via_owui(text, base_url="https://o", token="t",
+                got = await _resolve_media_via_owui(text, base_url="https://o", owner="u-1",
                                                     __event_emitter__=None)
                 self.assertEqual(got, (text, False))
                 upload.assert_not_called()

@@ -1697,11 +1697,13 @@ async def _resolve_media_via_owui(
     text,
     *,
     base_url,
-    token,
+    owner,
     __event_emitter__,
     ctx="",
 ):
-    """Upload every MEDIA: file to OWUI and attach it to the message.
+    """Upload every MEDIA: file to OWUI as user `owner` and attach it to the message.
+
+    Each file gets a login of its own (`_upload_token`), made just before its POST.
 
     If any one cannot be uploaded, return handled=False so the fallback
     resolves all of them the same way.
@@ -1710,6 +1712,8 @@ async def _resolve_media_via_owui(
     if not directives:
         return text, False
     for _start, _end, fname in directives:
+        if _is_media_url(fname):
+            continue   # a URL is shown as itself, nothing to upload
         if ".." in fname or "/" in fname or not os.path.isfile(os.path.join(MEDIA_DIR, fname)):
             return text, False
 
@@ -1717,9 +1721,13 @@ async def _resolve_media_via_owui(
     for _start, _end, fname in directives:
         if fname in shown:
             continue
+        if _is_media_url(fname):
+            shown[fname] = f"![{os.path.basename(fname)}]({fname})"
+            continue
         # Off the event loop: this blocking call goes to OWUI's own API, which
         # cannot answer while its loop is blocked (self-deadlock).
         fpath = os.path.join(MEDIA_DIR, fname)
+        token = await _upload_token(owner)
         file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
         if __event_emitter__:
             await __event_emitter__(
@@ -1741,25 +1749,120 @@ async def _resolve_media_via_owui(
     return _replace_media(text, directives, shown.__getitem__), True
 
 
-async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None, ctx=""):
-    """Resolve MEDIA: directives via OWUI Files, else the file server.
+# An upload's login lives this long: one POST and its answer (ELI-540).
+_UPLOAD_TOKEN_TTL_S = 120
 
-    Pass only text whose filenames are complete (see `_advance_media_buffer`).
+
+class _UploadOwnerUnknown(RuntimeError):
+    """The chat has no owner Open WebUI knows, so nothing is uploaded for it."""
+
+
+async def _owui_value(out):
+    return await out if asyncio.iscoroutine(out) else out
+
+
+async def _chat_owner_id(chat_id) -> str:
+    """The id of the user who owns `chat_id`, from Open WebUI's DB (ELI-540).
+
+    The only source of an upload's owner: never the message, the metadata
+    text, the session key or a user id the agent writes. No chat, no owner
+    or an owner that is not an active user raises `_UploadOwnerUnknown`.
+    Only the `user_id` column is read, not the chat (it builds its whole
+    transcript in Python, ELI-115)."""
+    if not chat_id:
+        raise _UploadOwnerUnknown("no chat id")
+    from sqlalchemy import select
+    from open_webui.internal.db import get_async_db_context
+    from open_webui.models.chats import Chat
+    from open_webui.models.users import Users
+    async with get_async_db_context() as db:
+        row = (await db.execute(select(Chat.user_id).where(Chat.id == chat_id))).first()
+    owner = row[0] if row else None
+    if not owner:
+        raise _UploadOwnerUnknown(f"chat {chat_id} has no owner")
+    if await _owui_value(Users.get_user_by_id(owner)) is None:
+        raise _UploadOwnerUnknown(f"chat {chat_id}: owner {owner} is not a user")
+    return owner
+
+
+async def _media_owner_id(chat_id, request_user_id=None) -> str:
+    """Whose upload a reply's file is (ELI-540).
+
+    A chat: its owner in Open WebUI's DB (`_chat_owner_id`). A channel mention
+    (`chat_id` `channel:<id>`) has no chat row: its file is the mentioning
+    user's, the `__user__` Open WebUI authenticated for this request after its
+    channel membership check. Callers pass `request_user_id` from `__user__`
+    only, never from the message; it is ignored for a chat."""
+    if not _channel_id_of(chat_id):
+        return await _chat_owner_id(chat_id)
+    if not request_user_id:
+        raise _UploadOwnerUnknown(f"{chat_id}: no requesting user")
+    from open_webui.models.users import Users
+    if await _owui_value(Users.get_user_by_id(request_user_id)) is None:
+        raise _UploadOwnerUnknown(f"{chat_id}: requesting user {request_user_id} is not a user")
+    return request_user_id
+
+
+async def _upload_token(user_id: str) -> str:
+    """A short Open WebUI login for `user_id`, so the Files API stores the
+    upload as theirs. The same token Open WebUI signs when it acts for a user on
+    the server (`utils/automations.py`, `utils/subagents.py`): `typ`
+    `automation` and the account's `session_stamp`. `is_valid_token` compares the
+    stamp with the account's stored one, so a token without it is refused for any
+    account that has one; and it asks a `session` token for `mfa_verified` when MFA
+    is on, which no server-side token has (a user with MFA or no password would
+    get an error note). The Files API needs a verified user, not a human session.
+    Read from the account's auth record and minted fresh for every file: the stamp
+    changes when the account's sessions are revoked, and a token lives 120 s. An
+    account Open WebUI marks inactive gets none."""
+    from datetime import timedelta
+    from open_webui.models.auths import Auths
+    from open_webui.utils.auth import create_token
+    auth = await _owui_value(Auths.get_auth_by_id(user_id))
+    if auth is None or not getattr(auth, "active", True):
+        raise _UploadOwnerUnknown(f"user {user_id} has no active account")
+    claims = {"id": user_id, "typ": "automation"}
+    stamp = getattr(auth, "session_stamp", None)
+    if stamp:
+        claims["session_stamp"] = stamp
+    return create_token(claims, timedelta(seconds=_UPLOAD_TOKEN_TTL_S))
+
+
+async def _resolve_media_text(text, *, valves, chat_id, request_user_id=None, __event_emitter__=None, ctx=""):
+    """Resolve MEDIA: directives via OWUI Files; the file server only with uploads off.
+
+    The upload belongs to `_media_owner_id(chat_id, request_user_id)`. With
+    uploads on, an unknown owner or a failed upload shows the file as not
+    uploaded, never as a file-server link (ELI-540). Pass only text whose
+    filenames are complete (see `_advance_media_buffer`).
     """
     handled = False
     resolved = text
     if valves.USE_OWUI_FILES:
-        token = _extract_request_bearer(__request__) or valves.OWUI_API_KEY
+        try:
+            owner = await _media_owner_id(chat_id, request_user_id)
+        except Exception as ex:
+            pipe_log(f"  MEDIA: no upload, the chat's owner is unknown: {ex}")
+            return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
         try:
             resolved, handled = await _resolve_media_via_owui(
                 text,
                 base_url=valves.OWUI_BASE_URL,
-                token=token,
+                owner=owner,
                 __event_emitter__=__event_emitter__,
                 ctx=ctx,
             )
+        except _UploadOwnerUnknown as ex:
+            # The owner's account went inactive, or is gone, while we uploaded: same as an unknown owner.
+            pipe_log(f"  MEDIA: no upload, the chat's owner is unknown: {ex}")
+            return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
         except Exception as ex:
-            pipe_log(f"  OWUI file upload failed; falling back: {ex}")
+            pipe_log(f"  OWUI file upload failed; the reply says so: {ex}")
+            return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
+        if handled:
+            return resolved, handled
+        # A file not under the media dir is not uploaded: as a failed upload, never a file-server link.
+        return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
     if not handled:
         resolved, handled = _resolve_media(
             text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=valves.ENABLE_FILE_SERVER)
@@ -1860,7 +1963,7 @@ def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
     return raw
 
 
-async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None,
+async def _gateway_images_text(blocks, *, valves, chat_id, request_user_id=None, __event_emitter__=None,
                                missing=()) -> str:
     """Fetch Gateway image blocks and show them as MEDIA: directives.
 
@@ -1883,7 +1986,8 @@ async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emit
         return ""
     text = "\n\n" + "\n\n".join(lines) + "\n"
     resolved, _handled = await _resolve_media_text(
-        text, valves=valves, __request__=__request__, __event_emitter__=__event_emitter__)
+        text, valves=valves, chat_id=chat_id, request_user_id=request_user_id,
+        __event_emitter__=__event_emitter__)
     return resolved
 
 
@@ -11135,7 +11239,8 @@ class _TurnWriter:
                 continue
             try:
                 shown, handled = await _resolve_media_text(
-                    directive, valves=self.conn._valves(), __event_emitter__=await self._emitter())
+                    directive, valves=self.conn._valves(), chat_id=self.chat_id,
+                    __event_emitter__=await self._emitter())
             except Exception as ex:
                 pipe_log(f"  turn writer: {directive[:60]} did not resolve: {ex!r}")
                 shown, handled = directive, False
@@ -11619,13 +11724,13 @@ class _TurnWriter:
         """M's images: stored blocks, then the events' `mediaUrls`."""
         try:
             emit = await self._emitter()
-            text = await _gateway_images_text(blocks, valves=self.conn._valves(),
+            text = await _gateway_images_text(blocks, valves=self.conn._valves(), chat_id=self.chat_id,
                                               __event_emitter__=emit, missing=missing) \
                 if blocks or missing else ""
             if self.event_media:
                 shown, _handled = await _resolve_media_text(
                     "\n".join(f"MEDIA:{u}" for u in self.event_media) + "\n",
-                    valves=self.conn._valves(), __event_emitter__=emit)
+                    valves=self.conn._valves(), chat_id=self.chat_id, __event_emitter__=emit)
                 text = f"{text}\n\n{shown}"
         except Exception as ex:
             pipe_log(f"  turn writer: the run's images could not be shown: {ex!r}")
@@ -16663,11 +16768,9 @@ class Pipe:
         ENABLE_FILE_SERVER: bool = Field(
             default=True,
             description="Start a small HTTP server on port 18791 to serve "
-                "agent-generated images and files. Only used as a fallback when "
-                "USE_OWUI_FILES is off or an upload fails. Note it is "
-                "unauthenticated -- leave off if port 18791 is exposed. With "
-                "it off, a file that cannot be uploaded shows as an error "
-                "in the reply, not as a link that never loads. Turning it off "
+                "agent-generated images and files. Only used when USE_OWUI_FILES "
+                "is off; a failed upload is never sent here. Note it is "
+                "unauthenticated -- leave off if port 18791 is exposed. Turning it off "
                 "closes the port at the next model list or message, no "
                 "Open WebUI restart needed."
         )
@@ -16675,7 +16778,9 @@ class Pipe:
             default=True,
             description="Recommended. Upload agent-generated images and files "
                 "through Open WebUI's own Files API so they attach natively and "
-                "work over HTTPS. Falls back to the file server if it fails."
+                "work over HTTPS. Each file is stored as the chat owner's (a channel "
+                "reply's: the mentioning user's). A file that cannot be uploaded "
+                "shows as an error in the reply, never as a file-server link."
         )
         SEND_STOP_ON_CANCEL: bool = Field(
             default=True,
@@ -16713,18 +16818,13 @@ class Pipe:
                 "for a standard single-container install; change it only if "
                 "Open WebUI cannot reach itself at 127.0.0.1:8080."
         )
-        OWUI_API_KEY: str = Field(
-            default="",
-            description="(Optional.) Only needed if media uploads fail with an "
-                "auth error -- the pipe normally reuses your own login token."
-        )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
-            description="Legacy fallback only: base URL of the built-in media file "
-                "server, used when USE_OWUI_FILES is off or an upload fails. The "
+            description="Base URL of the built-in media file "
+                "server, used only when USE_OWUI_FILES is off. The "
                 "browser resolves this URL, not OWUI, so the default only works when "
                 "you browse OWUI from the same host. Point it at an address your "
-                "browser can reach if you depend on this fallback."
+                "browser can reach if you turn uploads off."
         )
         DEFAULT_MODEL: str = Field(
             default="",
@@ -18719,7 +18819,8 @@ class _PipeTurn:
         if not blocks and not missing:
             return
         shown = await _gateway_images_text(
-            blocks, valves=self.pipe.valves, __request__=self.__request__,
+            blocks, valves=self.pipe.valves, chat_id=self.owui_origin_chat_id,
+            request_user_id=self._request_user_id(),
             __event_emitter__=self.__event_emitter__, missing=missing)
         if shown:
             pipe_log(f"  showed {len(blocks)} gateway image block(s), {len(missing)} missing")
@@ -19352,6 +19453,11 @@ class _PipeTurn:
         if shown_as is not text:
             await self.maybe_emit_snapshot()
 
+    def _request_user_id(self):
+        """The id of the user Open WebUI authenticated for this request (`__user__`), for a channel
+        reply's upload owner (ELI-540). Never read from the message or its metadata text."""
+        return self.__user__.get("id") if isinstance(self.__user__, dict) else None
+
     async def settle_held_media(self, held: str) -> str:
         """Resolve held `MEDIA:` text once its message item ends; one in code
         stays text (ELI-111). A path directive is dropped: its image is the
@@ -19362,7 +19468,8 @@ class _PipeTurn:
         resolved, handled = await _resolve_media_text(
             text,
             valves=self.pipe.valves,
-            __request__=self.__request__,
+            chat_id=self.owui_origin_chat_id,
+            request_user_id=self._request_user_id(),
             __event_emitter__=self.__event_emitter__,
             ctx=ctx,
         )

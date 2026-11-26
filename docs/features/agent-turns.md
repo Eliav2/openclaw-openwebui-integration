@@ -3,7 +3,7 @@
 A reply the agent starts without a message from you (a cron job, another session's `sessions_send`, a finished sub-agent's result) appears in your chat as a normal reply, live, with its tool cards. It sits at the end of the chat like any other reply, with no label on it.
 
 Applies to: Pipe
-Valves: `OWUI_API_KEY`, `PUBLISH_CHAT_FINISHED`
+Valves: `PUBLISH_CHAT_FINISHED`
 
 ## What you see
 
@@ -62,7 +62,7 @@ To watch a sub-agent while it works, open it from the [Status dialog](./status.m
 
 ## Images, files and questions
 
-A `MEDIA:` line in such a reply becomes an attached image or file, as in [your own replies](./chat.md#images-and-files-from-the-agent). There is no request of yours to borrow a login from, so the upload to Open WebUI's Files API uses the [`OWUI_API_KEY`](../configuration.md#owui_api_key) valve. Without it, the file falls back to the built-in file server link.
+A `MEDIA:` line in such a reply becomes an attached image or file, as in [your own replies](./chat.md#images-and-files-from-the-agent). The upload is stored as the chat owner's, as in your own replies, so it opens for the person whose chat it is.
 
 A reply that ends with a question asks it as a [question card](./questions.md#questions-in-replies-the-agent-starts) on the tab viewing the chat. With no such tab, the question stays as text.
 
