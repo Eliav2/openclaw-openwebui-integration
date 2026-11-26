@@ -35,6 +35,7 @@ class _OwuiDb:
     def __init__(self, chats: dict, users: dict):
         self.chats, self.users = chats, users          # users: id -> {"stamp": str|None, "active": bool}
         self.minted, self.posts, self.now, self.events = [], [], 1_000.0, []
+        self.mfa_enabled = False
 
     def valid_token(self, token):
         """The user id a token is valid for at the clock's time, else None."""
@@ -43,6 +44,12 @@ class _OwuiDb:
             return None
         user = self.users.get(claims["id"])
         if not user or not user["active"] or claims.get("session_stamp") != user["stamp"]:
+            return None
+        if claims.get("typ", "session") not in ("session", "automation", "subagent"):
+            return None
+        # utils/auth.py is_valid_token: only a `session` token is asked for MFA when MFA is on.
+        if (claims.get("typ", "session") == "session" and self.mfa_enabled
+                and not (claims.get("mfa_verified") is True and user.get("mfa_secret"))):
             return None
         return claims["id"]
 
@@ -169,9 +176,29 @@ class UploadOwnerTests(unittest.IsolatedAsyncioTestCase):
         made with only {id} is a 401 for Ortal, and the reply would fall back or show the error text."""
         out, _ = await self._resolve("MEDIA:pic.png", ORTAL_CHAT, ENABLE_FILE_SERVER=False)
         self.assertEqual(self.db.minted[0]["session_stamp"], "stamp-ortal")
-        self.assertEqual(self.db.minted[0]["typ"], "session")
+        self.assertEqual(self.db.minted[0]["typ"], "automation")
         self.assertEqual(self.uploads, [("pic.png", ORTAL)], "the Files API took it")
         self.assertNotIn("could not be uploaded", out)
+
+    async def test_with_mfa_on_the_login_is_still_accepted_for_an_account_with_mfa(self):
+        """Open WebUI asks a `session` token for mfa_verified when MFA is enabled (is_valid_token); the
+        server-side `automation` token skips that, so a user with MFA (or no password) still gets their file."""
+        self.db.mfa_enabled = True
+        self.db.users[ORTAL]["mfa_secret"] = "enrolled"
+        out, _ = await self._resolve("MEDIA:pic.png", ORTAL_CHAT, ENABLE_FILE_SERVER=False)
+        self.assertEqual(self.uploads, [("pic.png", ORTAL)])
+        self.assertNotIn("could not be uploaded", out)
+        self.assertEqual(self.db.minted[0]["typ"], "automation")
+
+    async def test_a_session_token_without_mfa_verified_is_what_open_webui_refuses_with_mfa_on(self):
+        """The first version's login, the check shown on its own."""
+        self.db.mfa_enabled = True
+        self.db.users[ORTAL]["mfa_secret"] = "enrolled"
+        await self._resolve("MEDIA:pic.png", ORTAL_CHAT)
+        as_session = {**self.db.minted[0], "typ": "session"}
+        self.db.claims["as-session"] = as_session
+        self.assertEqual(self.db.valid_token("jwt-0"), ORTAL)
+        self.assertIsNone(self.db.valid_token("as-session"))
 
     async def test_an_account_with_no_stamp_gets_a_token_without_one_and_it_is_accepted(self):
         await self._resolve("MEDIA:pic.png", "chat-eliav", ENABLE_FILE_SERVER=False)

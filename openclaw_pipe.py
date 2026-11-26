@@ -1805,20 +1805,23 @@ async def _media_owner_id(chat_id, request_user_id=None) -> str:
 
 async def _upload_token(user_id: str) -> str:
     """A short Open WebUI login for `user_id`, so the Files API stores the
-    upload as theirs. The claims are the ones Open WebUI's own sign-in puts in
-    a session token (`create_session_response`): `session_stamp` is the one its
-    `is_valid_token` compares with the account's stored stamp, so a token without
-    it is refused for any account that has one. Read from the account's auth
-    record and minted fresh for every file: the stamp changes when the account's
-    sessions are revoked, and a token lives 120 s. An account Open WebUI marks
-    inactive gets none."""
+    upload as theirs. The same token Open WebUI signs when it acts for a user on
+    the server (`utils/automations.py`, `utils/subagents.py`): `typ`
+    `automation` and the account's `session_stamp`. `is_valid_token` compares the
+    stamp with the account's stored one, so a token without it is refused for any
+    account that has one; and it asks a `session` token for `mfa_verified` when MFA
+    is on, which no server-side token has (a user with MFA or no password would
+    get an error note). The Files API needs a verified user, not a human session.
+    Read from the account's auth record and minted fresh for every file: the stamp
+    changes when the account's sessions are revoked, and a token lives 120 s. An
+    account Open WebUI marks inactive gets none."""
     from datetime import timedelta
     from open_webui.models.auths import Auths
     from open_webui.utils.auth import create_token
     auth = await _owui_value(Auths.get_auth_by_id(user_id))
     if auth is None or not getattr(auth, "active", True):
         raise _UploadOwnerUnknown(f"user {user_id} has no active account")
-    claims = {"id": user_id, "typ": "session"}
+    claims = {"id": user_id, "typ": "automation"}
     stamp = getattr(auth, "session_stamp", None)
     if stamp:
         claims["session_stamp"] = stamp
