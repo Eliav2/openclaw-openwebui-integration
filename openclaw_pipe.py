@@ -1697,11 +1697,13 @@ async def _resolve_media_via_owui(
     text,
     *,
     base_url,
-    token,
+    owner,
     __event_emitter__,
     ctx="",
 ):
-    """Upload every MEDIA: file to OWUI and attach it to the message.
+    """Upload every MEDIA: file to OWUI as user `owner` and attach it to the message.
+
+    Each file gets a login of its own (`_upload_token`), made just before its POST.
 
     If any one cannot be uploaded, return handled=False so the fallback
     resolves all of them the same way.
@@ -1720,6 +1722,7 @@ async def _resolve_media_via_owui(
         # Off the event loop: this blocking call goes to OWUI's own API, which
         # cannot answer while its loop is blocked (self-deadlock).
         fpath = os.path.join(MEDIA_DIR, fname)
+        token = await _upload_token(owner)
         file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
         if __event_emitter__:
             await __event_emitter__(
@@ -1758,13 +1761,18 @@ async def _chat_owner_id(chat_id) -> str:
 
     The only source of an upload's owner: never the message, the metadata
     text, the session key or a user id the agent writes. No chat, no owner
-    or an owner that is not a user raises `_UploadOwnerUnknown`."""
+    or an owner that is not an active user raises `_UploadOwnerUnknown`.
+    Only the `user_id` column is read, not the chat (it builds its whole
+    transcript in Python, ELI-115)."""
     if not chat_id:
         raise _UploadOwnerUnknown("no chat id")
-    from open_webui.models.chats import Chats
+    from sqlalchemy import select
+    from open_webui.internal.db import get_async_db_context
+    from open_webui.models.chats import Chat
     from open_webui.models.users import Users
-    chat = await _owui_value(Chats.get_chat_by_id(chat_id))
-    owner = getattr(chat, "user_id", None) if chat is not None else None
+    async with get_async_db_context() as db:
+        row = (await db.execute(select(Chat.user_id).where(Chat.id == chat_id))).first()
+    owner = row[0] if row else None
     if not owner:
         raise _UploadOwnerUnknown(f"chat {chat_id} has no owner")
     if await _owui_value(Users.get_user_by_id(owner)) is None:
@@ -1772,12 +1780,26 @@ async def _chat_owner_id(chat_id) -> str:
     return owner
 
 
-def _upload_token(user_id: str) -> str:
+async def _upload_token(user_id: str) -> str:
     """A short Open WebUI login for `user_id`, so the Files API stores the
-    upload as theirs. Open WebUI's own `create_token`, as its sign-in uses."""
+    upload as theirs. The claims are the ones Open WebUI's own sign-in puts in
+    a session token (`create_session_response`): `session_stamp` is the one its
+    `is_valid_token` compares with the account's stored stamp, so a token without
+    it is refused for any account that has one. Read from the account's auth
+    record and minted fresh for every file: the stamp changes when the account's
+    sessions are revoked, and a token lives 120 s. An account Open WebUI marks
+    inactive gets none."""
     from datetime import timedelta
+    from open_webui.models.auths import Auths
     from open_webui.utils.auth import create_token
-    return create_token({"id": user_id}, timedelta(seconds=_UPLOAD_TOKEN_TTL_S))
+    auth = await _owui_value(Auths.get_auth_by_id(user_id))
+    if auth is None or not getattr(auth, "active", True):
+        raise _UploadOwnerUnknown(f"user {user_id} has no active account")
+    claims = {"id": user_id, "typ": "session"}
+    stamp = getattr(auth, "session_stamp", None)
+    if stamp:
+        claims["session_stamp"] = stamp
+    return create_token(claims, timedelta(seconds=_UPLOAD_TOKEN_TTL_S))
 
 
 async def _resolve_media_text(text, *, valves, chat_id, __event_emitter__=None, ctx=""):
@@ -1799,10 +1821,14 @@ async def _resolve_media_text(text, *, valves, chat_id, __event_emitter__=None, 
             resolved, handled = await _resolve_media_via_owui(
                 text,
                 base_url=valves.OWUI_BASE_URL,
-                token=_upload_token(owner),
+                owner=owner,
                 __event_emitter__=__event_emitter__,
                 ctx=ctx,
             )
+        except _UploadOwnerUnknown as ex:
+            # The owner's account went inactive, or is gone, while we uploaded: same as an unknown owner.
+            pipe_log(f"  MEDIA: no upload, the chat's owner is unknown: {ex}")
+            return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
         except Exception as ex:
             pipe_log(f"  OWUI file upload failed; falling back: {ex}")
     if not handled:

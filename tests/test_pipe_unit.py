@@ -147,7 +147,10 @@ def _chat_owners_known(test, owner="u-chat-owner"):
         if not chat_id:
             raise openclaw_pipe._UploadOwnerUnknown("no chat id")
         return owner
-    for name, fake in (("_chat_owner_id", owner_of), ("_upload_token", lambda user_id: f"upload-token:{user_id}")):
+
+    async def token_of(user_id):
+        return f"upload-token:{user_id}"
+    for name, fake in (("_chat_owner_id", owner_of), ("_upload_token", token_of)):
         patcher = mock.patch.object(openclaw_pipe, name, fake)
         patcher.start()
         test.addCleanup(patcher.stop)
@@ -5346,6 +5349,9 @@ class ResolveMediaTests(unittest.TestCase):
 class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
     """The native-OWUI-upload MEDIA: path, same cases as ResolveMediaTests."""
 
+    def setUp(self):
+        _chat_owners_known(self)
+
     async def test_resolves_multiple_directives_in_one_chunk(self):
         uploads = []
 
@@ -5359,7 +5365,7 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
             result, handled = await _resolve_media_via_owui(
                 "caption\nMEDIA:a.png\n\nMEDIA:b.png\nend",
                 base_url="https://owui.example.com",
-                token="tok",
+                owner="u-1",
                 __event_emitter__=None,
             )
 
@@ -5378,7 +5384,7 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
             result, handled = await _resolve_media_via_owui(
                 "MEDIA:missing.png",
                 base_url="https://owui.example.com",
-                token="tok",
+                owner="u-1",
                 __event_emitter__=None,
             )
         self.assertFalse(handled)
@@ -5392,7 +5398,7 @@ class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
             result, handled = await _resolve_media_via_owui(
                 text,
                 base_url="https://owui.example.com",
-                token="tok",
+                owner="u-1",
                 __event_emitter__=None,
             )
         upload_mock.assert_not_called()
@@ -7383,6 +7389,9 @@ class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
     """ELI-76: a bare `MEDIA:<file>.png` reply was saved with the name doubled (stream half fixed
     in ELI-80). A filename ends at the next `MEDIA:` and a glued copy is dropped."""
 
+    def setUp(self):
+        _chat_owners_known(self)
+
     BASE = "https://pipe.example.invalid:18791"
     F = "baseline-test2-0102-1785351819.png"
     MALFORMED = (f"![{F}MEDIA:{F}]"
@@ -7447,7 +7456,7 @@ class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
              mock.patch("os.path.isfile", return_value=True):
             result, handled = await _resolve_media_via_owui(
                 f"MEDIA:{self.F}MEDIA:{self.F}",
-                base_url="https://owui.example.com", token="tok", __event_emitter__=None,
+                base_url="https://owui.example.com", owner="u-1", __event_emitter__=None,
             )
         self.assertTrue(handled)
         self.assertEqual(uploads, [self.F])
@@ -15784,7 +15793,7 @@ class MediaDirectiveCodeAwareTests(_TurnCase):
             with self.subTest(text=text), \
                  mock.patch("openclaw_pipe._upload_owui_file") as upload, \
                  mock.patch("os.path.isfile", return_value=True):
-                got = await _resolve_media_via_owui(text, base_url="https://o", token="t",
+                got = await _resolve_media_via_owui(text, base_url="https://o", owner="u-1",
                                                     __event_emitter__=None)
                 self.assertEqual(got, (text, False))
                 upload.assert_not_called()
