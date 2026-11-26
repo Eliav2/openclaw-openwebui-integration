@@ -13472,7 +13472,7 @@ class SilentTurnTests(_TurnCase):
         self.assertNotIn("NO_REPLY", text)
         self.assertEqual(text.strip(), "")
 
-    async def _steered_silent_turn(self, after_message):
+    async def _steered_silent_turn(self, after_message, earlier=(), closer_text="The host run's own answer."):
         """The reply's message was steered into a host run (`steered_span_run` is its own run, `our_run_id` the
         host's), which ends silent with every delta lost. The host's closer is the whole host run."""
         orig = openclaw_pipe._PipeTurn.finish
@@ -13484,18 +13484,35 @@ class SilentTurnTests(_TurnCase):
         async def steered_answer(*_args, **_kw):
             return self.history
 
-        host_closer = {"role": "assistant", "content": [{"type": "text", "text": "The host run's own answer."}],
+        host_closer = {"role": "assistant", "content": [{"type": "text", "text": closer_text}],
                        "idempotencyKey": "cli-assistant:host-1"}
         with unittest.mock.patch.object(openclaw_pipe._PipeTurn, "finish", finish), \
                 unittest.mock.patch.object(openclaw_pipe, "_await_steered_answer", steered_answer):
             return await self._accepted_silent_turn(
                 {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
-                closing=[*after_message, host_closer])
+                earlier=earlier, closing=[*after_message, host_closer])
 
     async def test_a_steered_silent_end_does_not_show_the_host_runs_answer(self):
         text = await self._steered_silent_turn([])
         self.assertNotIn("The host run's own answer.", text)
         self.assertEqual(text.strip(), "")
+
+    HOST_MESSAGE = {"role": "user", "content": "the host's message", "idempotencyKey": "host-1:user"}
+
+    async def test_a_steered_silent_end_after_a_host_answer_does_not_show_the_hosts_closer(self):
+        """The host answered before the steered message, which got no answer: the host's closer, the
+        whole host run, is all that follows it (review: PR #431)."""
+        text = await self._steered_silent_turn([], earlier=[
+            self.HOST_MESSAGE,
+            {"role": "assistant", "content": [{"type": "text", "text": "The host run's own answer."}]}])
+        self.assertNotIn("The host run's own answer.", text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_steered_answer_only_in_the_hosts_closer_still_shows(self):
+        """Without a host answer before it, the closer is the steered message's answer: Claude Code's own
+        record of it merged into the closing copy (mergeCliHistoryRow)."""
+        text = await self._steered_silent_turn([], earlier=[self.HOST_MESSAGE], closer_text="The steered answer.")
+        self.assertIn("The steered answer.", text)
 
     async def test_a_steered_silent_end_shows_its_own_spans_text(self):
         text = await self._steered_silent_turn(

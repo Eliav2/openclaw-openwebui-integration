@@ -3195,7 +3195,22 @@ def _history_steered_span(history: dict, run_id: str) -> list | None:
     # (cli-session-history mergeCliHistoryRow).
     answered = any(m.get("role") == "assistant" and _history_renderer([m]).text.strip() for m in own
                    if isinstance(m, dict))
-    return own if answered else span
+    if not answered and _history_closer_repeats_host(messages, host, start, span):
+        # The closer holds the host's last answer: one it gave before the
+        # message, so not this message's.
+        return own
+    return span
+
+
+def _history_closer_repeats_host(messages: list, host: str, index: int, span: list) -> bool:
+    """A closer of `host` in `span` repeats an answer the host wrote between
+    its own message and `index`."""
+    begin = next((n for n in range(index - 1, -1, -1) if _history_user_run_id(messages[n]) == host), None)
+    if begin is None:
+        return False
+    before = {_history_renderer([m]).text.strip() for m in messages[begin + 1:index]
+              if isinstance(m, dict) and m.get("role") == "assistant"} - {""}
+    return any(_run_closed_by(m) == host and _history_renderer([m]).text.strip() in before for m in span)
 
 
 def _history_steered_tail(history: dict, run_id: str) -> list | None:
