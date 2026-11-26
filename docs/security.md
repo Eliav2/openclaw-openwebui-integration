@@ -3,7 +3,7 @@
 What to protect when you run this integration: the secrets it keeps, the optional media file server on port 18791, the agent privileges every chat user gets, and the scripts it runs in your browser.
 
 Applies to: Pipe, Action
-Valves: `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `USE_OWUI_FILES`, `FILE_SERVER_BASE_URL`, `AGENT_ID`, `OWNER_USERS`, `COMPOSER_STATUS_BUTTON`
+Valves: `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `ENABLE_FILE_SERVER`, `USE_OWUI_FILES`, `FILE_SERVER_BASE_URL`, `AGENT_ID`, `OWNER_USERS`, `COMPOSER_STATUS_BUTTON`
 
 ## Secrets
 
@@ -11,7 +11,6 @@ Treat these as secrets:
 
 - **[`GATEWAY_TOKEN`](./configuration.md#gateway_token)** is your Gateway API token (`gateway.auth.token` in your OpenClaw config).
 - **[`DEVICE_IDENTITY`](./configuration.md#device_identity)** holds an Ed25519 **private key**: the device identity the Gateway approved. Whoever has it connects as that approved device.
-- **[`OWUI_API_KEY`](./configuration.md#owui_api_key)**, if you set it, is an Open WebUI API key.
 
 Where copies of them end up:
 
@@ -37,7 +36,7 @@ Then delete `STATE_DIR/identity.json` and `STATE_DIR/device-token.json`, clear t
 
 ## The media file server
 
-When the agent sends a file (`MEDIA:<filename>`), the Pipe first uploads it through Open WebUI's own Files API ([`USE_OWUI_FILES`](./configuration.md#use_owui_files), on by default). That path is same-origin and uses Open WebUI's own login: the request's login token, or [`OWUI_API_KEY`](./configuration.md#owui_api_key) if set.
+When the agent sends a file (`MEDIA:<filename>`), the Pipe first uploads it through Open WebUI's own Files API ([`USE_OWUI_FILES`](./configuration.md#use_owui_files), on by default). That path is same-origin and uses Open WebUI's own login: a two-minute login the Pipe makes with Open WebUI's `create_token` for the chat's owner, read from Open WebUI's database by the chat id. Nothing in a message, its metadata or the agent's text decides the owner; a chat with no known owner gets no upload.
 
 As a fallback, the Pipe also runs a small HTTP file server, and that server is **unauthenticated**. With [`ENABLE_FILE_SERVER`](./configuration.md#enable_file_server) on (the default), the Pipe starts it the first time it handles a chat in an Open WebUI process:
 

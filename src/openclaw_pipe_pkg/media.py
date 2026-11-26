@@ -330,20 +330,65 @@ async def _resolve_media_via_owui(
     return _replace_media(text, directives, shown.__getitem__), True
 
 
-async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None, ctx=""):
+# An upload's login lives this long: one POST and its answer (ELI-540).
+_UPLOAD_TOKEN_TTL_S = 120
+
+
+class _UploadOwnerUnknown(RuntimeError):
+    """The chat has no owner Open WebUI knows, so nothing is uploaded for it."""
+
+
+async def _owui_value(out):
+    return await out if asyncio.iscoroutine(out) else out
+
+
+async def _chat_owner_id(chat_id) -> str:
+    """The id of the user who owns `chat_id`, from Open WebUI's DB (ELI-540).
+
+    The only source of an upload's owner: never the message, the metadata
+    text, the session key or a user id the agent writes. No chat, no owner
+    or an owner that is not a user raises `_UploadOwnerUnknown`."""
+    if not chat_id:
+        raise _UploadOwnerUnknown("no chat id")
+    from open_webui.models.chats import Chats
+    from open_webui.models.users import Users
+    chat = await _owui_value(Chats.get_chat_by_id(chat_id))
+    owner = getattr(chat, "user_id", None) if chat is not None else None
+    if not owner:
+        raise _UploadOwnerUnknown(f"chat {chat_id} has no owner")
+    if await _owui_value(Users.get_user_by_id(owner)) is None:
+        raise _UploadOwnerUnknown(f"chat {chat_id}: owner {owner} is not a user")
+    return owner
+
+
+def _upload_token(user_id: str) -> str:
+    """A short Open WebUI login for `user_id`, so the Files API stores the
+    upload as theirs. Open WebUI's own `create_token`, as its sign-in uses."""
+    from datetime import timedelta
+    from open_webui.utils.auth import create_token
+    return create_token({"id": user_id}, timedelta(seconds=_UPLOAD_TOKEN_TTL_S))
+
+
+async def _resolve_media_text(text, *, valves, chat_id, __event_emitter__=None, ctx=""):
     """Resolve MEDIA: directives via OWUI Files, else the file server.
 
-    Pass only text whose filenames are complete (see `_advance_media_buffer`).
+    The upload belongs to the owner of `chat_id` in Open WebUI's DB; a chat
+    with no known owner gets no upload and no fallback (ELI-540). Pass only
+    text whose filenames are complete (see `_advance_media_buffer`).
     """
     handled = False
     resolved = text
     if valves.USE_OWUI_FILES:
-        token = _extract_request_bearer(__request__) or valves.OWUI_API_KEY
+        try:
+            owner = await _chat_owner_id(chat_id)
+        except Exception as ex:
+            pipe_log(f"  MEDIA: no upload, the chat's owner is unknown: {ex}")
+            return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
         try:
             resolved, handled = await _resolve_media_via_owui(
                 text,
                 base_url=valves.OWUI_BASE_URL,
-                token=token,
+                token=_upload_token(owner),
                 __event_emitter__=__event_emitter__,
                 ctx=ctx,
             )
@@ -449,7 +494,7 @@ def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
     return raw
 
 
-async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None,
+async def _gateway_images_text(blocks, *, valves, chat_id, __event_emitter__=None,
                                missing=()) -> str:
     """Fetch Gateway image blocks and show them as MEDIA: directives.
 
@@ -472,7 +517,7 @@ async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emit
         return ""
     text = "\n\n" + "\n\n".join(lines) + "\n"
     resolved, _handled = await _resolve_media_text(
-        text, valves=valves, __request__=__request__, __event_emitter__=__event_emitter__)
+        text, valves=valves, chat_id=chat_id, __event_emitter__=__event_emitter__)
     return resolved
 
 

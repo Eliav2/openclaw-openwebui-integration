@@ -106,7 +106,6 @@ class Config:
     agent_id: str
     state_dir: str
     owui_api_base_url: str
-    owui_api_key: str
     file_server_base_url: str
     auto_approve: bool = True
 
@@ -756,8 +755,6 @@ def update_valves(client: OwuiClient, cfg: Config, preserved_valves: dict | None
         "USE_OWUI_FILES": True,
         "SEND_STOP_ON_CANCEL": True,
     }
-    if cfg.owui_api_key:
-        required["OWUI_API_KEY"] = cfg.owui_api_key
     if cfg.file_server_base_url:
         required["FILE_SERVER_BASE_URL"] = cfg.file_server_base_url
 
@@ -1064,8 +1061,6 @@ def common_options(f):
         click.option("--owui-api-base-url", envvar="OWUI_API_BASE_URL", default="",
                      help="Base URL the pipe uses to call OWUI's own API "
                           "(defaults to --owui-url)"),
-        click.option("--owui-api-key", envvar="OWUI_API_KEY", default="",
-                     help="Optional OWUI API key for native media uploads"),
         click.option("--file-server-base-url", envvar="FILE_SERVER_BASE_URL", default="",
                      help="Legacy media fallback base URL"),
         click.option("--auto-approve/--no-auto-approve", default=True,

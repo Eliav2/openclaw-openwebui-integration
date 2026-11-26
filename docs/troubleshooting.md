@@ -3,7 +3,7 @@
 Something not working? Find your symptom or the error in the chat below, then check the Open WebUI backend log for `[openclaw-pipe]` lines. If you still need help, the last section says what to put in a bug report.
 
 Applies to: Pipe, Action
-Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `STATE_DIR`, `DEVICE_IDENTITY`, `MAX_MODELS`, `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `TITLE_GEN_AGENT_ID`
+Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `STATE_DIR`, `DEVICE_IDENTITY`, `MAX_MODELS`, `USE_OWUI_FILES`, `OWUI_BASE_URL`, `TITLE_GEN_AGENT_ID`
 
 ## Start with the healthcheck
 
@@ -34,7 +34,7 @@ More on these commands: [The installer](./install/installer.md).
 | Models are listed as "-- example, Gateway not reached" | The Pipe has not reached your Gateway yet, so the picker shows a built-in example list instead of your models. Pick `OpenClaw · Default` (it always works), send one message to connect, then reload: the real list replaces it. If it persists, the Gateway is unreachable: check `GATEWAY_URL` and `GATEWAY_TOKEN`. |
 | "Could not start a session on agent `<id>`" | [`AGENT_ID`](./configuration.md#agent_id) names an agent your Gateway does not define. Use `main` unless you configured others. |
 | Tool calls not showing | The calls that draw tool cards fail silently. Check the backend log, and that Open WebUI is at least the minimum in [Versions](./versions.md). |
-| An image link points at port 18791 instead of being attached | The upload to Open WebUI's Files API failed and the Pipe fell back to its own file server. The log says `OWUI file upload failed; falling back`. Check [`OWUI_BASE_URL`](./configuration.md#owui_base_url), the request's login or [`OWUI_API_KEY`](./configuration.md#owui_api_key), and the Open WebUI log. See also [Security](./security.md#the-media-file-server). |
+| An image link points at port 18791 instead of being attached | The upload to Open WebUI's Files API failed and the Pipe fell back to its own file server. The log says `OWUI file upload failed; falling back`. Check [`OWUI_BASE_URL`](./configuration.md#owui_base_url) and the Open WebUI log. See also [Security](./security.md#the-media-file-server). |
 | A reply goes quiet for a long time | The Pipe has no silence timeout: a quiet reply is usually a long tool call or the model thinking. The reply ends when the run ends, fails or is stopped. If the page stopped updating, reload: the partial answer is kept. Check the backend log for the turn. See [Reliability](./features/reliability.md). |
 | The answer stops after a Gateway restart | The Pipe resumes a reply cut off by a Gateway restart, up to 3 times per reply. After that the reply ends with a "cut off" note: the Gateway was down too long or kept restarting. Send the message again. |
 | A typed `/compact`, `/status`, `/fork` or `/model` does nothing in OpenClaw | Open WebUI 0.12 handles these commands itself, so they never reach OpenClaw. To compact the session, use the Compact button in the [Status dialog](./features/status.md#compact). |
@@ -109,6 +109,6 @@ Open an issue at [github.com/Eliav2/openclaw-openwebui-integration/issues](https
 4. **The healthcheck output:** `uv run install.py healthcheck`.
 5. **The log lines:** the `[openclaw-pipe]` lines for the failing turn, and the Gateway's log around the same time.
 
-Before you paste anything, remove secrets: never include `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `OWUI_API_KEY`, `.pipe_device_identity.json` or anything from `backups/`. See [Security](./security.md#secrets).
+Before you paste anything, remove secrets: never include `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `.pipe_device_identity.json` or anything from `backups/`. See [Security](./security.md#secrets).
 
 For a security problem, do not open a public issue: report it privately as [SECURITY.md](../SECURITY.md) describes.

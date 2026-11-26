@@ -84,12 +84,6 @@ Type: `str`. Default: `http://127.0.0.1:8080`.
 
 Open WebUI's own base URL, resolved by the Open WebUI backend itself and not by your browser. The default is correct for a standard single-container install; change it only if Open WebUI cannot reach itself at 127.0.0.1:8080.
 
-### OWUI_API_KEY
-
-Type: `str`. Default: empty.
-
-(Optional.) Only needed if media uploads fail with an auth error -- the pipe normally reuses your own login token.
-
 ### FILE_SERVER_BASE_URL
 
 Type: `str`. Default: `http://localhost:18791`.

@@ -327,11 +327,6 @@ class Pipe:
                 "for a standard single-container install; change it only if "
                 "Open WebUI cannot reach itself at 127.0.0.1:8080."
         )
-        OWUI_API_KEY: str = Field(
-            default="",
-            description="(Optional.) Only needed if media uploads fail with an "
-                "auth error -- the pipe normally reuses your own login token."
-        )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
             description="Legacy fallback only: base URL of the built-in media file "
@@ -2333,7 +2328,7 @@ class _PipeTurn:
         if not blocks and not missing:
             return
         shown = await _gateway_images_text(
-            blocks, valves=self.pipe.valves, __request__=self.__request__,
+            blocks, valves=self.pipe.valves, chat_id=self.owui_origin_chat_id,
             __event_emitter__=self.__event_emitter__, missing=missing)
         if shown:
             pipe_log(f"  showed {len(blocks)} gateway image block(s), {len(missing)} missing")
@@ -2976,7 +2971,7 @@ class _PipeTurn:
         resolved, handled = await _resolve_media_text(
             text,
             valves=self.pipe.valves,
-            __request__=self.__request__,
+            chat_id=self.owui_origin_chat_id,
             __event_emitter__=self.__event_emitter__,
             ctx=ctx,
         )

@@ -138,6 +138,20 @@ from openclaw_pipe import (
 )
 
 
+
+def _chat_owners_known(test, owner="u-chat-owner"):
+    """Open WebUI's DB as these tests' chats have it: every chat id is owned by
+    `owner`, and an upload signs in as them (ELI-540). No chat id has no owner.
+    test_upload_owner_unit runs the real lookup."""
+    async def owner_of(chat_id):
+        if not chat_id:
+            raise openclaw_pipe._UploadOwnerUnknown("no chat id")
+        return owner
+    for name, fake in (("_chat_owner_id", owner_of), ("_upload_token", lambda user_id: f"upload-token:{user_id}")):
+        patcher = mock.patch.object(openclaw_pipe, name, fake)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
 class RecoveryItemsTests(unittest.TestCase):
     def test_recovers_assistant_after_matching_user_message(self):
         items = [
@@ -3649,6 +3663,10 @@ class GatewayImageBlockTests(_TurnCase):
     """ELI-322: a tool-made image reaches only the stored message as an `image` block; the live
     final has only text (lifecycle end, then the final)."""
 
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        _chat_owners_known(self)
+
     SK = None
     _collect = staticmethod(NoDroppedMessagesTests._collect)
 
@@ -3697,7 +3715,6 @@ class GatewayImageBlockTests(_TurnCase):
         media_dir = self._media_dir()
         self.pipe.valves.GATEWAY_URL = "localhost:18789"
         self.pipe.valves.GATEWAY_TOKEN = "gw-token"
-        self.pipe.valves.OWUI_API_KEY = "owui-key"
         self._stored("run-1", self.BLOCK)
         uploads = []
 
@@ -3713,7 +3730,7 @@ class GatewayImageBlockTests(_TurnCase):
         fetch.assert_called_once_with("localhost:18789", "gw-token", self.BLOCK["url"])
         self.assertEqual(len(uploads), 1)
         fname, raw, token = uploads[0]
-        self.assertEqual((raw, token), (b"PNG", "owui-key"))
+        self.assertEqual((raw, token), (b"PNG", "upload-token:u-chat-owner"))
         self.assertRegex(fname, r"^codex-image-generation-2---05e44654-[0-9a-f-]+-[0-9a-f]{8}\.png$")
         self.assertTrue(os.path.isfile(os.path.join(media_dir, fname)))
         self.assertTrue(out.startswith("Here it is."))
@@ -5388,6 +5405,9 @@ class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
     that cannot be uploaded is an error in the reply, not an image that
     never loads."""
 
+    def setUp(self):
+        _chat_owners_known(self)
+
     def test_a_bare_filename_is_an_error_when_the_file_server_is_off(self):
         result, handled = _resolve_media(
             "see\nMEDIA:pic.png\nend", base_url="https://example.com", file_server=False)
@@ -5405,7 +5425,7 @@ class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
         v = Pipe.Valves(**valves)
         with mock.patch("openclaw_pipe._upload_owui_file", side_effect=OSError("upload refused")), \
              mock.patch("os.path.isfile", return_value=True):
-            return await _resolve_media_text(text, valves=v)
+            return await _resolve_media_text(text, valves=v, chat_id="chat-1")
 
     async def test_a_failed_upload_with_the_file_server_off_is_an_error(self):
         result, handled = await self._resolve(
@@ -14544,6 +14564,7 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await self.asyncSetUp_inline()
         self.owui = _FakeOwuiChat(self, self.CHAT)
+        _chat_owners_known(self)
 
     @staticmethod
     def A(text):

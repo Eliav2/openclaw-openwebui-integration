@@ -1741,20 +1741,65 @@ async def _resolve_media_via_owui(
     return _replace_media(text, directives, shown.__getitem__), True
 
 
-async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None, ctx=""):
+# An upload's login lives this long: one POST and its answer (ELI-540).
+_UPLOAD_TOKEN_TTL_S = 120
+
+
+class _UploadOwnerUnknown(RuntimeError):
+    """The chat has no owner Open WebUI knows, so nothing is uploaded for it."""
+
+
+async def _owui_value(out):
+    return await out if asyncio.iscoroutine(out) else out
+
+
+async def _chat_owner_id(chat_id) -> str:
+    """The id of the user who owns `chat_id`, from Open WebUI's DB (ELI-540).
+
+    The only source of an upload's owner: never the message, the metadata
+    text, the session key or a user id the agent writes. No chat, no owner
+    or an owner that is not a user raises `_UploadOwnerUnknown`."""
+    if not chat_id:
+        raise _UploadOwnerUnknown("no chat id")
+    from open_webui.models.chats import Chats
+    from open_webui.models.users import Users
+    chat = await _owui_value(Chats.get_chat_by_id(chat_id))
+    owner = getattr(chat, "user_id", None) if chat is not None else None
+    if not owner:
+        raise _UploadOwnerUnknown(f"chat {chat_id} has no owner")
+    if await _owui_value(Users.get_user_by_id(owner)) is None:
+        raise _UploadOwnerUnknown(f"chat {chat_id}: owner {owner} is not a user")
+    return owner
+
+
+def _upload_token(user_id: str) -> str:
+    """A short Open WebUI login for `user_id`, so the Files API stores the
+    upload as theirs. Open WebUI's own `create_token`, as its sign-in uses."""
+    from datetime import timedelta
+    from open_webui.utils.auth import create_token
+    return create_token({"id": user_id}, timedelta(seconds=_UPLOAD_TOKEN_TTL_S))
+
+
+async def _resolve_media_text(text, *, valves, chat_id, __event_emitter__=None, ctx=""):
     """Resolve MEDIA: directives via OWUI Files, else the file server.
 
-    Pass only text whose filenames are complete (see `_advance_media_buffer`).
+    The upload belongs to the owner of `chat_id` in Open WebUI's DB; a chat
+    with no known owner gets no upload and no fallback (ELI-540). Pass only
+    text whose filenames are complete (see `_advance_media_buffer`).
     """
     handled = False
     resolved = text
     if valves.USE_OWUI_FILES:
-        token = _extract_request_bearer(__request__) or valves.OWUI_API_KEY
+        try:
+            owner = await _chat_owner_id(chat_id)
+        except Exception as ex:
+            pipe_log(f"  MEDIA: no upload, the chat's owner is unknown: {ex}")
+            return _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx, file_server=False)
         try:
             resolved, handled = await _resolve_media_via_owui(
                 text,
                 base_url=valves.OWUI_BASE_URL,
-                token=token,
+                token=_upload_token(owner),
                 __event_emitter__=__event_emitter__,
                 ctx=ctx,
             )
@@ -1860,7 +1905,7 @@ def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
     return raw
 
 
-async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None,
+async def _gateway_images_text(blocks, *, valves, chat_id, __event_emitter__=None,
                                missing=()) -> str:
     """Fetch Gateway image blocks and show them as MEDIA: directives.
 
@@ -1883,7 +1928,7 @@ async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emit
         return ""
     text = "\n\n" + "\n\n".join(lines) + "\n"
     resolved, _handled = await _resolve_media_text(
-        text, valves=valves, __request__=__request__, __event_emitter__=__event_emitter__)
+        text, valves=valves, chat_id=chat_id, __event_emitter__=__event_emitter__)
     return resolved
 
 
@@ -11135,7 +11180,8 @@ class _TurnWriter:
                 continue
             try:
                 shown, handled = await _resolve_media_text(
-                    directive, valves=self.conn._valves(), __event_emitter__=await self._emitter())
+                    directive, valves=self.conn._valves(), chat_id=self.chat_id,
+                    __event_emitter__=await self._emitter())
             except Exception as ex:
                 pipe_log(f"  turn writer: {directive[:60]} did not resolve: {ex!r}")
                 shown, handled = directive, False
@@ -11619,13 +11665,13 @@ class _TurnWriter:
         """M's images: stored blocks, then the events' `mediaUrls`."""
         try:
             emit = await self._emitter()
-            text = await _gateway_images_text(blocks, valves=self.conn._valves(),
+            text = await _gateway_images_text(blocks, valves=self.conn._valves(), chat_id=self.chat_id,
                                               __event_emitter__=emit, missing=missing) \
                 if blocks or missing else ""
             if self.event_media:
                 shown, _handled = await _resolve_media_text(
                     "\n".join(f"MEDIA:{u}" for u in self.event_media) + "\n",
-                    valves=self.conn._valves(), __event_emitter__=emit)
+                    valves=self.conn._valves(), chat_id=self.chat_id, __event_emitter__=emit)
                 text = f"{text}\n\n{shown}"
         except Exception as ex:
             pipe_log(f"  turn writer: the run's images could not be shown: {ex!r}")
@@ -16713,11 +16759,6 @@ class Pipe:
                 "for a standard single-container install; change it only if "
                 "Open WebUI cannot reach itself at 127.0.0.1:8080."
         )
-        OWUI_API_KEY: str = Field(
-            default="",
-            description="(Optional.) Only needed if media uploads fail with an "
-                "auth error -- the pipe normally reuses your own login token."
-        )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
             description="Legacy fallback only: base URL of the built-in media file "
@@ -18719,7 +18760,7 @@ class _PipeTurn:
         if not blocks and not missing:
             return
         shown = await _gateway_images_text(
-            blocks, valves=self.pipe.valves, __request__=self.__request__,
+            blocks, valves=self.pipe.valves, chat_id=self.owui_origin_chat_id,
             __event_emitter__=self.__event_emitter__, missing=missing)
         if shown:
             pipe_log(f"  showed {len(blocks)} gateway image block(s), {len(missing)} missing")
@@ -19362,7 +19403,7 @@ class _PipeTurn:
         resolved, handled = await _resolve_media_text(
             text,
             valves=self.pipe.valves,
-            __request__=self.__request__,
+            chat_id=self.owui_origin_chat_id,
             __event_emitter__=self.__event_emitter__,
             ctx=ctx,
         )

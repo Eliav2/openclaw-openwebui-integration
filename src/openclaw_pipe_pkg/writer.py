@@ -1438,7 +1438,8 @@ class _TurnWriter:
                 continue
             try:
                 shown, handled = await _resolve_media_text(
-                    directive, valves=self.conn._valves(), __event_emitter__=await self._emitter())
+                    directive, valves=self.conn._valves(), chat_id=self.chat_id,
+                    __event_emitter__=await self._emitter())
             except Exception as ex:
                 pipe_log(f"  turn writer: {directive[:60]} did not resolve: {ex!r}")
                 shown, handled = directive, False
@@ -1922,13 +1923,13 @@ class _TurnWriter:
         """M's images: stored blocks, then the events' `mediaUrls`."""
         try:
             emit = await self._emitter()
-            text = await _gateway_images_text(blocks, valves=self.conn._valves(),
+            text = await _gateway_images_text(blocks, valves=self.conn._valves(), chat_id=self.chat_id,
                                               __event_emitter__=emit, missing=missing) \
                 if blocks or missing else ""
             if self.event_media:
                 shown, _handled = await _resolve_media_text(
                     "\n".join(f"MEDIA:{u}" for u in self.event_media) + "\n",
-                    valves=self.conn._valves(), __event_emitter__=emit)
+                    valves=self.conn._valves(), chat_id=self.chat_id, __event_emitter__=emit)
                 text = f"{text}\n\n{shown}"
         except Exception as ex:
             pipe_log(f"  turn writer: the run's images could not be shown: {ex!r}")
