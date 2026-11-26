@@ -3209,7 +3209,7 @@ def _history_closer_repeats_host(messages: list, host: str, index: int, span: li
     if begin is None:
         return False
     before = {_history_renderer([m]).text.strip() for m in messages[begin + 1:index]
-              if isinstance(m, dict) and m.get("role") == "assistant"} - {""}
+              if isinstance(m, dict) and m.get("role") == _ASSISTANT_ROLE} - {""}
     return any(_run_closed_by(m) == host and _history_renderer([m]).text.strip() in before for m in span)
 
 
