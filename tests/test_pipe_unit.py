@@ -13416,6 +13416,114 @@ class SilentTurnTests(_TurnCase):
         self.assert_silent(text)
         self.assertEqual(text.strip(), "")
 
+    async def _accepted_silent_turn(self, end_data, earlier=(), closing=()):
+        """2026.11.7 (upstream 9bec8f8) accepts a person's NO_REPLY in a webchat turn: no error,
+        the run ends `done` with no text, and the lifecycle end says why (CI compat run 45419239133)."""
+        self.describe_extra = {"status": "done"}
+        self.history = {"messages": [*earlier, {"role": "user", "content": "[manager] a note for you",
+                                                "idempotencyKey": "run-1:user"}, *closing]}
+        gen = self._reply("[manager] a note for you", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._event("agent", stream="lifecycle", data={"phase": "end", **end_data}))
+        q.put_nowait(self._event("chat", state="final"))
+        items = []
+
+        async def drain():
+            try:
+                items.append(await first)
+            except StopAsyncIteration:
+                return
+            async for chunk in gen:
+                items.append(chunk)
+        # Bounds the test only.
+        await asyncio.wait_for(drain(), 5)
+        return "".join(i for i in items if isinstance(i, str))
+
+    async def test_a_no_reply_the_gateway_accepts_shows_nothing(self):
+        text = await self._accepted_silent_turn({"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}})
+        self.assert_silent(text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_silent_end_shows_the_runs_own_text_the_transcript_holds(self):
+        """A socket gap lost every delta of the run; its closing text is in chat.history under its run id."""
+        text = await self._accepted_silent_turn(
+            {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+            closing=[{"role": "assistant", "content": [{"type": "text", "text": "Noted, thanks."}],
+                      "idempotencyKey": "cli-assistant:run-1"}])
+        self.assertIn("Noted, thanks.", text)
+        self.assertNotIn("no reply text", text)
+
+    async def test_a_silent_end_does_not_take_an_earlier_answer_to_the_same_words(self):
+        text = await self._accepted_silent_turn(
+            {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+            earlier=[{"role": "user", "content": "[manager] a note for you", "idempotencyKey": "run-0:user"},
+                     {"role": "assistant", "content": [{"type": "text", "text": "An older answer."}],
+                      "idempotencyKey": "cli-assistant:run-0"}])
+        self.assertNotIn("An older answer.", text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_silent_end_whose_closer_is_the_sentinel_stays_silent(self):
+        text = await self._accepted_silent_turn(
+            {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+            closing=[{"role": "assistant", "content": [{"type": "text", "text": "NO_REPLY"}],
+                      "idempotencyKey": "cli-assistant:run-1"}])
+        self.assertNotIn("NO_REPLY", text)
+        self.assertEqual(text.strip(), "")
+
+    async def _steered_silent_turn(self, after_message, earlier=(), closer_text="The host run's own answer."):
+        """The reply's message was steered into a host run (`steered_span_run` is its own run, `our_run_id` the
+        host's), which ends silent with every delta lost. The host's closer is the whole host run."""
+        orig = openclaw_pipe._PipeTurn.finish
+
+        def finish(turn):
+            turn.steered_span_run, turn.our_run_id = "run-1", "host-1"
+            return orig(turn)
+
+        async def steered_answer(*_args, **_kw):
+            return self.history
+
+        host_closer = {"role": "assistant", "content": [{"type": "text", "text": closer_text}],
+                       "idempotencyKey": "cli-assistant:host-1"}
+        with unittest.mock.patch.object(openclaw_pipe._PipeTurn, "finish", finish), \
+                unittest.mock.patch.object(openclaw_pipe, "_await_steered_answer", steered_answer):
+            return await self._accepted_silent_turn(
+                {"stopReason": "end_turn", "terminalReply": {"disposition": "silent"}},
+                earlier=earlier, closing=[*after_message, host_closer])
+
+    async def test_a_steered_silent_end_does_not_show_the_host_runs_answer(self):
+        text = await self._steered_silent_turn([])
+        self.assertNotIn("The host run's own answer.", text)
+        self.assertEqual(text.strip(), "")
+
+    HOST_MESSAGE = {"role": "user", "content": "the host's message", "idempotencyKey": "host-1:user"}
+
+    async def test_a_steered_silent_end_after_a_host_answer_does_not_show_the_hosts_closer(self):
+        """The host answered before the steered message, which got no answer: the host's closer, the
+        whole host run, is all that follows it (review: PR #431)."""
+        text = await self._steered_silent_turn([], earlier=[
+            self.HOST_MESSAGE,
+            {"role": "assistant", "content": [{"type": "text", "text": "The host run's own answer."}]}])
+        self.assertNotIn("The host run's own answer.", text)
+        self.assertEqual(text.strip(), "")
+
+    async def test_a_steered_answer_only_in_the_hosts_closer_still_shows(self):
+        """Without a host answer before it, the closer is the steered message's answer: Claude Code's own
+        record of it merged into the closing copy (mergeCliHistoryRow)."""
+        text = await self._steered_silent_turn([], earlier=[self.HOST_MESSAGE], closer_text="The steered answer.")
+        self.assertIn("The steered answer.", text)
+
+    async def test_a_steered_silent_end_shows_its_own_spans_text(self):
+        text = await self._steered_silent_turn(
+            [{"role": "assistant", "content": [{"type": "text", "text": "The steered answer."}]}])
+        self.assertIn("The steered answer.", text)
+        self.assertNotIn("The host run's own answer.", text)
+
+    async def test_an_end_with_no_text_that_is_not_silence_still_says_so(self):
+        text = await self._accepted_silent_turn({"stopReason": "end_turn"})
+        self.assertIn("no reply text", text)
+
     async def test_silence_after_a_tool_call_keeps_only_the_card(self):
         tool = self._event("agent", stream="tool", data={
             "phase": "start", "name": "Bash", "toolCallId": "toolu_1", "args": {"command": "ls"}})

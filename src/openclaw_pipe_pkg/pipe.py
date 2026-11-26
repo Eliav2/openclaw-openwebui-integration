@@ -2055,6 +2055,11 @@ class _PipeTurn:
             if (payload.get("data") or {}).get("yielded") is True and self.renderer.yielded is None:
                 # The Gateway says the run yielded (2026.11.5), whatever its tool said.
                 self.renderer.yielded = ""
+            if ((payload.get("data") or {}).get("terminalReply") or {}).get("disposition") == _DISPOSITION_SILENT:
+                # From 2026.11.7 a person's NO_REPLY in a webchat turn is accepted (upstream 9bec8f8): the run
+                # ends `done` with no text and no error, where it used to fail with EMPTY_RESPONSE_ERROR (ELI-336).
+                self.model_silent = True
+                pipe_log("  lifecycle end: the model ended silent -> done, nothing shown")
             pipe_log("  lifecycle end -> done")
         elif _is_model_silence(err):
             self.model_silent = self.done = True
@@ -2446,8 +2451,19 @@ class _PipeTurn:
             # Silence after tool calls is on purpose: the cards are the reply (ELI-227).
             pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded and self.model_silent:
-            # The model's silence is its answer: no error and no fallback line (ELI-336).
-            pipe_log("  the run ended silent: nothing shown")
+            # The model's silence is its answer: no error and no fallback line (ELI-336). Unless this run's own
+            # text is in the transcript (a socket gap lost its deltas): by run id only, never by user text,
+            # which could be an earlier answer to the same words. A steered reply's run id is the host run's,
+            # whose closer is the whole host run: it reads its own span (recover_from_transcript's steered path).
+            recovered = await (self.recover_from_transcript() if getattr(self, "steered_span_run", None)
+                               else self.run_text_by_id())
+            if recovered:
+                pipe_log("  the run ended silent, but its text is in the transcript: shown")
+                self.record_visible_chunk(recovered)
+                yield recovered
+                await self.save_end_snapshot()
+            else:
+                pipe_log("  the run ended silent: nothing shown")
         elif not self.aborted and not self.text_yielded and self.renderer.yielded is not None:
             # From 2026.11.5 an accepted yield ends the run; the children's
             # answer is a new run, in its own reply (ELI-512).
@@ -2663,6 +2679,16 @@ class _PipeTurn:
         stopped_by_deadline = self.abort_stop_reason == TIMEOUT_STATUS
         return _textless_end_note(TIMEOUT_STATUS if stopped_by_deadline else STOPPED_STATUSES[-1], self.lang)
 
+    async def run_text_by_id(self) -> str | None:
+        """This run's closing text in the transcript, by its run id; None when it has none or ended silent."""
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+            found, whole = _history_text_for_run(hist, self.our_run_id)
+            return whole if found else None
+        except Exception as ex:
+            pipe_log(f"  recovery by run id: chat.history failed: {ex!r}")
+            return None
+
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back by run id, else by user text (only for a run
         seen here: otherwise the last reply may be another run's). A steered
@@ -2677,13 +2703,9 @@ class _PipeTurn:
             if not text:
                 pipe_log("  recovery: the steered message's answer is not in the transcript")
             return text or None
-        try:
-            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
-            found, whole = _history_text_for_run(hist, self.our_run_id)
-            if found and whole:
-                return whole
-        except Exception as ex:
-            pipe_log(f"  recovery by run id: chat.history failed: {ex!r}")
+        whole = await self.run_text_by_id()
+        if whole:
+            return whole
         if not self.first_event_arrived:
             pipe_log("  recovery: nothing of this run seen, no text by its id")
             return None

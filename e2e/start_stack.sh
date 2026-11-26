@@ -222,6 +222,20 @@ if [[ "$(printf '%s\n%s\n' "$OPENCLAW_VERSION" "$HEARTBEAT_RETIRED_IN" | sort -V
 else
   HEARTBEAT_KEY='"heartbeat": {"agentId": "main", "every": "0m"},'
 fi
+# The weekly skill review is switched off under `skills.workshop` up to 2026.11.9. 2026.11.10 moved the
+# Workshop's settings into its plugin's config (upstream 710b58d, #190365) and refuses the old key until
+# a doctor --fix moves it; the same version gate as the heartbeat's, for the same reason. 2026.11.10 also
+# ignores a `plugins.entries.skill-workshop` in a config without doctor's migration marker
+# (projectSkillWorkshopPluginPolicy), so the marker goes with it: without it the review would stay on.
+WORKSHOP_MOVED_IN=2026.11.10
+WORKSHOP_OFF='"autonomous": {"mode": "off"}'
+if [[ "$(printf '%s\n%s\n' "$OPENCLAW_VERSION" "$WORKSHOP_MOVED_IN" | sort -V | head -1)" == "$WORKSHOP_MOVED_IN" ]]; then
+  SKILLS_KEY='"meta": {"migrations": {"skillWorkshopPlugin": true}},'
+  WORKSHOP_PLUGIN_KEY="\"skill-workshop\": {\"config\": {$WORKSHOP_OFF}},"
+else
+  SKILLS_KEY="\"skills\": {\"workshop\": {$WORKSHOP_OFF}},"
+  WORKSHOP_PLUGIN_KEY=""
+fi
 cat >"$HOME/.openclaw/openclaw.json" <<EOF
 {
   "gateway": {
@@ -247,9 +261,10 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
     "ownership": "explicit",
     "entries": {"main": {"workspace": "$HOME/.openclaw/workspace"}, "title-gen": {}}
   },
-  "skills": {"workshop": {"autonomous": {"mode": "off"}}},
+  $SKILLS_KEY
   "plugins": {"load": {"paths": ["$PWD/e2e/agent-tool"]},
-              "entries": {"memory-core": {"config": {"dreaming": {"enabled": false}}},
+              "entries": {$WORKSHOP_PLUGIN_KEY
+                          "memory-core": {"config": {"dreaming": {"enabled": false}}},
                           "e2e-agent-tool": {"enabled": true}}}
 }
 EOF
