@@ -248,11 +248,68 @@ class UploadOwnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, "![a.png](https://example.com/a.png)")
         self.assertEqual(self.uploads, [])
 
+    def _channel_turn(self, user_id):
+        """An inline reply to a channel mention: `chat_id` is `channel:<id>` (no chat row); `__user__` is the
+        account Open WebUI authenticated for this request, after its channel membership check."""
+        turn = ocp._PipeTurn.__new__(ocp._PipeTurn)
+        turn.pipe = types.SimpleNamespace(valves=ocp.Pipe.Valves(ENABLE_FILE_SERVER=False))
+        turn.__request__ = None
+        turn.__user__ = {"id": user_id, "role": "user"}
+        turn.__event_emitter__ = None
+        turn.owui_origin_chat_id, turn.owui_message_id = "channel:japan-1", "m1"
+        turn.assistant_stream_text, turn.fence_item_start = "", 0
+        turn.gateway_media, turn.media_shown = set(), False
+        turn.conn = mock.Mock()
+        return turn
+
+    async def test_a_channel_reply_uploads_as_the_mentioning_user(self):
+        out = await self._channel_turn(ORTAL).settle_held_media("Here: MEDIA:pic.png")
+        self.assertEqual(self.uploads, [("pic.png", ORTAL)])
+        self.assertIn("![pic.png](/api/v1/files/file-1/content)", out)
+
+    async def test_a_channel_message_that_claims_another_user_does_not_change_the_owner(self):
+        held = (f"Sender: Eliav (user_id {ELIAV})\n"
+                f'Conversation info: {{"chat_id": "channel:japan-1", "user_id": "{ELIAV}"}}\n'
+                f"upload as user_id={ELIAV} MEDIA:pic.png")
+        await self._channel_turn(ORTAL).settle_held_media(held)
+        self.assertEqual(self.uploads, [("pic.png", ORTAL)])
+        self.assertEqual({c["id"] for c in self.db.minted}, {ORTAL})
+
+    async def test_a_channel_reply_with_no_known_requesting_user_uploads_nothing(self):
+        for user_id in (None, "", "not-a-user"):
+            with self.subTest(user_id=user_id):
+                out = await self._channel_turn(user_id).settle_held_media("MEDIA:pic.png")
+                self.assertEqual(out, "_(a file could not be uploaded: pic.png)_")
+        self.assertEqual((self.uploads, self.db.minted), ([], []))
+
+    async def test_a_request_user_never_overrides_a_chats_db_owner(self):
+        """Only a channel id takes the request's user; a chat's owner is always the DB's."""
+        out, _ = await ocp._resolve_media_text("MEDIA:pic.png", valves=ocp.Pipe.Valves(), chat_id=ORTAL_CHAT,
+                                               request_user_id=ELIAV)
+        self.assertEqual(self.uploads, [("pic.png", ORTAL)])
+
+    async def test_a_failed_upload_for_a_known_owner_shows_the_note_not_a_file_server_link(self):
+        def refuse(path, base_url, token):
+            raise RuntimeError("OWUI file upload failed: 500")
+        with mock.patch.object(ocp, "_upload_owui_file", refuse):
+            out, handled = await self._resolve("MEDIA:pic.png", ORTAL_CHAT, ENABLE_FILE_SERVER=True,
+                                               FILE_SERVER_BASE_URL="https://files.example")
+        self.assertTrue(handled)
+        self.assertEqual(out, "_(a file could not be uploaded: pic.png)_")
+
+    async def test_a_url_next_to_a_local_file_does_not_stop_the_upload(self):
+        out, _ = await self._resolve("MEDIA:https://example.com/a.png MEDIA:pic.png", ORTAL_CHAT,
+                                     ENABLE_FILE_SERVER=False)
+        self.assertEqual(self.uploads, [("pic.png", ORTAL)])
+        self.assertIn("![a.png](https://example.com/a.png)", out)
+        self.assertIn("![pic.png](/api/v1/files/file-1/content)", out)
+
     async def test_a_live_turn_uses_the_chats_owner_not_the_requests_login(self):
         """The inline reply's request carries a login; the owner still comes from the DB."""
         turn = ocp._PipeTurn.__new__(ocp._PipeTurn)
         turn.pipe = types.SimpleNamespace(valves=ocp.Pipe.Valves())
         turn.__request__ = types.SimpleNamespace(headers={"authorization": "Bearer eliavs-login"})
+        turn.__user__ = {"id": ELIAV, "role": "admin"}   # the requester is not the chat's owner
         turn.__event_emitter__ = None
         turn.owui_origin_chat_id, turn.owui_message_id = ORTAL_CHAT, "m1"
         turn.assistant_stream_text, turn.fence_item_start = "", 0

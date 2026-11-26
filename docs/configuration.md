@@ -52,13 +52,13 @@ Which OpenClaw agent handles these chats. Leave as 'main' unless your Gateway de
 
 Type: `bool`. Default: `True`.
 
-Start a small HTTP server on port 18791 to serve agent-generated images and files. Only used as a fallback when USE_OWUI_FILES is off or an upload fails. Note it is unauthenticated -- leave off if port 18791 is exposed. With it off, a file that cannot be uploaded shows as an error in the reply, not as a link that never loads. Turning it off closes the port at the next model list or message, no Open WebUI restart needed.
+Start a small HTTP server on port 18791 to serve agent-generated images and files. Only used when USE_OWUI_FILES is off; a failed upload is never sent here. Note it is unauthenticated -- leave off if port 18791 is exposed. Turning it off closes the port at the next model list or message, no Open WebUI restart needed.
 
 ### USE_OWUI_FILES
 
 Type: `bool`. Default: `True`.
 
-Recommended. Upload agent-generated images and files through Open WebUI's own Files API so they attach natively and work over HTTPS. Falls back to the file server if it fails.
+Recommended. Upload agent-generated images and files through Open WebUI's own Files API so they attach natively and work over HTTPS. Each file is stored as the chat owner's (a channel reply's: the mentioning user's). A file that cannot be uploaded shows as an error in the reply, never as a file-server link.
 
 ### SEND_STOP_ON_CANCEL
 
@@ -88,7 +88,7 @@ Open WebUI's own base URL, resolved by the Open WebUI backend itself and not by 
 
 Type: `str`. Default: `http://localhost:18791`.
 
-Legacy fallback only: base URL of the built-in media file server, used when USE_OWUI_FILES is off or an upload fails. The browser resolves this URL, not OWUI, so the default only works when you browse OWUI from the same host. Point it at an address your browser can reach if you depend on this fallback.
+Base URL of the built-in media file server, used only when USE_OWUI_FILES is off. The browser resolves this URL, not OWUI, so the default only works when you browse OWUI from the same host. Point it at an address your browser can reach if you turn uploads off.
 
 ### DEFAULT_MODEL
 

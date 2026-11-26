@@ -42,6 +42,7 @@ Without owner rights is not a sandbox: the agent can still run commands and read
 
 ## Privacy
 
+- **Files the agent sends.** A `MEDIA:` file in a channel reply is uploaded as the user who mentioned the agent, the account Open WebUI signed in for that request after it checked their channel membership; a name in the message never decides it. See [Images and files from the agent](./chat.md#images-and-files-from-the-agent).
 - **One agent.** Channel threads run on the Pipe's [`AGENT_ID`](../configuration.md#agent_id), the same agent as your chats. OpenClaw starts each of its sessions with that agent's workspace files, so a channel's turns can see the agent's private memory (for example `MEMORY.md`) and may quote it to everyone in the channel.
 - **A thread is shared.** Everything the agent says in a thread, and everything it was told there, is visible to everyone who can read the thread.
 - **The utility model sees the thread.** The relevance question sends the thread's last 12 messages and the new ones (at most 15,000 characters, names and user ids included) to the model your Gateway uses as its utility model, which may be another provider than your agent's.

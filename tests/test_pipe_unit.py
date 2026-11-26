@@ -5440,9 +5440,16 @@ class MediaWithoutFileServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "here _(a file could not be uploaded: chart.png)_\nnow")
         self.assertNotIn("https://x", result)
 
-    async def test_a_failed_upload_with_the_file_server_on_still_links_to_it(self):
+    async def test_a_failed_upload_with_the_file_server_on_is_an_error_too(self):
+        """ELI-540: a failed upload never becomes a file-server link; only USE_OWUI_FILES off uses the server."""
         result, handled = await self._resolve(
             "MEDIA:chart.png", ENABLE_FILE_SERVER=True, FILE_SERVER_BASE_URL="https://x")
+        self.assertTrue(handled)
+        self.assertEqual(result, "_(a file could not be uploaded: chart.png)_")
+
+    async def test_with_uploads_off_the_file_server_on_links_to_it(self):
+        result, handled = await self._resolve(
+            "MEDIA:chart.png", USE_OWUI_FILES=False, ENABLE_FILE_SERVER=True, FILE_SERVER_BASE_URL="https://x")
         self.assertTrue(handled)
         self.assertEqual(result, "![chart.png](https://x/chart.png)")
 
@@ -14568,7 +14575,8 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
     PROMPT = "OpenClaw needs input: Which branch?\n1. main\n2. dev"
     # The documented form, marker on its own line (ELI-151).
     PROMPT_OWN_LINE = "OpenClaw needs input:\nWhich branch?\n1. main\n2. dev"
-    IMG = "![chart.png](http://localhost:18791/chart.png)"
+    # The file is not in the media dir, so it is not uploaded: both sides show the note (ELI-540: never a file-server link).
+    IMG = "_(a file could not be uploaded: chart.png)_"
 
     async def asyncSetUp(self):
         await self.asyncSetUp_inline()
