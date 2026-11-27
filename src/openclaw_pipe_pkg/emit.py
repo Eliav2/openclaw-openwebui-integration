@@ -237,7 +237,7 @@ def _window_reset_line(w: dict) -> str | None:
 
 
 async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
-                                    run_usage: dict | None = None) -> list[str]:
+                                    run_usage: dict | None = None, with_context: bool = True) -> list[str]:
     """Best-effort final status lines: context fill with the primary window,
     a reset line per window, and the goal. One fact per line, since OWUI clamps
     each status row to one line; the thin line goes last since OWUI shows only
@@ -245,6 +245,8 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
 
     `run_usage`: the run's own usage gives the context fill, since OpenClaw
     2026.10 writes a first reply's totals to the row only after the run (ELI-177).
+    `with_context` False: no context fill, for a reply the run goes on past (a message steered into
+    it): the row's totals, which 2026.11.10 keeps current mid-run, are the run's end to show (ELI-537).
 
     The context and rate-limit lines are for owner users only (`_sender_is_owner`,
     the check that picks the restricted connection): to anyone else they are
@@ -272,7 +274,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
         provider = session_row.get("modelProvider")
         context_tokens = session_row.get("contextTokens")
         total_tokens = _usage_prompt_tokens(run_usage) or session_row.get("totalTokens")
-        if context_tokens and total_tokens is not None:
+        if with_context and context_tokens and total_tokens is not None:
             pct = round(total_tokens / context_tokens * 100, 1)
             context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"
         goal = session_row.get("goal")

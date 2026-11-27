@@ -439,23 +439,40 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
+def resumes_a_restart_run(version) -> bool:
+    """True for a Gateway that continues the run a restart or crash cut by a startup resume input: its own
+    run, with no user turn of its own in `chat.history` (the input is hidden), started within seconds of
+    the boot (2026.11.10-beta.1+: "Root session left unfinished in a pending crash-recovery interval
+    receives the same single resume input", docs/gateway/restart-recovery.md). Unknown versions count as older."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= RESTART_RESUME_FROM
+
+
+RESTART_RESUME_FROM = (2026, 11, 10)
+
+
 def resumes_a_crash(version) -> bool:
-    """True for a Gateway that continues a run its crash cut (2026.11.3 and older). From 2026.11.5 only
-    a graceful restart writes a resume marker, so a crash leaves an idle session with no status and
-    nothing coming (docs/gateway/restart-recovery.md). Unknown versions count as older."""
+    """True for a Gateway whose startup recovery continues a run its crash cut as a run with a user turn naming
+    it (rule E): 2026.11.3 and older. From 2026.11.5 only a graceful restart writes a resume marker, so a
+    crash leaves an idle session with no status and nothing coming (docs/gateway/restart-recovery.md); from
+    2026.11.10 a crash is resumed again, but by a hidden input (`resumes_a_restart_run`, rule F) and only for a
+    run the boot ledger records, so the message waits a grace for it. Unknown versions count as older."""
     return not hides_cron_run_output(version)
 
 
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
-                      after_restart: bool = False) -> str:
+                      after_restart: bool = False, restart_resume: bool = False) -> str:
     """`gateway`, `wait`, `resume` or `finalize` for M's writer when its run settles.
     A resume into a busy session fails after a restart recovery (M3-crash
     04351f67), so it is never sent then. MAX_TURN_RESUMES stops an OOM loop.
-    `after_restart`: the idle no-status row is not a settle yet."""
+    `after_restart`: the idle no-status row is not a settle yet. `restart_resume` (2026.11.10+, rule F): nor is
+    the `killed` row a crash leaves, until the Gateway's startup resume or the grace has said otherwise."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
+        return "gateway"
+    if after_restart and restart_resume and not (row or {}).get("hasActiveRun") and (row or {}).get("status") == "killed":
         return "gateway"
     if (row or {}).get("hasActiveRun"):
         return "wait"
@@ -493,9 +510,24 @@ def recovery_source_run(messages: list, run_id: str) -> str | None:
     return None
 
 
-def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list | None = None) -> str | None:
-    """The message `run_id` writes into: its source run's for a recovery (rule E)."""
-    source = recovery_source_run(messages, run_id) if messages else None
+def resumed_source_run(messages: list, run_id: str, open_runs) -> str | None:
+    """Rule F (2026.11.10+): the run a startup resume continues. The resume input is hidden from `chat.history`
+    and the run is its own, so `run_id` has no user turn there; it continues the run whose turn is the newest
+    admitted one, if a message of that run was kept open for the Gateway's recovery (`open_runs`).
+    Anything newer from the user, or a run with a turn of its own, is not a resume. Else None."""
+    turns = _history_user_turns(messages)
+    if not turns or any(run == run_id for run, _tool in turns):
+        return None
+    newest = turns[-1][0]
+    return newest if newest in open_runs else None
+
+
+def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list | None = None,
+                   open_runs=()) -> str | None:
+    """The message `run_id` writes into: its source run's for a recovery (rule E) or a startup resume of a
+    run whose message is still open (rule F, `open_runs`)."""
+    source = (recovery_source_run(messages, run_id) or resumed_source_run(messages, run_id, open_runs)
+              if messages else None)
     return turn_message_id(session_key, source or run_id, chat_id)
 
 

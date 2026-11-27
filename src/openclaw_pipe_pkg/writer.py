@@ -322,6 +322,11 @@ def _owui_request_task(task_id: str | None):
 # about to recover, so the message waits this long for a recovery run before it ends as cut off.
 GATEWAY_RECOVERY_GRACE_S = 90
 
+# 2026.11.10+ resumes a run its restart cut by an input hidden from chat.history, so that run has no user turn
+# to name its source (rule F): it is taken for the kept-open message's after this long without one (rule E's
+# own turn commits about 0.7 s after the first event).
+RESUME_TURN_WAIT_S = 4.0
+
 
 def _run_prompt_text(span: list | None) -> str:
     """The needs-input prompt a run's text ends with, or ""."""
@@ -1467,11 +1472,13 @@ class _TurnWriter:
         return True
 
     async def _persist_final(self, output: list, text: str, stopped: bool,
-                             run_usage: dict | None = None, said: bool = False) -> tuple[list, list, bool]:
+                             run_usage: dict | None = None, said: bool = False,
+                             with_context: bool = True) -> tuple[list, list, bool]:
         """M's `done: true` write with its final status lines (ELI-210), after
         the handed-over request ends. Returns M's whole status history, the new
         lines and whether the row reads back finished. `run_usage`: for a row
-        with no totals (ELI-177). `said`: M's text ends with the Pipe's "Stopped." note."""
+        with no totals (ELI-177). `said`: M's text ends with the Pipe's "Stopped." note.
+        `with_context` False: no context fill line (a steered reply: the run goes on)."""
         from open_webui.models.chats import Chats
 
         if self.request_task is not None and not self.request_task.done():
@@ -1481,7 +1488,7 @@ class _TurnWriter:
                          f"request still running after {FINAL_STATUS_REQUEST_WAIT_S} s; "
                          f"its own status write may land after this one")
         lines = [] if stopped else await _build_usage_status_lines(
-            self.conn, self.session_key, run_usage=run_usage)
+            self.conn, self.session_key, run_usage=run_usage, with_context=with_context)
         async with self.conn._chat_write_lock(self.chat_id):
             try:
                 saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
@@ -1546,7 +1553,8 @@ class _TurnWriter:
         """The run settled (DESIGN 2.5, 2.7): keep M open, resume, or finalize."""
         if self.closed:
             return
-        decision = next_continuation(row, stop_notice_before, self.resumes, after_restart)
+        decision = next_continuation(row, stop_notice_before, self.resumes, after_restart,
+                                    resumes_a_restart_run(self.conn.gateway_version))
         if decision in ("gateway", "wait"):
             # A recovery the Gateway gives up on tombstones the row to failed
             # (main-session-restart-recovery-CPJjd8da.mjs:1150).
@@ -1839,8 +1847,9 @@ class _TurnWriter:
                 output.append(_turn_note_item(note))
             run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
                              None) if hist else None
-            history, status, saved = await self._persist_final(output, text, stopped, run_usage,
-                                                                   said=said_stopped)
+            history, status, saved = await self._persist_final(
+                output, text, stopped, run_usage, said=said_stopped,
+                with_context=not (steered or self.steered_into))
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
@@ -2476,12 +2485,24 @@ def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
             pump.queue.put_nowait((_PUMP_SETTLED, None))
 
 
+def _runs_kept_open(conn: "_GatewayConnection", sess: str) -> set:
+    """The runs of the session's messages kept open for the Gateway's recovery: what a startup resume
+    (rule F, 2026.11.10+) may continue. None before that, whose recovery run names its source (rule E)."""
+    if not resumes_a_restart_run(conn.gateway_version):
+        return set()
+    return {r for w in list(conn._turn_writers.values())
+            if w.session_key == sess and not w.closed and w.awaiting_row for r in (*w.runs, w.run_id)}
+
+
 async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
                                pump: _RunPump) -> None:
     """Rule E needs a recovery run's `:user` turn, which 2026.10 commits about
-    0.7 s after the first event: wait for the next append or the run's end."""
+    0.7 s after the first event: wait for the next append or the run's end. A startup resume (rule F,
+    2026.11.10+) never has one: the run with no turn after RESUME_TURN_WAIT_S that continues a kept-open
+    message is that message's."""
     if parse_pipe_run_id(run) is not None:
         return
+    deadline = time.monotonic() + RESUME_TURN_WAIT_S
     while not pump.terminal.is_set():
         if not any(w.session_key == sess and not w.closed and (w.awaiting_row or w.takeover)
                    for w in list(conn._turn_writers.values())):
@@ -2494,9 +2515,13 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
             return
         if any(r == run for r, _tool in _history_user_turns(messages)):
             return
+        left = deadline - time.monotonic()
+        if left <= 0 and resumed_source_run(messages, run, _runs_kept_open(conn, sess)):
+            pipe_log(f"  run {run[:24]}... has no user turn: the Gateway's startup resume of a kept-open message")
+            return
         waits = [asyncio.ensure_future(appended.wait()), asyncio.ensure_future(pump.terminal.wait())]
         try:
-            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(waits, timeout=max(left, 1.0), return_when=asyncio.FIRST_COMPLETED)
         finally:
             for w in waits:
                 w.cancel()
@@ -2517,7 +2542,7 @@ async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id):
             messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for rule E failed: {ex!r}")
-    mid = run_message_id(sess, chat_id, run, messages)
+    mid = run_message_id(sess, chat_id, run, messages, _runs_kept_open(conn, sess))
     if mid is None:
         return None
     writer = conn._turn_writers.get((chat_id, mid))
@@ -2725,8 +2750,9 @@ async def _give_up_on_recovery(pump: "_RunPump") -> None:
 
 
 def _arm_recovery_grace(conn: "_GatewayConnection", pump: _RunPump) -> None:
-    """Once per pump: the Gateway that restarted does not continue a crash (2026.11.5+), and it may push
-    no row for the session either, so a reply left open waits only the grace for a recovery run."""
+    """Once per pump: the Gateway that restarted does not continue a crash (2026.11.5 - 2026.11.9), or only the
+    runs its boot ledger records (2026.11.10+, rule F), and it may push no row for the session either, so a
+    reply left open waits only the grace for a recovery run."""
     if pump.grace_armed or pump.wake or resumes_a_crash(conn.gateway_version):
         return
     pump.grace_armed = True

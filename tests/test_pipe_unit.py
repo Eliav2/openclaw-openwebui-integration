@@ -45,6 +45,7 @@ from openclaw_pipe import (
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
+    resumed_source_run, resumes_a_crash, resumes_a_restart_run, _runs_kept_open, _turn_writer_for_locked,
     _turn_route_now, _turn_after_hello, _turn_resync, _history_span_messages, _turn_settled,
     _transcript_commit_order,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
@@ -5593,6 +5594,20 @@ class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
         lines = await _build_usage_status_lines(conn, "agent:main:x")
         self.assertEqual(lines, ["🧠 115k/1.0m (11.5%) · ⏱ 5h 76% left"])
 
+    async def test_a_reply_the_run_goes_on_past_gets_no_context_fill(self):
+        """ELI-537: 2026.11.10 keeps the row's totals current mid-run, so a reply a message was steered
+        past showed 28k of its run's total, and the answer the run's own: the fill is the end's to show."""
+        conn = self._conn(
+            describe_result={"session": {"contextTokens": 200_000, "totalTokens": 28_000,
+                                         "modelProvider": "anthropic"}},
+            usage_result={"providers": [{"provider": "anthropic",
+                                         "windows": [{"label": "5h", "usedPercent": 24}]}]},
+        )
+        self.assertEqual(await _build_usage_status_lines(conn, "agent:main:x"),
+                         ["🧠 28k/200k (14%) · ⏱ 5h 76% left"])
+        self.assertEqual(await _build_usage_status_lines(conn, "agent:main:x", with_context=False),
+                         ["⏱ 5h 76% left"])
+
     async def test_windows_with_reset_time_get_their_own_detail_line(self):
         now_ms = time.time() * 1000
         conn = self._conn(
@@ -8673,6 +8688,64 @@ class RecoveryLinkTests(unittest.TestCase):
         self.assertNotEqual(run_message_id(self.KEY, self.CHAT, f, self.history()), self.M)
 
 
+class RestartResumeLinkTests(unittest.TestCase):
+    """ELI-537, rule F: from 2026.11.10-beta.1 the Gateway continues a run its restart or crash cut by a
+    resume input hidden from `chat.history`, as a run of its own with no user turn there. The pipe took it
+    for a new turn and wrote it into a second message (e2e: test_a_guest_run_continued_after_a_gateway_crash)."""
+
+    CHAT = RecoveryLinkTests.CHAT
+    M = RecoveryLinkTests.M
+    KEY = RecoveryLinkTests.KEY
+    SRC = RecoveryLinkTests.SRC
+    RESUME = "e020580c-d850-4451-864a-b1a8bcde2e87"
+    user = staticmethod(RecoveryLinkTests.user)
+
+    def test_a_run_with_no_turn_continues_the_newest_turn_kept_open(self):
+        msgs = [self.user(self.SRC)]
+        self.assertEqual(resumed_source_run(msgs, self.RESUME, {self.SRC}), self.SRC)
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, self.RESUME, msgs, {self.SRC}), self.M)
+
+    def test_nothing_kept_open_means_a_message_of_its_own(self):
+        msgs = [self.user(self.SRC)]
+        self.assertIsNone(resumed_source_run(msgs, self.RESUME, set()))
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, self.RESUME, msgs),
+                         turn_message_id(self.KEY, self.RESUME, self.CHAT))
+
+    def test_a_newer_user_turn_is_not_the_cut_runs_to_continue(self):
+        msgs = [self.user(self.SRC), self.user("04351f67-dbc3-4533-b2aa-2a0d88d79da0")]
+        self.assertIsNone(resumed_source_run(msgs, self.RESUME, {self.SRC}))
+
+    def test_a_run_with_a_turn_of_its_own_is_not_a_resume(self):
+        msgs = [self.user(self.SRC), self.user(self.RESUME)]
+        self.assertIsNone(resumed_source_run(msgs, self.RESUME, {self.SRC}))
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, self.RESUME, msgs, {self.SRC}),
+                         turn_message_id(self.KEY, self.RESUME, self.CHAT))
+
+    def test_rule_e_still_wins_for_a_recovery_with_a_turn(self):
+        rec = "f2445aa8-aeda-47d8-af7b-cf853aae34e6"
+        msgs = [self.user(self.SRC), self.user(rec, "main_session_restart_recovery")]
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, rec, msgs, {self.SRC}), self.M)
+
+    def test_which_gateways_continue_a_cut_run(self):
+        for version, rule_f, rule_e in (
+                ("2026.11.3", False, True), ("2026.11.5", False, False), ("2026.11.9", False, False),
+                ("2026.11.10-beta.1", True, False), ("2026.11.10", True, False), ("2026.11.11", True, False),
+                ("2026.12.1", True, False), (None, False, True)):
+            with self.subTest(version):
+                self.assertEqual((resumes_a_restart_run(version), resumes_a_crash(version)), (rule_f, rule_e))
+
+    def test_the_killed_row_a_crash_leaves_is_no_settle_while_a_startup_resume_may_come(self):
+        """2026.11.10 reads `killed` after a SIGKILL, with no lastRunError: the writer finalized M at once, so
+        the resumed run found no message to join."""
+        row = {"status": "killed", "hasActiveRun": False, "lastRunId": self.SRC}
+        self.assertEqual(next_continuation(row, False, 0, after_restart=True, restart_resume=True), "gateway")
+        self.assertEqual(next_continuation(row, False, 0, after_restart=True), "finalize")
+        self.assertEqual(next_continuation(row, False, 0, restart_resume=True), "finalize",
+                         "a kill with no restart behind it is the run's end")
+        self.assertEqual(next_continuation({**row, "hasActiveRun": True}, False, 0, after_restart=True,
+                                           restart_resume=True), "wait")
+
+
 def _owui_output_text(output) -> str:
     """Open WebUI 0.12's `get_output_text` (utils/misc.py): message texts, one per line."""
     texts = []
@@ -8867,6 +8940,43 @@ class _TurnWriterCase(unittest.IsolatedAsyncioTestCase):
     def writer(self, run="agent-run-1", message_id="m1"):
         return _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT,
                            user_id=self.USER, run_id=run, message_id=message_id)
+
+
+class RestartResumeWriterTests(_TurnWriterCase):
+    """Rule F at the writer: the resumed run's events go into the message kept open for the Gateway."""
+
+    CHAT = "24c342e4-50fa-442e-9b93-c215ed135f3a"
+    KEY = f"agent:main:openwebui-u1-{CHAT}"
+    MID = "8acdce95-1111-4222-8333-444455556666"
+    RUN = f"msg-{CHAT}-{MID}-1.0"
+    RESUME = "e020580c-d850-4451-864a-b1a8bcde2e87"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.history = {"messages": [RecoveryLinkTests.user(self.RUN)]}
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                return copy.deepcopy(self.history)
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+        self.kept = self.writer(run=self.RUN, message_id=self.MID)
+        self.kept.awaiting_row = True
+        self.conn._turn_writers[(self.CHAT, self.MID)] = self.kept
+
+    async def test_the_resumed_run_is_the_kept_open_messages_writer(self):
+        self.conn.gateway_version = "2026.11.10"
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT)
+        self.assertIs(got, self.kept)
+        self.assertEqual((self.kept.run_id, self.kept.runs), (self.RESUME, [self.RUN, self.RESUME]))
+        self.assertFalse(self.kept.awaiting_row, "the resume took M over")
+
+    async def test_an_older_gateway_gives_the_run_a_message_of_its_own(self):
+        self.conn.gateway_version = "2026.11.9"
+        self.assertEqual(_runs_kept_open(self.conn, self.KEY), set())
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT)
+        self.assertIsNot(got, self.kept)
+        self.assertEqual(got.message_id, turn_message_id(self.KEY, self.RESUME, self.CHAT))
 
 
 class TurnWriterOpenTests(_TurnWriterCase):
@@ -10576,6 +10686,22 @@ class TurnWriterEndTests(_TurnWriterCase):
         await self.cancel_from_the_page(w, None)
         self.assertNotIn("chat.abort", [m for m, _ in self.sent])
         self.assertFalse(w.closed)
+
+    async def finalize_with_usage_lines(self, steered):
+        lines = mock.AsyncMock(return_value=[])
+        self.history = {"messages": []}
+        w = await self.opened_writer()
+        with mock.patch.object(openclaw_pipe, "_build_usage_status_lines", lines):
+            await w.finalize(steered=steered)
+        return lines.await_args.kwargs["with_context"]
+
+    async def test_a_steered_reply_ends_without_the_context_fill_the_answer_shows(self):
+        """ELI-537: M's message was steered past (`finalize(steered=True)`): the run goes on under the next
+        message and ends there, so the usage line is that answer's alone."""
+        self.assertIs(await self.finalize_with_usage_lines(True), False)
+
+    async def test_a_reply_that_ends_plainly_keeps_its_context_fill(self):
+        self.assertIs(await self.finalize_with_usage_lines(False), True)
 
     async def test_a_silent_run_with_tools_keeps_its_cards_and_no_sentinel(self):
         self.history = {"messages": []}
