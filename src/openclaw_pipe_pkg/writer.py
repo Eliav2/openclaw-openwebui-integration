@@ -22,6 +22,13 @@ CRON_RESULT_WAIT_S = 120
 OPEN_AT_END_LOCKED_TRIES = 6
 # M's final write waits this long for the handed-over request to end.
 FINAL_STATUS_REQUEST_WAIT_S = 30
+# A finished reply is sent once more this long after its end, for a tab that
+# was loading the chat then. Open WebUI 0.13.5 joins a loading tab to the
+# chat's room only once its load is answered (about 0.3 s on an idle server),
+# so a tab whose load read the chat before the final save misses the end and
+# keeps the reply running. A few times that span covers a busy server or a
+# phone; the repeat changes nothing in a tab that already has the end.
+FINAL_RESEND_DELAY_S = 2.0
 # A cancel's tail on a reply's status lines: "Stopped" from `park` (in any
 # UI language), then the empty closing line.
 _CANCEL_STATUS_TAIL = (*ui_texts("stopped"), "")
@@ -833,6 +840,15 @@ async def _log_remote_reply_requests(conn: "_GatewayConnection", session_key: st
                  "in another Open WebUI worker (one worker per Pipe process only)")
 
 
+async def _owui_chat_has_task(chat_id: str) -> bool:
+    """True while Open WebUI lists a task for `chat_id`, or when unsure."""
+    try:
+        from open_webui.tasks import list_task_ids_by_item_id
+        return bool(await list_task_ids_by_item_id(_owui_redis(), chat_id))
+    except Exception:
+        return True
+
+
 async def _settle_waits(conn: "_GatewayConnection", refs: list) -> None:
     """Until no one still saves a reply of `refs`: a turn writer (also while it
     finalizes), or an Open WebUI request in its chat, which saves at its end."""
@@ -1159,6 +1175,7 @@ class _TurnWriter:
         self.steered_into: str | None = None
         # A later run works: M's end leaves the active state to its reply.
         self.newer_run = False
+        self._final_resend: asyncio.Future | None = None   # the end's one repeat
         self.sent_output: list = []     # the `output` open tabs hold
         self.sent_text = ""
         # A handover owes M one write after the request's `done: true` save,
@@ -1523,6 +1540,31 @@ class _TurnWriter:
             return False
         return True
 
+    async def _resend_final(self, text: str, output: list, status_history: list) -> None:
+        """Send M finished and the chat idle once more, FINAL_RESEND_DELAY_S
+        after the end, to a tab that joined the chat's room since. Not when
+        the chat runs something newer: its tab must keep that running."""
+        await asyncio.sleep(FINAL_RESEND_DELAY_S)
+        others = [w for w in self.conn._turn_writers.values() if w is not self and w.chat_id == self.chat_id]
+        busy = ("a newer run" if self.newer_run else "another writer" if others
+                else "an Open WebUI task" if await _owui_chat_has_task(self.chat_id) else None)
+        if busy:
+            pipe_log(f"  turn writer: {self.message_id[:8]}...'s end not repeated: the chat has {busy}")
+            return
+        message = {**self._claim["messages"][self.message_id],
+                   "content": text, "output": output, "done": True, "statusHistory": status_history}
+        try:
+            # Idle first: a late tab holds the load's task ids, and while it does it
+            # keeps its own copy of a reply over a pushed one (0.13.5 mergeChatMessages).
+            emit = await self._emitter()
+            await emit({"type": "chat:active", "data": {"active": False}})
+            # No parent link and no view: a repeat moves nobody's view.
+            await _introduce_turn_message(self.chat_id, self.user_id, {self.message_id: message},
+                                          None, self.message_id)
+            pipe_log(f"  turn writer: {self.message_id[:8]}...'s end repeated for tabs that joined since")
+        except Exception as ex:
+            pipe_log(f"  turn writer: repeating the end of {self.message_id[:8]}... failed: {ex!r}")
+
     def adopt(self, run_id: str) -> None:
         """Write a run that continues M (resume or recovery) into M."""
         self.awaiting_row = False       # the recovery took M over
@@ -1873,6 +1915,8 @@ class _TurnWriter:
                 await emit({"type": "chat:completion", "data": data})
             if not self.newer_run:
                 await emit({"type": "chat:active", "data": {"active": False}})
+                if pushed:
+                    self._final_resend = asyncio.ensure_future(self._resend_final(text, output, history))
             tools = sum(1 for i in output if i.get("type") == "function_call")
             pipe_log(f"  turn writer: finalized {self.message_id[:8]}... ({len(text)} chars, "
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
