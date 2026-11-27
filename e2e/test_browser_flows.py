@@ -741,8 +741,11 @@ def _both_answered(page, token: str, run: str, answer: str) -> None:
     same after a reload. Open WebUI draws the running reply finished as soon
     as the new message goes in, while it is still being written, so it is
     judged once the new message's answer, which waits for the run, is done.
-    The reload waits for the reply's save (`_saved_whole`)."""
-    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    The reload waits for the reply's save (`_saved_whole`). The answer's own
+    text says it is there: Open WebUI 0.13.5 loads the chat again when the
+    held message goes in (#35027), and that load draws the placeholder done."""
+    _wait(page, _reply_js(-1, f"all.length === 2 && all[0].done && r.done && r.text.includes({json.dumps(answer)})"),
+          "both replies done")
     first, second = _replies(page)
     assert first["text"].count(run) == 1, f"the running reply was cut or doubled: {first['text'][-120:]!r}"
     assert answer in second["text"] and "slow-" not in second["text"], second["text"]
@@ -1161,7 +1164,9 @@ def test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped(page,
     finally:
         open(hold, "w").close()
         capture.pipe_valves(token, **old)
-    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    # By the correction's text, not done alone: 0.13.5 draws its placeholder done (see _both_answered).
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done && r.text.includes('BROWSER_CORRECTION')"),
+          "both replies done")
     first, second = _replies(page)
     # The correction's own answer, on any Gateway: it went to the agent, not just under the run.
     assert "BROWSER_CORRECTION" in second["text"], second["text"]
