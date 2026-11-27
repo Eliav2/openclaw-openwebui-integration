@@ -9219,6 +9219,40 @@ class RestartResumeWriterTests(_TurnWriterCase):
         self.assertTrue(self.kept.awaiting_row)
         self.assertEqual(_runs_kept_open(self.conn, self.KEY), {self.RUN})
 
+    async def resume_before_any_marking(self, version, restarts_before, restarts=1):
+        """The resume's first event arrives before the hello's snapshot or a settle row marked M's writer:
+        `_await_recovery_turn`'s verdict and the writer `_turn_writer_for_locked` then gives the run."""
+        self.conn.gateway_version, self.conn.gateway_restarts = version, restarts
+        self.kept.awaiting_row = False
+        self.conn._turn_pumps = {(self.KEY, self.RUN): self.pump_of(self.kept, restarts_before)}
+        self.history_of(0)
+        self.conn.session_message_event = lambda sess: asyncio.Event()
+        pump = types.SimpleNamespace(terminal=asyncio.Event())
+        with mock.patch.object(openclaw_pipe, "RESUME_TURN_WAIT_S", 0):
+            resumed = await asyncio.wait_for(_await_recovery_turn(self.conn, self.KEY, self.RESUME, pump), 5)
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, resumed)
+        return resumed, got
+
+    async def test_a_resume_that_beats_the_marking_joins_the_cut_reply(self):
+        """CI on #436 (guest crash, 11.10): the resume's first event came before the cut reply's writer was
+        marked, so the run was opened as a message of its own."""
+        resumed, got = await self.resume_before_any_marking("2026.11.10", restarts_before=0)
+        self.assertTrue(resumed)
+        self.assertIs(got, self.kept)
+
+    async def test_a_run_with_no_restart_since_the_replys_hand_over_is_not_its_resume(self):
+        resumed, got = await self.resume_before_any_marking("2026.11.10", restarts_before=1)
+        self.assertFalse(resumed)
+        self.assertIsNot(got, self.kept)
+
+    async def test_before_2026_11_10_nothing_marks_a_cut_reply_for_a_run_with_no_turn(self):
+        for version in ("2026.11.5", "2026.11.9"):
+            with self.subTest(version):
+                resumed, got = await self.resume_before_any_marking(version, restarts_before=0)
+                self.assertFalse(resumed)
+                self.assertFalse(self.kept.awaiting_row)
+                self.assertIsNot(got, self.kept)
+
     async def test_a_writers_own_live_run_is_not_a_cut_reply(self):
         self.conn.gateway_version = "2026.11.10"
         self.kept.awaiting_row = False

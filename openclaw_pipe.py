@@ -12383,6 +12383,8 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
     if parse_pipe_run_id(run) is not None:
         return False
     rule_f = resumes_a_restart_run(conn.gateway_version)
+    if rule_f:
+        _keep_cut_reply_open_for_run(conn, sess, run)
     deadline = time.monotonic() + RESUME_TURN_WAIT_S
     while not pump.terminal.is_set():
         if not any(w.session_key == sess and not w.closed and (w.awaiting_row or w.takeover)
@@ -12953,6 +12955,19 @@ def _keep_cut_replies_open_for_a_resume(conn: "_GatewayConnection") -> None:
         active = conn.active_run_snapshot.get(sess)
         if (active is not None and run not in active and writer is not None and not writer.closed
                 and writer.run_id == run and conn.gateway_restarts > pump.restarts_before
+                and not pump.terminal.is_set()):
+            writer.awaiting_row = True
+
+
+def _keep_cut_reply_open_for_run(conn: "_GatewayConnection", sess: str, run: str) -> None:
+    """2026.11.10+ (rule F): the resume's first event can come before the hello's snapshot or a settle row
+    marked the cut reply's writer, which would make `run` a message of its own (CI on #436: a guest crash on
+    11.10). A restart passed since that writer's run was handed over, and the run is another one's: the writer
+    waits for it; the no-turn wait and `resumed_source_run` still decide whether it is the writer's."""
+    for (other_sess, other), pump in list(conn._turn_pumps.items()):
+        writer = pump.writer
+        if (other_sess == sess and other != run and writer is not None and not writer.closed
+                and writer.run_id == other and conn.gateway_restarts > pump.restarts_before
                 and not pump.terminal.is_set()):
             writer.awaiting_row = True
 
