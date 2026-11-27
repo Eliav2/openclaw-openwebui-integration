@@ -1024,13 +1024,14 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
     A resume into a busy session fails after a restart recovery (M3-crash
     04351f67), so it is never sent then. MAX_TURN_RESUMES stops an OOM loop.
     `after_restart`: the idle no-status row is not a settle yet. `restart_resume` (2026.11.10+, rule F): nor is
-    the `killed` row a crash leaves, until the Gateway's startup resume or the grace has said otherwise."""
+    the `killed` row a crash leaves, until the Gateway's startup resume or the grace has said otherwise; a
+    stop-mode shutdown (`stop_notice_before`) was never going to be recovered, so the pipe resumes it."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
         return "gateway"
-    if (after_restart and restart_resume and not (row or {}).get("hasActiveRun")
+    if (after_restart and restart_resume and not stop_notice_before and not (row or {}).get("hasActiveRun")
             and (row or {}).get("status") == ROW_KILLED):
         return "gateway"
     if (row or {}).get("hasActiveRun"):
@@ -1073,7 +1074,10 @@ def resumed_source_run(messages: list, run_id: str, open_runs) -> str | None:
     """Rule F (2026.11.10+): the run a startup resume continues. The resume input is hidden from `chat.history`
     and the run is its own, so `run_id` has no user turn there; it continues the run whose turn is the newest
     admitted one, if a message of that run was kept open for the Gateway's recovery (`open_runs`).
-    Anything newer from the user, or a run with a turn of its own, is not a resume. Else None."""
+    Anything newer from the user, or a run with a turn of its own, is not a resume, and nor is a sub-agent's
+    announce run (it keeps its own message). Else None."""
+    if str(run_id).startswith(ANNOUNCE_RUN_PREFIX):
+        return None
     turns = _history_user_turns(messages)
     if not turns or any(run == run_id for run, _tool in turns):
         return None

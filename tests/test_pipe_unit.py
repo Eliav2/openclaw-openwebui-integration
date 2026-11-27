@@ -46,6 +46,7 @@ from openclaw_pipe import (
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     resumed_source_run, resumes_a_crash, resumes_a_restart_run, _runs_kept_open, _turn_writer_for_locked,
+    _history_to_a_user_turn, _keep_cut_replies_open_for_a_resume,
     _turn_route_now, _turn_after_hello, _turn_resync, _history_span_messages, _turn_settled,
     _transcript_commit_order,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
@@ -3978,6 +3979,24 @@ class RunMessagesTests(_TurnCase):
         _, usage = await self._turn()
         self.assertEqual(usage, self.USAGE)
         self.assertNotIn("chat.history", self.rpc)
+
+    async def test_the_inline_reply_a_message_was_steered_into_has_no_context_fill(self):
+        """CodeRabbit on #436 (outside the diff): the inline path's usage line, like the turn writer's."""
+        self._push({"role": "assistant", "content": "hi", "usage": self.USAGE, "__openclaw": {"runId": "run-1"}})
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": self.ocp._STEERED_MARKER_TYPE, "into": "run-1"})
+        out, _ = await self._collect(first, gen)
+        self.assertIn("hi", out)
+        self.assertIs(self.ocp._build_usage_status_lines.await_args.kwargs["with_context"], False)
+
+    async def test_an_ordinary_inline_reply_keeps_its_context_fill(self):
+        self._push({"role": "assistant", "content": "hi", "usage": self.USAGE, "__openclaw": {"runId": "run-1"}})
+        await self._turn()
+        self.assertIs(self.ocp._build_usage_status_lines.await_args.kwargs["with_context"], True)
 
     async def test_a_cli_reply_is_found_by_its_key(self):
         self._push({"role": "assistant", "content": "hi", "usage": self.USAGE,
@@ -8726,6 +8745,20 @@ class RestartResumeLinkTests(unittest.TestCase):
         msgs = [self.user(self.SRC), self.user(rec, "main_session_restart_recovery")]
         self.assertEqual(run_message_id(self.KEY, self.CHAT, rec, msgs, {self.SRC}), self.M)
 
+    def test_a_sub_agents_announce_run_keeps_its_own_message(self):
+        """CodeRabbit on #436: an announce run has no user turn either, so it matched the newest turn."""
+        announce = "announce:v1:agent:main:subagent:1234:run-1"
+        msgs = [self.user(self.SRC)]
+        self.assertIsNone(resumed_source_run(msgs, announce, {self.SRC}))
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, announce, msgs, {self.SRC}),
+                         turn_message_id(self.KEY, announce, self.CHAT))
+
+    def test_a_stop_mode_shutdown_stays_the_pipes_to_resume(self):
+        """CodeRabbit on #436: a stop-mode shutdown is never recovered, so the killed row it leaves is the
+        pipe's to resume, not the Gateway's to wait for."""
+        row = {"status": "killed", "hasActiveRun": False, "lastRunId": self.SRC}
+        self.assertEqual(next_continuation(row, True, 0, after_restart=True, restart_resume=True), "resume")
+
     def test_which_gateways_continue_a_cut_run(self):
         for version, rule_f, rule_e in (
                 ("2026.11.3", False, True), ("2026.11.5", False, False), ("2026.11.9", False, False),
@@ -8970,6 +9003,64 @@ class RestartResumeWriterTests(_TurnWriterCase):
         self.assertIs(got, self.kept)
         self.assertEqual((self.kept.run_id, self.kept.runs), (self.RESUME, [self.RUN, self.RESUME]))
         self.assertFalse(self.kept.awaiting_row, "the resume took M over")
+
+    def history_of(self, after_the_turn):
+        """chat.history as the Gateway answers it: the newest `limit` messages."""
+        everything = [RecoveryLinkTests.user(self.RUN),
+                      *({"role": "assistant", "content": [{"type": "toolCall"}]} for _ in range(after_the_turn))]
+
+        async def history(sess, limit, max_chars):
+            return {"messages": everything[-limit:]}
+        self.conn.session_history = history
+
+    async def test_the_interrupted_turn_is_found_under_many_tool_messages(self):
+        """CodeRabbit on #436: a run with more than 50 messages after its user turn."""
+        self.history_of(120)
+        messages = await _history_to_a_user_turn(self.conn, self.KEY)
+        self.assertEqual([r for r, _t in openclaw_pipe._history_user_turns(messages)], [self.RUN])
+
+    async def test_the_resumed_run_joins_the_message_under_many_tool_messages(self):
+        self.history_of(120)
+        self.conn.gateway_version = "2026.11.10"
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT)
+        self.assertIs(got, self.kept)
+
+    async def test_a_history_with_no_user_turn_stops_widening_at_its_end(self):
+        self.history_of(0)
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": [{"role": "assistant"}] * 3})
+        self.assertEqual(len(await _history_to_a_user_turn(self.conn, self.KEY)), 3)
+        self.assertEqual(self.conn.session_history.await_count, 1, "fewer than asked for: nothing more to read")
+
+    def pump_of(self, writer, restarts_before=0):
+        return types.SimpleNamespace(writer=writer, restarts_before=restarts_before, terminal=asyncio.Event())
+
+    async def test_a_resume_already_active_when_the_session_is_subscribed_finds_the_message(self):
+        """CodeRabbit on #436: the session is in the subscribe snapshot, so no settle row marks the cut reply's
+        writer as waiting; the hello after the restart does."""
+        self.conn.gateway_version = "2026.11.10"
+        self.kept.awaiting_row = False
+        self.conn._turn_pumps = {(self.KEY, self.RUN): self.pump_of(self.kept)}
+        self.conn.gateway_restarts = 1
+        self.conn.active_run_snapshot = {self.KEY: [self.RESUME]}
+        _keep_cut_replies_open_for_a_resume(self.conn)
+        self.assertTrue(self.kept.awaiting_row)
+        self.assertEqual(_runs_kept_open(self.conn, self.KEY), {self.RUN})
+
+    async def test_a_writers_own_live_run_is_not_a_cut_reply(self):
+        self.conn.gateway_version = "2026.11.10"
+        self.kept.awaiting_row = False
+        self.conn._turn_pumps = {(self.KEY, self.RUN): self.pump_of(self.kept)}
+        self.conn.gateway_restarts = 1
+        for snapshot, restarts_before, version in (({self.KEY: [self.RUN]}, 0, "2026.11.10"),
+                                                   ({self.KEY: [self.RESUME]}, 1, "2026.11.10"),
+                                                   ({self.KEY: [self.RESUME]}, 0, "2026.11.9"),
+                                                   ({}, 0, "2026.11.10")):
+            with self.subTest(snapshot=snapshot, restarts_before=restarts_before, version=version):
+                self.conn.active_run_snapshot = snapshot
+                self.conn.gateway_version = version
+                self.conn._turn_pumps = {(self.KEY, self.RUN): self.pump_of(self.kept, restarts_before)}
+                _keep_cut_replies_open_for_a_resume(self.conn)
+                self.assertFalse(self.kept.awaiting_row)
 
     async def test_an_older_gateway_gives_the_run_a_message_of_its_own(self):
         self.conn.gateway_version = "2026.11.9"

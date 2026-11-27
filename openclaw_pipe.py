@@ -1030,13 +1030,14 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
     A resume into a busy session fails after a restart recovery (M3-crash
     04351f67), so it is never sent then. MAX_TURN_RESUMES stops an OOM loop.
     `after_restart`: the idle no-status row is not a settle yet. `restart_resume` (2026.11.10+, rule F): nor is
-    the `killed` row a crash leaves, until the Gateway's startup resume or the grace has said otherwise."""
+    the `killed` row a crash leaves, until the Gateway's startup resume or the grace has said otherwise; a
+    stop-mode shutdown (`stop_notice_before`) was never going to be recovered, so the pipe resumes it."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
         return "gateway"
-    if (after_restart and restart_resume and not (row or {}).get("hasActiveRun")
+    if (after_restart and restart_resume and not stop_notice_before and not (row or {}).get("hasActiveRun")
             and (row or {}).get("status") == ROW_KILLED):
         return "gateway"
     if (row or {}).get("hasActiveRun"):
@@ -1079,7 +1080,10 @@ def resumed_source_run(messages: list, run_id: str, open_runs) -> str | None:
     """Rule F (2026.11.10+): the run a startup resume continues. The resume input is hidden from `chat.history`
     and the run is its own, so `run_id` has no user turn there; it continues the run whose turn is the newest
     admitted one, if a message of that run was kept open for the Gateway's recovery (`open_runs`).
-    Anything newer from the user, or a run with a turn of its own, is not a resume. Else None."""
+    Anything newer from the user, or a run with a turn of its own, is not a resume, and nor is a sub-agent's
+    announce run (it keeps its own message). Else None."""
+    if str(run_id).startswith(ANNOUNCE_RUN_PREFIX):
+        return None
     turns = _history_user_turns(messages)
     if not turns or any(run == run_id for run, _tool in turns):
         return None
@@ -10164,6 +10168,8 @@ GATEWAY_RECOVERY_GRACE_S = 90
 # to name its source (rule F): it is taken for the kept-open message's after this long without one (rule E's
 # own turn commits about 0.7 s after the first event).
 RESUME_TURN_WAIT_S = 4.0
+# The widening reads of `_history_to_a_user_turn`: messages from the end, until an admitted user turn is among them.
+TURN_HISTORY_LIMITS = (50, 200, 600)
 
 
 def _run_prompt_text(span: list | None) -> str:
@@ -12323,6 +12329,17 @@ def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
             pump.queue.put_nowait((_PUMP_SETTLED, None))
 
 
+async def _history_to_a_user_turn(conn: "_GatewayConnection", sess: str) -> list:
+    """The session's newest messages, read wider until one is an admitted user turn: a run's tool calls and
+    results can stand between the interrupted turn and the end (rule E and rule F name a run by that turn)."""
+    messages: list = []
+    for limit in TURN_HISTORY_LIMITS:
+        messages = (await conn.session_history(sess, limit=limit, max_chars=200)).get("messages") or []
+        if _history_user_turns(messages) or len(messages) < limit:
+            break
+    return messages
+
+
 def _runs_kept_open(conn: "_GatewayConnection", sess: str) -> set:
     """The runs of the session's messages kept open for the Gateway's recovery: what a startup resume
     (rule F, 2026.11.10+) may continue. None before that, whose recovery run names its source (rule E)."""
@@ -12347,7 +12364,7 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
             return
         appended = conn.session_message_event(sess)
         try:
-            messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+            messages = await _history_to_a_user_turn(conn, sess)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for run {run[:24]}... failed: {ex!r}")
             return
@@ -12377,7 +12394,7 @@ async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id):
     if parse_pipe_run_id(run) is None:
         # Rule E: only the transcript names a recovery's message.
         try:
-            messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+            messages = await _history_to_a_user_turn(conn, sess)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for rule E failed: {ex!r}")
     mid = run_message_id(sess, chat_id, run, messages, _runs_kept_open(conn, sess))
@@ -12877,8 +12894,24 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
     for pump in list(conn._turn_pumps.values()):
         if conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set():
             _arm_recovery_grace(conn, pump)
+    _keep_cut_replies_open_for_a_resume(conn)
     await _turn_resync(conn, skip=set(conn.active_run_snapshot))
     await _wake_resync(conn)
+
+
+def _keep_cut_replies_open_for_a_resume(conn: "_GatewayConnection") -> None:
+    """2026.11.10+ (rule F): the startup resume can already run when the session is subscribed again, so its
+    session is in the snapshot and no settle row reaches the cut reply's writer, which `_runs_kept_open` would
+    then not list. A restart passed, and the session's active run is not the writer's: it waits for the resume."""
+    if not resumes_a_restart_run(conn.gateway_version):
+        return
+    for (sess, run), pump in list(conn._turn_pumps.items()):
+        writer = pump.writer
+        active = conn.active_run_snapshot.get(sess)
+        if (active is not None and run not in active and writer is not None and not writer.closed
+                and writer.run_id == run and conn.gateway_restarts > pump.restarts_before
+                and not pump.terminal.is_set()):
+            writer.awaiting_row = True
 
 
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
@@ -18388,7 +18421,8 @@ class _PipeTurn:
             try:
                 if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
                     status_lines = await _build_usage_status_lines(
-                        self.conn, self.session_key, run_usage=await self.own_run_usage())
+                        self.conn, self.session_key, run_usage=await self.own_run_usage(),
+                        with_context=not self.steered_into)
             finally:
                 # A parked queue belongs to whoever claims the run.
                 if not self.turn.parked:
