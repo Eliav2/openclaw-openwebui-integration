@@ -2012,9 +2012,11 @@ class _PipeTurn:
         queued = []
         if not self.keeps_its_run and self.owui_message_id:
             queued = self.queue.take_all()
+            # The gap's queue can hold the restart marker too: the count is already past it.
+            restarted = any(m.get("type") == _RESTART_MARKER_TYPE for m in queued)
             if _hand_over_run(
                     self.conn, self.session_key, self.our_run_id,
-                    thinking=self.resolved_thinking, read_row=True,
+                    thinking=self.resolved_thinking, read_row=True, after_restart=restarted,
                     reply={"message_id": self.owui_message_id,
                            "renderer": copy.deepcopy(self.renderer),
                            "events": [m.get("payload") or {} for m in queued

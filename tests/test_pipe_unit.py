@@ -9026,7 +9026,7 @@ class RestartResumeWriterTests(_TurnWriterCase):
 
     async def test_the_resumed_run_is_the_kept_open_messages_writer(self):
         self.conn.gateway_version = "2026.11.10"
-        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, True)
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, self.RUN)
         self.assertIs(got, self.kept)
         self.assertEqual((self.kept.run_id, self.kept.runs), (self.RESUME, [self.RUN, self.RESUME]))
         self.assertFalse(self.kept.awaiting_row, "the resume took M over")
@@ -9050,7 +9050,7 @@ class RestartResumeWriterTests(_TurnWriterCase):
     async def test_the_resumed_run_joins_the_message_under_many_tool_messages(self):
         self.history_of(120)
         self.conn.gateway_version = "2026.11.10"
-        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, True)
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, self.RUN)
         self.assertIs(got, self.kept)
 
     async def test_a_history_with_no_user_turn_stops_widening_at_its_end(self):
@@ -9100,7 +9100,7 @@ class RestartResumeWriterTests(_TurnWriterCase):
                     limits, timeouts = await self.read_counts(version, after_the_turn)
                     self.assertEqual(limits, [50, 50, 50])
                     self.assertEqual(timeouts, [None, None, None], "no clock: only an append or the run's end wakes it")
-                    self.assertFalse(self.resumed, "no rule F before 2026.11.10")
+                    self.assertIsNone(self.resumed, "no rule F before 2026.11.10")
 
     async def test_from_2026_11_10_the_recovery_wait_widens_and_re_reads_on_a_clock(self):
         limits, timeouts = await self.read_counts("2026.11.10", after_the_turn=120)
@@ -9116,7 +9116,7 @@ class RestartResumeWriterTests(_TurnWriterCase):
         with mock.patch.object(openclaw_pipe, "RESUME_TURN_WAIT_S", 0):
             resumed = await asyncio.wait_for(_await_recovery_turn(self.conn, self.KEY, self.RESUME, pump), 5)
         self.assertFalse(pump.terminal.is_set(), "returned on rule F, not on the run's end")
-        self.assertTrue(resumed)
+        self.assertEqual(resumed, self.RUN)
 
     async def test_a_run_with_no_turn_is_not_mapped_before_the_wait_is_over(self):
         """CodeRabbit on #436: rule F's mapping stays behind RESUME_TURN_WAIT_S, so a turn that commits
@@ -9147,23 +9147,31 @@ class RestartResumeWriterTests(_TurnWriterCase):
         async def history(sess, limit, max_chars):
             return {"messages": [RecoveryLinkTests.user(self.RUN)]}
         resumed, took = await self.wait_out(history)
-        self.assertTrue(resumed)
+        self.assertEqual(resumed, self.RUN)
         self.assertGreaterEqual(took, 0.3)
 
     async def test_a_turn_that_commits_after_the_run_ended_is_the_runs_own(self):
-        reads = []
+        """The run ends inside the window and its turn commits before the window's end: the helper is still
+        waiting at the commit, and reads the turn after the deadline, not at the end."""
+        committed = []
 
         async def history(sess, limit, max_chars):
-            reads.append(limit)
             messages = [RecoveryLinkTests.user(self.RUN)]
-            if len(reads) > 1:
+            if committed:
                 messages.append(RecoveryLinkTests.user(self.RESUME))
-            else:
-                self.pump.terminal.set()   # the run ends right after the first read: no turn yet
             return {"messages": messages}
-        resumed, _took = await self.wait_out(history, ends_inside_the_window=False)
-        self.assertGreater(len(reads), 1, "read again after the window")
-        self.assertFalse(resumed)
+        self.conn.gateway_version = "2026.11.10"
+        self.kept.awaiting_row = True
+        pump = types.SimpleNamespace(terminal=asyncio.Event())
+        pump.terminal.set()
+        self.conn.session_history, self.conn.session_message_event = history, lambda sess: asyncio.Event()
+        with mock.patch.object(openclaw_pipe, "RESUME_TURN_WAIT_S", 0.6):
+            task = asyncio.ensure_future(_await_recovery_turn(self.conn, self.KEY, self.RESUME, pump))
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done(), "the run ended; the window has not")
+            committed.append(True)
+            resumed = await asyncio.wait_for(task, 5)
+        self.assertIsNone(resumed, "its turn committed inside the window")
 
     async def test_a_failed_read_inside_the_wait_does_not_map_early(self):
         """The read-failure path: it waits the window out and reads again, whatever the first read did."""
@@ -9175,14 +9183,14 @@ class RestartResumeWriterTests(_TurnWriterCase):
                 raise ConnectionError("gateway restarting")
             return {"messages": [RecoveryLinkTests.user(self.RUN)]}
         resumed, took = await self.wait_out(history, ends_inside_the_window=False)
-        self.assertTrue(resumed)
+        self.assertEqual(resumed, self.RUN)
         self.assertGreaterEqual(took, 0.3)
         reads.clear()
 
         async def failing(sess, limit, max_chars):
             raise ConnectionError("gateway restarting")
         resumed, _took = await self.wait_out(failing, ends_inside_the_window=False)
-        self.assertFalse(resumed, "no read, no mapping")
+        self.assertIsNone(resumed, "no read, no mapping")
 
     async def test_before_2026_11_10_a_run_that_ends_or_fails_to_read_is_not_waited_for(self):
         for version in ("2026.11.5", "2026.11.9"):
@@ -9201,7 +9209,7 @@ class RestartResumeWriterTests(_TurnWriterCase):
                     with mock.patch.object(openclaw_pipe, "RESUME_TURN_WAIT_S", 3600):
                         resumed = await asyncio.wait_for(
                             _await_recovery_turn(self.conn, self.KEY, self.RESUME, pump), 5)
-                    self.assertFalse(resumed)
+                    self.assertIsNone(resumed)
                     self.assertLess(time.monotonic() - started, 2)
 
     def pump_of(self, writer, restarts_before=0):
@@ -9237,19 +9245,95 @@ class RestartResumeWriterTests(_TurnWriterCase):
         """CI on #436 (guest crash, 11.10): the resume's first event came before the cut reply's writer was
         marked, so the run was opened as a message of its own."""
         resumed, got = await self.resume_before_any_marking("2026.11.10", restarts_before=0)
-        self.assertTrue(resumed)
+        self.assertEqual(resumed, self.RUN)
         self.assertIs(got, self.kept)
+
+    async def test_a_resume_that_ends_inside_the_wait_finds_the_cut_reply_open(self):
+        """CodeRabbit on #436: the resumed run's idle row reaches the cut run's pump while the wait is on; it
+        must not finalize M, or the resume's output starts a reply of its own."""
+        self.conn.gateway_version = "2026.11.10"
+        self.history_of(0)
+        self.kept.awaiting_row = True
+        pump = types.SimpleNamespace(terminal=asyncio.Event())
+        pump.terminal.set()
+        self.conn.session_message_event = lambda sess: asyncio.Event()
+        row = {"status": "done", "hasActiveRun": False, "lastRunId": self.RESUME}
+        with mock.patch.object(openclaw_pipe, "RESUME_TURN_WAIT_S", 0.4):
+            task = asyncio.ensure_future(_await_recovery_turn(self.conn, self.KEY, self.RESUME, pump))
+            await asyncio.sleep(0.1)
+            await self.kept.end(row)
+            self.assertFalse(self.kept.closed, "held for the verdict")
+            resumed = await asyncio.wait_for(task, 5)
+        self.assertEqual(resumed, self.RUN)
+        self.assertFalse(self.kept.closed)
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, resumed)
+        self.assertIs(got, self.kept)
+
+    async def test_a_held_end_is_replayed_when_the_run_is_not_a_resume(self):
+        """No turn of its own and no kept-open source (the newest turn is another's): M's row comes back
+        through its pump, which ends it as it would have."""
+        self.conn.gateway_version = "2026.11.10"
+        self.kept.awaiting_row = True
+        self.kept.holds_for_resume = True
+        row = {"status": "done", "hasActiveRun": False, "lastRunId": "someone-else"}
+        await self.kept.end(row)
+        self.assertEqual(self.kept.held_end, (row,))
+        pump = self.pump_of(self.kept)
+        pump.queue = asyncio.Queue()
+        self.conn._turn_pumps = {(self.KEY, self.RUN): pump}
+        openclaw_pipe._release_cut_replies(self.conn, {self.kept}, None)
+        self.assertFalse(self.kept.holds_for_resume)
+        self.assertIsNone(self.kept.held_end)
+        self.assertEqual(pump.queue.get_nowait(), (openclaw_pipe._PUMP_SETTLED, row))
+
+    async def test_a_held_end_is_dropped_when_the_run_continues_the_message(self):
+        self.kept.holds_for_resume, self.kept.held_end = True, ({"status": "done"},)
+        pump = self.pump_of(self.kept)
+        pump.queue = asyncio.Queue()
+        self.conn._turn_pumps = {(self.KEY, self.RUN): pump}
+        openclaw_pipe._release_cut_replies(self.conn, {self.kept}, self.RUN)
+        self.assertTrue(pump.queue.empty(), "the resumed run's own row ends M")
+
+    async def test_the_resume_joins_the_message_even_if_the_rule_e_read_fails(self):
+        """CodeRabbit on #436: the wait confirmed the source; a second history read that raises must not
+        send the run to a message of its own."""
+        self.conn.gateway_version = "2026.11.10"
+
+        async def failing(sess, limit, max_chars):
+            raise ConnectionError("gateway restarting")
+        self.conn.session_history = failing
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, self.RUN)
+        self.assertIs(got, self.kept)
+
+    async def test_the_resume_attaches_to_the_source_the_wait_authorized(self):
+        """CodeRabbit on #436: a newer kept-open reply B after the verdict does not take the run, and a
+        source whose writer no longer waits is not joined."""
+        self.conn.gateway_version = "2026.11.10"
+        mid_b = "b00b0000-1111-4222-8333-444455556666"
+        run_b = f"msg-{self.CHAT}-{mid_b}-2.0"
+        writer_b = self.writer(run=run_b, message_id=mid_b)
+        writer_b.awaiting_row = True
+        self.conn._turn_writers[(self.CHAT, mid_b)] = writer_b
+        self.history = {"messages": [RecoveryLinkTests.user(self.RUN), RecoveryLinkTests.user(run_b)]}
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, self.RUN)
+        self.assertIs(got, self.kept)
+        self.assertEqual(writer_b.runs, [run_b], "B did not take the run")
+        self.kept.awaiting_row = False
+        got = await _turn_writer_for_locked(self.conn, self.KEY, self.RESUME, self.USER, self.CHAT, self.RUN)
+        self.assertIsNot(got, self.kept)
+        self.assertIsNot(got, writer_b)
+        self.assertEqual(got.message_id, turn_message_id(self.KEY, self.RESUME, self.CHAT))
 
     async def test_a_run_with_no_restart_since_the_replys_hand_over_is_not_its_resume(self):
         resumed, got = await self.resume_before_any_marking("2026.11.10", restarts_before=1)
-        self.assertFalse(resumed)
+        self.assertIsNone(resumed)
         self.assertIsNot(got, self.kept)
 
     async def test_before_2026_11_10_nothing_marks_a_cut_reply_for_a_run_with_no_turn(self):
         for version in ("2026.11.5", "2026.11.9"):
             with self.subTest(version):
                 resumed, got = await self.resume_before_any_marking(version, restarts_before=0)
-                self.assertFalse(resumed)
+                self.assertIsNone(resumed)
                 self.assertFalse(self.kept.awaiting_row)
                 self.assertIsNot(got, self.kept)
 
@@ -9309,7 +9393,30 @@ class RestartResumeWriterTests(_TurnWriterCase):
         """`on_restart` is the one hand-over that follows a counted restart."""
         src = inspect.getsource(openclaw_pipe._PipeTurn.on_restart)
         self.assertIn("after_restart=True", src)
-        self.assertNotIn("after_restart", inspect.getsource(openclaw_pipe._PipeTurn.on_gap))
+
+    async def gap_with(self, queued):
+        """`_PipeTurn.on_gap` with `queued` in the reply's queue: what `_hand_over_run` is told."""
+        asked = {}
+
+        def hand_over(conn, sess, run, **kw):
+            asked.update(kw)
+            return True
+        queue = mock.Mock(take_all=mock.Mock(return_value=list(queued)))
+        turn = types.SimpleNamespace(keeps_its_run=False, owui_message_id="m1", queue=queue, conn=mock.Mock(),
+                                     session_key=self.KEY, our_run_id=self.RUN, resolved_thinking=None,
+                                     renderer={}, turn=types.SimpleNamespace(handed_over=False))
+        with mock.patch.object(openclaw_pipe, "_hand_over_run", hand_over):
+            openclaw_pipe._PipeTurn.on_gap(turn)
+        return asked
+
+    async def test_a_gap_that_drained_the_restart_marker_hands_the_run_over_as_after_it(self):
+        """CodeRabbit on #436: a socket gap and a restart in one queue: `on_gap` takes the marker with the
+        queue, and the count is already past it."""
+        marker = {"type": openclaw_pipe._RESTART_MARKER_TYPE}
+        event = {"type": "event", "payload": {"state": "delta"}}
+        self.assertIs((await self.gap_with([event, marker]))["after_restart"], True)
+        self.assertIs((await self.gap_with([event]))["after_restart"], False)
+        self.assertIs((await self.gap_with([]))["after_restart"], False)
 
     async def test_an_older_gateway_gives_the_run_a_message_of_its_own(self):
         self.conn.gateway_version = "2026.11.9"
