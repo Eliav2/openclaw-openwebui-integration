@@ -1820,7 +1820,7 @@ else:
     if row is not None:
         for k in row.keys():
             v = row[k]
-            if isinstance(v, str) and v[:1] in '[{':
+            if isinstance(v, str) and v[:1] in '[{"':
                 v = json.loads(v)
             out[k] = v
         out = {**out, **(out.pop('data', None) or {}), 'parentId': out.get('parent_id'),
