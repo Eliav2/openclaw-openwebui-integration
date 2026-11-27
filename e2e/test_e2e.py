@@ -3316,50 +3316,75 @@ def _pipe_log_since(since: str) -> str:
     return out.stdout
 
 
-# The Gateway's startup trace line once restart recovery of sub-agents ended
-# (`startup phase: <name> <ms>ms total=...`, server-startup-trace).
-SUBAGENT_RECOVERY_DONE = r"startup phase: sidecars\.subagent-recovery [\d.]+ms"
-# 2026.11.5 has no such phase (a crash is not resumed, `_gateway_recovers_a_crash`). After an unclean
-# stop its sessions are writable again once the agent's database has been inspected; after a clean one
-# the Gateway logs `ready` (and logs only one of the two lines).
+# 2026.11.5 has no sub-agent recovery phase (a crash is not resumed, `_gateway_recovers_a_crash`).
 GATEWAY_NOT_CONTINUED = "did not continue it"   # the Pipe's note for a reply a crash cut on 2026.11.5
-GATEWAY_READY = r"agent database recovered after background inspection|\[gateway\] ready"
 
 
-def _read_from(path: str, offset: int) -> str:
-    with open(path, errors="replace") as f:
-        f.seek(offset)
-        return f.read()
+# Where the Pipe's backoff wait is when the message goes out. The Pipe waits 1, 2, 4, 8, 16, then 30 s between
+# attempts (`GatewayConnection._reconnect`); this is the line of the 16 s wait, the fifth.
+BACKOFF_WAIT = "reconnect in 16s"
+# What the Pipe logs when a message ends that wait (`_await_reconnect`).
+BACKOFF_ENDED_BY_A_MESSAGE = "reconnecting now: a message is waiting for the connection"
 
 
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
                     reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
 def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
-    """After a Gateway restart the Pipe reconnects with a backoff (1 s up to
-    30 s). A message sent while it waits out the backoff must get its reply
-    (ELI-176: the turn connected a socket of its own, which nothing read until
-    the backoff ended, so the turn's first request timed out)."""
+    """After its Gateway connection is lost the Pipe reconnects with a backoff
+    (1 s up to 30 s). A message sent while it waits out the backoff, with the
+    Gateway reachable again, must get its reply (ELI-176: the turn connected a
+    socket of its own, which nothing read until the backoff ended, so the
+    turn's first request timed out).
+
+    The state is made, not waited for (ELI-532): the Gateway process is
+    SIGSTOPped, so it accepts the TCP connection but never answers the
+    handshake, and its connection to the Pipe is dropped. Every reconnect then
+    fails after the Pipe's 10 s handshake timeout until the Pipe waits 16 s.
+    Only then is the Gateway resumed, answering at once, with the Pipe's wait
+    just begun. An earlier version killed and relaunched the Gateway and sent
+    once it was ready, which needs the restart to finish inside the Pipe's 30 s
+    wait: it took 34 to 46 s on one CPU (12 s on an idle host), the Pipe
+    reconnected by itself first, and the test failed on its own precondition.
+    The order of the Pipe's log lines is the proof that the message, not the
+    timer, ended the wait."""
+    import signal
+    import socket_drop
+    _chat_turn(token, "Respond with exactly: E2E_BEFORE_DROP")   # the Pipe is connected
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    restart_log = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
-    offset = os.path.getsize(restart_log) if os.path.exists(restart_log) else 0
-    # Down until the Pipe waits its longest backoff, so the Gateway is back
-    # well before its next attempt.
-    _kill_and_restart_gateway(15, while_down=lambda: _until(
-        "the Pipe to wait 30 s before its next attempt",
-        lambda: "reconnect in 30s" in _pipe_log_since(since), timeout_s=120))
-    # The relaunched Gateway recovers sub-agents an earlier test left. On
-    # OpenClaw 2026.10.5 a chat.send whose session read overlaps any write to
-    # the agent's database fails (SessionEntryChangedDuringReadError, run
-    # 42610236049); 2026.10.10 dropped that check. This test is about the
-    # Pipe's backoff, so it sends once that recovery has ended.
-    recovered = SUBAGENT_RECOVERY_DONE if _openclaw_version() < CRASH_RECOVERY_RETIRED_IN else GATEWAY_READY
-    _until("the Gateway's sub-agent recovery to end", lambda: re.search(
-        recovered, _read_from(restart_log, offset)), timeout_s=180)
-    log = _pipe_log_since(since)
-    assert log.rfind("reconnect in ") > log.rfind("Connected to Gateway (persistent)"), \
-        "precondition: the Pipe reconnected before the message went out"
-    _, msg = _chat_turn(token, "Reply with exactly: E2E_AFTER_RESTART")
+    with open(GATEWAY_PID_FILE) as f:
+        pids = _pid_tree(int(f.read().strip()))
+    assert pids, f"the stack's Gateway (pid file {GATEWAY_PID_FILE}) is not running"
+
+    def signal_gateway(sig):
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except ProcessLookupError:
+                pass
+
+    frozen = False
+    try:
+        signal_gateway(signal.SIGSTOP)
+        frozen = True
+        dropped = [d for d in socket_drop.drop() if "fd" in d]
+        assert dropped, "no Gateway connection of Open WebUI was dropped"
+        # 1 + 10 + 2 + 10 + 4 + 10 + 8 + 10 s of failed attempts and waits, about a minute.
+        _until("the Pipe to wait 16 s before its next attempt",
+               lambda: BACKOFF_WAIT in _pipe_log_since(since), timeout_s=180)
+        signal_gateway(signal.SIGCONT)
+        frozen = False
+        _, msg = _chat_turn(token, "Reply with exactly: E2E_AFTER_RESTART")
+    finally:
+        if frozen:
+            signal_gateway(signal.SIGCONT)   # the later tests still get a Gateway
     assert msg.get("content", "").strip() == "E2E_AFTER_RESTART", msg.get("content")
+    log = _pipe_log_since(since)
+    waiting = log.rfind(BACKOFF_WAIT)
+    ended = log.find(BACKOFF_ENDED_BY_A_MESSAGE, waiting)
+    connected = log.find("Connected to Gateway (persistent)", waiting)
+    assert waiting >= 0 and ended > waiting, \
+        f"the message did not end the Pipe's backoff wait (no {BACKOFF_ENDED_BY_A_MESSAGE!r} after it): {log[-1500:]}"
+    assert connected > ended, f"the Pipe connected before the message ended its wait (its timer won): {log[-1500:]}"
 
 
 # ── ELI-369: the Pipe's Gateway socket drops mid run ─────────────────────────
