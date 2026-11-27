@@ -86,6 +86,11 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
     `created`: gets a new chat's id as soon as it exists, for a turn run in a
     thread."""
     chat_id, aid = _send_turn(token, prompt, model, chat_id, extra, created, folder_id)
+    return chat_id, _await_reply(token, chat_id, aid)
+
+
+def _await_reply(token: str, chat_id: str, aid: str) -> dict:
+    """The saved assistant message `aid` of `chat_id`, once it is done."""
     deadline = time.time() + TURN_TIMEOUT_S
     msg: dict = {}
     while time.time() < deadline:
@@ -93,7 +98,7 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
         assert status == 200, f"chat read failed: {status} {got}"
         msg = got["chat"]["history"]["messages"].get(aid, {})
         if msg.get("done"):
-            return chat_id, msg
+            return msg
         time.sleep(1.5)
     pytest.fail(f"turn did not finish within {TURN_TIMEOUT_S:.0f}s; last saved state: "
                 f"{json.dumps(msg)[:1500]}")
@@ -104,6 +109,17 @@ def _send_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
                created: list | None = None, folder_id: str | None = None) -> tuple[str, str]:
     """(chat id, assistant message id) of a turn as the browser sends it, once Open WebUI
     accepted it: the reply is in the persisted chat from then on."""
+    chat_id, aid, body = _prepare_turn(token, prompt, model, chat_id, extra, created, folder_id)
+    _submit_turn(token, body)
+    return chat_id, aid
+
+
+def _prepare_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
+                  chat_id: str | None = None, extra: dict | None = None,
+                  created: list | None = None, folder_id: str | None = None) -> tuple[str, str, dict]:
+    """(chat id, assistant message id, completion request body) of a turn: the chat is saved with the
+    user's message, nothing is sent to the model yet. `_submit_turn(token, body)` sends it. Split so that
+    a test can have its timing-sensitive step be the submit alone (ELI-532)."""
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     if chat_id:
@@ -144,16 +160,21 @@ def _send_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
         m = chat["history"]["messages"][at]
         path.insert(0, {"role": m["role"], "content": m["content"]})
         at = m.get("parentId")
-    status, ack = _request("POST", "/api/chat/completions", {
+    body = {
         "model": model, "messages": path,
         "stream": True, "chat_id": chat_id, "id": aid,
         "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
         "parent_id": uid, "user_message": user, **(extra or {}),
-    }, token)
+    }
+    return chat_id, aid, body
+
+
+def _submit_turn(token: str, body: dict) -> None:
+    """Send a prepared turn to Open WebUI's completion endpoint."""
+    status, ack = _request("POST", "/api/chat/completions", body, token)
     # With a chat_id Open WebUI runs the turn as a background task and returns
     # an ack at once; the reply only exists in the persisted chat.
     assert status == 200, f"completion request failed: {status} {ack}"
-    return chat_id, aid
 
 
 def test_both_functions_installed_and_active(token):
@@ -3350,6 +3371,9 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     import signal
     import socket_drop
     _chat_turn(token, "Respond with exactly: E2E_BEFORE_DROP")   # the Pipe is connected
+    # Everything that does not need the Gateway is done now: once the Gateway is resumed the Pipe's 16 s
+    # wait is running, and only the submit of the message may be left to do inside it.
+    chat_id, aid, completion = _prepare_turn(token, "Reply with exactly: E2E_AFTER_RESTART")
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with open(GATEWAY_PID_FILE) as f:
         pids = _pid_tree(int(f.read().strip()))
@@ -3371,9 +3395,13 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
         # 1 + 10 + 2 + 10 + 4 + 10 + 8 + 10 s of failed attempts and waits, about a minute.
         _until("the Pipe to wait 16 s before its next attempt",
                lambda: BACKOFF_WAIT in _pipe_log_since(since), timeout_s=180)
+        seen_at = time.time()
         signal_gateway(signal.SIGCONT)
         frozen = False
-        _, msg = _chat_turn(token, "Reply with exactly: E2E_AFTER_RESTART")
+        _submit_turn(token, completion)
+        submit_lag_s = time.time() - seen_at   # of the 16 s wait, spent between seeing it and the submit's ack
+        print(f"ELI-532: the message was submitted {submit_lag_s:.1f}s after the Pipe's 16 s wait was seen")
+        msg = _await_reply(token, chat_id, aid)
     finally:
         if frozen:
             signal_gateway(signal.SIGCONT)   # the later tests still get a Gateway
@@ -3384,7 +3412,8 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     connected = log.find("Connected to Gateway (persistent)", waiting)
     assert waiting >= 0 and ended > waiting, \
         f"the message did not end the Pipe's backoff wait (no {BACKOFF_ENDED_BY_A_MESSAGE!r} after it): {log[-1500:]}"
-    assert connected > ended, f"the Pipe connected before the message ended its wait (its timer won): {log[-1500:]}"
+    assert connected > ended, (f"the Pipe connected before the message ended its wait (its timer won; the submit took "
+                               f"{submit_lag_s:.1f}s of the 16 s): {log[-1500:]}")
 
 
 # ── ELI-369: the Pipe's Gateway socket drops mid run ─────────────────────────
