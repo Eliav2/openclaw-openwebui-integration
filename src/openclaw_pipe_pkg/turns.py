@@ -418,6 +418,8 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
 # already terminal with an outside kill, so a run never gets two continuations.
 
 MAX_TURN_RESUMES = 3
+# The row status a SIGKILL of the Gateway leaves on 2026.11.10, until the startup resume.
+ROW_KILLED = "killed"
 # The exit reaches the row only as text (pinned in
 # test_fixture_openclaw_exit_errors.json): SIGTERM 143, SIGKILL / OOM 137.
 _EXTERNAL_KILL_RE = re.compile(r"process exited with (?:code (?:143|137)\b|signal SIG[A-Z]+)")
@@ -472,7 +474,8 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
         return "gateway"
-    if after_restart and restart_resume and not (row or {}).get("hasActiveRun") and (row or {}).get("status") == "killed":
+    if (after_restart and restart_resume and not (row or {}).get("hasActiveRun")
+            and (row or {}).get("status") == ROW_KILLED):
         return "gateway"
     if (row or {}).get("hasActiveRun"):
         return "wait"
