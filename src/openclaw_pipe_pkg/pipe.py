@@ -1834,7 +1834,8 @@ class _PipeTurn:
             try:
                 if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
                     status_lines = await _build_usage_status_lines(
-                        self.conn, self.session_key, run_usage=await self.own_run_usage())
+                        self.conn, self.session_key, run_usage=await self.own_run_usage(),
+                        with_context=shows_context_fill(self.conn.gateway_version, bool(self.steered_into)))
             finally:
                 # A parked queue belongs to whoever claims the run.
                 if not self.turn.parked:
@@ -1992,7 +1993,7 @@ class _PipeTurn:
         # A new Gateway process may recover the run or need a resume: its row
         # decides in the turn writer, unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
-                self.our_run_id, thinking=self.resolved_thinking, read_row=True):
+                self.our_run_id, thinking=self.resolved_thinking, read_row=True, after_restart=True):
             self.handed_over = self.done = self.turn.handed_over = True
         elif self.awaiting_owner:
             spawn_background(self.conn.push_row(self.session_key))
@@ -2011,9 +2012,11 @@ class _PipeTurn:
         queued = []
         if not self.keeps_its_run and self.owui_message_id:
             queued = self.queue.take_all()
+            # The gap's queue can hold the restart marker too: the count is already past it.
+            restarted = any(m.get("type") == _RESTART_MARKER_TYPE for m in queued)
             if _hand_over_run(
                     self.conn, self.session_key, self.our_run_id,
-                    thinking=self.resolved_thinking, read_row=True,
+                    thinking=self.resolved_thinking, read_row=True, after_restart=restarted,
                     reply={"message_id": self.owui_message_id,
                            "renderer": copy.deepcopy(self.renderer),
                            "events": [m.get("payload") or {} for m in queued

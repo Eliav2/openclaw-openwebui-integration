@@ -41,16 +41,19 @@ FORMS = [
 # 2026.11.5 on: run-prompt-*.mjs, variable names minified. Each part is a pattern; the pinned source is the
 # line with its variable names and placeholders normalized (`_`, `${job.id}`, `${}`).
 MINIFIED_FILES = "run-prompt-*.mjs"
+# 2026.11.10 minifies the whole file onto a few lines with no spaces around `=` (`const o=`...;const s=`...`.trim();`,
+# `}else d=`...`.trim();`), so the patterns allow any whitespace and are searched in the file, not line by line.
 MINIFIED_FORM = {
-    "prefix": r"const [\w$]+ = `\[cron:\$\{[\w$]+\.id\} \$\{[\w$]+\.name\}\]`;",
-    "base": r"const [\w$]+ = `\$\{[\w$]+\} \$\{[\w$]+\}`\.trim\(\);",
-    "command_body": r"\} else [\w$]+ = `\$\{[\w$]+\}\\n\$\{[\w$]+\}`\.trim\(\);",
+    "prefix": r"const [\w$]+\s*=\s*`\[cron:\$\{[\w$]+\.id\} \$\{[\w$]+\.name\}\]`;",
+    "base": r"const [\w$]+\s*=\s*`\$\{[\w$]+\} \$\{[\w$]+\}`\.trim\(\);",
+    "command_body": r"\}\s*else\s+[\w$]+\s*=\s*`\$\{[\w$]+\}\\n\$\{[\w$]+\}`\.trim\(\);",
 }
 
 
 def normalize(line: str) -> str:
     """A minified dist line with its variable names taken out: `const _ = ...`, `${job.id}`, `${}`."""
-    line = re.sub(r"\b(const|else)\s+[\w$]+\s*=", r"\1 _ =", line)
+    line = re.sub(r"\}\s*else\b", "} else", line)
+    line = re.sub(r"\b(const|else)\s+[\w$]+\s*=\s*", r"\1 _ = ", line)
     line = re.sub(r"\$\{[\w$]+\.(id|name)\}", r"${job.\1}", line)
     return re.sub(r"\$\{[\w$]+\}", "${}", line)
 FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures",
@@ -72,10 +75,11 @@ def extract(dist_dir: str) -> dict | None:
                 return {"openclaw_version": version, "file": os.path.basename(path), **found}
     for path in sorted(glob.glob(os.path.join(dist_dir, MINIFIED_FILES))):
         found = {}
-        for n, line in enumerate(open(path, encoding="utf-8"), 1):
-            for name, pattern in MINIFIED_FORM.items():
-                if name not in found and re.search(pattern, line):
-                    found[name] = {"line": n, "source": normalize(line.strip())}
+        text = open(path, encoding="utf-8").read()
+        for name, pattern in MINIFIED_FORM.items():
+            m = re.search(pattern, text)
+            if m:
+                found[name] = {"line": text.count("\n", 0, m.start()) + 1, "source": normalize(m.group(0))}
         if len(found) == len(MINIFIED_FORM):
             return {"openclaw_version": version, "file": os.path.basename(path), "minified": True, **found}
     return None
