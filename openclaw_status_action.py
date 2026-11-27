@@ -997,16 +997,32 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
+def _version_at_least(version, floor: tuple) -> bool:
+    """`version` ("2026.11.10", "2026.11.10-beta.1") is `floor` or newer. Unknown versions count as older."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= floor
+
+
+RESTART_RESUME_FROM = (2026, 11, 10)
+# 2026.11.10 keeps the session row's token totals current mid-run (before, a first run's totals came after it).
+ROW_TOTALS_MID_RUN_FROM = (2026, 11, 10)
+
+
 def resumes_a_restart_run(version) -> bool:
     """True for a Gateway that continues the run a restart or crash cut by a startup resume input: its own
     run, with no user turn of its own in `chat.history` (the input is hidden), started within seconds of
     the boot (2026.11.10-beta.1+: "Root session left unfinished in a pending crash-recovery interval
-    receives the same single resume input", docs/gateway/restart-recovery.md). Unknown versions count as older."""
-    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
-    return bool(m) and tuple(int(g) for g in m.groups()) >= RESTART_RESUME_FROM
+    receives the same single resume input", docs/gateway/restart-recovery.md). Unknown versions count as older.
+    Everything rule F adds (the widening and timed reads, the open `killed` row) is gated on this: an older
+    Gateway behaves as before."""
+    return _version_at_least(version, RESTART_RESUME_FROM)
 
 
-RESTART_RESUME_FROM = (2026, 11, 10)
+def shows_context_fill(version, steered: bool) -> bool:
+    """Whether a reply's final status carries the context fill. A reply a message was steered into does not
+    from 2026.11.10, whose row totals are the run's current ones mid-run: the run's end shows them. Older
+    Gateways keep the line as before (their first run's row has no totals yet)."""
+    return not (steered and _version_at_least(version, ROW_TOTALS_MID_RUN_FROM))
 
 
 def resumes_a_crash(version) -> bool:

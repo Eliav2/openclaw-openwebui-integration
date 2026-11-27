@@ -1003,16 +1003,32 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
+def _version_at_least(version, floor: tuple) -> bool:
+    """`version` ("2026.11.10", "2026.11.10-beta.1") is `floor` or newer. Unknown versions count as older."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= floor
+
+
+RESTART_RESUME_FROM = (2026, 11, 10)
+# 2026.11.10 keeps the session row's token totals current mid-run (before, a first run's totals came after it).
+ROW_TOTALS_MID_RUN_FROM = (2026, 11, 10)
+
+
 def resumes_a_restart_run(version) -> bool:
     """True for a Gateway that continues the run a restart or crash cut by a startup resume input: its own
     run, with no user turn of its own in `chat.history` (the input is hidden), started within seconds of
     the boot (2026.11.10-beta.1+: "Root session left unfinished in a pending crash-recovery interval
-    receives the same single resume input", docs/gateway/restart-recovery.md). Unknown versions count as older."""
-    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
-    return bool(m) and tuple(int(g) for g in m.groups()) >= RESTART_RESUME_FROM
+    receives the same single resume input", docs/gateway/restart-recovery.md). Unknown versions count as older.
+    Everything rule F adds (the widening and timed reads, the open `killed` row) is gated on this: an older
+    Gateway behaves as before."""
+    return _version_at_least(version, RESTART_RESUME_FROM)
 
 
-RESTART_RESUME_FROM = (2026, 11, 10)
+def shows_context_fill(version, steered: bool) -> bool:
+    """Whether a reply's final status carries the context fill. A reply a message was steered into does not
+    from 2026.11.10, whose row totals are the run's current ones mid-run: the run's end shows them. Older
+    Gateways keep the line as before (their first run's row has no totals yet)."""
+    return not (steered and _version_at_least(version, ROW_TOTALS_MID_RUN_FROM))
 
 
 def resumes_a_crash(version) -> bool:
@@ -11693,7 +11709,7 @@ class _TurnWriter:
                              None) if hist else None
             history, status, saved = await self._persist_final(
                 output, text, stopped, run_usage, said=said_stopped,
-                with_context=not (steered or self.steered_into))
+                with_context=shows_context_fill(self.conn.gateway_version, bool(steered or self.steered_into)))
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
@@ -12331,9 +12347,11 @@ def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
 
 async def _history_to_a_user_turn(conn: "_GatewayConnection", sess: str) -> list:
     """The session's newest messages, read wider until one is an admitted user turn: a run's tool calls and
-    results can stand between the interrupted turn and the end (rule E and rule F name a run by that turn)."""
+    results can stand between the interrupted turn and the end (rule E and rule F name a run by that turn).
+    One read of 50 before 2026.11.10, as ever: only rule F needs the widening."""
+    limits = TURN_HISTORY_LIMITS if resumes_a_restart_run(conn.gateway_version) else TURN_HISTORY_LIMITS[:1]
     messages: list = []
-    for limit in TURN_HISTORY_LIMITS:
+    for limit in limits:
         messages = (await conn.session_history(sess, limit=limit, max_chars=200)).get("messages") or []
         if _history_user_turns(messages) or len(messages) < limit:
             break
@@ -12357,6 +12375,7 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
     message is that message's."""
     if parse_pipe_run_id(run) is not None:
         return
+    rule_f = resumes_a_restart_run(conn.gateway_version)
     deadline = time.monotonic() + RESUME_TURN_WAIT_S
     while not pump.terminal.is_set():
         if not any(w.session_key == sess and not w.closed and (w.awaiting_row or w.takeover)
@@ -12371,12 +12390,14 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
         if any(r == run for r, _tool in _history_user_turns(messages)):
             return
         left = deadline - time.monotonic()
-        if left <= 0 and resumed_source_run(messages, run, _runs_kept_open(conn, sess)):
+        if rule_f and left <= 0 and resumed_source_run(messages, run, _runs_kept_open(conn, sess)):
             pipe_log(f"  run {run[:24]}... has no user turn: the Gateway's startup resume of a kept-open message")
             return
         waits = [asyncio.ensure_future(appended.wait()), asyncio.ensure_future(pump.terminal.wait())]
         try:
-            await asyncio.wait(waits, timeout=max(left, 1.0), return_when=asyncio.FIRST_COMPLETED)
+            # Rule F re-reads on a clock; before 2026.11.10 only the next append or the run's end wakes it.
+            await asyncio.wait(waits, timeout=max(left, 1.0) if rule_f else None,
+                               return_when=asyncio.FIRST_COMPLETED)
         finally:
             for w in waits:
                 w.cancel()
@@ -18422,7 +18443,7 @@ class _PipeTurn:
                 if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
                     status_lines = await _build_usage_status_lines(
                         self.conn, self.session_key, run_usage=await self.own_run_usage(),
-                        with_context=not self.steered_into)
+                        with_context=shows_context_fill(self.conn.gateway_version, bool(self.steered_into)))
             finally:
                 # A parked queue belongs to whoever claims the run.
                 if not self.turn.parked:

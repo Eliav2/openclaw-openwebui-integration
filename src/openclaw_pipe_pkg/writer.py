@@ -1851,7 +1851,7 @@ class _TurnWriter:
                              None) if hist else None
             history, status, saved = await self._persist_final(
                 output, text, stopped, run_usage, said=said_stopped,
-                with_context=not (steered or self.steered_into))
+                with_context=shows_context_fill(self.conn.gateway_version, bool(steered or self.steered_into)))
             # ELI-340: drop the mid-turn copy, then push M finished: a tab
             # loading across the save shows M cut, and keeps the push over its
             # fetch. A failed save keeps the copy, the only whole one left.
@@ -2489,9 +2489,11 @@ def _turn_next_run(conn: "_GatewayConnection", payload: dict) -> None:
 
 async def _history_to_a_user_turn(conn: "_GatewayConnection", sess: str) -> list:
     """The session's newest messages, read wider until one is an admitted user turn: a run's tool calls and
-    results can stand between the interrupted turn and the end (rule E and rule F name a run by that turn)."""
+    results can stand between the interrupted turn and the end (rule E and rule F name a run by that turn).
+    One read of 50 before 2026.11.10, as ever: only rule F needs the widening."""
+    limits = TURN_HISTORY_LIMITS if resumes_a_restart_run(conn.gateway_version) else TURN_HISTORY_LIMITS[:1]
     messages: list = []
-    for limit in TURN_HISTORY_LIMITS:
+    for limit in limits:
         messages = (await conn.session_history(sess, limit=limit, max_chars=200)).get("messages") or []
         if _history_user_turns(messages) or len(messages) < limit:
             break
@@ -2515,6 +2517,7 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
     message is that message's."""
     if parse_pipe_run_id(run) is not None:
         return
+    rule_f = resumes_a_restart_run(conn.gateway_version)
     deadline = time.monotonic() + RESUME_TURN_WAIT_S
     while not pump.terminal.is_set():
         if not any(w.session_key == sess and not w.closed and (w.awaiting_row or w.takeover)
@@ -2529,12 +2532,14 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
         if any(r == run for r, _tool in _history_user_turns(messages)):
             return
         left = deadline - time.monotonic()
-        if left <= 0 and resumed_source_run(messages, run, _runs_kept_open(conn, sess)):
+        if rule_f and left <= 0 and resumed_source_run(messages, run, _runs_kept_open(conn, sess)):
             pipe_log(f"  run {run[:24]}... has no user turn: the Gateway's startup resume of a kept-open message")
             return
         waits = [asyncio.ensure_future(appended.wait()), asyncio.ensure_future(pump.terminal.wait())]
         try:
-            await asyncio.wait(waits, timeout=max(left, 1.0), return_when=asyncio.FIRST_COMPLETED)
+            # Rule F re-reads on a clock; before 2026.11.10 only the next append or the run's end wakes it.
+            await asyncio.wait(waits, timeout=max(left, 1.0) if rule_f else None,
+                               return_when=asyncio.FIRST_COMPLETED)
         finally:
             for w in waits:
                 w.cancel()

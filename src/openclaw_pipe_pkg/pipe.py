@@ -1835,7 +1835,7 @@ class _PipeTurn:
                 if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
                     status_lines = await _build_usage_status_lines(
                         self.conn, self.session_key, run_usage=await self.own_run_usage(),
-                        with_context=not self.steered_into)
+                        with_context=shows_context_fill(self.conn.gateway_version, bool(self.steered_into)))
             finally:
                 # A parked queue belongs to whoever claims the run.
                 if not self.turn.parked:
