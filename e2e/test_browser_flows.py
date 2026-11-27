@@ -440,8 +440,7 @@ def _slow(token: str, n: int) -> str:
 
 def _type_and_send(page, text: str) -> None:
     """Type in the composer of the open chat and press its send button."""
-    page.locator("#chat-input").click()
-    page.keyboard.type(text, delay=5)
+    capture.type_in_composer(page, text)
     page.locator("#send-message-button").click()
 
 

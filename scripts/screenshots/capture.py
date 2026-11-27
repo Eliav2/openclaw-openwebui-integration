@@ -420,14 +420,32 @@ def new_chat(page: Page) -> None:
     dismiss_popups(page)
 
 
+# Open WebUI 0.13.5 rewrites a new chat's composer once, a few hundred ms
+# after the page loads (same element, no blur): a key typed in that moment is
+# lost, as it is for a person (0.13.4 loses none). Nothing on the page says
+# when it is done, so the text is checked and typed again.
+COMPOSER_TYPE_ATTEMPTS = 3
+
+
+def type_in_composer(page: Page, text: str) -> None:
+    """Type `text` in an empty composer like a person, until it reads `text`."""
+    box = page.locator("#chat-input")
+    got = None
+    for _ in range(COMPOSER_TYPE_ATTEMPTS):
+        box.click()
+        # The composer keeps a draft across chats; start from an empty box.
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.type(text, delay=5)
+        got = page.evaluate("() => document.querySelector('#chat-input').innerText.trim()")
+        if got == text.strip():
+            return
+    raise AssertionError(f"the composer reads {got!r} after typing {text!r} {COMPOSER_TYPE_ATTEMPTS} times")
+
+
 def send(page: Page, text: str) -> str:
     """Type `text` in the composer like a person, send it, return the chat id."""
-    box = page.locator("#chat-input")
-    box.click()
-    # The composer keeps a draft across chats; start from an empty box.
-    page.keyboard.press("Control+A")
-    page.keyboard.press("Backspace")
-    page.keyboard.type(text, delay=5)
+    type_in_composer(page, text)
     # On a touch device Enter is a newline, so send the way a phone user does.
     page.locator("#send-message-button").click()
     # Open WebUI moves to /c/<id> with history.replaceState: no navigation event.
