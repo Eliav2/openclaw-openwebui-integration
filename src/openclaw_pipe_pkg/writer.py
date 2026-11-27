@@ -90,19 +90,20 @@ async def _set_turn_meta(chat_id: str, message_id: str, meta: dict) -> bool:
 
 async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from open_webui.models.chats import Chats
-    from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
         if chat is None:
             return False
-        data = chat.chat or {}
-        history = data.get("history") or {}
+        history = await _owui_locked_history(db, chat, [message_id])
         msg = (history.get("messages") or {}).get(message_id)
         if msg is None:
             return False
         msg["meta"] = {**(msg.get("meta") or {}), **meta}
-        chat.chat = {**data, "history": history}
-        flag_modified(chat, "chat")
+        if _owui_history_in_rows():
+            # The whole message: a partial dict would reset the row's data column.
+            from open_webui.models.chat_messages import ChatMessages
+            await ChatMessages.upsert_message(message_id, chat_id, msg.get("user_id") or chat.user_id, msg, db=db)
+        _owui_keep_locked_history(chat, history)
         return True
 
 

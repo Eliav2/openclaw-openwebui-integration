@@ -152,8 +152,7 @@ async def _pending_txn_now(chat_id: str, edit):
     async with Chats._chat_transaction(chat_id) as (db, chat):
         if chat is None:
             return None
-        data = chat.chat or {}
-        history = data.get("history") or {}
+        history = await _owui_locked_history(db, chat)
         was_meta = chat.meta or {}
         chat_meta = dict(was_meta)
         result, saves = edit(history.get("messages") or {}, chat_meta)
@@ -163,8 +162,7 @@ async def _pending_txn_now(chat_id: str, edit):
             message = Chats.upsert_message_to_history(history, message_id, Chats._clean_null_bytes(fields))
             await ChatMessages.upsert_message(message_id, chat_id, message.get("user_id") or chat.user_id,
                                               message, db=db)
-        chat.chat = {**data, "history": history}
-        flag_modified(chat, "chat")
+        _owui_keep_locked_history(chat, history)
         chat.meta = chat_meta
         flag_modified(chat, "meta")
         chat.updated_at = int(time.time())
