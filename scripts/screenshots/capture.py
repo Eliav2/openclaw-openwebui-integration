@@ -425,6 +425,8 @@ def new_chat(page: Page) -> None:
 # lost, as it is for a person (0.13.4 loses none). Nothing on the page says
 # when it is done, so the text is checked and typed again.
 COMPOSER_TYPE_ATTEMPTS = 3
+# The composer's typography turns straight quotes curly as they are typed.
+TYPOGRAPHIC_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
 
 
 def type_in_composer(page: Page, text: str) -> None:
@@ -438,7 +440,7 @@ def type_in_composer(page: Page, text: str) -> None:
         page.keyboard.press("Backspace")
         page.keyboard.type(text, delay=5)
         got = page.evaluate("() => document.querySelector('#chat-input').innerText.trim()")
-        if got == text.strip():
+        if got.translate(TYPOGRAPHIC_QUOTES) == text.strip():
             return
     raise AssertionError(f"the composer reads {got!r} after typing {text!r} {COMPOSER_TYPE_ATTEMPTS} times")
 
@@ -1098,7 +1100,9 @@ class Scenes:
         page.locator('button[aria-label="Edit"]').last.click()
         wait_js(page, """() => [...document.querySelectorAll('textarea')].some(t => t.value.includes('bike out'))""",
                 "the reply's markdown in the editor", 30_000)
-        self.s.shot(page, "media-turn-source")
+        # The image links to its upload by Open WebUI's file id, which shows here on purpose.
+        source = page.evaluate("() => [...document.querySelectorAll('textarea')].map(t => t.value).join('\\n')")
+        self.s.shot(page, "media-turn-source", allow=tuple(re.findall(r"/api/v1/files/([0-9a-f-]+)/", source)))
         page.keyboard.press("Escape")
 
     def first_reply(self, page: Page) -> None:
