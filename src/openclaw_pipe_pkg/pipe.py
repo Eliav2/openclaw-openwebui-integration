@@ -1993,7 +1993,7 @@ class _PipeTurn:
         # A new Gateway process may recover the run or need a resume: its row
         # decides in the turn writer, unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
-                self.our_run_id, thinking=self.resolved_thinking, read_row=True):
+                self.our_run_id, thinking=self.resolved_thinking, read_row=True, after_restart=True):
             self.handed_over = self.done = self.turn.handed_over = True
         elif self.awaiting_owner:
             spawn_background(self.conn.push_row(self.session_key))

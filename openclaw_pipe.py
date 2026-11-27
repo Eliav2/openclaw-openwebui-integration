@@ -12273,11 +12273,14 @@ def _release_unkinded(conn: "_GatewayConnection", sess: str, run: str) -> None:
 
 def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
                    thinking: str | None = None, read_row: bool = False,
-                   reply: dict | None = None) -> bool:
+                   reply: dict | None = None, after_restart: bool = False) -> bool:
     """Hand an interrupted run's message to the turn writer (DESIGN 2.6); its
     settled row decides who continues (2.7). `read_row`: read it now, in
     case the resync already passed. `reply`: a request's own state at an
-    event gap; `no_resume` for a run Send now kept (ELI-158)."""
+    event gap; `no_resume` for a run Send now kept (ELI-158). `after_restart`: the restart that cut the run was
+    counted before this pump (the restart marker is queued after the count), so on 2026.11.10+ the pump's
+    restart epoch is the one before it, and the guards that ask whether a restart passed (rule F) see it.
+    Older Gateways keep the count as it was."""
     key = f"{session_key}:{run_id}"
     target = conn._run_targets.get(key)
     parsed = conn.parse_owui_session_key(session_key)
@@ -12286,6 +12289,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
         return False
     pump = conn._turn_pumps[(session_key, run_id)] = _RunPump()
     pump.restarts_before = conn.gateway_restarts
+    if after_restart and conn.gateway_restarts and resumes_a_restart_run(conn.gateway_version):
+        pump.restarts_before -= 1
     if reply is None:
         pump.handover = conn.handover_of(session_key, run_id, thinking)
         pump.started = _handover_started(pump.handover)
@@ -12368,31 +12373,33 @@ def _runs_kept_open(conn: "_GatewayConnection", sess: str) -> set:
 
 
 async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
-                               pump: _RunPump) -> None:
+                               pump: _RunPump) -> bool:
     """Rule E needs a recovery run's `:user` turn, which 2026.10 commits about
     0.7 s after the first event: wait for the next append or the run's end. A startup resume (rule F,
     2026.11.10+) never has one: the run with no turn after RESUME_TURN_WAIT_S that continues a kept-open
-    message is that message's."""
+    message is that message's. Returns whether rule F may map the run to it: the window has closed, with
+    no turn of the run's own (the run ending first, or a failed read, does not close it early: the turn can
+    still commit after the run ends). Always False before 2026.11.10."""
     if parse_pipe_run_id(run) is not None:
-        return
+        return False
     rule_f = resumes_a_restart_run(conn.gateway_version)
     deadline = time.monotonic() + RESUME_TURN_WAIT_S
     while not pump.terminal.is_set():
         if not any(w.session_key == sess and not w.closed and (w.awaiting_row or w.takeover)
                    for w in list(conn._turn_writers.values())):
-            return
+            return False
         appended = conn.session_message_event(sess)
         try:
             messages = await _history_to_a_user_turn(conn, sess)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for run {run[:24]}... failed: {ex!r}")
-            return
+            break
         if any(r == run for r, _tool in _history_user_turns(messages)):
-            return
+            return False
         left = deadline - time.monotonic()
         if rule_f and left <= 0 and resumed_source_run(messages, run, _runs_kept_open(conn, sess)):
             pipe_log(f"  run {run[:24]}... has no user turn: the Gateway's startup resume of a kept-open message")
-            return
+            return True
         waits = [asyncio.ensure_future(appended.wait()), asyncio.ensure_future(pump.terminal.wait())]
         try:
             # Rule F re-reads on a clock; before 2026.11.10 only the next append or the run's end wakes it.
@@ -12401,16 +12408,31 @@ async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
         finally:
             for w in waits:
                 w.cancel()
+    if not rule_f:
+        return False
+    # The run ended, or a read failed, inside the window: rule F waits the window out, then reads once more.
+    left = deadline - time.monotonic()
+    if left > 0:
+        await asyncio.sleep(left)
+    try:
+        messages = await _history_to_a_user_turn(conn, sess)
+    except Exception as ex:
+        pipe_log(f"  turn writer: chat.history for run {run[:24]}... failed again: {ex!r}")
+        return False
+    if any(r == run for r, _tool in _history_user_turns(messages)):
+        return False
+    return resumed_source_run(messages, run, _runs_kept_open(conn, sess)) is not None
 
 
 async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
-                           user_id: str, chat_id: str) -> "_TurnWriter | None":
+                           user_id: str, chat_id: str, resumed: bool = False) -> "_TurnWriter | None":
     # Two runs can name one message, so resolve and register in one step.
     async with conn._turn_resolve_lock:
-        return await _turn_writer_for_locked(conn, sess, run, user_id, chat_id)
+        return await _turn_writer_for_locked(conn, sess, run, user_id, chat_id, resumed)
 
 
-async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id):
+async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id, resumed=False):
+    """`resumed`: `_await_recovery_turn` found the run a startup resume of a kept-open message (rule F)."""
     messages = None
     if parse_pipe_run_id(run) is None:
         # Rule E: only the transcript names a recovery's message.
@@ -12418,7 +12440,7 @@ async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id):
             messages = await _history_to_a_user_turn(conn, sess)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for rule E failed: {ex!r}")
-    mid = run_message_id(sess, chat_id, run, messages, _runs_kept_open(conn, sess))
+    mid = run_message_id(sess, chat_id, run, messages, _runs_kept_open(conn, sess) if resumed else ())
     if mid is None:
         return None
     writer = conn._turn_writers.get((chat_id, mid))
@@ -12465,8 +12487,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
         else:
-            await _await_recovery_turn(conn, sess, run, pump)
-            pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
+            resumed = await _await_recovery_turn(conn, sess, run, pump)
+            pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id, resumed)
         while True:
             kind, item = await pump.queue.get()
             if pump.wake:
@@ -18601,7 +18623,7 @@ class _PipeTurn:
         # A new Gateway process may recover the run or need a resume: its row
         # decides in the turn writer, unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
-                self.our_run_id, thinking=self.resolved_thinking, read_row=True):
+                self.our_run_id, thinking=self.resolved_thinking, read_row=True, after_restart=True):
             self.handed_over = self.done = self.turn.handed_over = True
         elif self.awaiting_owner:
             spawn_background(self.conn.push_row(self.session_key))
