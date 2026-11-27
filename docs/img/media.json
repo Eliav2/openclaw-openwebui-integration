@@ -382,10 +382,10 @@
       }
     },
     "status-dialog-folded-light.png": {
-      "sha": "b0324e1b74b8026e",
+      "sha": "6e4f6ebf32b973ca",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "3b4f241cda41d107"
+        "status": "bf483b23a236295f"
       }
     },
     "status-dialog-light.png": {
@@ -420,7 +420,7 @@
       "sha": "a3ad1cf7f95b6e89",
       "groups": {
         "chrome": "40732052bff72db4",
-        "status": "3b4f241cda41d107"
+        "status": "bf483b23a236295f"
       }
     },
     "subagent-drawer-light.png": {
