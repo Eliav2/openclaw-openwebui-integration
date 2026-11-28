@@ -21,12 +21,28 @@ const FETCH_TIMEOUT_MS = 8000;
 // The usage endpoint rate-limits aggressively; one fetch per minute is plenty
 // for a dialog a human opens by hand.
 const CACHE_TTL_MS = 60_000;
+// After a failed fetch the endpoint is not asked again before the 429's own Retry-After, and never sooner
+// than one cache period (the same one-fetch-per-minute the success path keeps). A Retry-After longer than
+// the shortest window (5 h) is capped there: a bogus header must not blind the dialog for days.
+const RETRY_AFTER_MAX_MS = 18_000_000;
+const MS_PER_SECOND = 1000;
 
-let cached = null; // { at, snapshot }
+let cached = null; // { at, snapshot }, set by a successful fetch (or a first failure with nothing to fall back on)
+let failure = null; // { until, snapshot }: the last failed fetch and the time before which nothing asks again
 // The plan changes rarely; asking for it every few hours is enough.
 const PLAN_TTL_MS = 6 * 3600_000;
 // Keyed on the access token: another login (or a token refresh) asks again.
 let cachedPlan = null; // { key, at, plan }
+
+// Retry-After as an absolute time (epoch ms), counted from `receivedAt`, the moment the answer arrived: delta-seconds run from
+// receipt (RFC 9110), an HTTP date is absolute. Never before receipt, never more than RETRY_AFTER_MAX_MS after it; undefined
+// when absent or unparseable.
+export function parseRetryAfter(raw, receivedAt = Date.now()) {
+  const text = String(raw ?? "").trim();
+  if (!text) return undefined;
+  const at = /^\d+$/.test(text) ? receivedAt + Number(text) * MS_PER_SECOND : /[a-z]/i.test(text) ? Date.parse(text) : NaN;
+  return Number.isFinite(at) ? Math.min(Math.max(at, receivedAt), receivedAt + RETRY_AFTER_MAX_MS) : undefined;
+}
 
 function credentialsPath() {
   const dir = process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
@@ -98,17 +114,18 @@ async function fetchPlan(oauth, headers, fetchFn, now) {
   return plan ?? planLabel(oauth);
 }
 
-async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
+// -> { snapshot, retryUntil? }: retryUntil (epoch ms) is the failed answer's own Retry-After, counted from when it arrived.
+async function fetchSnapshot(fetchFn = fetch, now = Date.now(), clock = Date.now) {
   const base = { provider: "anthropic", displayName: "Claude", source: "claude-cli" };
   let oauth;
   try {
     oauth = JSON.parse(await readFile(credentialsPath(), "utf8"))?.claudeAiOauth;
   } catch (err) {
-    return { ...base, windows: [], error: `Claude CLI credentials unreadable: ${err.code ?? err.message}` };
+    return { snapshot: { ...base, windows: [], error: `Claude CLI credentials unreadable: ${err.code ?? err.message}` } };
   }
-  if (!oauth?.accessToken) return { ...base, windows: [], error: "Claude CLI is not logged in" };
+  if (!oauth?.accessToken) return { snapshot: { ...base, windows: [], error: "Claude CLI is not logged in" } };
   if (typeof oauth.expiresAt === "number" && oauth.expiresAt <= Date.now()) {
-    return { ...base, windows: [], error: "Claude CLI token expired; it refreshes on Claude CLI's next run" };
+    return { snapshot: { ...base, windows: [], error: "Claude CLI token expired; it refreshes on Claude CLI's next run" } };
   }
 
   const headers = {
@@ -121,28 +138,48 @@ async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
   // Both requests start together: two 8 s timeouts in a row would pass the
   // caller's 10 s budget and lose the windows. fetchPlan never rejects.
   const planPromise = fetchPlan(oauth, headers, fetchFn, now);
+  const startedAt = clock();
   const res = await fetchFn(USAGE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  const receivedAt = now + (clock() - startedAt); // `now` is the caller's time (a test's, or Date.now()); `clock` measures the wait for the answer
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
-    return { ...base, windows: [], error: `Anthropic usage HTTP ${res.status}` };
+    return {
+      snapshot: { ...base, windows: [], error: `Anthropic usage HTTP ${res.status}` },
+      retryUntil: parseRetryAfter(res.headers?.get?.("retry-after"), receivedAt),
+    };
   }
   const windows = buildWindows(await res.json());
   const plan = await planPromise;
-  return { ...base, windows, ...(plan ? { plan } : {}) };
+  return { snapshot: { ...base, windows, ...(plan ? { plan } : {}) } };
 }
 
-export async function getClaudeCliUsage({ fetchFn, now = Date.now() } = {}) {
+// The last good windows, marked stale, rather than blanking the dialog.
+function servedStale(reason) {
+  return { ...cached.snapshot, stale: true, staleReason: reason };
+}
+
+export async function getClaudeCliUsage({ fetchFn, now = Date.now(), clock = Date.now } = {}) {
   if (cached && now - cached.at < CACHE_TTL_MS) return cached.snapshot;
+  // A failure holds every caller off the endpoint until its Retry-After (or one cache period) is over:
+  // asking again on each call while it answers 429 only prolongs the 429.
+  if (failure && now < failure.until) {
+    return cached?.snapshot.windows.length ? servedStale(failure.snapshot.error) : failure.snapshot;
+  }
   let snapshot;
+  let retryUntil;
+  const startedAt = clock();
   try {
-    snapshot = await fetchSnapshot(fetchFn, now);
+    ({ snapshot, retryUntil } = await fetchSnapshot(fetchFn, now, clock));
   } catch (err) {
     snapshot = { provider: "anthropic", displayName: "Claude", source: "claude-cli", windows: [], error: String(err?.message ?? err) };
   }
-  // A transient failure (429, timeout) keeps serving the last good windows,
-  // marked stale, rather than blanking the dialog.
-  if (snapshot.error && cached?.snapshot.windows.length) {
-    return { ...cached.snapshot, stale: true, staleReason: snapshot.error };
+  if (snapshot.error) {
+    const settledAt = now + (clock() - startedAt); // the hold runs from when the answer (or the failure) arrived, not from when we asked
+    failure = { until: Math.max(settledAt + CACHE_TTL_MS, retryUntil ?? 0), snapshot };
+    // A transient failure (429, timeout) keeps serving the last good windows, marked stale.
+    if (cached?.snapshot.windows.length) return servedStale(snapshot.error);
+  } else {
+    failure = null;
   }
   cached = { at: now, snapshot: { ...snapshot, fetchedAt: now } };
   return cached.snapshot;

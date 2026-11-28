@@ -48,7 +48,7 @@ The Action's valves mirror the Pipe's (`install_action.py` copies them over): [`
 
 ## Rate limits
 
-Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anthropic credential is a Claude CLI login, OpenClaw 2026.9.1 and later report no Anthropic windows there. The dialog then asks the optional [`gateway-plugins/claude-cli-usage`](../../gateway-plugins/claude-cli-usage) Gateway plugin, which serves the weekly window (and the 5h window on plans that have one) read-only from the Claude CLI login. Without the plugin the section shows a note instead. Installing the plugin: [Status button](../install/status-action.md).
+Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anthropic credential is a Claude CLI login, OpenClaw 2026.9.1 and later report no Anthropic windows there. The dialog then asks the optional [`gateway-plugins/claude-cli-usage`](../../gateway-plugins/claude-cli-usage) Gateway plugin, which serves the weekly window (and the 5h window on plans that have one) read-only from the Claude CLI login. Without the plugin the section shows a note instead. After a failed fetch (a 429, a timeout) it keeps serving the last good windows, marked stale, and does not ask Anthropic again before the 429's `Retry-After` (at least one minute, at most 5 h). Installing the plugin: [Status button](../install/status-action.md).
 
 A provider can answer with a plan but no usage windows: xAI's SuperGrok reports its plan, a summary such as "Included usage omitted" and its prepaid balance, and no percentages. The section then shows the provider's name, plan and summary, with one row for each billing figure, instead of the note. The note stays for a provider that has nothing to report, or none at all.
 
