@@ -445,11 +445,29 @@ def type_in_composer(page: Page, text: str) -> None:
     raise AssertionError(f"the composer reads {got!r} after typing {text!r} {COMPOSER_TYPE_ATTEMPTS} times")
 
 
+# A send the page took shows the message at once: its bubble, or the chat's URL.
+SEND_TAKEN_MS = 10_000
+SEND_TAKEN_JS = ("() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)"
+                 " || !!document.querySelector('.user-message')")
+
+
 def send(page: Page, text: str) -> str:
-    """Type `text` in the composer like a person, send it, return the chat id."""
-    type_in_composer(page, text)
-    # On a touch device Enter is a newline, so send the way a phone user does.
-    page.locator("#send-message-button").click()
+    """Type `text` in the composer like a person, send it, return the chat id.
+    On a cold first load (a slow CI runner) Open WebUI 0.13.5's composer reset
+    can come after the typing was checked, and the click then sends nothing:
+    no request reaches the server. When the message shows nowhere, it is
+    typed and sent once more; one that did go shows within SEND_TAKEN_MS, so
+    nothing is sent twice."""
+    for attempt in range(2):
+        type_in_composer(page, text)
+        # On a touch device Enter is a newline, so send the way a phone user does.
+        page.locator("#send-message-button").click()
+        try:
+            page.wait_for_function(SEND_TAKEN_JS, timeout=SEND_TAKEN_MS, polling=250)
+            break
+        except Exception:
+            held = page.evaluate("() => (document.querySelector('#chat-input') || {}).innerText || ''").strip()
+            print(f"  send {attempt + 1}: the page took no message; the composer holds {held[:80]!r}", flush=True)
     # Open WebUI moves to /c/<id> with history.replaceState: no navigation event.
     wait_js(page, "() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", "the new chat's URL", 60_000)
     return page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
