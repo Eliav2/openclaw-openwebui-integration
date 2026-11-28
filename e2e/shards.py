@@ -43,6 +43,7 @@ SHARDS = {
         f"{E2E}::test_hebrew_and_emoji_round_trip_exactly",
         f"{E2E}::test_the_model_folder_and_user_prompts_reach_the_agent_in_open_webui_s_order",
         f"{E2E}::test_the_second_exchange_titles_the_chat",
+        f"{E2E}::test_every_reply_keeps_its_parent_in_the_db",
         f"{E2E}::test_persisted_chat_keeps_the_reply",
         f"{E2E}::test_the_first_reply_in_a_new_chat_ends_with_the_usage_line",
         f"{E2E}::test_tool_call_persists_as_a_native_tool_card",

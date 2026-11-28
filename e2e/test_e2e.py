@@ -1818,12 +1818,72 @@ def _assert_one_reply(tok: str, chat_id: str, aid: str) -> None:
 def _db_message(chat_id: str, message_id: str) -> dict:
     """M as Open WebUI's DB holds it (what the orphan reconcile reads after a
     crash), not the GET, which overlays a live response stream (`done: false`)."""
-    code = ("import json,sqlite3,sys;c=sqlite3.connect('/app/backend/data/webui.db');"
-            "r=c.execute('select chat from chat where id=?',(sys.argv[1],)).fetchone();"
-            "print(json.dumps(json.loads(r[0])['history']['messages'].get(sys.argv[2]) or {}))")
-    out = subprocess.run(["docker", "exec", "owui", "python3", "-c", code, chat_id, message_id],
+    return _db_read(_DB_MESSAGE, chat_id, message_id)
+
+
+# Reads the stored message: Open WebUI 0.13.4 and older keep it in the chat blob's history; 0.13.5 and later keep
+# the history only in chat_message rows (the row's columns plus its `data`), and the blob holds none.
+_DB_MESSAGE = """
+import json, sqlite3, sys
+c = sqlite3.connect('/app/backend/data/webui.db')
+c.row_factory = sqlite3.Row
+chat_id, mid = sys.argv[1], sys.argv[2]
+blob = json.loads(c.execute('select chat from chat where id=?', (chat_id,)).fetchone()['chat'] or '{}')
+if 'history' in blob:
+    print(json.dumps(blob['history']['messages'].get(mid) or {}))
+else:
+    row = c.execute('select * from chat_message where id=?', (f'{chat_id}-{mid}',)).fetchone()
+    out = {}
+    if row is not None:
+        for k in row.keys():
+            v = row[k]
+            if isinstance(v, str) and v[:1] in '[{"':
+                v = json.loads(v)
+            out[k] = v
+        out = {**out, **(out.pop('data', None) or {}), 'parentId': out.get('parent_id'),
+               'done': None if out.get('done') is None else bool(out['done'])}
+    print(json.dumps(out))
+"""
+
+# The stored shape of a chat: whether its blob has a `history` key, and each message row's parent.
+_DB_LINKS = """
+import json, sqlite3, sys
+c = sqlite3.connect('/app/backend/data/webui.db')
+chat_id = sys.argv[1]
+blob = json.loads(c.execute('select chat from chat where id=?', (chat_id,)).fetchone()[0] or '{}')
+rows = c.execute('select id, role, parent_id from chat_message where chat_id=? order by created_at', (chat_id,)).fetchall()
+print(json.dumps({'blob_history': 'history' in blob,
+                  'rows': [[r[0][len(chat_id) + 1:], r[1], r[2]] for r in rows]}))
+"""
+
+
+def _db_read(code: str, *args: str):
+    out = subprocess.run(["docker", "exec", "owui", "python3", "-c", code, *args],
                          check=True, capture_output=True, text=True, timeout=60).stdout
     return json.loads(out)
+
+
+def _owui_stores_history_in_rows() -> bool:
+    """Open WebUI 0.13.5 and later: the chat blob holds no history (`Chats._without_history`)."""
+    code = "from open_webui.models.chats import Chats; print('true' if hasattr(Chats, '_without_history') else 'false')"
+    return _db_read(code)
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+def test_every_reply_keeps_its_parent_in_the_db(token):
+    """Issue #434: on Open WebUI 0.13.5 each reply's end save wrote `parent_id` NULL (the Pipe read the chat
+    blob's history, which 0.13.5 no longer stores), so a reload showed only the last reply. Two exchanges:
+    every message row links to the one before it, and the blob gets no stray history."""
+    chat_id, _ = _chat_turn(token, "E2E_ECHO: first link")
+    _chat_turn(token, "E2E_ECHO: second link", chat_id=chat_id)
+    got = _db_read(_DB_LINKS, chat_id)
+    replies = [(mid, parent) for mid, role, parent in got["rows"] if role == "assistant"]
+    assert len(replies) == 2, got
+    assert all(parent for _, parent in replies), f"a reply row lost its parent: {got}"
+    second_user = _chat_messages(token, chat_id)[replies[1][1]]
+    assert second_user.get("parentId") == replies[0][0], f"the second exchange is not under the first: {got}"
+    if _owui_stores_history_in_rows():
+        assert not got["blob_history"], f"a stray history in the 0.13.5 chat blob: {got}"
 
 
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None or shutil.which("docker") is None,

@@ -181,8 +181,9 @@ async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
 
 async def _set_title_unless_chosen_now(chat_id: str, title: str) -> bool:
     from open_webui.models.chats import Chats
-    async with Chats._chat_transaction(chat_id) as (_db, chat):
-        if chat is None or not _title_is_owui_default(chat.title, chat.chat):
+    async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None or not _title_is_owui_default(
+                chat.title, {"history": await _owui_locked_history(db, chat)}):
             return False
         title = title.replace("\x00", "")
         chat.title = title

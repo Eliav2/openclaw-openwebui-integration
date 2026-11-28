@@ -440,8 +440,7 @@ def _slow(token: str, n: int) -> str:
 
 def _type_and_send(page, text: str) -> None:
     """Type in the composer of the open chat and press its send button."""
-    page.locator("#chat-input").click()
-    page.keyboard.type(text, delay=5)
+    capture.type_in_composer(page, text)
     page.locator("#send-message-button").click()
 
 
@@ -742,8 +741,11 @@ def _both_answered(page, token: str, run: str, answer: str) -> None:
     same after a reload. Open WebUI draws the running reply finished as soon
     as the new message goes in, while it is still being written, so it is
     judged once the new message's answer, which waits for the run, is done.
-    The reload waits for the reply's save (`_saved_whole`)."""
-    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    The reload waits for the reply's save (`_saved_whole`). The answer's own
+    text says it is there: Open WebUI 0.13.5 loads the chat again when the
+    held message goes in (#35027), and that load draws the placeholder done."""
+    _wait(page, _reply_js(-1, f"all.length === 2 && all[0].done && r.done && r.text.includes({json.dumps(answer)})"),
+          "both replies done")
     first, second = _replies(page)
     assert first["text"].count(run) == 1, f"the running reply was cut or doubled: {first['text'][-120:]!r}"
     assert answer in second["text"] and "slow-" not in second["text"], second["text"]
@@ -957,11 +959,14 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         _taken_over(page, token)
         page.route(chat_get, hold)
         page.reload()
+        # From 0.13.5 the tab joins the room, and refreshes, only once its load is
+        # answered: that refresh comes after the save and is answered from it below.
+        loads = 1 if _owui_version() >= SINGLE_GET_CHAT_LOAD else 2
         deadline = time.time() + 30
-        while len(held) < 2:
+        while len(held) < loads:
             assert time.time() < deadline, (
-                f"the reloaded tab made {len(held)} chat GET(s), not its load and the refresh it makes "
-                f"on joining the chat's room")
+                f"the reloaded tab made {len(held)} chat GET(s), not its load"
+                + ("" if loads == 1 else " and the refresh it makes on joining the chat's room"))
             page.wait_for_timeout(50)
         # The precondition: both read the reply while it still ran.
         assert all(run not in response.text() for _, response in held), \
@@ -1162,7 +1167,9 @@ def test_a_message_sent_while_a_tool_runs_leaves_the_first_reply_unstopped(page,
     finally:
         open(hold, "w").close()
         capture.pipe_valves(token, **old)
-    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    # By the correction's text, not done alone: 0.13.5 draws its placeholder done (see _both_answered).
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done && r.text.includes('BROWSER_CORRECTION')"),
+          "both replies done")
     first, second = _replies(page)
     # The correction's own answer, on any Gateway: it went to the agent, not just under the run.
     assert "BROWSER_CORRECTION" in second["text"], second["text"]
@@ -1612,6 +1619,9 @@ def _listed_sessions(search: str) -> list:
 SAVED_SIDE_CHATS = (0, 13, 1)
 # The Open WebUI release whose chat, opened from the sidebar, no longer focuses its input.
 UNFOCUSED_CHAT_LOAD = (0, 13, 1)
+# The Open WebUI release whose chat load is one GET, with no tags request after
+# it, and whose tab joins the chat's room (and refreshes) only once it is answered.
+SINGLE_GET_CHAT_LOAD = (0, 13, 5)
 
 
 @functools.cache
@@ -1997,7 +2007,9 @@ def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, to
     until a reload. The second tab's tags are held until the reply's message
     is in the DB, which puts its introduction in that window every time. The
     tab shows the reply while it runs; the tab open all along shows it once,
-    never blanked, also through the end's second send of it."""
+    never blanked, also through the end's second send of it. From 0.13.5 the
+    load fetches no tags: its chat GET, read before the reply exists, is held
+    instead, so the tab draws a history without it and must still show it."""
     word = f"LOADRACE{os.getpid()}"
     capture.new_chat(page)
     capture.send(page, "E2E_ECHO: BROWSER_LOAD_RACE")
@@ -2011,9 +2023,19 @@ def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, to
     before = set(messages())
     late = page.context.new_page()
     held = []
-    late.route(f"**/api/v1/chats/{chat_id}/tags", lambda route: held.append(route))
+    # From 0.13.5 the load is the chat GET alone: it is read now, before the reply
+    # exists, and answered once the reply is in the DB, the same window.
+    single_get = _owui_version() >= SINGLE_GET_CHAT_LOAD
+    path = f"/api/v1/chats/{chat_id}" + ("" if single_get else "/tags")
+
+    def hold(route):
+        if single_get and held:
+            route.continue_()
+        else:
+            held.append([route, None])
+    late.route(f"**{path}", hold)
     try:
-        with late.expect_request(lambda r: r.url.endswith(f"/api/v1/chats/{chat_id}/tags"), timeout=60_000):
+        with late.expect_request(lambda r: r.url.endswith(path), timeout=60_000):
             late.goto(page.url)
         # The request is held from here on, but Playwright runs the route handler (which
         # records it in `held`) as a task on its own loop, and a sync test turns that loop
@@ -2022,15 +2044,20 @@ def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, to
         # on the poll below turning the loop (it does not when the reply's message is
         # already in the DB at the first check).
         late.context.cookies()
-        assert held, "the late tab's tags request was not held"
+        assert held, f"the late tab's {path} request was not held"
+        if single_get:
+            held[0][1] = held[0][0].fetch()  # read now, before the reply exists
         capture.gateway_call("chat.send", {"sessionKey": key, "message": f"E2E_SLOW:15 {word}",
                                            "idempotencyKey": f"race-{word}", "deliver": False})
         deadline = time.monotonic() + 60
         while not any(m.get("role") == "assistant" for i, m in messages().items() if i not in before):
             assert time.monotonic() < deadline, "the agent's reply never got its message"
             late.wait_for_timeout(200)  # polls the DB
-        for route in held:
-            route.continue_()
+        for route, response in held:
+            if response:
+                route.fulfill(response=response)
+            else:
+                route.continue_()
         _wait(late, _reply_js(1, f"r.text.includes({json.dumps(word)}) && !r.done"),
               "the agent's reply in the tab that loaded the chat as it began, while it runs")
         for tab in (late, page):

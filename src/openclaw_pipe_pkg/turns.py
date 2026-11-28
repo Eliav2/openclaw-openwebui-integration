@@ -323,17 +323,53 @@ async def _owui_upsert_message_with_statuses(chat_id: str, message_id: str, fiel
         _owui_upsert_message_with_statuses_now(chat_id, message_id, fields, statuses), on_commit))
 
 
+def _owui_history_in_rows() -> bool:
+    """Open WebUI 0.13.5 and later keep a chat's messages only in its chat_message rows, with the current
+    message in chat.current_message_id: the stored chat.chat holds no history (`Chats._without_history`)."""
+    from open_webui.models.chats import Chats
+    return hasattr(Chats, "_without_history")
+
+
+async def _owui_locked_history(db, chat, message_ids=None) -> dict:
+    """The history of a chat row held under `Chats._chat_transaction`, as {messages, currentId}.
+
+    Before Open WebUI 0.13.5 that is the chat.chat blob. From 0.13.5 the blob holds none, so it is read from the
+    chat_message rows the way Open WebUI's own upsert does: only `message_ids` (with their children's ids) when
+    they all have rows, else the whole chat (a new message needs its parent; a tree walk needs every message)."""
+    if not _owui_history_in_rows():
+        return (chat.chat or {}).get("history") or {"messages": {}, "currentId": None}
+    from open_webui.models.chat_messages import ChatMessages
+    msgs = None
+    if message_ids is not None:
+        msgs = await ChatMessages.get_messages_map_by_message_ids(chat.id, list(message_ids), db=db)
+        if any(m not in msgs for m in message_ids):
+            msgs = None
+    if msgs is None:
+        msgs = await ChatMessages.get_messages_map_by_chat_id(chat.id, db=db) or {}
+    return {"messages": msgs, "currentId": chat.current_message_id}
+
+
+def _owui_keep_locked_history(chat, history: dict) -> None:
+    """Store a changed history of a locked chat row. Before Open WebUI 0.13.5 it goes into the chat.chat blob;
+    from 0.13.5 the messages are already saved as rows (by the caller) and only the current message id is kept:
+    a history written into the blob would be a stray copy the next read ignores."""
+    if _owui_history_in_rows():
+        chat.current_message_id = history.get("currentId") or chat.current_message_id
+        return
+    from sqlalchemy.orm.attributes import flag_modified
+    chat.chat = {**(chat.chat or {}), "history": history}
+    flag_modified(chat, "chat")
+
+
 async def _owui_upsert_message_with_statuses_now(chat_id: str, message_id: str, fields: dict,
                                                  statuses: list) -> bool:
     from open_webui.models.chats import Chats
     from open_webui.models.chat_messages import ChatMessages
-    from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
         if chat is None:
             return False
-        data = chat.chat or {}
-        history = data.get("history") or {}
+        history = await _owui_locked_history(db, chat, [message_id])
         saved = (history.get("messages") or {}).get(message_id) or {}
         # As Open WebUI's upsert and its status save, in one transaction.
         message = Chats._clean_null_bytes(
@@ -341,8 +377,7 @@ async def _owui_upsert_message_with_statuses_now(chat_id: str, message_id: str, 
         message = Chats.upsert_message_to_history(history, message_id, message)
         await ChatMessages.upsert_message(message_id, chat_id, message.get("user_id") or chat.user_id,
                                           message, db=db)
-        chat.chat = {**data, "history": history}
-        flag_modified(chat, "chat")
+        _owui_keep_locked_history(chat, history)
         chat.updated_at = int(time.time())
         return True
 
@@ -362,7 +397,6 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
                                   writer_id: str, takeover: bool) -> dict:
     from open_webui.models.chats import Chats
     from open_webui.models.chat_messages import ChatMessages
-    from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
         if chat is None:
@@ -370,7 +404,7 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
             return {"claimed": False, "how": "gone", "message_id": message_id,
                     "parent": None, "messages": {}}
         data = chat.chat or {}
-        history = data.get("history") or {"messages": {}, "currentId": None}
+        history = await _owui_locked_history(db, chat)
         msgs = history.setdefault("messages", {})
         existing = msgs.get(message_id)
         if existing is not None:
@@ -402,8 +436,7 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
             history["currentId"] = message_id
             chat.current_message_id = message_id
             how, was_done = "new", False
-        chat.chat = {**data, "history": history}
-        flag_modified(chat, "chat")
+        _owui_keep_locked_history(chat, history)
         chat.updated_at = int(time.time())
         for mid, m in changed.items():
             await ChatMessages.upsert_message(mid, chat_id, user_id, m, db=db)

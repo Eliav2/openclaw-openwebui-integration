@@ -420,16 +420,54 @@ def new_chat(page: Page) -> None:
     dismiss_popups(page)
 
 
-def send(page: Page, text: str) -> str:
-    """Type `text` in the composer like a person, send it, return the chat id."""
+# Open WebUI 0.13.5 rewrites a new chat's composer once, a few hundred ms
+# after the page loads (same element, no blur): a key typed in that moment is
+# lost, as it is for a person (0.13.4 loses none). Nothing on the page says
+# when it is done, so the text is checked and typed again.
+COMPOSER_TYPE_ATTEMPTS = 3
+# The composer's typography turns straight quotes curly as they are typed.
+TYPOGRAPHIC_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+
+
+def type_in_composer(page: Page, text: str) -> None:
+    """Type `text` in an empty composer like a person, until it reads `text`."""
     box = page.locator("#chat-input")
-    box.click()
-    # The composer keeps a draft across chats; start from an empty box.
-    page.keyboard.press("Control+A")
-    page.keyboard.press("Backspace")
-    page.keyboard.type(text, delay=5)
-    # On a touch device Enter is a newline, so send the way a phone user does.
-    page.locator("#send-message-button").click()
+    got = None
+    for _ in range(COMPOSER_TYPE_ATTEMPTS):
+        box.click()
+        # The composer keeps a draft across chats; start from an empty box.
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.type(text, delay=5)
+        got = page.evaluate("() => document.querySelector('#chat-input').innerText.trim()")
+        if got.translate(TYPOGRAPHIC_QUOTES) == text.strip():
+            return
+    raise AssertionError(f"the composer reads {got!r} after typing {text!r} {COMPOSER_TYPE_ATTEMPTS} times")
+
+
+# A send the page took shows the message at once: its bubble, or the chat's URL.
+SEND_TAKEN_MS = 10_000
+SEND_TAKEN_JS = ("() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)"
+                 " || !!document.querySelector('.user-message')")
+
+
+def send(page: Page, text: str) -> str:
+    """Type `text` in the composer like a person, send it, return the chat id.
+    On a cold first load (a slow CI runner) Open WebUI 0.13.5's composer reset
+    can come after the typing was checked, and the click then sends nothing:
+    no request reaches the server. When the message shows nowhere, it is
+    typed and sent once more; one that did go shows within SEND_TAKEN_MS, so
+    nothing is sent twice."""
+    for attempt in range(2):
+        type_in_composer(page, text)
+        # On a touch device Enter is a newline, so send the way a phone user does.
+        page.locator("#send-message-button").click()
+        try:
+            page.wait_for_function(SEND_TAKEN_JS, timeout=SEND_TAKEN_MS, polling=250)
+            break
+        except Exception:
+            held = page.evaluate("() => (document.querySelector('#chat-input') || {}).innerText || ''").strip()
+            print(f"  send {attempt + 1}: the page took no message; the composer holds {held[:80]!r}", flush=True)
     # Open WebUI moves to /c/<id> with history.replaceState: no navigation event.
     wait_js(page, "() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", "the new chat's URL", 60_000)
     return page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
@@ -1080,7 +1118,9 @@ class Scenes:
         page.locator('button[aria-label="Edit"]').last.click()
         wait_js(page, """() => [...document.querySelectorAll('textarea')].some(t => t.value.includes('bike out'))""",
                 "the reply's markdown in the editor", 30_000)
-        self.s.shot(page, "media-turn-source")
+        # The image links to its upload by Open WebUI's file id, which shows here on purpose.
+        source = page.evaluate("() => [...document.querySelectorAll('textarea')].map(t => t.value).join('\\n')")
+        self.s.shot(page, "media-turn-source", allow=tuple(re.findall(r"/api/v1/files/([0-9a-f-]+)/", source)))
         page.keyboard.press("Escape")
 
     def first_reply(self, page: Page) -> None:

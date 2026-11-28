@@ -422,7 +422,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     card.appendChild(btn);
 
     const body = document.createElement('div');
-    body.className = 'border border-gray-50 dark:border-gray-850/30 rounded-2xl my-1.5 p-2.5 space-y-2';
+    body.className = 'border border-gray-50 dark:border-gray-850 rounded-2xl my-1.5 p-2.5 space-y-2';
     const input = document.createElement('div');
     input.appendChild(cardLabel('Input'));
     const args = parseJson(c.args || '');
@@ -977,7 +977,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     }
     el.dataset[o.kind] = '1';
     el.className = 'w-full block text-left py-1.5 px-1.5 -mx-1.5 rounded-lg'
-      + (o.open ? ' hover:bg-gray-50 dark:hover:bg-gray-800/60' : '');
+      + (o.open ? ' hover:bg-gray-50 dark:hover:bg-gray-850' : '');
     const top = document.createElement('div');
     top.className = 'flex items-center gap-2';
     const titleEl = document.createElement('div');
@@ -1632,7 +1632,7 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
     const pre = document.createElement('div');
     pre.dataset.openclawCommand = '1';
     pre.className = 'text-xs font-mono text-gray-500 dark:text-gray-400 whitespace-pre-wrap break-all mt-1 '
-      + 'p-1.5 rounded bg-gray-50 dark:bg-gray-800/60';
+      + 'p-1.5 rounded bg-gray-50 dark:bg-gray-850';
     pre.textContent = command;
     el.appendChild(pre);
   }

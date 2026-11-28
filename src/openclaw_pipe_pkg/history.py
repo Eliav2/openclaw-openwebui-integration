@@ -163,7 +163,11 @@ class _OwuiHistoryRows:
         return None if row is None else _coerce_text(row[0])
 
     async def model_idx(self, message_id: str) -> int | None:
-        """The reply's `modelIdx` from the chat row."""
+        """The reply's `modelIdx`: in the chat row's blob, or from Open WebUI 0.13.5 in the message row's data."""
+        if _owui_history_in_rows():
+            row = await self._row(message_id, "data")
+            idx = (row[0] or {}).get("modelIdx") if row is not None else None
+            return idx if isinstance(idx, int) else None
         from sqlalchemy import select
         from open_webui.internal.db import get_async_db_context
         from open_webui.models.chats import Chat

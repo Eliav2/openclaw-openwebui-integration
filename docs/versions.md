@@ -21,6 +21,8 @@ Below the Open WebUI minimum the chat itself still works, but some features brea
 
 An OpenClaw Gateway older than 2026.10.10 gets no messages: the Pipe answers every message with "OpenClaw needs an update" and sends nothing. The Pipe relies on what 2026.10.10 added: a message sent while the agent works is steered into the running run, on every runtime.
 
+**On Open WebUI 0.13.5, use this release or later.** 0.13.5 keeps a chat's messages in their own table instead of the chat itself, and the Pipe up to v1.1.0 still wrote them into the chat: every reply was saved with no parent, so after a reload a chat showed only its last reply ([#434](https://github.com/Eliav2/openclaw-openwebui-integration/issues/434)). Chats saved that way keep the broken links; an upgrade stops new ones.
+
 ## What each feature needs
 
 | Feature | Needs | On an older release |
@@ -51,6 +53,8 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.12.5 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660465558) |
 | 0.13.0 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660471297) |
 | 0.13.2 | pass (on OpenClaw 2026.10.10) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/42592174456) |
+| 0.13.4 | pass (on OpenClaw 2026.11.7) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/46099106134) |
+| 0.13.5 | pass (on OpenClaw 2026.11.7) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/46099103683) |
 
 ### OpenClaw, with Open WebUI 0.12.0 (before the 2026.10.10 minimum)
 
